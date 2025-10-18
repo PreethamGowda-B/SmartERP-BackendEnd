@@ -1,7 +1,9 @@
+require('dotenv').config();
 const express = require('express');
-const app = express();
 const cors = require('cors');
 const cookieParser = require('cookie-parser');
+
+// Import route modules
 const authRoutes = require('./routes/auth');
 const usersRoutes = require('./routes/users');
 const jobsRoutes = require('./routes/jobs');
@@ -13,15 +15,22 @@ const notificationsRoutes = require('./routes/notifications');
 const paymentsRoutes = require('./routes/payments');
 const analyticsRoutes = require('./routes/analytics');
 const employeesRoutes = require('./routes/employees');
-require('dotenv').config();
 
-// Allow credentials so cookies can be sent from the frontend.
-const allowedOrigin = process.env.FRONTEND_ORIGIN || '*';
-app.use(cors({ origin: allowedOrigin, credentials: true }));
+// PostgreSQL connection
+const { pool } = require('./db');
+
+const app = express();
+
+// CORS setup
+app.use(cors({
+  origin: process.env.FRONTEND_ORIGIN,
+  credentials: true
+}));
+
 app.use(cookieParser());
 app.use(express.json());
 
-// API routes
+// Register API routes
 app.use('/api/auth', authRoutes);
 app.use('/api/users', usersRoutes);
 app.use('/api/jobs', jobsRoutes);
@@ -34,40 +43,30 @@ app.use('/api/payments', paymentsRoutes);
 app.use('/api/analytics', analyticsRoutes);
 app.use('/api/employees', employeesRoutes);
 
-// Root route
-app.get('/', (req, res) => {
-  const accept = req.headers.accept || '';
-  if (accept.includes('application/json') || req.query.json === '1') {
-    return res.json({ status: 'ok', message: 'SmartERP backend - API available under /api' });
+// Root route for health check
+app.get('/', async (req, res) => {
+  try {
+    // Test DB connection
+    await pool.query('SELECT NOW()');
+    res.send(`
+      <h1>SmartERP Backend</h1>
+      <p>Status: <strong>OK</strong></p>
+      <p>Database: <strong>Connected</strong></p>
+      <p>API Base: /api</p>
+      <p>Server running on port ${process.env.PORT || 4000}</p>
+    `);
+  } catch (err) {
+    console.error('DB Connection Error:', err);
+    res.status(500).send(`
+      <h1>SmartERP Backend</h1>
+      <p>Status: <strong>ERROR</strong></p>
+      <p>Database: <strong>Disconnected</strong></p>
+      <p>Error: ${err.message}</p>
+    `);
   }
-
-  res.send(`
-    <!doctype html>
-    <html>
-      <head>
-        <meta charset="utf-8" />
-        <meta name="viewport" content="width=device-width, initial-scale=1" />
-        <title>SmartERP Backend</title>
-        <style>
-          body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial; color:#333; padding:24px; }
-          .card { max-width:800px; margin:32px auto; padding:20px; border-radius:8px; box-shadow:0 2px 8px rgba(0,0,0,0.06); background:#fff }
-          h1 { margin:0 0 8px 0 }
-          p { margin:8px 0 }
-          code { background:#f6f8fa; padding:4px 6px; border-radius:4px }
-        </style>
-      </head>
-      <body>
-        <div class="card">
-          <h1>SmartERP Backend</h1>
-          <p>Status: <strong>OK</strong></p>
-          <p>API Base: <code>/api</code></p>
-          <p>Server running on port ${process.env.PORT || 4000}</p>
-        </div>
-      </body>
-    </html>
-  `);
 });
 
+// Start server
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
   console.log(`Backend server running on port ${PORT}`);

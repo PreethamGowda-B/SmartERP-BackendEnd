@@ -21,16 +21,27 @@ const pool = require('./db');
 
 const app = express();
 
-// CORS setup
-app.use(cors({
-  origin: process.env.FRONTEND_ORIGIN || '*',
-  credentials: true,
-}));
+// ✅ CORS setup (fixed)
+app.use(
+  cors({
+    origin: [
+      "https://smart-erp-front-end-git-main-thepreethu01-9119s-projects.vercel.app",
+      "http://localhost:3000" // optional for local development
+    ],
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
 
+// ✅ Handle preflight requests
+app.options("*", cors());
+
+// Middleware
 app.use(cookieParser());
 app.use(express.json());
 
-// API routes
+// ✅ API routes
 app.use('/api/auth', authRoutes);
 app.use('/api/users', usersRoutes);
 app.use('/api/jobs', jobsRoutes);
@@ -43,7 +54,7 @@ app.use('/api/payments', paymentsRoutes);
 app.use('/api/analytics', analyticsRoutes);
 app.use('/api/employees', employeesRoutes);
 
-// Root route (health check)
+// ✅ Root route (health check)
 app.get('/', async (req, res) => {
   try {
     await pool.query('SELECT NOW()'); // Test DB connection
@@ -65,8 +76,8 @@ app.get('/', async (req, res) => {
   }
 });
 
-// Start server
+// ✅ Start server
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
-  console.log(`Backend server running on port ${PORT}`);
+  console.log(`✅ SmartERP Backend running on port ${PORT}`);
 });

@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const cookieParser = require('cookie-parser');
+const pool = require('./db');
 
 // Import routes
 const authRoutes = require('./routes/auth');
@@ -16,32 +17,21 @@ const paymentsRoutes = require('./routes/payments');
 const analyticsRoutes = require('./routes/analytics');
 const employeesRoutes = require('./routes/employees');
 
-// PostgreSQL connection
-const pool = require('./db');
-
 const app = express();
 
-// ✅ CORS setup (fixed)
+// ✅ CORS setup (update the URL below to your real frontend)
+const allowedOrigin = process.env.FRONTEND_ORIGIN || 'https://smart-erp-front-end-git-main-thepreethu01-9119s-projects.vercel.app';
 app.use(
   cors({
-    origin: [
-      "https://smart-erp-front-end-git-main-thepreethu01-9119s-projects.vercel.app",
-      "http://localhost:3000" // optional for local development
-    ],
+    origin: allowedOrigin,
     credentials: true,
-    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
 
-// ✅ Handle preflight requests
-app.options("*", cors());
-
-// Middleware
 app.use(cookieParser());
 app.use(express.json());
 
-// ✅ API routes
+// ✅ Register API routes
 app.use('/api/auth', authRoutes);
 app.use('/api/users', usersRoutes);
 app.use('/api/jobs', jobsRoutes);
@@ -54,10 +44,20 @@ app.use('/api/payments', paymentsRoutes);
 app.use('/api/analytics', analyticsRoutes);
 app.use('/api/employees', employeesRoutes);
 
-// ✅ Root route (health check)
+// ✅ Health check route
+app.get('/health', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT NOW()');
+    res.json({ status: 'ok', time: result.rows[0].now });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// ✅ Root route
 app.get('/', async (req, res) => {
   try {
-    await pool.query('SELECT NOW()'); // Test DB connection
+    await pool.query('SELECT NOW()');
     res.send(`
       <h1>SmartERP Backend</h1>
       <p>Status: <strong>OK</strong></p>
@@ -79,5 +79,5 @@ app.get('/', async (req, res) => {
 // ✅ Start server
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
-  console.log(`✅ SmartERP Backend running on port ${PORT}`);
+  console.log(`🚀 SmartERP backend running on port ${PORT}`);
 });

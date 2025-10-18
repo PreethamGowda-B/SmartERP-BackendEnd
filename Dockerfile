@@ -1,14 +1,14 @@
-# Use Node 18 Alpine for a lightweight image
+# Use Node 18 Alpine for lightweight image
 FROM node:18-alpine
 
-# Set working directory inside the container
+# Set working directory
 WORKDIR /usr/src/app
 
-# Copy package files first to leverage Docker cache
+# Copy package files first (leverages Docker cache)
 COPY package*.json ./
 
 # Install dependencies
-RUN npm ci --only=production && npm rebuild --unsafe-perm
+RUN npm ci --omit=dev && npm rebuild --unsafe-perm
 
 # Copy the rest of the app
 COPY . .
@@ -16,7 +16,5 @@ COPY . .
 # Expose backend port
 EXPOSE 4000
 
-# Default command to run the server
+# Start the server
 CMD ["node", "server.js"]
-# If you need to run in development mode, uncomment the following line and comment the above CMD
-# CMD ["npm", "run", "dev"] 

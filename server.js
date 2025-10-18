@@ -19,8 +19,8 @@ const employeesRoutes = require('./routes/employees');
 
 const app = express();
 
-// ✅ CORS setup (update the URL below to your real frontend)
-const allowedOrigin = process.env.FRONTEND_ORIGIN || 'https://smart-erp-front-end-git-main-thepreethu01-9119s-projects.vercel.app';
+// ✅ CORS
+const allowedOrigin = process.env.FRONTEND_ORIGIN;
 app.use(
   cors({
     origin: allowedOrigin,
@@ -31,7 +31,7 @@ app.use(
 app.use(cookieParser());
 app.use(express.json());
 
-// ✅ Register API routes
+// ✅ API routes
 app.use('/api/auth', authRoutes);
 app.use('/api/users', usersRoutes);
 app.use('/api/jobs', jobsRoutes);
@@ -44,7 +44,7 @@ app.use('/api/payments', paymentsRoutes);
 app.use('/api/analytics', analyticsRoutes);
 app.use('/api/employees', employeesRoutes);
 
-// ✅ Health check route
+// ✅ Health check
 app.get('/health', async (req, res) => {
   try {
     const result = await pool.query('SELECT NOW()');

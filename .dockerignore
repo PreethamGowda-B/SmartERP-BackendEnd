@@ -1,12 +1,9 @@
 node_modules
 npm-debug.log
-docker-compose.override.yml
+Dockerfile
+.dockerignore
 .env
-.env.*
-.vscode
 .git
 .gitignore
-*.log
-dist
-build
-/.DS_Store
+.vscode
+.idea           

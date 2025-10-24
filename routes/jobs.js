@@ -4,14 +4,32 @@ const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 
 // Ensure the jobs table can store JSON payloads and visibility flag
-(async function ensureColumns() {
-  try {
-    await pool.query("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS data JSONB");
-    await pool.query("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS visible_to_all BOOLEAN DEFAULT false");
-  } catch (err) {
-    console.warn('Could not ensure jobs.data/visible_to_all columns exist:', err.message || err);
+const ensureColumns = async () => {
+  if (!pool) {
+    console.warn("⚠️ Database pool not ready yet. Skipping schema checks.");
+    return;
   }
-})();
+
+  try {
+    await pool.query(`
+      ALTER TABLE IF NOT EXISTS jobs
+      ADD COLUMN IF NOT EXISTS data JSONB;
+    `);
+
+    await pool.query(`
+      ALTER TABLE IF NOT EXISTS jobs
+      ADD COLUMN IF NOT EXISTS visible_to_all BOOLEAN DEFAULT false;
+    `);
+
+    console.log("✅ Jobs table schema verified/updated.");
+  } catch (err) {
+    console.warn("⚠️ Could not ensure jobs.data/visible_to_all columns exist:", err.message || err);
+  }
+};
+
+// Run it asynchronously without blocking startup
+setTimeout(ensureColumns, 5000);
+
 
 /**
  * Create a new job

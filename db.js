@@ -13,7 +13,7 @@ const pool = new Pool({
 });
 
 pool.connect()
-  .then(() => console.log(`✅ Connected to PostgreSQL (Render Cloud)`))
-  .catch((err) => console.error("❌ Database connection error:", err));
+  .then(() => console.log("✅ Connected to PostgreSQL (Render Cloud)"))
+  .catch((err) => console.error("❌ Database connection error:", err.message));
 
 module.exports = { pool };

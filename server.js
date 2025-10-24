@@ -2,7 +2,7 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const bodyParser = require("body-parser");
-const { pool } = require("./db"); // ✅ Correct import
+const { pool } = require('../db'); // ✅ Correct import
 const jobsRouter = require("./routes/jobs");
 const usersRouter = require("./routes/users");
 const attendanceRouter = require("./routes/attendance");

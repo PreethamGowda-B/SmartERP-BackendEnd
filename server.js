@@ -2,7 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const cookieParser = require('cookie-parser');
-const pool = require('../db');
+const pool = require('./db');
 
 // Import routes
 const authRoutes = require('./routes/auth');

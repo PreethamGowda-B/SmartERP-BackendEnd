@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { pool } = require('../db');
+const { pool } = require('./db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 
 // Ensure the jobs table can store JSON payloads and visibility flag
@@ -11,15 +11,9 @@ const ensureColumns = async () => {
   }
 
   try {
-    await pool.query(`
-      ALTER TABLE IF NOT EXISTS jobs
-      ADD COLUMN IF NOT EXISTS data JSONB;
-    `);
+    await pool.query("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS data JSONB");
+await pool.query("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS visible_to_all BOOLEAN DEFAULT false");
 
-    await pool.query(`
-      ALTER TABLE IF NOT EXISTS jobs
-      ADD COLUMN IF NOT EXISTS visible_to_all BOOLEAN DEFAULT false;
-    `);
 
     console.log("✅ Jobs table schema verified/updated.");
   } catch (err) {

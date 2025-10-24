@@ -4,7 +4,9 @@ const cors = require('cors');
 const cookieParser = require('cookie-parser');
 const pool = require('./db');
 
-// Import routes
+const app = express();
+
+// ✅ Import routes
 const authRoutes = require('./routes/auth');
 const usersRoutes = require('./routes/users');
 const jobsRoutes = require('./routes/jobs');
@@ -17,21 +19,17 @@ const paymentsRoutes = require('./routes/payments');
 const analyticsRoutes = require('./routes/analytics');
 const employeesRoutes = require('./routes/employees');
 
-const app = express();
-
-// ✅ CORS
-const allowedOrigin = process.env.FRONTEND_ORIGIN;
+// ✅ Middleware
 app.use(
   cors({
-    origin: allowedOrigin,
+    origin: process.env.FRONTEND_ORIGIN,
     credentials: true,
   })
 );
-
 app.use(cookieParser());
 app.use(express.json());
 
-// ✅ API routes
+// ✅ API base routes
 app.use('/api/auth', authRoutes);
 app.use('/api/users', usersRoutes);
 app.use('/api/jobs', jobsRoutes);
@@ -44,17 +42,35 @@ app.use('/api/payments', paymentsRoutes);
 app.use('/api/analytics', analyticsRoutes);
 app.use('/api/employees', employeesRoutes);
 
-// ✅ Health check
-app.get('/health', async (req, res) => {
+// ✅ Health check (under /api)
+app.get('/api/health', async (req, res) => {
   try {
     const result = await pool.query('SELECT NOW()');
-    res.json({ status: 'ok', time: result.rows[0].now });
+    res.json({
+      status: 'ok',
+      database: 'connected',
+      time: result.rows[0].now,
+    });
   } catch (err) {
-    res.status(500).json({ status: 'error', message: err.message });
+    res.status(500).json({
+      status: 'error',
+      database: 'disconnected',
+      message: err.message,
+    });
   }
 });
 
-// ✅ Root route
+// ✅ Root API base (for quick check in browser)
+app.get('/api', (req, res) => {
+  res.json({
+    message: '🚀 SmartERP Backend API is running successfully!',
+    database: 'connected',
+    base: '/api',
+    frontend: process.env.FRONTEND_ORIGIN,
+  });
+});
+
+// ✅ Root HTML (optional, for testing)
 app.get('/', async (req, res) => {
   try {
     await pool.query('SELECT NOW()');
@@ -62,7 +78,7 @@ app.get('/', async (req, res) => {
       <h1>SmartERP Backend</h1>
       <p>Status: <strong>OK</strong></p>
       <p>Database: <strong>Connected</strong></p>
-      <p>API Base: /api</p>
+      <p>API Base: <code>/api</code></p>
       <p>Server running on port ${process.env.PORT || 4000}</p>
     `);
   } catch (err) {
@@ -81,3 +97,4 @@ const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
   console.log(`🚀 SmartERP backend running on port ${PORT}`);
 });
+module.exports = app; // for testing purposes 

@@ -1,21 +1,16 @@
-require('dotenv').config();
-const { Pool } = require('pg');
+const { Pool } = require("pg");
+require("dotenv").config();
 
 const pool = new Pool({
-  user: process.env.DB_USER,
-  host: process.env.DB_HOST,
-  database: process.env.DB_NAME,
-  password: process.env.DB_PASS,
-  port: process.env.DB_PORT || 5432,
-  ssl: false, // Render Postgres does NOT require SSL
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    require: true,
+    rejectUnauthorized: false, // Required for Neon/Render SSL
+  },
 });
 
-pool.on('connect', () => {
-  console.log('✅ Connected to Postgres DB');
-});
-
-pool.on('error', (err) => {
-  console.error('❌ Postgres DB error:', err);
-});
+pool.connect()
+  .then(() => console.log("✅ Connected to PostgreSQL (Neon)"))
+  .catch((err) => console.error("❌ Database connection error:", err));
 
 module.exports = pool;

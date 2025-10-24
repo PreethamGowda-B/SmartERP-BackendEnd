@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
-const { pool } = require('../db');
+const pool = require("../db");
+
 const { authenticateToken } = require('../middleware/authMiddleware');
 
 // Ensure the jobs table can store JSON payloads and visibility flag

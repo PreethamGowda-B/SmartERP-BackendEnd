@@ -12,8 +12,9 @@ const pool = new Pool({
   ssl: isProduction ? { rejectUnauthorized: false } : false,
 });
 
-pool.connect()
+pool
+  .connect()
   .then(() => console.log("✅ Connected to PostgreSQL (Render Cloud)"))
   .catch((err) => console.error("❌ Database connection error:", err.message));
 
-module.exports = { pool };
+module.exports = pool; // ✅ Export pool directly

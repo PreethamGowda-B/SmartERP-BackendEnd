@@ -1,147 +1,130 @@
-const express = require("express");
-const bcrypt = require("bcrypt");
-const jwt = require("jsonwebtoken");
-const pool = require("../db");
+// backend/routes/auth.js
+const express = require('express');
 const router = express.Router();
-const cookieParser = require("cookie-parser");
-require("dotenv").config();
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const { pool } = require('../db');
+const logActivity = require('../helpers/logActivity');
 
+require('dotenv').config();
 
-const ACCESS_SECRET = process.env.JWT_SECRET || "supersecretkey";
-const REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || ACCESS_SECRET;
+// Choose refresh secret
+const REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || process.env.JWT_SECRET;
 
-// ================================
-// Utility: create JWT tokens
-// ================================
-function createAccessToken(payload) {
-  return jwt.sign(payload, ACCESS_SECRET, { expiresIn: "15m" });
-}
-function createRefreshToken(payload) {
-  return jwt.sign(payload, REFRESH_SECRET, { expiresIn: "7d" });
-}
-
-// ================================
-// Register user
-// ================================
-router.post("/register", async (req, res) => {
+// --------------------
+// Login route
+// --------------------
+router.post('/login', async (req, res) => {
+  const { email, password } = req.body;
   try {
-    const { email, password, role = "employee" } = req.body;
-
-    if (!email || !password)
-      return res.status(400).json({ message: "Email and password are required" });
-
-    const userExists = await pool.query("SELECT id FROM users WHERE email = $1", [
-      email.toLowerCase(),
-    ]);
-    if (userExists.rows.length > 0)
-      return res.status(409).json({ message: "Account already exists" });
-
-    const hashedPassword = await bcrypt.hash(password, 10);
-    const result = await pool.query(
-      "INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3) RETURNING id, email, role",
-      [email.toLowerCase(), hashedPassword, role]
-    );
-
-    res.status(201).json({
-      message: "Account created successfully",
-      user: result.rows[0],
-    });
-  } catch (err) {
-    console.error("❌ Register error:", err);
-    res.status(500).json({ message: "Server error" });
-  }
-});
-
-// ================================
-// Login user
-// ================================
-router.post("/login", async (req, res) => {
-  try {
-    const { email, password } = req.body;
-    if (!email || !password)
-      return res.status(400).json({ message: "Email and password are required" });
-
-    const userResult = await pool.query(
-      "SELECT * FROM users WHERE email = $1",
-      [email.toLowerCase()]
-    );
+    const userResult = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+    if (userResult.rows.length === 0) {
+      return res.status(401).json({ message: 'Invalid credentials' });
+    }
     const user = userResult.rows[0];
-    if (!user) return res.status(401).json({ message: "Invalid credentials" });
+    const valid = await bcrypt.compare(password, user.password_hash);
+    if (!valid) {
+      return res.status(401).json({ message: 'Invalid credentials' });
+    }
 
-    const match = await bcrypt.compare(password, user.password_hash);
-    if (!match) return res.status(401).json({ message: "Invalid credentials" });
+    // Log login activity
+    await logActivity(user.id, 'login', req);
 
-    const payload = { id: user.id, email: user.email, role: user.role };
-    const accessToken = createAccessToken(payload);
-    const refreshToken = createRefreshToken(payload);
+    // Create tokens
+    const accessToken = jwt.sign({ userId: user.id, role: user.role }, process.env.JWT_SECRET, { expiresIn: '15m' });
+    const refreshToken = jwt.sign({ userId: user.id }, REFRESH_SECRET, { expiresIn: '7d' });
 
-    // Store tokens as cookies
-    const cookieOptions = {
-      httpOnly: true,
-      sameSite: "lax",
-      // secure: process.env.NODE_ENV === "production",
-    };
-    res.cookie("access_token", accessToken, {
-      ...cookieOptions,
-      maxAge: 15 * 60 * 1000,
-    });
-    res.cookie("refresh_token", refreshToken, {
-      ...cookieOptions,
-      maxAge: 7 * 24 * 60 * 60 * 1000,
-    });
+    // Store refresh token
+    await pool.query(
+      'INSERT INTO refresh_tokens (user_id, token, expires_at) VALUES ($1, $2, NOW() + INTERVAL \'7 days\')',
+      [user.id, refreshToken]
+    );
 
-    res.status(200).json({
-      message: "Login successful",
-      user: { id: user.id, email: user.email, role: user.role },
-    });
+    // Set cookies
+    const cookieOptions = { httpOnly: true, sameSite: 'lax' };
+    res.cookie('access_token', accessToken, { ...cookieOptions, maxAge: 15 * 60 * 1000 });
+    res.cookie('refresh_token', refreshToken, { ...cookieOptions, maxAge: 7 * 24 * 60 * 60 * 1000 });
+
+    res.json({ ok: true, user: { id: user.id, email: user.email, role: user.role } });
   } catch (err) {
-    console.error("❌ Login error:", err);
-    res.status(500).json({ message: "Server error" });
+    console.error('Login error', err);
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
-// ================================
-// Refresh Token
-// ================================
-router.post("/refresh", async (req, res) => {
+// --------------------
+// Refresh token route
+// --------------------
+router.post('/refresh', async (req, res) => {
+  const token = req.cookies?.refresh_token;
+  if (!token) return res.status(401).json({ message: 'No refresh token' });
+
   try {
-    const token = req.cookies?.refresh_token || req.body.refresh_token;
-    if (!token) return res.status(401).json({ message: "No refresh token" });
+    const rt = await pool.query('SELECT * FROM refresh_tokens WHERE token = $1', [token]);
+    if (rt.rows.length === 0) return res.status(401).json({ message: 'Invalid refresh token' });
 
-    jwt.verify(token, REFRESH_SECRET, (err, decoded) => {
-      if (err) return res.status(401).json({ message: "Invalid refresh token" });
-      const newAccess = createAccessToken({
-        id: decoded.id,
-        email: decoded.email,
-        role: decoded.role,
-      });
-      res.cookie("access_token", newAccess, {
-        httpOnly: true,
-        sameSite: "lax",
-        maxAge: 15 * 60 * 1000,
-      });
-      res.json({ message: "Token refreshed" });
+    jwt.verify(token, REFRESH_SECRET, async (err, payload) => {
+      if (err) return res.status(403).json({ message: 'Invalid token' });
+
+      try {
+        // Rotate refresh token
+        await pool.query('DELETE FROM refresh_tokens WHERE token = $1', [token]);
+        const newRefresh = jwt.sign({ userId: payload.userId }, REFRESH_SECRET, { expiresIn: '7d' });
+        await pool.query(
+          'INSERT INTO refresh_tokens (user_id, token, expires_at) VALUES ($1, $2, NOW() + INTERVAL \'7 days\')',
+          [payload.userId, newRefresh]
+        );
+
+        const accessToken = jwt.sign({ userId: payload.userId }, process.env.JWT_SECRET, { expiresIn: '15m' });
+
+        res.cookie('access_token', accessToken, { httpOnly: true, sameSite: 'lax', maxAge: 15 * 60 * 1000 });
+        res.cookie('refresh_token', newRefresh, { httpOnly: true, sameSite: 'lax', maxAge: 7 * 24 * 60 * 60 * 1000 });
+
+        // Log refresh activity
+        await logActivity(payload.userId, 'refresh_token', req);
+
+        res.json({ ok: true });
+      } catch (err) {
+        console.error('Error rotating token', err);
+        res.status(500).json({ message: 'Server error' });
+      }
     });
   } catch (err) {
-    console.error("Refresh token error:", err);
-    res.status(500).json({ message: "Server error" });
+    console.error('Refresh error', err);
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
-// ================================
-// Logout
-// ================================
-router.post("/logout", (req, res) => {
-  res.clearCookie("access_token");
-  res.clearCookie("refresh_token");
-  res.json({ message: "Logged out successfully" });
+// --------------------
+// Logout route
+// --------------------
+router.post('/logout', async (req, res) => {
+  try {
+    const token = req.cookies?.refresh_token;
+    if (token) {
+      const rt = await pool.query('SELECT * FROM refresh_tokens WHERE token = $1', [token]);
+      if (rt.rows.length) {
+        const userId = rt.rows[0].user_id;
+        await logActivity(userId, 'logout', req);
+      }
+
+      await pool.query('DELETE FROM refresh_tokens WHERE token = $1', [token]);
+    }
+
+    res.clearCookie('access_token');
+    res.clearCookie('refresh_token');
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Logout error', err);
+    res.status(500).json({ message: 'Server error' });
+  }
 });
 
-// ================================
+// --------------------
 // Test route
-// ================================
-router.get("/", (req, res) => {
-  res.json({ message: "Auth API is working fine ✅" });
+// --------------------
+router.get('/', (req, res) => {
+  res.json({ message: 'Auth route is working!' });
 });
 
 module.exports = router;

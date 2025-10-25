@@ -1,4 +1,3 @@
-// routes/auth.js
 const express = require("express");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
@@ -6,6 +5,7 @@ const pool = require("../db");
 const router = express.Router();
 const cookieParser = require("cookie-parser");
 require("dotenv").config();
+
 
 const ACCESS_SECRET = process.env.JWT_SECRET || "supersecretkey";
 const REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || ACCESS_SECRET;
@@ -145,4 +145,3 @@ router.get("/", (req, res) => {
 });
 
 module.exports = router;
-const express = require("express");   

@@ -1,6 +1,6 @@
 -- ===============================
 -- SmartERP Database Schema
--- Fully Updated
+-- Fully Updated with Inventory Images
 -- ===============================
 
 -- Users table
@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS inventory_items (
   unit VARCHAR(50),
   location VARCHAR(255),
   reorder_threshold NUMERIC DEFAULT 0,
+  image_url TEXT,
   created_at TIMESTAMP DEFAULT NOW()
 );
 
@@ -152,3 +153,6 @@ VALUES (
   'admin'
 )
 ON CONFLICT (email) DO NOTHING;
+
+-- Add image_url column to existing inventory_items table if it doesn't exist
+ALTER TABLE inventory_items ADD COLUMN IF NOT EXISTS image_url TEXT;

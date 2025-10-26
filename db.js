@@ -1,21 +1,27 @@
-require('dotenv').config();
-const { Pool } = require('pg');
+const { Pool } = require("pg");
+require("dotenv").config();
 
+// ✅ Supports both Render and Neon DB setups
 const pool = new Pool({
-  user: process.env.DB_USER,
   host: process.env.DB_HOST,
-  database: process.env.DB_NAME,
+  user: process.env.DB_USER,
   password: process.env.DB_PASS,
+  database: process.env.DB_NAME,
   port: process.env.DB_PORT || 5432,
-  ssl: false, // Render Postgres does NOT require SSL
+  ssl: {
+    rejectUnauthorized: false, // Required for Render
+  },
 });
 
-pool.on('connect', () => {
-  console.log('✅ Connected to Postgres DB');
-});
-
-pool.on('error', (err) => {
-  console.error('❌ Postgres DB error:', err);
-});
+// ✅ Test the connection immediately
+(async () => {
+  try {
+    const res = await pool.query("SELECT NOW()");
+    console.log("✅ Connected to PostgreSQL (Render Cloud)");
+    console.log("🕒 Database time:", res.rows[0].now);
+  } catch (err) {
+    console.error("❌ PostgreSQL connection error:", err.message);
+  }
+})();
 
 module.exports = pool;

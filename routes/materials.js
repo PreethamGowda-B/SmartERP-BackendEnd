@@ -5,14 +5,15 @@ const { authenticateToken } = require('../middleware/authMiddleware');
 
 // Create inventory item
 router.post('/items', authenticateToken, async (req, res) => {
-  const { sku, name, description, quantity, unit, location, reorder_threshold } = req.body;
+  const { sku, name, description, quantity, unit, location, reorder_threshold, image_url } = req.body;
   try {
     const result = await pool.query(
-      'INSERT INTO inventory_items (sku, name, description, quantity, unit, location, reorder_threshold) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *',
-      [sku, name, description, quantity || 0, unit || null, location || null, reorder_threshold || 0]
+      'INSERT INTO inventory_items (sku, name, description, quantity, unit, location, reorder_threshold, image_url) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *',
+      [sku, name, description, quantity || 0, unit || null, location || null, reorder_threshold || 0, image_url || null]
     );
     res.json(result.rows[0]);
   } catch (err) {
+    console.error('Error creating inventory item:', err);
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -23,11 +24,45 @@ router.get('/items', authenticateToken, async (req, res) => {
     const result = await pool.query('SELECT * FROM inventory_items ORDER BY name');
     res.json(result.rows);
   } catch (err) {
+    console.error('Error fetching inventory items:', err);
     res.status(500).json({ message: 'Server error' });
   }
 });
 
-// Create material request
+// Update inventory item
+router.put('/items/:id', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  const { sku, name, description, quantity, unit, location, reorder_threshold, image_url } = req.body;
+  try {
+    const result = await pool.query(
+      'UPDATE inventory_items SET sku = COALESCE($1, sku), name = COALESCE($2, name), description = COALESCE($3, description), quantity = COALESCE($4, quantity), unit = COALESCE($5, unit), location = COALESCE($6, location), reorder_threshold = COALESCE($7, reorder_threshold), image_url = COALESCE($8, image_url) WHERE id = $9 RETURNING *',
+      [sku, name, description, quantity, unit, location, reorder_threshold, image_url, id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Inventory item not found' });
+    }
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Error updating inventory item:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Delete inventory item
+router.delete('/items/:id', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await pool.query('DELETE FROM inventory_items WHERE id = $1 RETURNING *', [id]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Inventory item not found' });
+    }
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Error deleting inventory item:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 // Create material request - only employees can create requests
 router.post('/requests', authenticateToken, async (req, res) => {
   const { requestNumber, items } = req.body; // items: [{ inventory_item_id, name, quantity, unit }]
@@ -56,7 +91,6 @@ router.post('/requests', authenticateToken, async (req, res) => {
   }
 });
 
-// List requests
 // List requests
 // - employees see only their requests
 // - owners/admins see all requests

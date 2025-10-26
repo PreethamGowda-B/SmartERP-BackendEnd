@@ -18,4 +18,5 @@ const pool = new Pool({
   }
 })();
 
-module.exports = pool;
+// ✅ Export correctly for server.js
+module.exports = { pool };

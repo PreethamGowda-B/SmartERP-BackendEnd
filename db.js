@@ -18,5 +18,5 @@ const pool = new Pool({
   }
 })();
 
-// ✅ Export correctly for server.js
-module.exports = { pool };
+// ✅ Export correctly for all backend routes
+module.exports = pool;

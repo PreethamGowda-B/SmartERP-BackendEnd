@@ -1,25 +1,22 @@
-// back/db.js
-require('dotenv').config();
-const { Pool } = require('pg');
+const { Pool } = require("pg");
+require("dotenv").config();
 
+// ✅ Always prefer DATABASE_URL (Neon or Render)
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
 
-pool.on('error', (err) => {
-  console.error('Unexpected DB error', err);
-});
-
-async function testConnection() {
+// ✅ Test connection immediately
+(async () => {
   try {
-    const res = await pool.query('SELECT NOW() as now');
-    console.log('✅ Connected to Neon PostgreSQL database');
-    console.log('🕒 Database time:', res.rows[0].now);
+    const res = await pool.query("SELECT NOW()");
+    console.log("✅ Connected to Neon PostgreSQL database");
+    console.log("🕒 Database time:", res.rows[0].now);
   } catch (err) {
-    console.error('❌ DB connection test failed:', err);
+    console.error("❌ Database connection error:", err.message);
   }
-}
-testConnection();
+})();
 
-module.exports = { pool };
+// ✅ Export correctly for all backend routes
+module.exports = pool;

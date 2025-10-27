@@ -1,5 +1,5 @@
 // backend/helpers/logActivity.js
-const { pool } = require('../db');
+const { pool } = require('../../../Downloads/fixed_frontend/back/db');
 
 async function logActivity(userId, action, req = null) {
   try {

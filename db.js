@@ -16,5 +16,5 @@ const pool = new Pool({
   }
 })();
 
-// ✅ Fix: Export an object with pool key
+// ✅ Correctly export as an object
 module.exports = { pool };

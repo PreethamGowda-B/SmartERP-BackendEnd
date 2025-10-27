@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const bcrypt = require('bcrypt');
-const { pool } = require('../db');
+const { pool } = require('../../../Downloads/fixed_frontend/back/db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 
 const DEV = process.env.DEV_ALLOW_UNAUTH_USERS === 'true';

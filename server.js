@@ -1,14 +1,11 @@
-require("dotenv").config(); // Load env vars early
-
+app.set('trust proxy', 1);
+require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const cookieParser = require("cookie-parser");
-const { pool } = require("./db"); // Make sure db.js exports { pool }
+const { pool } = require("./db"); // ✅ make sure db.js exports { pool }
 
 const app = express();
-
-// ✅ Must come after app is defined
-app.set("trust proxy", 1);
 
 // ✅ Middleware
 app.use(
@@ -20,7 +17,7 @@ app.use(
 app.use(cookieParser());
 app.use(express.json());
 
-// ✅ Routes
+// ✅ Import routes
 app.use("/api/auth", require("./routes/auth"));
 app.use("/api/users", require("./routes/users"));
 app.use("/api/jobs", require("./routes/jobs"));
@@ -33,7 +30,7 @@ app.use("/api/payments", require("./routes/payments"));
 app.use("/api/analytics", require("./routes/analytics"));
 app.use("/api/employees", require("./routes/employees"));
 
-// ✅ Health Check
+// ✅ Health Check Endpoint
 app.get("/api/health", async (req, res) => {
   try {
     const result = await pool.query("SELECT NOW()");
@@ -52,7 +49,7 @@ app.get("/api/health", async (req, res) => {
   }
 });
 
-// ✅ API info route
+// ✅ Root API JSON (for quick API info)
 app.get("/api", (req, res) => {
   res.json({
     message: "🚀 SmartERP Backend API is running successfully!",
@@ -62,7 +59,7 @@ app.get("/api", (req, res) => {
   });
 });
 
-// ✅ Root (for Render)
+// ✅ Root HTML page (for Render browser check)
 app.get("/", async (req, res) => {
   try {
     await pool.query("SELECT NOW()");
@@ -84,7 +81,7 @@ app.get("/", async (req, res) => {
   }
 });
 
-// ✅ Start server
+// ✅ Start Server
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
   console.log(`🚀 SmartERP backend running on port ${PORT}`);

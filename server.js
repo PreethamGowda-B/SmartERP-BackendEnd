@@ -7,26 +7,30 @@ const cookieParser = require('cookie-parser');
 const { pool } = require('./db');
 const { ensureAll } = require('./dbSetup');
 
-const authRoutes = require('./routes/auth');
-const employeesRoutes = require('./routes/employees');
+// add these lines near where you already mount routes
+app.use('/api/auth', authRoutes);
+app.use('/api/employees', employeesRoutes);
 
-const app = express();
+// Also add for other route modules if present
+// e.g. if you have jobsRoutes, materialsRoutes, paymentsRoutes, attendanceRoutes, activitiesRoutes, analyticsRoutes, etc:
+const jobsRoutes = require('./routes/jobs');        // if not already required
+const materialsRoutes = require('./routes/materials');
+const paymentsRoutes = require('./routes/payments');
+const attendanceRoutes = require('./routes/attendance');
+const activitiesRoutes = require('./routes/activities');
+const analyticsRoutes = require('./routes/analytics');
+// mount them under /api as well
+app.use('/api/jobs', jobsRoutes);
+app.use('/api/materials', materialsRoutes);
+app.use('/api/payments', paymentsRoutes);
+app.use('/api/attendance', attendanceRoutes);
+app.use('/api/activities', activitiesRoutes);
+app.use('/api/analytics', analyticsRoutes);
 
-// If behind a proxy (Render, Heroku), trust it so secure cookies work
-app.set('trust proxy', 1);
-
-app.use(express.json());
-app.use(cookieParser());
-
-const FRONTEND = process.env.FRONTEND_ORIGIN || 'https://smart-erp-front-end.vercel.app';
-app.use(cors({
-  origin: FRONTEND,
-  credentials: true
-}));
-
-// mount routes
+// Keep the original mounts if they already exist (optional)
 app.use('/auth', authRoutes);
 app.use('/employees', employeesRoutes);
+
 
 // healthcheck
 app.get('/health', (req, res) => res.json({ ok: true }));

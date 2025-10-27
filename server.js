@@ -1,115 +1,90 @@
-// back/server.js
-require('dotenv').config();
-const fs = require('fs');
-const path = require('path');
-const express = require('express');
-const cors = require('cors');
-const cookieParser = require('cookie-parser');
-
-const { pool } = require('./db');
-const { ensureAll } = require('./dbSetup');
+app.set('trust proxy', 1);
+require("dotenv").config();
+const express = require("express");
+const cors = require("cors");
+const cookieParser = require("cookie-parser");
+const { pool } = require("./db"); // ✅ make sure db.js exports { pool }
 
 const app = express();
 
-// Trust proxy (important on Render so secure cookies work)
-app.set('trust proxy', 1);
-
-// Basic middleware
-app.use(express.json());
+// ✅ Middleware
+app.use(
+  cors({
+    origin: process.env.FRONTEND_ORIGIN || "https://smart-erp-front-end.vercel.app",
+    credentials: true,
+  })
+);
 app.use(cookieParser());
+app.use(express.json());
 
-// CORS: allow only your frontend origin and credentials
-const FRONTEND = process.env.FRONTEND_ORIGIN || process.env.NEXT_PUBLIC_FRONTEND_URL || 'https://smart-erp-front-end.vercel.app';
-app.use(cors({
-  origin: FRONTEND,
-  credentials: true
-}));
+// ✅ Import routes
+app.use("/api/auth", require("./routes/auth"));
+app.use("/api/users", require("./routes/users"));
+app.use("/api/jobs", require("./routes/jobs"));
+app.use("/api/activities", require("./routes/activities"));
+app.use("/api/attendance", require("./routes/attendance"));
+app.use("/api/materials", require("./routes/materials"));
+app.use("/api/payroll", require("./routes/payroll"));
+app.use("/api/notifications", require("./routes/notifications"));
+app.use("/api/payments", require("./routes/payments"));
+app.use("/api/analytics", require("./routes/analytics"));
+app.use("/api/employees", require("./routes/employees"));
 
-// Helper to safely require route modules if they exist
-function tryRequireRoute(relativePath) {
-  const full = path.join(__dirname, relativePath);
-  if (fs.existsSync(full + '.js') || fs.existsSync(full) ) {
-    try {
-      return require(full);
-    } catch (err) {
-      console.error(`Failed to require route ${relativePath}:`, err);
-      return null;
-    }
-  }
-  return null;
-}
-
-// Require route modules only if present
-const authRoutes = tryRequireRoute('./routes/auth');
-const employeesRoutes = tryRequireRoute('./routes/employees');
-const jobsRoutes = tryRequireRoute('./routes/jobs');
-const materialsRoutes = tryRequireRoute('./routes/materials');
-const paymentsRoutes = tryRequireRoute('./routes/payments');
-const attendanceRoutes = tryRequireRoute('./routes/attendance');
-const activitiesRoutes = tryRequireRoute('./routes/activities');
-const analyticsRoutes = tryRequireRoute('./routes/analytics');
-
-// Mount routes under /api/* if the modules exist
-if (authRoutes) {
-  app.use('/api/auth', authRoutes);
-  app.use('/auth', authRoutes); // keep original mount too
-}
-if (employeesRoutes) {
-  app.use('/api/employees', employeesRoutes);
-  app.use('/employees', employeesRoutes);
-}
-if (jobsRoutes) {
-  app.use('/api/jobs', jobsRoutes);
-  app.use('/jobs', jobsRoutes);
-}
-if (materialsRoutes) {
-  app.use('/api/materials', materialsRoutes);
-  app.use('/materials', materialsRoutes);
-}
-if (paymentsRoutes) {
-  app.use('/api/payments', paymentsRoutes);
-  app.use('/payments', paymentsRoutes);
-}
-if (attendanceRoutes) {
-  app.use('/api/attendance', attendanceRoutes);
-  app.use('/attendance', attendanceRoutes);
-}
-if (activitiesRoutes) {
-  app.use('/api/activities', activitiesRoutes);
-  app.use('/activities', activitiesRoutes);
-}
-if (analyticsRoutes) {
-  app.use('/api/analytics', analyticsRoutes);
-  app.use('/analytics', analyticsRoutes);
-}
-
-// Friendly root so visiting the base URL shows a message
-app.get('/', (req, res) => {
-  res.send('SmartERP Backend API is running. Use /api/auth or /auth endpoints.');
-});
-
-// Healthcheck
-app.get('/health', (req, res) => res.json({ ok: true }));
-
-// Start server after DB setup
-(async () => {
+// ✅ Health Check Endpoint
+app.get("/api/health", async (req, res) => {
   try {
-    // ensureAll will run schema checks safely (it uses the pool)
-    if (typeof ensureAll === 'function') {
-      await ensureAll();
-    } else {
-      console.warn('No ensureAll() exported from dbSetup, skipping schema checks.');
-    }
-
-    const PORT = process.env.PORT || 4000;
-    app.listen(PORT, () => {
-      console.log(`🚀 SmartERP backend running on port ${PORT}`);
+    const result = await pool.query("SELECT NOW()");
+    res.json({
+      status: "ok",
+      database: "connected",
+      time: result.rows[0].now,
     });
   } catch (err) {
-    console.error('Startup error:', err);
-    const PORT = process.env.PORT || 4000;
-    app.listen(PORT, () => {
-      console.log(`🚀 SmartERP backend running (startup errors) on port ${PORT}`);
+    console.error("❌ Health check failed:", err.message);
+    res.status(500).json({
+      status: "error",
+      database: "disconnected",
+      message: err.message,
     });
   }
-})();
+});
+
+// ✅ Root API JSON (for quick API info)
+app.get("/api", (req, res) => {
+  res.json({
+    message: "🚀 SmartERP Backend API is running successfully!",
+    database: "connected",
+    base: "/api",
+    frontend: process.env.FRONTEND_ORIGIN,
+  });
+});
+
+// ✅ Root HTML page (for Render browser check)
+app.get("/", async (req, res) => {
+  try {
+    await pool.query("SELECT NOW()");
+    res.send(`
+      <h1>SmartERP Backend</h1>
+      <p>Status: <strong>OK</strong></p>
+      <p>Database: <strong>Connected to Neon</strong></p>
+      <p>API Base: <code>/api</code></p>
+      <p>Server running on port ${process.env.PORT || 4000}</p>
+    `);
+  } catch (err) {
+    console.error("❌ DB Connection Error:", err.message);
+    res.status(500).send(`
+      <h1>SmartERP Backend</h1>
+      <p>Status: <strong>ERROR</strong></p>
+      <p>Database: <strong>Disconnected</strong></p>
+      <p>Error: ${err.message}</p>
+    `);
+  }
+});
+
+// ✅ Start Server
+const PORT = process.env.PORT || 4000;
+app.listen(PORT, () => {
+  console.log(`🚀 SmartERP backend running on port ${PORT}`);
+});
+
+module.exports = app;

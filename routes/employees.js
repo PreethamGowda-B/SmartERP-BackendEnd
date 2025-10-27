@@ -1,47 +1,131 @@
-// back/routes/employees.js
 const express = require('express');
 const router = express.Router();
+const bcrypt = require('bcrypt');
 const { pool } = require('../db');
+const { authenticateToken } = require('../middleware/authMiddleware');
 
-// GET /employees - list employees (example)
-router.get('/', async (req, res) => {
-  if (!pool) {
-    console.error('employees.get: DB pool undefined');
-    return res.status(500).json({ error: 'Database not ready' });
-  }
+const DEV = process.env.DEV_ALLOW_UNAUTH_USERS === 'true';
 
-  try {
-    const result = await pool.query('SELECT id, name, email, position FROM employees ORDER BY id DESC LIMIT 200;');
-    res.json({ employees: result.rows });
-  } catch (err) {
-    console.error('employees.get error:', err);
-    res.status(500).json({ error: 'Failed to fetch employees' });
-  }
-});
+async function mapRowToEmployee(row) {
+  // derive a display name from the email if no explicit name column exists
+  const email = row.email || '';
+  const local = email.split('@')[0] || '';
+  const name = local.replace('.', ' ').replace('_', ' ');
+  return {
+    id: row.id,
+    name: name.charAt(0).toUpperCase() + name.slice(1),
+    email: row.email,
+    phone: row.phone || '',
+    position: row.position || 'Employee',
+    status: row.is_active === false ? 'inactive' : 'active',
+    currentJob: null,
+    hoursThisWeek: 0,
+    location: row.location || 'Unassigned',
+    avatar: '/placeholder-user.jpg',
+  };
+}
 
-// POST /employees - create a simple employee (example)
-router.post('/', async (req, res) => {
-  if (!pool) {
-    console.error('employees.post: DB pool undefined');
-    return res.status(500).json({ error: 'Database not ready' });
-  }
+// GET /api/employees - list employees
+if (DEV) {
+  router.get('/', async (req, res) => {
+    try {
+      const result = await pool.query(
+        `SELECT u.id, u.email, u.role, p.phone, p.position, p.department, p.hire_date, p.is_active, p.created_at AS profile_created_at
+         FROM users u
+         LEFT JOIN employee_profiles p ON u.id = p.user_id
+         ORDER BY u.id`);
+      const employees = await Promise.all(result.rows.map(mapRowToEmployee));
+      res.json(employees);
+    } catch (err) {
+      console.error('Error fetching employees:', err);
+      res.status(500).json({ message: 'Server error fetching employees' });
+    }
+  });
 
-  const { name, email, position } = req.body || {};
-  if (!name || !email) {
-    return res.status(400).json({ error: 'name and email are required' });
-  }
+  // POST /api/employees - create employee (dev-unprotected)
+  router.post('/', async (req, res) => {
+    const { email, password, position, phone } = req.body;
+    if (!email) return res.status(400).json({ message: 'Email required' });
+    try {
+      const pwd = password || 'ChangeMe123!';
+      const hash = await bcrypt.hash(pwd, 10);
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const insertUser = await client.query(
+          'INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3) RETURNING id, email',
+          [email, hash, 'user']
+        );
+        const userId = insertUser.rows[0].id;
+        await client.query(
+          'INSERT INTO employee_profiles (user_id, phone, position) VALUES ($1, $2, $3)',
+          [userId, phone || null, position || null]
+        );
+        await client.query('COMMIT');
+        const employee = await mapRowToEmployee({ id: userId, email, phone, position, is_active: true });
+        res.json(employee);
+      } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('Error creating employee:', err);
+        res.status(500).json({ message: 'Server error creating employee' });
+      } finally {
+        client.release();
+      }
+    } catch (err) {
+      console.error('Error hashing password:', err);
+      res.status(500).json({ message: 'Server error' });
+    }
+  });
 
-  try {
-    const result = await pool.query(
-      `INSERT INTO employees (name, email, position, created_at)
-       VALUES ($1, $2, $3, NOW()) RETURNING id, name, email, position;`,
-      [name, email, position || null]
-    );
-    res.status(201).json({ employee: result.rows[0] });
-  } catch (err) {
-    console.error('employees.post error:', err);
-    res.status(500).json({ error: 'Failed to create employee' });
-  }
-});
+} else {
+  // Protected versions - require authentication
+  router.get('/', authenticateToken, async (req, res) => {
+    try {
+      const result = await pool.query(
+        `SELECT u.id, u.email, u.role, p.phone, p.position, p.department, p.hire_date, p.is_active, p.created_at AS profile_created_at
+         FROM users u
+         LEFT JOIN employee_profiles p ON u.id = p.user_id
+         ORDER BY u.id`);
+      const employees = await Promise.all(result.rows.map(mapRowToEmployee));
+      res.json(employees);
+    } catch (err) {
+      console.error('Error fetching employees:', err);
+      res.status(500).json({ message: 'Server error fetching employees' });
+    }
+  });
+
+  router.post('/', authenticateToken, async (req, res) => {
+    const { email, password, position, phone } = req.body;
+    if (!email || !password) return res.status(400).json({ message: 'Email and password required' });
+    try {
+      const hash = await bcrypt.hash(password, 10);
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const insertUser = await client.query(
+          'INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3) RETURNING id, email',
+          [email, hash, 'user']
+        );
+        const userId = insertUser.rows[0].id;
+        await client.query(
+          'INSERT INTO employee_profiles (user_id, phone, position) VALUES ($1, $2, $3)',
+          [userId, phone || null, position || null]
+        );
+        await client.query('COMMIT');
+        const employee = await mapRowToEmployee({ id: userId, email, phone, position, is_active: true });
+        res.json(employee);
+      } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('Error creating employee:', err);
+        res.status(500).json({ message: 'Server error creating employee' });
+      } finally {
+        client.release();
+      }
+    } catch (err) {
+      console.error('Error hashing password:', err);
+      res.status(500).json({ message: 'Server error' });
+    }
+  });
+}
 
 module.exports = router;

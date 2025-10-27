@@ -1,18 +1,32 @@
-// backend/helpers/logActivity.js
-const db = require('../db'); // or './db' depending on location
+// back/helpers/logActivity.js
+const { pool } = require('../db');
 
+/**
+ * logActivity - insert an activity record into activities table (safe)
+ * Params:
+ *   userId: string or number
+ *   type: string
+ *   details: object or string
+ */
+async function logActivity(userId, type, details = null) {
+  if (!pool) {
+    console.error('logActivity: DB pool is undefined, skipping log', { userId, type });
+    return;
+  }
 
-async function logActivity(userId, action, req = null) {
   try {
-    const ip = req?.headers['x-forwarded-for'] || req?.socket?.remoteAddress || null;
-    const userAgent = req?.headers['user-agent'] || null;
+    const detailsText =
+      details && typeof details === 'object' ? JSON.stringify(details) : details;
 
-    await pool.query(
-      'INSERT INTO activities (user_id, action, ip_address, user_agent) VALUES ($1, $2, $3, $4)',
-      [userId, action, ip, userAgent]
-    );
+    const sql = `
+      INSERT INTO activities (user_id, type, details, created_at)
+      VALUES ($1, $2, $3, NOW())
+      RETURNING id;
+    `;
+    const values = [userId, type, detailsText];
+    await pool.query(sql, values);
   } catch (err) {
-    console.error('Failed to log activity:', err);
+    console.error('logActivity error:', err);
   }
 }
 

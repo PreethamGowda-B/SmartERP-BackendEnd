@@ -2,7 +2,8 @@ const express = require("express");
 const router = express.Router();
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
-const pool = require("../db"); // ✅ Fix import
+const { pool } = require('../db'); // ✅ correct
+
 const logActivity = require("../helpers/logActivity");
 require("dotenv").config();
 

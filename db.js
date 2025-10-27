@@ -1,13 +1,11 @@
 const { Pool } = require("pg");
 require("dotenv").config();
 
-// ✅ Always prefer DATABASE_URL (Neon or Render)
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
 
-// ✅ Test connection immediately
 (async () => {
   try {
     const res = await pool.query("SELECT NOW()");
@@ -18,5 +16,5 @@ const pool = new Pool({
   }
 })();
 
-// ✅ Export correctly for all backend routes
-module.exports = pool;
+// ✅ Correctly export as an object
+module.exports = { pool };

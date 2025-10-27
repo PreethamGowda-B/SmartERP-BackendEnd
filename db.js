@@ -6,6 +6,7 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
+// Test DB connection
 (async () => {
   try {
     const res = await pool.query("SELECT NOW()");
@@ -16,5 +17,5 @@ const pool = new Pool({
   }
 })();
 
-// ✅ Correctly export as an object
+// ✅ Correctly export
 module.exports = { pool };

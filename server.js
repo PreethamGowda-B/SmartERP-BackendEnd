@@ -3,34 +3,42 @@ require("dotenv").config(); // Load environment variables early
 const express = require("express");
 const cors = require("cors");
 const cookieParser = require("cookie-parser");
-const { pool } = require("./db");
+const { pool } = require("./db"); // ✅ Make sure db.js exports { pool }
 
 const app = express();
 
-// ✅ Trust proxy (important for Render + cookies)
+// ✅ Trust proxy (required for HTTPS cookies on Render)
 app.set("trust proxy", 1);
 
-// ✅ Define allowed origins (main + preview)
+// ✅ Proper CORS configuration
 const allowedOrigins = [
-  process.env.FRONTEND_ORIGIN || "https://smart-erp-front-end.vercel.app",
-  "https://smart-erp-front-dogibjmtv-thepreethu01-9119s-projects.vercel.app", // preview builds
+  "https://smart-erp-front-end.vercel.app",
+  "https://smart-erp-front-dogibjmtv-thepreethu01-9119s-projects.vercel.app",
 ];
 
-// ✅ Middleware
 app.use(
   cors({
-    origin: (origin, callback) => {
+    origin: function (origin, callback) {
+      // Allow requests with no origin (like Postman or server-to-server)
       if (!origin || allowedOrigins.includes(origin)) {
         callback(null, true);
       } else {
-        console.warn(`❌ CORS blocked for origin: ${origin}`);
+        console.warn("🚫 Blocked CORS request from:", origin);
         callback(new Error("Not allowed by CORS"));
       }
     },
-    credentials: true, // 👈 Required for cookies + auth
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+    exposedHeaders: ["Set-Cookie"],
+    optionsSuccessStatus: 200,
   })
 );
 
+// ✅ Handle preflight requests globally
+app.options("*", cors());
+
+// ✅ Common middlewares
 app.use(cookieParser());
 app.use(express.json());
 
@@ -47,7 +55,7 @@ app.use("/api/payments", require("./routes/payments"));
 app.use("/api/analytics", require("./routes/analytics"));
 app.use("/api/employees", require("./routes/employees"));
 
-// ✅ Health check endpoint
+// ✅ Health check route
 app.get("/api/health", async (req, res) => {
   try {
     const result = await pool.query("SELECT NOW()");
@@ -66,7 +74,7 @@ app.get("/api/health", async (req, res) => {
   }
 });
 
-// ✅ Base info route
+// ✅ Info route
 app.get("/api", (req, res) => {
   res.json({
     message: "🚀 SmartERP Backend API is running successfully!",
@@ -76,13 +84,13 @@ app.get("/api", (req, res) => {
   });
 });
 
-// ✅ Root route (for Render preview)
+// ✅ Root (for Render homepage)
 app.get("/", async (req, res) => {
   try {
     await pool.query("SELECT NOW()");
     res.send(`
       <h1>SmartERP Backend</h1>
-      <p>Status: <strong>OK</strong></p>
+      <p>Status: <strong>OK ✅</strong></p>
       <p>Database: <strong>Connected to Neon</strong></p>
       <p>API Base: <code>/api</code></p>
       <p>Server running on port ${process.env.PORT || 4000}</p>
@@ -102,7 +110,7 @@ app.get("/", async (req, res) => {
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
   console.log(`🚀 SmartERP backend running on port ${PORT}`);
-  console.log(`🌐 Allowed origins:`, allowedOrigins);
+  console.log("🌐 Allowed origins:", allowedOrigins);
 });
 
 module.exports = app;

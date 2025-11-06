@@ -1,22 +1,36 @@
-require("dotenv").config(); // Load env vars early
+require("dotenv").config(); // Load environment variables early
 
 const express = require("express");
 const cors = require("cors");
 const cookieParser = require("cookie-parser");
-const { pool } = require("./db"); // Make sure db.js exports { pool }
+const { pool } = require("./db");
 
 const app = express();
 
-// ✅ Must come after app is defined
+// ✅ Trust proxy (important for Render + cookies)
 app.set("trust proxy", 1);
+
+// ✅ Define allowed origins (main + preview)
+const allowedOrigins = [
+  process.env.FRONTEND_ORIGIN || "https://smart-erp-front-end.vercel.app",
+  "https://smart-erp-front-dogibjmtv-thepreethu01-9119s-projects.vercel.app", // preview builds
+];
 
 // ✅ Middleware
 app.use(
   cors({
-    origin: process.env.FRONTEND_ORIGIN || "https://smart-erp-front-end.vercel.app",
-    credentials: true,
+    origin: (origin, callback) => {
+      if (!origin || allowedOrigins.includes(origin)) {
+        callback(null, true);
+      } else {
+        console.warn(`❌ CORS blocked for origin: ${origin}`);
+        callback(new Error("Not allowed by CORS"));
+      }
+    },
+    credentials: true, // 👈 Required for cookies + auth
   })
 );
+
 app.use(cookieParser());
 app.use(express.json());
 
@@ -33,7 +47,7 @@ app.use("/api/payments", require("./routes/payments"));
 app.use("/api/analytics", require("./routes/analytics"));
 app.use("/api/employees", require("./routes/employees"));
 
-// ✅ Health Check
+// ✅ Health check endpoint
 app.get("/api/health", async (req, res) => {
   try {
     const result = await pool.query("SELECT NOW()");
@@ -52,7 +66,7 @@ app.get("/api/health", async (req, res) => {
   }
 });
 
-// ✅ API info route
+// ✅ Base info route
 app.get("/api", (req, res) => {
   res.json({
     message: "🚀 SmartERP Backend API is running successfully!",
@@ -62,7 +76,7 @@ app.get("/api", (req, res) => {
   });
 });
 
-// ✅ Root (for Render)
+// ✅ Root route (for Render preview)
 app.get("/", async (req, res) => {
   try {
     await pool.query("SELECT NOW()");
@@ -88,6 +102,7 @@ app.get("/", async (req, res) => {
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
   console.log(`🚀 SmartERP backend running on port ${PORT}`);
+  console.log(`🌐 Allowed origins:`, allowedOrigins);
 });
 
 module.exports = app;

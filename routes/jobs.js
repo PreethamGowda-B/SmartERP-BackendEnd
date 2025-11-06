@@ -69,35 +69,41 @@ router.get('/', authenticateToken, async (req, res) => {
   try {
     let result;
 
-    if (req.user && req.user.role === 'employee') {
-      // ✅ Employees see ALL visible jobs
-      result = await pool.query(`SELECT * FROM jobs WHERE visible_to_all = true`);
-    } else if (req.user && req.user.role === 'owner') {
+    console.log("🧩 Fetching jobs for:", req.user); // for debugging in Render logs
+
+    if (req.user.role === 'owner') {
       // Owners see all jobs they created
-      result = await pool.query(`SELECT * FROM jobs WHERE created_by = $1`, [req.user.userId]);
+      result = await pool.query(
+        `SELECT * FROM jobs WHERE created_by = $1 ORDER BY created_at DESC`,
+        [req.user.userId]
+      );
+    } else if (req.user.role === 'employee') {
+      // Employees see all visible jobs OR those assigned to them
+      result = await pool.query(
+        `SELECT * FROM jobs 
+         WHERE visible_to_all = true 
+         OR assigned_to = $1 
+         ORDER BY created_at DESC`,
+        [req.user.userId]
+      );
     } else {
-      // Default: return visible jobs if role not identified
+      // Fallback (just in case)
       result = await pool.query(`SELECT * FROM jobs WHERE visible_to_all = true`);
     }
 
     const rows = result.rows.map((r) => {
-      if (r.data && typeof r.data === 'object') {
-        return {
-          ...r.data,
-          id: r.id.toString(),
-          _db_row: r,
-          __assigned_to: r.assigned_to,
-          __created_by: r.created_by,
-        };
-      }
+      const job = r.data && typeof r.data === 'object' ? r.data : {};
       return {
-        id: r.id.toString(),
+        id: r.id,
         title: r.title,
         description: r.description,
-        assignedTo: r.assigned_to,
-        _db_row: r,
-        __assigned_to: r.assigned_to,
-        __created_by: r.created_by,
+        priority: r.priority,
+        status: r.status,
+        visible_to_all: r.visible_to_all,
+        created_by: r.created_by,
+        assigned_to: r.assigned_to,
+        created_at: r.created_at,
+        ...job,
       };
     });
 

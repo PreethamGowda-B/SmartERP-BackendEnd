@@ -1,11 +1,12 @@
 const express = require('express');
 const router = express.Router();
-const { pool } = require('../db'); // ✅ correct
-
-
+const { pool } = require('../db'); // ✅ keep as-is
 const { authenticateToken } = require('../middleware/authMiddleware');
 
-// Ensure the jobs table can store JSON payloads and visibility flag
+/**
+ * Ensure the jobs table can store JSON payloads and visibility flag
+ * (SAFE, NON-BREAKING)
+ */
 const ensureColumns = async () => {
   if (!pool) {
     console.warn("⚠️ Database pool not ready yet. Skipping schema checks.");
@@ -13,46 +14,57 @@ const ensureColumns = async () => {
   }
 
   try {
-    await pool.query("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS data JSONB");
-await pool.query("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS visible_to_all BOOLEAN DEFAULT false");
-
+    await pool.query(
+      "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS data JSONB"
+    );
+    await pool.query(
+      "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS visible_to_all BOOLEAN DEFAULT false"
+    );
 
     console.log("✅ Jobs table schema verified/updated.");
   } catch (err) {
-    console.warn("⚠️ Could not ensure jobs.data/visible_to_all columns exist:", err.message || err);
+    console.warn(
+      "⚠️ Could not ensure jobs.data/visible_to_all columns exist:",
+      err.message || err
+    );
   }
 };
 
 // Run it asynchronously without blocking startup
 setTimeout(ensureColumns, 5000);
 
-
 /**
  * Create a new job
- * Every job created (especially by an owner) is now visible to all employees by default.
  */
 router.post('/', authenticateToken, async (req, res) => {
   const job = req.body || {};
   const title = job.title || '';
   const description = job.description || '';
 
-  // Support both assignedEmployees (array) or single assignedTo field
   const assignedTo =
     (job.assignedEmployees && job.assignedEmployees[0]) ||
     job.assignedTo ||
     null;
 
-  // ✅ Force jobs to be visible to all employees by default
   const visibleToAll =
-    job.visible_to_all === false ? false : true; // default true unless explicitly false
+    job.visible_to_all === false ? false : true;
 
   try {
     const result = await pool.query(
-      `INSERT INTO jobs (title, description, assigned_to, created_by, data, visible_to_all)
+      `INSERT INTO jobs 
+       (title, description, assigned_to, created_by, data, visible_to_all)
        VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING *`,
-      [title, description, assignedTo, req.user.userId, job, visibleToAll]
+      [
+        title,
+        description,
+        assignedTo,
+        req.user.id,        // ✅ FIXED (was userId)
+        job,
+        visibleToAll
+      ]
     );
+
     res.json(result.rows[0]);
   } catch (err) {
     console.error('jobs POST error', err);
@@ -61,34 +73,33 @@ router.post('/', authenticateToken, async (req, res) => {
 });
 
 /**
- * Get all jobs visible to the current user
- * - Owners: see their created jobs
- * - Employees: see all visible jobs (visible_to_all = true)
+ * Get jobs (role-based)
  */
 router.get('/', authenticateToken, async (req, res) => {
   try {
     let result;
 
-    console.log("🧩 Fetching jobs for:", req.user); // for debugging in Render logs
+    console.log("🧩 Fetching jobs for:", req.user);
 
     if (req.user.role === 'owner') {
-      // Owners see all jobs they created
       result = await pool.query(
-        `SELECT * FROM jobs WHERE created_by = $1 ORDER BY created_at DESC`,
-        [req.user.userId]
+        `SELECT * FROM jobs 
+         WHERE created_by = $1 
+         ORDER BY created_at DESC`,
+        [req.user.id]       // ✅ FIXED
       );
     } else if (req.user.role === 'employee') {
-      // Employees see all visible jobs OR those assigned to them
       result = await pool.query(
         `SELECT * FROM jobs 
          WHERE visible_to_all = true 
          OR assigned_to = $1 
          ORDER BY created_at DESC`,
-        [req.user.userId]
+        [req.user.id]       // ✅ FIXED
       );
     } else {
-      // Fallback (just in case)
-      result = await pool.query(`SELECT * FROM jobs WHERE visible_to_all = true`);
+      result = await pool.query(
+        `SELECT * FROM jobs WHERE visible_to_all = true`
+      );
     }
 
     const rows = result.rows.map((r) => {
@@ -115,7 +126,7 @@ router.get('/', authenticateToken, async (req, res) => {
 });
 
 /**
- * Update job (partial update)
+ * Update job
  */
 router.put('/:id', authenticateToken, async (req, res) => {
   const { id } = req.params;
@@ -128,7 +139,10 @@ router.put('/:id', authenticateToken, async (req, res) => {
          description = COALESCE($2, description),
          assigned_to = COALESCE($3, assigned_to),
          visible_to_all = COALESCE($4, visible_to_all),
-         data = CASE WHEN data IS NULL THEN $5 ELSE data || $5 END
+         data = CASE 
+           WHEN data IS NULL THEN $5 
+           ELSE data || $5 
+         END
        WHERE id = $6
        RETURNING *`,
       [
@@ -144,6 +158,7 @@ router.put('/:id', authenticateToken, async (req, res) => {
         id,
       ]
     );
+
     res.json(result.rows[0]);
   } catch (err) {
     console.error('jobs PUT error', err);
@@ -156,8 +171,12 @@ router.put('/:id', authenticateToken, async (req, res) => {
  */
 router.delete('/:id', authenticateToken, async (req, res) => {
   const { id } = req.params;
+
   try {
-    await pool.query('DELETE FROM jobs WHERE id = $1', [id]);
+    await pool.query(
+      'DELETE FROM jobs WHERE id = $1',
+      [id]
+    );
     res.json({ success: true });
   } catch (err) {
     console.error('jobs DELETE error', err);

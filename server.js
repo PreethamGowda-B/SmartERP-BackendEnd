@@ -12,6 +12,7 @@ app.set("trust proxy", 1);
 
 // ✅ Proper CORS configuration
 const allowedOrigins = [
+  "http://localhost:3000",
   "https://smart-erp-front-end.vercel.app",
   "https://smart-erp-front-dogibjmtv-thepreethu01-9119s-projects.vercel.app",
 ];

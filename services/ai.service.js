@@ -1,22 +1,13 @@
-const OpenAI = require("openai");
+const Groq = require("groq-sdk");
 
-const client = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
+const client = new Groq({
+  apiKey: process.env.GROQ_API_KEY,
 });
 
-/**
- * SmartERP AI core brain
- * - Handles real-time info on server
- * - Uses OpenAI for reasoning & language
- */
 async function chatWithAI(message) {
   const text = message.toLowerCase().trim();
 
-  /* ===============================
-     1️⃣ HARD SYSTEM LOGIC (LIKE CHATGPT)
-     =============================== */
-
-  // Handle time / date locally (guaranteed)
+  // Handle time / date locally
   if (
     text.includes("time") ||
     text.includes("date") ||
@@ -25,16 +16,12 @@ async function chatWithAI(message) {
     const now = new Date().toLocaleString("en-IN", {
       timeZone: "Asia/Kolkata",
     });
-
     return `The current date and time is ${now}.`;
   }
 
-  /* ===============================
-     2️⃣ OPENAI (THINKING & ANSWERS)
-     =============================== */
-
+  // Use Groq AI
   const response = await client.chat.completions.create({
-    model: "gpt-4o-mini",
+    model: "llama-3.3-70b-versatile", // Free model
     temperature: 0.7,
     messages: [
       {

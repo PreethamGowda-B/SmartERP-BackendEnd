@@ -22,14 +22,7 @@ function authenticateToken(req, res, next) {
     if (err) {
       return res.status(401).json({ message: "Invalid or expired token" });
     }
-    
-    // ✅ FIXED: Map userId from token payload to id for req.user
-    // The token contains { userId, role }, but routes expect req.user.id
-    req.user = {
-      id: payload.userId,
-      role: payload.role
-    };
-    
+    req.user = payload;
     next();
   });
 }

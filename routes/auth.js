@@ -42,7 +42,7 @@ router.post("/signup", async (req, res) => {
 });
 
 // ---------------------------------------------
-// ✅ Login Route (FIXED - Returns tokens in response)
+// ✅ Login Route
 // ---------------------------------------------
 router.post("/login", async (req, res) => {
   const { email, password } = req.body;
@@ -79,7 +79,7 @@ router.post("/login", async (req, res) => {
       [user.id, refreshToken]
     );
 
-    // ✅ Set cookies (for cookie-based auth as backup)
+    // ✅ Correct cookie config for cross-domain (Render + Vercel)
     const cookieOpts = {
       httpOnly: true,
       sameSite: "none",
@@ -90,14 +90,7 @@ router.post("/login", async (req, res) => {
     res.cookie("refresh_token", refreshToken, { ...cookieOpts, maxAge: 7 * 24 * 60 * 60 * 1000 });
 
     delete user.password_hash;
-    
-    // ✅ FIXED: Return tokens in response body so frontend can store them in localStorage
-    res.json({ 
-      ok: true, 
-      user,
-      accessToken,
-      refreshToken
-    });
+    res.json({ ok: true, user });
   } catch (err) {
     console.error("Login error:", err.message);
     res.status(500).json({ message: "Server error during login" });

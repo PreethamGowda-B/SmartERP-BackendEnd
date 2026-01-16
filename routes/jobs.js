@@ -84,9 +84,10 @@ router.post('/', authenticateToken, async (req, res) => {
       ]
     );
 
+    console.log('✅ Job created successfully:', result.rows[0].id);
     res.json(result.rows[0]);
   } catch (err) {
-    console.error('jobs POST error', err);
+    console.error('❌ jobs POST error', err);
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -119,7 +120,7 @@ router.get('/', authenticateToken, async (req, res) => {
       );
     } else {
       result = await pool.query(
-        `SELECT * FROM jobs WHERE visible_to_all = true`
+        `SELECT * FROM jobs WHERE visible_to_all = true ORDER BY created_at DESC`
       );
     }
 
@@ -145,9 +146,10 @@ router.get('/', authenticateToken, async (req, res) => {
       };
     });
 
+    console.log(`✅ Returning ${rows.length} jobs for user ${req.user.id}`);
     res.json(rows);
   } catch (err) {
-    console.error('jobs GET error', err);
+    console.error('❌ jobs GET error', err);
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -180,9 +182,10 @@ router.post('/:id/accept', authenticateToken, async (req, res) => {
       [id, req.user.id]
     );
 
+    console.log(`✅ Job ${id} accepted by employee ${req.user.id}`);
     res.json(result.rows[0]);
   } catch (err) {
-    console.error('jobs ACCEPT error', err);
+    console.error('❌ jobs ACCEPT error', err);
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -213,9 +216,10 @@ router.post('/:id/decline', authenticateToken, async (req, res) => {
       [id]
     );
 
+    console.log(`✅ Job ${id} declined by employee ${req.user.id}`);
     res.json(result.rows[0]);
   } catch (err) {
-    console.error('jobs DECLINE error', err);
+    console.error('❌ jobs DECLINE error', err);
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -260,9 +264,10 @@ router.post('/:id/progress', authenticateToken, async (req, res) => {
       [progress, status, completed_at, id]
     );
 
+    console.log(`✅ Job ${id} progress updated to ${progress}%`);
     res.json(result.rows[0]);
   } catch (err) {
-    console.error('jobs PROGRESS error', err);
+    console.error('❌ jobs PROGRESS error', err);
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -281,11 +286,13 @@ router.put('/:id', authenticateToken, async (req, res) => {
          description = COALESCE($2, description),
          assigned_to = COALESCE($3, assigned_to),
          visible_to_all = COALESCE($4, visible_to_all),
+         priority = COALESCE($5, priority),
+         status = COALESCE($6, status),
          data = CASE 
-           WHEN data IS NULL THEN $5 
-           ELSE data || $5 
+           WHEN data IS NULL THEN $7 
+           ELSE data || $7 
          END
-       WHERE id = $6
+       WHERE id = $8
        RETURNING *`,
       [
         updates.title,
@@ -296,14 +303,17 @@ router.put('/:id', authenticateToken, async (req, res) => {
         typeof updates.visible_to_all !== 'undefined'
           ? updates.visible_to_all
           : null,
+        updates.priority,
+        updates.status,
         updates,
         id,
       ]
     );
 
+    console.log(`✅ Job ${id} updated successfully`);
     res.json(result.rows[0]);
   } catch (err) {
-    console.error('jobs PUT error', err);
+    console.error('❌ jobs PUT error', err);
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -319,124 +329,12 @@ router.delete('/:id', authenticateToken, async (req, res) => {
       'DELETE FROM jobs WHERE id = $1',
       [id]
     );
+    console.log(`✅ Job ${id} deleted successfully`);
     res.json({ success: true });
   } catch (err) {
-    console.error('jobs DELETE error', err);
+    console.error('❌ jobs DELETE error', err);
     res.status(500).json({ message: 'Server error' });
   }
 });
 
-/**
- * Accept a job (Employee only)
- */
-router.post('/:id/accept', authenticateToken, async (req, res) => {
-  const { id } = req.params;
-
-  try {
-    const jobCheck = await pool.query(
-      `SELECT * FROM jobs WHERE id = $1`,
-      [id]
-    );
-
-    if (jobCheck.rows.length === 0) {
-      return res.status(404).json({ message: 'Job not found' });
-    }
-
-    const result = await pool.query(
-      `UPDATE jobs
-       SET employee_status = 'accepted',
-           accepted_at = NOW(),
-           status = 'active',
-           assigned_to = COALESCE(assigned_to, $2)
-       WHERE id = $1
-       RETURNING *`,
-      [id, req.user.id]
-    );
-
-    res.json(result.rows[0]);
-  } catch (err) {
-    console.error('jobs ACCEPT error', err);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-
-/**
- * Decline a job (Employee only)
- */
-router.post('/:id/decline', authenticateToken, async (req, res) => {
-  const { id } = req.params;
-
-  try {
-    const jobCheck = await pool.query(
-      `SELECT * FROM jobs WHERE id = $1`,
-      [id]
-    );
-
-    if (jobCheck.rows.length === 0) {
-      return res.status(404).json({ message: 'Job not found' });
-    }
-
-    const result = await pool.query(
-      `UPDATE jobs
-       SET employee_status = 'declined',
-           declined_at = NOW()
-       WHERE id = $1
-       RETURNING *`,
-      [id]
-    );
-
-    res.json(result.rows[0]);
-  } catch (err) {
-    console.error('jobs DECLINE error', err);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-
-/**
- * Update job progress (Employee only)
- */
-router.post('/:id/progress', authenticateToken, async (req, res) => {
-  const { id } = req.params;
-  const { progress } = req.body;
-
-  if (typeof progress !== 'number' || progress < 0 || progress > 100) {
-    return res.status(400).json({ message: 'Progress must be between 0 and 100' });
-  }
-
-  try {
-    const checkJob = await pool.query(
-      'SELECT * FROM jobs WHERE id = $1 AND assigned_to = $2',
-      [id, req.user.id]
-    );
-
-    if (checkJob.rows.length === 0) {
-      return res.status(403).json({ message: 'Job not assigned to you' });
-    }
-
-    let status = 'active';
-    let completed_at = null;
-
-    if (progress === 100) {
-      status = 'completed';
-      completed_at = new Date();
-    }
-
-    const result = await pool.query(
-      `UPDATE jobs 
-       SET progress = $1, 
-           status = $2,
-           completed_at = $3
-       WHERE id = $4
-       RETURNING *`,
-      [progress, status, completed_at, id]
-    );
-
-    res.json(result.rows[0]);
-  } catch (err) {
-    console.error('jobs PROGRESS error', err);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
 module.exports = router;

@@ -333,21 +333,21 @@ router.post('/:id/accept', authenticateToken, async (req, res) => {
   const { id } = req.params;
 
   try {
-    const checkJob = await pool.query(
-      'SELECT * FROM jobs WHERE id = $1 AND (assigned_to = $2 OR visible_to_all = true)',
-      [id, req.user.id]
+    const jobCheck = await pool.query(
+      `SELECT * FROM jobs WHERE id = $1`,
+      [id]
     );
 
-    if (checkJob.rows.length === 0) {
-      return res.status(403).json({ message: 'Job not assigned to you' });
+    if (jobCheck.rows.length === 0) {
+      return res.status(404).json({ message: 'Job not found' });
     }
 
     const result = await pool.query(
-      `UPDATE jobs 
-       SET employee_status = 'accepted', 
+      `UPDATE jobs
+       SET employee_status = 'accepted',
            accepted_at = NOW(),
            status = 'active',
-           assigned_to = $2
+           assigned_to = COALESCE(assigned_to, $2)
        WHERE id = $1
        RETURNING *`,
       [id, req.user.id]
@@ -360,6 +360,7 @@ router.post('/:id/accept', authenticateToken, async (req, res) => {
   }
 });
 
+
 /**
  * Decline a job (Employee only)
  */
@@ -367,18 +368,18 @@ router.post('/:id/decline', authenticateToken, async (req, res) => {
   const { id } = req.params;
 
   try {
-    const checkJob = await pool.query(
-      'SELECT * FROM jobs WHERE id = $1 AND (assigned_to = $2 OR visible_to_all = true)',
-      [id, req.user.id]
+    const jobCheck = await pool.query(
+      `SELECT * FROM jobs WHERE id = $1`,
+      [id]
     );
 
-    if (checkJob.rows.length === 0) {
-      return res.status(403).json({ message: 'Job not assigned to you' });
+    if (jobCheck.rows.length === 0) {
+      return res.status(404).json({ message: 'Job not found' });
     }
 
     const result = await pool.query(
-      `UPDATE jobs 
-       SET employee_status = 'declined', 
+      `UPDATE jobs
+       SET employee_status = 'declined',
            declined_at = NOW()
        WHERE id = $1
        RETURNING *`,
@@ -391,6 +392,7 @@ router.post('/:id/decline', authenticateToken, async (req, res) => {
     res.status(500).json({ message: 'Server error' });
   }
 });
+
 
 /**
  * Update job progress (Employee only)
@@ -437,6 +439,4 @@ router.post('/:id/progress', authenticateToken, async (req, res) => {
     res.status(500).json({ message: 'Server error' });
   }
 });
-module.exports = router;
-
 module.exports = router;

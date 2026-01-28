@@ -67,22 +67,16 @@ router.post('/', authenticateToken, async (req, res) => {
     job.visible_to_all === false ? false : true;
 
   try {
-    // ✅ Verify user has a company
-    if (!req.user.companyId) {
-      return res.status(403).json({ message: 'User not associated with a company' });
-    }
-
     const result = await pool.query(
       `INSERT INTO jobs 
-       (title, description, assigned_to, created_by, company_id, data, visible_to_all, status, priority)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       (title, description, assigned_to, created_by, data, visible_to_all, status, priority)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        RETURNING *`,
       [
         title,
         description,
         assignedTo,
-        req.user.userId,
-        req.user.companyId,
+        req.user.id,
         job,
         visibleToAll,
         job.status || 'pending',
@@ -90,10 +84,9 @@ router.post('/', authenticateToken, async (req, res) => {
       ]
     );
 
-    console.log('✅ Job created successfully:', result.rows[0].id, 'for company:', req.user.companyId);
     res.json(result.rows[0]);
   } catch (err) {
-    console.error('❌ jobs POST error', err);
+    console.error('jobs POST error', err);
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -107,36 +100,27 @@ router.get('/', authenticateToken, async (req, res) => {
 
     console.log("🧩 Fetching jobs for:", req.user);
 
-    // ✅ Verify user has a company
-    if (!req.user.companyId) {
-      console.log('⚠️ User has no company_id, returning empty jobs');
-      return res.json([]);
-    }
-
     if (req.user.role === 'owner') {
-      // ✅ Owner sees ALL jobs in their company
       result = await pool.query(
-        `SELECT j.*, u.email as employee_email, u.name as employee_name
+        `SELECT j.*, u.email as employee_email 
          FROM jobs j
          LEFT JOIN users u ON j.assigned_to = u.id
-         WHERE j.company_id = $1 
+         WHERE j.created_by = $1 
          ORDER BY j.created_at DESC`,
-        [req.user.companyId]
+        [req.user.id]
       );
     } else if (req.user.role === 'employee') {
-      // ✅ Employee sees jobs in their company that are either assigned to them OR visible to all
       result = await pool.query(
-        `SELECT j.*, u.email as employee_email, u.name as employee_name
-         FROM jobs j
-         LEFT JOIN users u ON j.assigned_to = u.id
-         WHERE j.company_id = $1 
-         AND (j.visible_to_all = true OR j.assigned_to = $2)
-         ORDER BY j.created_at DESC`,
-        [req.user.companyId, req.user.userId]
+        `SELECT * FROM jobs 
+         WHERE visible_to_all = true 
+         OR assigned_to = $1 
+         ORDER BY created_at DESC`,
+        [req.user.id]
       );
     } else {
-      // Unknown role - no jobs
-      result = { rows: [] };
+      result = await pool.query(
+        `SELECT * FROM jobs WHERE visible_to_all = true`
+      );
     }
 
     const rows = result.rows.map((r) => {
@@ -150,7 +134,6 @@ router.get('/', authenticateToken, async (req, res) => {
         visible_to_all: r.visible_to_all,
         created_by: r.created_by,
         assigned_to: r.assigned_to,
-        company_id: r.company_id,
         created_at: r.created_at,
         employee_status: r.employee_status,
         progress: r.progress || 0,
@@ -158,15 +141,13 @@ router.get('/', authenticateToken, async (req, res) => {
         declined_at: r.declined_at,
         completed_at: r.completed_at,
         employee_email: r.employee_email,
-        employee_name: r.employee_name,
         ...job,
       };
     });
 
-    console.log(`✅ Returning ${rows.length} jobs for user ${req.user.userId} in company ${req.user.companyId}`);
     res.json(rows);
   } catch (err) {
-    console.error('❌ jobs GET error', err);
+    console.error('jobs GET error', err);
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -178,14 +159,14 @@ router.post('/:id/accept', authenticateToken, async (req, res) => {
   const { id } = req.params;
 
   try {
-    // ✅ Check if job belongs to user's company and is accessible
+    // Check if job is assigned to this employee
     const checkJob = await pool.query(
-      'SELECT * FROM jobs WHERE id = $1 AND company_id = $2 AND (assigned_to = $3 OR visible_to_all = true)',
-      [id, req.user.companyId, req.user.userId]
+      'SELECT * FROM jobs WHERE id = $1 AND (assigned_to = $2 OR visible_to_all = true)',
+      [id, req.user.id]
     );
 
     if (checkJob.rows.length === 0) {
-      return res.status(403).json({ message: 'Job not found or not accessible' });
+      return res.status(403).json({ message: 'Job not assigned to you' });
     }
 
     const result = await pool.query(
@@ -196,13 +177,12 @@ router.post('/:id/accept', authenticateToken, async (req, res) => {
            assigned_to = $2
        WHERE id = $1
        RETURNING *`,
-      [id, req.user.userId]
+      [id, req.user.id]
     );
 
-    console.log(`✅ Job ${id} accepted by employee ${req.user.userId}`);
     res.json(result.rows[0]);
   } catch (err) {
-    console.error('❌ jobs ACCEPT error', err);
+    console.error('jobs ACCEPT error', err);
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -214,14 +194,14 @@ router.post('/:id/decline', authenticateToken, async (req, res) => {
   const { id } = req.params;
 
   try {
-    // ✅ Check if job belongs to user's company and is accessible
+    // Check if job is assigned to this employee
     const checkJob = await pool.query(
-      'SELECT * FROM jobs WHERE id = $1 AND company_id = $2 AND (assigned_to = $3 OR visible_to_all = true)',
-      [id, req.user.companyId, req.user.userId]
+      'SELECT * FROM jobs WHERE id = $1 AND (assigned_to = $2 OR visible_to_all = true)',
+      [id, req.user.id]
     );
 
     if (checkJob.rows.length === 0) {
-      return res.status(403).json({ message: 'Job not found or not accessible' });
+      return res.status(403).json({ message: 'Job not assigned to you' });
     }
 
     const result = await pool.query(
@@ -233,10 +213,9 @@ router.post('/:id/decline', authenticateToken, async (req, res) => {
       [id]
     );
 
-    console.log(`✅ Job ${id} declined by employee ${req.user.userId}`);
     res.json(result.rows[0]);
   } catch (err) {
-    console.error('❌ jobs DECLINE error', err);
+    console.error('jobs DECLINE error', err);
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -253,10 +232,10 @@ router.post('/:id/progress', authenticateToken, async (req, res) => {
   }
 
   try {
-    // ✅ Check if job belongs to user's company, is assigned to them, and is accepted
+    // Check if job is assigned to this employee and accepted
     const checkJob = await pool.query(
-      'SELECT * FROM jobs WHERE id = $1 AND company_id = $2 AND assigned_to = $3 AND employee_status = $4',
-      [id, req.user.companyId, req.user.userId, 'accepted']
+      'SELECT * FROM jobs WHERE id = $1 AND assigned_to = $2 AND employee_status = $3',
+      [id, req.user.id, 'accepted']
     );
 
     if (checkJob.rows.length === 0) {
@@ -281,10 +260,9 @@ router.post('/:id/progress', authenticateToken, async (req, res) => {
       [progress, status, completed_at, id]
     );
 
-    console.log(`✅ Job ${id} progress updated to ${progress}%`);
     res.json(result.rows[0]);
   } catch (err) {
-    console.error('❌ jobs PROGRESS error', err);
+    console.error('jobs PROGRESS error', err);
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -297,50 +275,35 @@ router.put('/:id', authenticateToken, async (req, res) => {
   const updates = req.body || {};
 
   try {
-    // ✅ Verify job belongs to user's company
-    const checkJob = await pool.query(
-      'SELECT * FROM jobs WHERE id = $1 AND company_id = $2',
-      [id, req.user.companyId]
-    );
-
-    if (checkJob.rows.length === 0) {
-      return res.status(403).json({ message: 'Job not found or not accessible' });
-    }
-
     const result = await pool.query(
       `UPDATE jobs SET
          title = COALESCE($1, title),
          description = COALESCE($2, description),
          assigned_to = COALESCE($3, assigned_to),
          visible_to_all = COALESCE($4, visible_to_all),
-         priority = COALESCE($5, priority),
-         status = COALESCE($6, status),
          data = CASE 
-           WHEN data IS NULL THEN $7 
-           ELSE data || $7 
+           WHEN data IS NULL THEN $5 
+           ELSE data || $5 
          END
-       WHERE id = $8
+       WHERE id = $6
        RETURNING *`,
       [
         updates.title,
         updates.description,
         (updates.assignedEmployees && updates.assignedEmployees[0]) ||
-        updates.assignedTo ||
-        null,
+          updates.assignedTo ||
+          null,
         typeof updates.visible_to_all !== 'undefined'
           ? updates.visible_to_all
           : null,
-        updates.priority,
-        updates.status,
         updates,
         id,
       ]
     );
 
-    console.log(`✅ Job ${id} updated successfully`);
     res.json(result.rows[0]);
   } catch (err) {
-    console.error('❌ jobs PUT error', err);
+    console.error('jobs PUT error', err);
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -352,22 +315,128 @@ router.delete('/:id', authenticateToken, async (req, res) => {
   const { id } = req.params;
 
   try {
-    // ✅ Verify job belongs to user's company before deleting
-    const result = await pool.query(
-      'DELETE FROM jobs WHERE id = $1 AND company_id = $2 RETURNING id',
-      [id, req.user.companyId]
+    await pool.query(
+      'DELETE FROM jobs WHERE id = $1',
+      [id]
     );
-
-    if (result.rows.length === 0) {
-      return res.status(403).json({ message: 'Job not found or not accessible' });
-    }
-
-    console.log(`✅ Job ${id} deleted successfully`);
     res.json({ success: true });
   } catch (err) {
-    console.error('❌ jobs DELETE error', err);
+    console.error('jobs DELETE error', err);
     res.status(500).json({ message: 'Server error' });
   }
 });
+
+/**
+ * Accept a job (Employee only)
+ */
+router.post('/:id/accept', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const checkJob = await pool.query(
+      'SELECT * FROM jobs WHERE id = $1 AND (assigned_to = $2 OR visible_to_all = true)',
+      [id, req.user.id]
+    );
+
+    if (checkJob.rows.length === 0) {
+      return res.status(403).json({ message: 'Job not assigned to you' });
+    }
+
+    const result = await pool.query(
+      `UPDATE jobs 
+       SET employee_status = 'accepted', 
+           accepted_at = NOW(),
+           status = 'active',
+           assigned_to = $2
+       WHERE id = $1
+       RETURNING *`,
+      [id, req.user.id]
+    );
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('jobs ACCEPT error', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+/**
+ * Decline a job (Employee only)
+ */
+router.post('/:id/decline', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const checkJob = await pool.query(
+      'SELECT * FROM jobs WHERE id = $1 AND (assigned_to = $2 OR visible_to_all = true)',
+      [id, req.user.id]
+    );
+
+    if (checkJob.rows.length === 0) {
+      return res.status(403).json({ message: 'Job not assigned to you' });
+    }
+
+    const result = await pool.query(
+      `UPDATE jobs 
+       SET employee_status = 'declined', 
+           declined_at = NOW()
+       WHERE id = $1
+       RETURNING *`,
+      [id]
+    );
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('jobs DECLINE error', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+/**
+ * Update job progress (Employee only)
+ */
+router.post('/:id/progress', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  const { progress } = req.body;
+
+  if (typeof progress !== 'number' || progress < 0 || progress > 100) {
+    return res.status(400).json({ message: 'Progress must be between 0 and 100' });
+  }
+
+  try {
+    const checkJob = await pool.query(
+      'SELECT * FROM jobs WHERE id = $1 AND assigned_to = $2',
+      [id, req.user.id]
+    );
+
+    if (checkJob.rows.length === 0) {
+      return res.status(403).json({ message: 'Job not assigned to you' });
+    }
+
+    let status = 'active';
+    let completed_at = null;
+
+    if (progress === 100) {
+      status = 'completed';
+      completed_at = new Date();
+    }
+
+    const result = await pool.query(
+      `UPDATE jobs 
+       SET progress = $1, 
+           status = $2,
+           completed_at = $3
+       WHERE id = $4
+       RETURNING *`,
+      [progress, status, completed_at, id]
+    );
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('jobs PROGRESS error', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+module.exports = router;
 
 module.exports = router;

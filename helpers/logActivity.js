@@ -1,6 +1,6 @@
 const { pool } = require('../db');
 
-async function logActivity(userId, action, req = null, companyId = null) {
+async function logActivity(userId, type, req = null) {
   if (!pool || !pool.query) {
     console.warn("logActivity: DB not ready");
     return;
@@ -11,13 +11,16 @@ async function logActivity(userId, action, req = null, companyId = null) {
     const ip = req?.headers?.['x-forwarded-for'] || req?.socket?.remoteAddress || null;
     const userAgent = req?.headers?.['user-agent'] || null;
 
-    // If companyId not provided but req.user exists, try to get it from there
-    const finalCompanyId = companyId || req?.user?.companyId || null;
+    const details = {
+      ip_address: ip,
+      user_agent: userAgent,
+      timestamp: new Date().toISOString()
+    };
 
     await pool.query(
-      `INSERT INTO activities (user_id, action, ip_address, user_agent, company_id, timestamp)
-       VALUES ($1, $2, $3, $4, $5, NOW())`,
-      [userId, action, ip, userAgent, finalCompanyId]
+      `INSERT INTO activities (user_id, activity_type, details, created_at)
+       VALUES ($1, $2, $3, NOW())`,
+      [userId, type, JSON.stringify(details)]
     );
   } catch (err) {
     console.error("logActivity error:", err.message);

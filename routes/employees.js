@@ -31,7 +31,7 @@ if (DEV) {
   router.get('/', async (req, res) => {
     try {
       const result = await pool.query(
-        `SELECT u.id, u.email, u.role, u.company_id, p.phone, p.position, p.department, p.hire_date, p.is_active, p.created_at AS profile_created_at
+        `SELECT u.id, u.email, u.role, p.phone, p.position, p.department, p.hire_date, p.is_active, p.created_at AS profile_created_at
          FROM users u
          LEFT JOIN employee_profiles p ON u.id = p.user_id
          ORDER BY u.id`);
@@ -82,14 +82,11 @@ if (DEV) {
   // Protected versions - require authentication
   router.get('/', authenticateToken, async (req, res) => {
     try {
-      // ✅ Filter employees by company_id
       const result = await pool.query(
-        `SELECT u.id, u.email, u.role, u.company_id, p.phone, p.position, p.department, p.hire_date, p.is_active, p.created_at AS profile_created_at
+        `SELECT u.id, u.email, u.role, p.phone, p.position, p.department, p.hire_date, p.is_active, p.created_at AS profile_created_at
          FROM users u
          LEFT JOIN employee_profiles p ON u.id = p.user_id
-         WHERE u.company_id = $1
-         ORDER BY u.id`,
-        [req.user.companyId]);
+         ORDER BY u.id`);
       const employees = await Promise.all(result.rows.map(mapRowToEmployee));
       res.json(employees);
     } catch (err) {
@@ -106,15 +103,14 @@ if (DEV) {
       const client = await pool.connect();
       try {
         await client.query('BEGIN');
-        // ✅ Add company_id when creating employee
         const insertUser = await client.query(
-          'INSERT INTO users (email, password_hash, role, company_id) VALUES ($1, $2, $3, $4) RETURNING id, email',
-          [email, hash, 'employee', req.user.companyId]
+          'INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3) RETURNING id, email',
+          [email, hash, 'user']
         );
         const userId = insertUser.rows[0].id;
         await client.query(
-          'INSERT INTO employee_profiles (user_id, phone, position, company_id) VALUES ($1, $2, $3, $4)',
-          [userId, phone || null, position || null, req.user.companyId]
+          'INSERT INTO employee_profiles (user_id, phone, position) VALUES ($1, $2, $3)',
+          [userId, phone || null, position || null]
         );
         await client.query('COMMIT');
         const employee = await mapRowToEmployee({ id: userId, email, phone, position, is_active: true });

@@ -8,8 +8,8 @@ router.post('/clock-in', authenticateToken, async (req, res) => {
   const { jobId, location, notes } = req.body;
   try {
     const result = await pool.query(
-      'INSERT INTO attendance_records (user_id, job_id, company_id, clock_in, location, notes) VALUES ($1, $2, $3, NOW(), $4, $5) RETURNING *',
-      [req.user.userId, jobId || null, req.user.companyId, location || null, notes || null]
+      'INSERT INTO attendance_records (user_id, job_id, clock_in, location, notes) VALUES ($1, $2, NOW(), $3, $4) RETURNING *',
+      [req.user.userId, jobId || null, location || null, notes || null]
     );
     res.json(result.rows[0]);
   } catch (err) {
@@ -21,7 +21,7 @@ router.post('/clock-in', authenticateToken, async (req, res) => {
 router.post('/clock-out', authenticateToken, async (req, res) => {
   const { recordId } = req.body;
   try {
-    const rec = await pool.query('SELECT * FROM attendance_records WHERE id = $1 AND user_id = $2 AND company_id = $3', [recordId, req.user.userId, req.user.companyId]);
+    const rec = await pool.query('SELECT * FROM attendance_records WHERE id = $1 AND user_id = $2', [recordId, req.user.userId]);
     if (rec.rows.length === 0) return res.status(404).json({ message: 'Record not found' });
     const clockIn = rec.rows[0].clock_in;
     const result = await pool.query(
@@ -37,7 +37,7 @@ router.post('/clock-out', authenticateToken, async (req, res) => {
 // Get recent attendance
 router.get('/', authenticateToken, async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM attendance_records WHERE user_id = $1 AND company_id = $2 ORDER BY created_at DESC LIMIT 100', [req.user.userId, req.user.companyId]);
+    const result = await pool.query('SELECT * FROM attendance_records WHERE user_id = $1 ORDER BY created_at DESC LIMIT 100', [req.user.userId]);
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ message: 'Server error' });

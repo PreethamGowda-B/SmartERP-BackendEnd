@@ -14,7 +14,7 @@ const REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || ACCESS_SECRET;
 // ✅ Signup (Register New Users)
 // ---------------------------------------------
 router.post("/signup", async (req, res) => {
-  const { name, email, password, role = "owner", phone, position, department, companyName, companyId } = req.body;
+  const { name, email, password, role = "owner", phone, position, department } = req.body;
 
   try {
     const existing = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
@@ -23,39 +23,12 @@ router.post("/signup", async (req, res) => {
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
-    let finalCompanyId = null;
-
-    // If owner, create a new company
-    if (role.toLowerCase() === "owner") {
-      const companyResult = await pool.query(
-        `INSERT INTO companies (name, owner_email, created_at)
-         VALUES ($1, $2, NOW())
-         RETURNING id, name`,
-        [companyName || `${name}'s Company`, email]
-      );
-      finalCompanyId = companyResult.rows[0].id;
-      console.log(`✅ Created company ${companyResult.rows[0].name} with ID ${finalCompanyId}`);
-    }
-    // If employee, verify and join existing company
-    else if (role.toLowerCase() === "employee") {
-      if (!companyId) {
-        return res.status(400).json({ message: "Company ID required for employee signup" });
-      }
-
-      const companyCheck = await pool.query("SELECT id FROM companies WHERE id = $1 AND is_active = true", [companyId]);
-      if (companyCheck.rows.length === 0) {
-        return res.status(400).json({ message: "Invalid or inactive company ID" });
-      }
-
-      finalCompanyId = companyCheck.rows[0].id;
-      console.log(`✅ Employee joining company ID ${finalCompanyId}`);
-    }
 
     const insert = await pool.query(
-      `INSERT INTO users (name, email, password_hash, role, phone, position, department, company_id, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
-       RETURNING id, name, email, role, phone, position, department, company_id, created_at`,
-      [name, email, hashedPassword, role.toLowerCase(), phone || null, position || null, department || null, finalCompanyId]
+      `INSERT INTO users (name, email, password_hash, role, phone, position, department, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+       RETURNING id, name, email, role, phone, position, department, created_at`,
+      [name, email, hashedPassword, role.toLowerCase(), phone || null, position || null, department || null]
     );
 
     const user = insert.rows[0];
@@ -88,21 +61,14 @@ router.post("/login", async (req, res) => {
 
     await logActivity(user.id, "login", req);
 
-    // ✅ Generate JWTs with company_id
+    // Generate JWTs
     const accessToken = jwt.sign(
-      {
-        userId: user.id,
-        role: user.role,
-        companyId: user.company_id
-      },
+      { userId: user.id, role: user.role },
       ACCESS_SECRET,
       { expiresIn: "15m" }
     );
     const refreshToken = jwt.sign(
-      {
-        userId: user.id,
-        companyId: user.company_id
-      },
+      { userId: user.id },
       REFRESH_SECRET,
       { expiresIn: "7d" }
     );
@@ -149,14 +115,7 @@ router.post("/refresh", async (req, res) => {
 
       try {
         await pool.query("DELETE FROM refresh_tokens WHERE token = $1", [token]);
-        const newRefresh = jwt.sign(
-          {
-            userId: payload.userId,
-            companyId: payload.companyId
-          },
-          REFRESH_SECRET,
-          { expiresIn: "7d" }
-        );
+        const newRefresh = jwt.sign({ userId: payload.userId }, REFRESH_SECRET, { expiresIn: "7d" });
         await pool.query(
           `INSERT INTO refresh_tokens (user_id, token, expires_at)
            VALUES ($1, $2, NOW() + INTERVAL '7 days')`,
@@ -164,10 +123,7 @@ router.post("/refresh", async (req, res) => {
         );
 
         const accessToken = jwt.sign(
-          {
-            userId: payload.userId,
-            companyId: payload.companyId
-          },
+          { userId: payload.userId },
           ACCESS_SECRET,
           { expiresIn: "15m" }
         );

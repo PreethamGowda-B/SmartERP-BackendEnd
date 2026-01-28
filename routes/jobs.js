@@ -67,16 +67,22 @@ router.post('/', authenticateToken, async (req, res) => {
     job.visible_to_all === false ? false : true;
 
   try {
+    // ✅ Verify user has a company
+    if (!req.user.companyId) {
+      return res.status(403).json({ message: 'User not associated with a company' });
+    }
+
     const result = await pool.query(
       `INSERT INTO jobs 
-       (title, description, assigned_to, created_by, data, visible_to_all, status, priority)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       (title, description, assigned_to, created_by, company_id, data, visible_to_all, status, priority)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        RETURNING *`,
       [
         title,
         description,
         assignedTo,
-        req.user.id,
+        req.user.userId,
+        req.user.companyId,
         job,
         visibleToAll,
         job.status || 'pending',
@@ -84,7 +90,7 @@ router.post('/', authenticateToken, async (req, res) => {
       ]
     );
 
-    console.log('✅ Job created successfully:', result.rows[0].id);
+    console.log('✅ Job created successfully:', result.rows[0].id, 'for company:', req.user.companyId);
     res.json(result.rows[0]);
   } catch (err) {
     console.error('❌ jobs POST error', err);
@@ -101,27 +107,36 @@ router.get('/', authenticateToken, async (req, res) => {
 
     console.log("🧩 Fetching jobs for:", req.user);
 
+    // ✅ Verify user has a company
+    if (!req.user.companyId) {
+      console.log('⚠️ User has no company_id, returning empty jobs');
+      return res.json([]);
+    }
+
     if (req.user.role === 'owner') {
+      // ✅ Owner sees ALL jobs in their company
       result = await pool.query(
-        `SELECT j.*, u.email as employee_email 
+        `SELECT j.*, u.email as employee_email, u.name as employee_name
          FROM jobs j
          LEFT JOIN users u ON j.assigned_to = u.id
-         WHERE j.created_by = $1 
+         WHERE j.company_id = $1 
          ORDER BY j.created_at DESC`,
-        [req.user.id]
+        [req.user.companyId]
       );
     } else if (req.user.role === 'employee') {
+      // ✅ Employee sees jobs in their company that are either assigned to them OR visible to all
       result = await pool.query(
-        `SELECT * FROM jobs 
-         WHERE visible_to_all = true 
-         OR assigned_to = $1 
-         ORDER BY created_at DESC`,
-        [req.user.id]
+        `SELECT j.*, u.email as employee_email, u.name as employee_name
+         FROM jobs j
+         LEFT JOIN users u ON j.assigned_to = u.id
+         WHERE j.company_id = $1 
+         AND (j.visible_to_all = true OR j.assigned_to = $2)
+         ORDER BY j.created_at DESC`,
+        [req.user.companyId, req.user.userId]
       );
     } else {
-      result = await pool.query(
-        `SELECT * FROM jobs WHERE visible_to_all = true ORDER BY created_at DESC`
-      );
+      // Unknown role - no jobs
+      result = { rows: [] };
     }
 
     const rows = result.rows.map((r) => {
@@ -135,6 +150,7 @@ router.get('/', authenticateToken, async (req, res) => {
         visible_to_all: r.visible_to_all,
         created_by: r.created_by,
         assigned_to: r.assigned_to,
+        company_id: r.company_id,
         created_at: r.created_at,
         employee_status: r.employee_status,
         progress: r.progress || 0,
@@ -142,11 +158,12 @@ router.get('/', authenticateToken, async (req, res) => {
         declined_at: r.declined_at,
         completed_at: r.completed_at,
         employee_email: r.employee_email,
+        employee_name: r.employee_name,
         ...job,
       };
     });
 
-    console.log(`✅ Returning ${rows.length} jobs for user ${req.user.id}`);
+    console.log(`✅ Returning ${rows.length} jobs for user ${req.user.userId} in company ${req.user.companyId}`);
     res.json(rows);
   } catch (err) {
     console.error('❌ jobs GET error', err);
@@ -161,14 +178,14 @@ router.post('/:id/accept', authenticateToken, async (req, res) => {
   const { id } = req.params;
 
   try {
-    // Check if job is assigned to this employee
+    // ✅ Check if job belongs to user's company and is accessible
     const checkJob = await pool.query(
-      'SELECT * FROM jobs WHERE id = $1 AND (assigned_to = $2 OR visible_to_all = true)',
-      [id, req.user.id]
+      'SELECT * FROM jobs WHERE id = $1 AND company_id = $2 AND (assigned_to = $3 OR visible_to_all = true)',
+      [id, req.user.companyId, req.user.userId]
     );
 
     if (checkJob.rows.length === 0) {
-      return res.status(403).json({ message: 'Job not assigned to you' });
+      return res.status(403).json({ message: 'Job not found or not accessible' });
     }
 
     const result = await pool.query(
@@ -179,10 +196,10 @@ router.post('/:id/accept', authenticateToken, async (req, res) => {
            assigned_to = $2
        WHERE id = $1
        RETURNING *`,
-      [id, req.user.id]
+      [id, req.user.userId]
     );
 
-    console.log(`✅ Job ${id} accepted by employee ${req.user.id}`);
+    console.log(`✅ Job ${id} accepted by employee ${req.user.userId}`);
     res.json(result.rows[0]);
   } catch (err) {
     console.error('❌ jobs ACCEPT error', err);
@@ -197,14 +214,14 @@ router.post('/:id/decline', authenticateToken, async (req, res) => {
   const { id } = req.params;
 
   try {
-    // Check if job is assigned to this employee
+    // ✅ Check if job belongs to user's company and is accessible
     const checkJob = await pool.query(
-      'SELECT * FROM jobs WHERE id = $1 AND (assigned_to = $2 OR visible_to_all = true)',
-      [id, req.user.id]
+      'SELECT * FROM jobs WHERE id = $1 AND company_id = $2 AND (assigned_to = $3 OR visible_to_all = true)',
+      [id, req.user.companyId, req.user.userId]
     );
 
     if (checkJob.rows.length === 0) {
-      return res.status(403).json({ message: 'Job not assigned to you' });
+      return res.status(403).json({ message: 'Job not found or not accessible' });
     }
 
     const result = await pool.query(
@@ -216,7 +233,7 @@ router.post('/:id/decline', authenticateToken, async (req, res) => {
       [id]
     );
 
-    console.log(`✅ Job ${id} declined by employee ${req.user.id}`);
+    console.log(`✅ Job ${id} declined by employee ${req.user.userId}`);
     res.json(result.rows[0]);
   } catch (err) {
     console.error('❌ jobs DECLINE error', err);
@@ -236,10 +253,10 @@ router.post('/:id/progress', authenticateToken, async (req, res) => {
   }
 
   try {
-    // Check if job is assigned to this employee and accepted
+    // ✅ Check if job belongs to user's company, is assigned to them, and is accepted
     const checkJob = await pool.query(
-      'SELECT * FROM jobs WHERE id = $1 AND assigned_to = $2 AND employee_status = $3',
-      [id, req.user.id, 'accepted']
+      'SELECT * FROM jobs WHERE id = $1 AND company_id = $2 AND assigned_to = $3 AND employee_status = $4',
+      [id, req.user.companyId, req.user.userId, 'accepted']
     );
 
     if (checkJob.rows.length === 0) {
@@ -280,6 +297,16 @@ router.put('/:id', authenticateToken, async (req, res) => {
   const updates = req.body || {};
 
   try {
+    // ✅ Verify job belongs to user's company
+    const checkJob = await pool.query(
+      'SELECT * FROM jobs WHERE id = $1 AND company_id = $2',
+      [id, req.user.companyId]
+    );
+
+    if (checkJob.rows.length === 0) {
+      return res.status(403).json({ message: 'Job not found or not accessible' });
+    }
+
     const result = await pool.query(
       `UPDATE jobs SET
          title = COALESCE($1, title),
@@ -298,8 +325,8 @@ router.put('/:id', authenticateToken, async (req, res) => {
         updates.title,
         updates.description,
         (updates.assignedEmployees && updates.assignedEmployees[0]) ||
-          updates.assignedTo ||
-          null,
+        updates.assignedTo ||
+        null,
         typeof updates.visible_to_all !== 'undefined'
           ? updates.visible_to_all
           : null,
@@ -325,10 +352,16 @@ router.delete('/:id', authenticateToken, async (req, res) => {
   const { id } = req.params;
 
   try {
-    await pool.query(
-      'DELETE FROM jobs WHERE id = $1',
-      [id]
+    // ✅ Verify job belongs to user's company before deleting
+    const result = await pool.query(
+      'DELETE FROM jobs WHERE id = $1 AND company_id = $2 RETURNING id',
+      [id, req.user.companyId]
     );
+
+    if (result.rows.length === 0) {
+      return res.status(403).json({ message: 'Job not found or not accessible' });
+    }
+
     console.log(`✅ Job ${id} deleted successfully`);
     res.json({ success: true });
   } catch (err) {

@@ -90,7 +90,7 @@ router.post("/login", async (req, res) => {
     res.cookie("refresh_token", refreshToken, { ...cookieOpts, maxAge: 7 * 24 * 60 * 60 * 1000 });
 
     delete user.password_hash;
-    res.json({ ok: true, user });
+    res.json({ ok: true, user, accessToken, refreshToken });
   } catch (err) {
     console.error("Login error:", err.message);
     res.status(500).json({ message: "Server error during login" });
@@ -101,7 +101,7 @@ router.post("/login", async (req, res) => {
 // ✅ Refresh Token Route
 // ---------------------------------------------
 router.post("/refresh", async (req, res) => {
-  const token = req.cookies?.refresh_token;
+  const token = req.cookies?.refresh_token || req.body?.refreshToken;
   if (!token) return res.status(401).json({ message: "No refresh token provided" });
 
   try {
@@ -139,7 +139,7 @@ router.post("/refresh", async (req, res) => {
         res.cookie("refresh_token", newRefresh, { ...cookieOpts, maxAge: 7 * 24 * 60 * 60 * 1000 });
 
         await logActivity(payload.userId, "refresh_token", req);
-        res.json({ ok: true });
+        res.json({ ok: true, accessToken, refreshToken: newRefresh });
       } catch (error) {
         console.error("Token rotation error:", error);
         res.status(500).json({ message: "Server error during token refresh" });

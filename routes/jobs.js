@@ -21,28 +21,32 @@ router.post('/', authenticateToken, async (req, res) => {
 
   try {
     const result = await pool.query(
-      `INSERT INTO jobs
-       (title, description, assigned_to, created_by, data, visible_to_all, status, priority)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-       RETURNING *`,
-      [
-        title,
-        description,
-        assignedTo,
-        req.user.id,
-        job,
-        visibleToAll,
-        job.status || 'pending',
-        job.priority || 'medium'
-      ]
-    );
+  `INSERT INTO jobs
+   (title, description, assigned_to, created_by, data, visible_to_all, status, priority)
+   VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8)
+   RETURNING *`,
+  [
+    title,
+    description,
+    assignedTo,
+    req.user.id,
+    JSON.stringify(job),   // 🔥 THIS FIXES 500
+    visibleToAll,
+    job.status || 'pending',
+    job.priority || 'medium'
+  ]
+);
+
 
     res.status(201).json(result.rows[0]);
   } catch (err) {
-    console.error('jobs POST error:', err);
-    res.status(500).json({ message: 'Server error' });
-  }
+  console.error('🔥 ERROR 🔥');
+  console.error(err.message);
+  console.error(err.stack);
+  res.status(500).json({ message: 'Server error' });
+}
 });
+
 
 /**
  * Get jobs (role-based)
@@ -110,10 +114,13 @@ router.get('/', authenticateToken, async (req, res) => {
 
     res.json(rows);
   } catch (err) {
-    console.error('jobs GET error:', err);
-    res.status(500).json({ message: 'Server error' });
-  }
+  console.error('🔥 ERROR 🔥');
+  console.error(err.message);
+  console.error(err.stack);
+  res.status(500).json({ message: 'Server error' });
+}
 });
+
 
 /**
  * Accept job (Employee)
@@ -155,11 +162,14 @@ router.post('/:id/accept', authenticateToken, async (req, res) => {
     );
 
     res.json(result.rows[0]);
-  } catch (err) {
-    console.error('jobs ACCEPT error:', err);
-    res.status(500).json({ message: 'Server error' });
-  }
+ } catch (err) {
+  console.error('🔥 ERROR 🔥');
+  console.error(err.message);
+  console.error(err.stack);
+  res.status(500).json({ message: 'Server error' });
+}
 });
+
 
 /**
  * Decline job (Employee)
@@ -199,11 +209,14 @@ router.post('/:id/decline', authenticateToken, async (req, res) => {
     );
 
     res.json(result.rows[0]);
-  } catch (err) {
-    console.error('jobs DECLINE error:', err);
-    res.status(500).json({ message: 'Server error' });
-  }
+ } catch (err) {
+  console.error('🔥 ERROR 🔥');
+  console.error(err.message);
+  console.error(err.stack);
+  res.status(500).json({ message: 'Server error' });
+}
 });
+
 
 /**
  * Update job progress (Employee)
@@ -246,10 +259,13 @@ router.post('/:id/progress', authenticateToken, async (req, res) => {
 
     res.json(result.rows[0]);
   } catch (err) {
-    console.error('jobs PROGRESS error:', err);
-    res.status(500).json({ message: 'Server error' });
-  }
+  console.error('🔥 ERROR 🔥');
+  console.error(err.message);
+  console.error(err.stack);
+  res.status(500).json({ message: 'Server error' });
+}
 });
+
 
 /**
  * Update job (Owner)
@@ -288,11 +304,14 @@ router.put('/:id', authenticateToken, async (req, res) => {
     );
 
     res.json(result.rows[0]);
-  } catch (err) {
-    console.error('jobs PUT error:', err);
-    res.status(500).json({ message: 'Server error' });
-  }
+ } catch (err) {
+  console.error('🔥 ERROR 🔥');
+  console.error(err.message);
+  console.error(err.stack);
+  res.status(500).json({ message: 'Server error' });
+}
 });
+
 
 /**
  * Delete job
@@ -301,10 +320,13 @@ router.delete('/:id', authenticateToken, async (req, res) => {
   try {
     await pool.query('DELETE FROM jobs WHERE id = $1', [req.params.id]);
     res.json({ success: true });
-  } catch (err) {
-    console.error('jobs DELETE error:', err);
-    res.status(500).json({ message: 'Server error' });
-  }
+ } catch (err) {
+  console.error('🔥 ERROR 🔥');
+  console.error(err.message);
+  console.error(err.stack);
+  res.status(500).json({ message: 'Server error' });
+}
 });
+
 
 module.exports = router;

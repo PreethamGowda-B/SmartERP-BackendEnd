@@ -22,7 +22,12 @@ function authenticateToken(req, res, next) {
     if (err) {
       return res.status(401).json({ message: "Invalid or expired token" });
     }
-    req.user = payload;
+    // Normalize payload: ensure both 'id' and 'userId' exist for compatibility
+    req.user = {
+      ...payload,
+      id: payload.id || payload.userId,
+      userId: payload.userId || payload.id
+    };
     next();
   });
 }

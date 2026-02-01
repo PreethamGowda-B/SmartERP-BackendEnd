@@ -10,23 +10,39 @@ const app = express();
 // ✅ Trust proxy (required for HTTPS cookies on Render)
 app.set("trust proxy", 1);
 
-// ✅ Proper CORS configuration
-const allowedOrigins = [
-  "http://localhost:3000",
-  "https://smart-erp-front-end.vercel.app",
-  "https://smart-erp-front-dogibjmtv-thepreethu01-9119s-projects.vercel.app",
-];
-
+// ✅ FIXED: Dynamic CORS configuration that accepts all Vercel preview URLs
 app.use(
   cors({
     origin: function (origin, callback) {
       // Allow requests with no origin (like Postman or server-to-server)
-      if (!origin || allowedOrigins.includes(origin)) {
-        callback(null, true);
-      } else {
-        console.warn("🚫 Blocked CORS request from:", origin);
-        callback(new Error("Not allowed by CORS"));
+      if (!origin) {
+        return callback(null, true);
       }
+
+      // List of explicitly allowed origins
+      const allowedOrigins = [
+        "http://localhost:3000",
+        "https://smart-erp-front-end.vercel.app",
+      ];
+
+      // Check if origin is in allowed list
+      if (allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+
+      // ✅ CRITICAL FIX: Allow ALL Vercel preview deployments
+      // Pattern: https://smart-erp-front-*.vercel.app
+      if (origin.match(/^https:\/\/smart-erp-front(-[a-z0-9]+)?(-[a-z0-9-]+)?\.vercel\.app$/)) {
+        return callback(null, true);
+      }
+
+      // Also allow pattern: https://smart-erp-front-*-thepreethu01-9119s-projects.vercel.app
+      if (origin.match(/^https:\/\/smart-erp-front-[a-z0-9]+-thepreethu01-9119s-projects\.vercel\.app$/)) {
+        return callback(null, true);
+      }
+
+      console.warn("🚫 Blocked CORS request from:", origin);
+      callback(new Error("Not allowed by CORS"));
     },
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
@@ -97,6 +113,7 @@ app.get("/", async (req, res) => {
       <p>Database: <strong>Connected to Neon</strong></p>
       <p>API Base: <code>/api</code></p>
       <p>Server running on port ${process.env.PORT || 4000}</p>
+      <p>CORS: <strong>Configured for all Vercel deployments ✅</strong></p>
     `);
   } catch (err) {
     console.error("❌ DB Connection Error:", err.message);
@@ -113,7 +130,7 @@ app.get("/", async (req, res) => {
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
   console.log(`🚀 SmartERP backend running on port ${PORT}`);
-  console.log("🌐 Allowed origins:", allowedOrigins);
+  console.log("🌐 CORS: Accepting all Vercel preview deployments");
 });
 
 module.exports = app;

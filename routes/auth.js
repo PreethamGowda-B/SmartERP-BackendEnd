@@ -63,12 +63,12 @@ router.post("/login", async (req, res) => {
 
     // Generate JWTs
     const accessToken = jwt.sign(
-      { userId: user.id, role: user.role },
+      { id: user.id, userId: user.id, role: user.role },
       ACCESS_SECRET,
       { expiresIn: "15m" }
     );
     const refreshToken = jwt.sign(
-      { userId: user.id },
+      { id: user.id, userId: user.id },
       REFRESH_SECRET,
       { expiresIn: "7d" }
     );
@@ -115,7 +115,7 @@ router.post("/refresh", async (req, res) => {
 
       try {
         await pool.query("DELETE FROM refresh_tokens WHERE token = $1", [token]);
-        const newRefresh = jwt.sign({ userId: payload.userId }, REFRESH_SECRET, { expiresIn: "7d" });
+        const newRefresh = jwt.sign({ id: payload.userId, userId: payload.userId }, REFRESH_SECRET, { expiresIn: "7d" });
         await pool.query(
           `INSERT INTO refresh_tokens (user_id, token, expires_at)
            VALUES ($1, $2, NOW() + INTERVAL '7 days')`,
@@ -123,7 +123,7 @@ router.post("/refresh", async (req, res) => {
         );
 
         const accessToken = jwt.sign(
-          { userId: payload.userId },
+          { id: payload.userId, userId: payload.userId },
           ACCESS_SECRET,
           { expiresIn: "15m" }
         );

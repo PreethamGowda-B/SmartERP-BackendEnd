@@ -23,6 +23,8 @@ app.use(
       const allowedOrigins = [
         "http://localhost:3000",
         "https://smart-erp-front-end.vercel.app",
+        "https://www.prozync.in",
+        "https://prozync.in",
       ];
 
       // Check if origin is in allowed list

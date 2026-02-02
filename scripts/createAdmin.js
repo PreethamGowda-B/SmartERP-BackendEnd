@@ -8,7 +8,7 @@ async function createAdmin() {
   const role = 'owner';
 
   const hash = await bcrypt.hash(password, 10);
-  const res = await pool.query('INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3) RETURNING id, email, role', [email, hash, role]);
+  const res = await pool.query('INSERT INTO users (email, password_hash, role, name) VALUES ($1, $2, $3, $4) RETURNING id, email, role', [email, hash, role, 'Admin User']);
   console.log('Created admin user:', res.rows[0]);
   process.exit(0);
 }

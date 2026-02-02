@@ -3,6 +3,8 @@ const fetch = require('node-fetch');
 const base = process.env.API_BASE || 'http://localhost:4000';
 
 function extractCookie(headers) {
+  console.log('Headers:', headers.raw ? headers.raw() : headers);
+  if (!headers.raw) return null;
   const raw = headers.raw()['set-cookie'];
   if (!raw) return null;
   return raw.map(s => s.split(';')[0]).join('; ');

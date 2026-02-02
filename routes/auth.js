@@ -79,21 +79,28 @@ router.post("/login", async (req, res) => {
       [user.id, refreshToken]
     );
 
-    // ✅ Correct cookie config for cross-domain (Render + Vercel)
+    // ✅ Cookie config for same-domain scenarios (optional fallback)
     const cookieOpts = {
       httpOnly: true,
       sameSite: "none",
       secure: true,
-      path: "/", // Ensure cookies are sent for all paths
+      path: "/",
     };
 
     res.cookie("access_token", accessToken, { ...cookieOpts, maxAge: 15 * 60 * 1000 });
     res.cookie("refresh_token", refreshToken, { ...cookieOpts, maxAge: 7 * 24 * 60 * 60 * 1000 });
 
-    console.log("✅ Cookies set for user:", user.email);
+    console.log("✅ Login successful for user:", user.email);
 
     delete user.password_hash;
-    res.json({ ok: true, user });
+
+    // ✅ CRITICAL: Return tokens in response body for cross-domain auth
+    res.json({
+      ok: true,
+      user,
+      accessToken,  // Frontend will store this in localStorage
+      refreshToken  // Frontend will store this in localStorage
+    });
   } catch (err) {
     console.error("Login error:", err.message);
     res.status(500).json({ message: "Server error during login" });
@@ -104,7 +111,8 @@ router.post("/login", async (req, res) => {
 // ✅ Refresh Token Route
 // ---------------------------------------------
 router.post("/refresh", async (req, res) => {
-  const token = req.cookies?.refresh_token;
+  // Try cookie first, then request body (for cross-domain scenarios)
+  const token = req.cookies?.refresh_token || req.body?.refreshToken;
   if (!token) return res.status(401).json({ message: "No refresh token provided" });
 
   try {
@@ -142,7 +150,13 @@ router.post("/refresh", async (req, res) => {
         res.cookie("refresh_token", newRefresh, { ...cookieOpts, maxAge: 7 * 24 * 60 * 60 * 1000 });
 
         await logActivity(payload.userId, "refresh_token", req);
-        res.json({ ok: true });
+
+        // ✅ Return tokens in response body for cross-domain auth
+        res.json({
+          ok: true,
+          accessToken,
+          refreshToken: newRefresh
+        });
       } catch (error) {
         console.error("Token rotation error:", error);
         res.status(500).json({ message: "Server error during token refresh" });

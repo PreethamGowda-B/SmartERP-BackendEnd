@@ -84,10 +84,13 @@ router.post("/login", async (req, res) => {
       httpOnly: true,
       sameSite: "none",
       secure: true,
+      path: "/", // Ensure cookies are sent for all paths
     };
 
     res.cookie("access_token", accessToken, { ...cookieOpts, maxAge: 15 * 60 * 1000 });
     res.cookie("refresh_token", refreshToken, { ...cookieOpts, maxAge: 7 * 24 * 60 * 60 * 1000 });
+
+    console.log("✅ Cookies set for user:", user.email);
 
     delete user.password_hash;
     res.json({ ok: true, user });

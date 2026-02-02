@@ -12,9 +12,11 @@ function authenticateToken(req, res, next) {
   // Fallback to cookie
   if (!token && req.cookies) {
     token = req.cookies.access_token;
+    console.log("🍪 Cookie token found:", token ? "YES" : "NO", "| Cookies:", Object.keys(req.cookies));
   }
 
   if (!token) {
+    console.log("❌ No token found in request from:", req.headers.origin || req.headers.host);
     return res.status(401).json({ message: "Not authenticated" });
   }
 

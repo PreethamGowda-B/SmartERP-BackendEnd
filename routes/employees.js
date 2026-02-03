@@ -8,12 +8,17 @@ const { authenticateToken } = require('../middleware/authMiddleware');
 const DEV = process.env.DEV_ALLOW_UNAUTH_USERS === 'true';
 
 async function mapRowToEmployee(row) {
-  const email = row.email || '';
-  const local = email.split('@')[0] || '';
-  const name = local.replace('.', ' ').replace('_', ' ');
+  // Use actual name from database if available, otherwise derive from email
+  let name = row.name;
+  if (!name) {
+    const email = row.email || '';
+    const local = email.split('@')[0] || '';
+    name = local.replace('.', ' ').replace('_', ' ');
+    name = name.charAt(0).toUpperCase() + name.slice(1);
+  }
   return {
     id: row.id,
-    name: name.charAt(0).toUpperCase() + name.slice(1),
+    name: name,
     email: row.email,
     phone: row.phone || '',
     position: row.position || 'Employee',
@@ -29,7 +34,7 @@ async function mapRowToEmployee(row) {
 router.get('/', DEV ? (req, res, next) => next() : authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT u.id, u.email, u.role, p.phone, p.position, p.department, p.hire_date, p.is_active, p.created_at AS profile_created_at
+      `SELECT u.id, u.name, u.email, u.role, p.phone, p.position, p.department, p.hire_date, p.is_active, p.created_at AS profile_created_at
        FROM users u
        LEFT JOIN employee_profiles p ON u.id = p.user_id
        WHERE u.role != 'owner' AND u.role != 'admin'
@@ -55,10 +60,10 @@ router.post('/', DEV ? (req, res, next) => next() : authenticateToken, async (re
 
   const { email, password, position, phone, name } = req.body;
   if (!email) return res.status(400).json({ message: 'Email is required' });
+  if (!name) return res.status(400).json({ message: 'Name is required' });
 
-  // In production mode password is required; in DEV we default it
-  const pwd = password || (DEV ? 'ChangeMe123!' : null);
-  if (!pwd) return res.status(400).json({ message: 'Password is required' });
+  // Auto-generate a secure default password if not provided
+  const pwd = password || 'Employee@123';
 
   try {
     // Check for duplicate email
@@ -72,8 +77,8 @@ router.post('/', DEV ? (req, res, next) => next() : authenticateToken, async (re
     try {
       await client.query('BEGIN');
       const insertUser = await client.query(
-        'INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3) RETURNING id, email',
-        [email, hash, 'user']
+        'INSERT INTO users (name, email, password_hash, role) VALUES ($1, $2, $3, $4) RETURNING id, name, email',
+        [name, email, hash, 'user']
       );
       const userId = insertUser.rows[0].id;
       await client.query(
@@ -82,9 +87,7 @@ router.post('/', DEV ? (req, res, next) => next() : authenticateToken, async (re
       );
       await client.query('COMMIT');
 
-      const employee = await mapRowToEmployee({ id: userId, email, phone, position, is_active: true });
-      // If a name was explicitly passed, honour it over the email-derived one
-      if (name) employee.name = name;
+      const employee = await mapRowToEmployee({ id: userId, name, email, phone, position, is_active: true });
       res.status(201).json(employee);
     } catch (err) {
       await client.query('ROLLBACK');

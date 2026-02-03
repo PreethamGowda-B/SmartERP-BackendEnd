@@ -126,6 +126,8 @@ router.get('/', authenticateToken, async (req, res) => {
     const rows = result.rows.map((r) => {
       const job = r.data && typeof r.data === 'object' ? r.data : {};
       return {
+        ...job,  // Spread job data first
+        // Then override with database values (these take precedence)
         id: r.id,
         title: r.title,
         description: r.description,
@@ -141,7 +143,6 @@ router.get('/', authenticateToken, async (req, res) => {
         declined_at: r.declined_at,
         completed_at: r.completed_at,
         employee_email: r.employee_email,
-        ...job,
       };
     });
 

@@ -61,6 +61,22 @@ app.options("*", cors());
 app.use(cookieParser());
 app.use(express.json());
 
+// Fix database constraints on startup
+async function fixDatabaseConstraints() {
+  try {
+    console.log('🔧 Fixing database constraints...');
+    await pool.query(`ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_status_check`);
+    await pool.query(`
+      ALTER TABLE jobs ADD CONSTRAINT jobs_status_check 
+      CHECK (status IN ('open', 'pending', 'in_progress', 'active', 'completed', 'closed', 'cancelled'))
+    `);
+    console.log('✅ Database constraints fixed');
+  } catch (err) {
+    console.warn('⚠️  Could not fix constraints:', err.message);
+  }
+}
+setTimeout(fixDatabaseConstraints, 3000); // Run after DB connection
+
 // ✅ Routes
 app.use("/api/auth", require("./routes/auth"));
 app.use("/api/users", require("./routes/users"));

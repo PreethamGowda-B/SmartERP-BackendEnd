@@ -79,7 +79,7 @@ router.post('/', authenticateToken, async (req, res) => {
         req.user.id,
         job,
         visibleToAll,
-        job.status || 'pending',
+        job.status || 'open',  // Changed from 'pending' to 'open' to match DB constraint
         job.priority || 'medium'
       ]
     );
@@ -291,8 +291,8 @@ router.put('/:id', authenticateToken, async (req, res) => {
         updates.title,
         updates.description,
         (updates.assignedEmployees && updates.assignedEmployees[0]) ||
-          updates.assignedTo ||
-          null,
+        updates.assignedTo ||
+        null,
         typeof updates.visible_to_all !== 'undefined'
           ? updates.visible_to_all
           : null,

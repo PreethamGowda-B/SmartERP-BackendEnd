@@ -31,6 +31,14 @@ CREATE TABLE IF NOT EXISTS jobs (
   assigned_to INTEGER REFERENCES users(id),
   created_by INTEGER REFERENCES users(id),
   status VARCHAR(50) DEFAULT 'open',
+  priority VARCHAR(50) DEFAULT 'medium',
+  data JSONB,
+  visible_to_all BOOLEAN DEFAULT false,
+  employee_status VARCHAR(50) DEFAULT 'pending',
+  progress INTEGER DEFAULT 0,
+  accepted_at TIMESTAMP,
+  declined_at TIMESTAMP,
+  completed_at TIMESTAMP,
   created_at TIMESTAMP DEFAULT NOW()
 );
 

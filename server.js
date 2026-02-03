@@ -65,11 +65,26 @@ app.use(express.json());
 async function fixDatabaseConstraints() {
   try {
     console.log('🔧 Fixing database constraints...');
+
+    // Step 1: Update any existing jobs with invalid status to 'open'
+    const updateResult = await pool.query(`
+      UPDATE jobs 
+      SET status = 'open' 
+      WHERE status NOT IN ('open', 'pending', 'in_progress', 'active', 'completed', 'closed', 'cancelled')
+    `);
+    if (updateResult.rowCount > 0) {
+      console.log(`✅ Updated ${updateResult.rowCount} jobs with invalid status`);
+    }
+
+    // Step 2: Drop old constraint
     await pool.query(`ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_status_check`);
+
+    // Step 3: Add new flexible constraint
     await pool.query(`
       ALTER TABLE jobs ADD CONSTRAINT jobs_status_check 
       CHECK (status IN ('open', 'pending', 'in_progress', 'active', 'completed', 'closed', 'cancelled'))
     `);
+
     console.log('✅ Database constraints fixed');
   } catch (err) {
     console.warn('⚠️  Could not fix constraints:', err.message);

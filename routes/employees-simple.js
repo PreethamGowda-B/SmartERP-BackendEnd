@@ -6,8 +6,8 @@ const { authenticateToken } = require('../middleware/authMiddleware');
 
 // Simple employee management - no user accounts, just employee records
 
-// ─── GET /api/employees/simple ──────────────────────────────────────────────
-router.get('/simple', authenticateToken, async (req, res) => {
+// ─── GET /api/employees-simple ──────────────────────────────────────────────
+router.get('/', authenticateToken, async (req, res) => {
     try {
         const result = await pool.query(
             `SELECT id, name, email, phone, position, department, hire_date, is_active, created_at
@@ -37,8 +37,8 @@ router.get('/simple', authenticateToken, async (req, res) => {
     }
 });
 
-// ─── POST /api/employees/simple ─────────────────────────────────────────────
-router.post('/simple', authenticateToken, async (req, res) => {
+// ─── POST /api/employees-simple ─────────────────────────────────────────────
+router.post('/', authenticateToken, async (req, res) => {
     // Role guard
     const role = req.user?.role;
     if (role !== 'owner' && role !== 'admin') {
@@ -91,8 +91,8 @@ router.post('/simple', authenticateToken, async (req, res) => {
     }
 });
 
-// ─── DELETE /api/employees/simple/:id ───────────────────────────────────────
-router.delete('/simple/:id', authenticateToken, async (req, res) => {
+// ─── DELETE /api/employees-simple/:id ───────────────────────────────────────
+router.delete('/:id', authenticateToken, async (req, res) => {
     const role = req.user?.role;
     if (role !== 'owner' && role !== 'admin') {
         return res.status(403).json({ message: 'Only owners can delete employees' });

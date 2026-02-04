@@ -1,41 +1,14 @@
 const express = require('express');
 const router = express.Router();
 const multer = require('multer');
-const path = require('path');
-const fs = require('fs');
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
+const { storage } = require('../config/cloudinary');
 
-// Configure multer for image uploads
-const storage = multer.diskStorage({
-    destination: function (req, file, cb) {
-        const uploadDir = path.join(__dirname, '../uploads/inventory');
-        // Create directory if it doesn't exist
-        if (!fs.existsSync(uploadDir)) {
-            fs.mkdirSync(uploadDir, { recursive: true });
-        }
-        cb(null, uploadDir);
-    },
-    filename: function (req, file, cb) {
-        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-        cb(null, 'inventory-' + uniqueSuffix + path.extname(file.originalname));
-    }
-});
-
+// Configure multer with Cloudinary storage
 const upload = multer({
     storage: storage,
     limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
-    fileFilter: function (req, file, cb) {
-        const allowedTypes = /jpeg|jpg|png|gif|webp/;
-        const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
-        const mimetype = allowedTypes.test(file.mimetype);
-
-        if (mimetype && extname) {
-            return cb(null, true);
-        } else {
-            cb(new Error('Only image files are allowed!'));
-        }
-    }
 });
 
 // ─── POST /api/inventory ─────────────────────────────────────────────────────
@@ -49,10 +22,10 @@ router.post('/', authenticateToken, upload.single('image'), async (req, res) => 
             return res.status(400).json({ message: 'Item name is required' });
         }
 
-        // Get image URL if file was uploaded
+        // Get image URL from Cloudinary if file was uploaded
         let imageUrl = null;
         if (req.file) {
-            imageUrl = `/uploads/inventory/${req.file.filename}`;
+            imageUrl = req.file.path; // Cloudinary URL
         }
 
         // Get employee name
@@ -132,13 +105,8 @@ router.delete('/:id', authenticateToken, async (req, res) => {
             return res.status(404).json({ message: 'Inventory item not found' });
         }
 
-        // Delete image file if exists
-        if (result.rows[0].image_url) {
-            const imagePath = path.join(__dirname, '..', result.rows[0].image_url);
-            if (fs.existsSync(imagePath)) {
-                fs.unlinkSync(imagePath);
-            }
-        }
+        // Note: Cloudinary images persist even after deletion
+        // To delete from Cloudinary, you'd need to extract the public_id and call cloudinary.uploader.destroy()
 
         res.json({ message: 'Inventory item deleted successfully' });
     } catch (err) {

@@ -109,6 +109,7 @@ app.use("/api/payments", require("./routes/payments"));
 app.use("/api/analytics", require("./routes/analytics"));
 app.use("/api/employees", require("./routes/employees"));
 app.use("/api/employees-simple", require("./routes/employees-simple"));
+app.use("/api/material-requests", require("./routes/materialRequests"));
 app.use("/api/ai", require("./routes/ai.routes"));
 
 

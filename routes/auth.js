@@ -125,6 +125,13 @@ router.post("/refresh", async (req, res) => {
       if (err) return res.status(403).json({ message: "Invalid token" });
 
       try {
+        // ✅ Fetch user role from database to include in new access token
+        const userResult = await pool.query("SELECT role FROM users WHERE id = $1", [payload.userId]);
+        if (userResult.rows.length === 0) {
+          return res.status(401).json({ message: "User not found" });
+        }
+        const userRole = userResult.rows[0].role;
+
         await pool.query("DELETE FROM refresh_tokens WHERE token = $1", [token]);
         const newRefresh = jwt.sign({ id: payload.userId, userId: payload.userId }, REFRESH_SECRET, { expiresIn: "7d" });
         await pool.query(
@@ -133,8 +140,9 @@ router.post("/refresh", async (req, res) => {
           [payload.userId, newRefresh]
         );
 
+        // ✅ Include role in access token (critical for role-based authorization)
         const accessToken = jwt.sign(
-          { id: payload.userId, userId: payload.userId },
+          { id: payload.userId, userId: payload.userId, role: userRole },
           ACCESS_SECRET,
           { expiresIn: "15m" }
         );

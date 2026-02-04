@@ -3,11 +3,11 @@ const router = express.Router();
 const multer = require('multer');
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
-const { storage } = require('../config/cloudinary');
+const { storage, hasCloudinaryConfig } = require('../config/cloudinary');
 
-// Configure multer with Cloudinary storage
+// Configure multer with Cloudinary storage or memory storage as fallback
 const upload = multer({
-    storage: storage,
+    storage: storage || multer.memoryStorage(),
     limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
 });
 
@@ -25,7 +25,12 @@ router.post('/', authenticateToken, upload.single('image'), async (req, res) => 
         // Get image URL from Cloudinary if file was uploaded
         let imageUrl = null;
         if (req.file) {
-            imageUrl = req.file.path; // Cloudinary URL
+            if (hasCloudinaryConfig && req.file.path) {
+                imageUrl = req.file.path; // Cloudinary URL
+            } else if (req.file && !hasCloudinaryConfig) {
+                console.warn('⚠️  Image uploaded but Cloudinary not configured. Skipping image.');
+                imageUrl = null;
+            }
         }
 
         // Get employee name

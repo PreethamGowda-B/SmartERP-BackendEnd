@@ -14,7 +14,7 @@ const REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || ACCESS_SECRET;
 // ✅ Signup (Register New Users)
 // ---------------------------------------------
 router.post("/signup", async (req, res) => {
-  const { name, email, password, role = "owner", phone, position, department } = req.body;
+  const { name, email, password, role = "user", phone, position, department } = req.body;
 
   try {
     const existing = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
@@ -24,17 +24,38 @@ router.post("/signup", async (req, res) => {
 
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    const insert = await pool.query(
-      `INSERT INTO users (name, email, password_hash, role, phone, position, department, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-       RETURNING id, name, email, role, phone, position, department, created_at`,
-      [name, email, hashedPassword, role.toLowerCase(), phone || null, position || null, department || null]
-    );
+    // Use transaction to create both user and employee_profile
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
 
-    const user = insert.rows[0];
-    await logActivity(user.id, "signup", req);
+      // Create user
+      const userInsert = await client.query(
+        `INSERT INTO users (name, email, password_hash, role, created_at)
+         VALUES ($1, $2, $3, $4, NOW())
+         RETURNING id, name, email, role, created_at`,
+        [name, email, hashedPassword, role.toLowerCase()]
+      );
 
-    res.status(201).json({ ok: true, user });
+      const user = userInsert.rows[0];
+
+      // Create employee_profile for all users (including owners)
+      await client.query(
+        `INSERT INTO employee_profiles (user_id, phone, position, department, hire_date, is_active)
+         VALUES ($1, $2, $3, $4, NOW(), true)`,
+        [user.id, phone || null, position || null, department || null]
+      );
+
+      await client.query('COMMIT');
+      await logActivity(user.id, "signup", req);
+
+      res.status(201).json({ ok: true, user });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
   } catch (err) {
     console.error("Signup error:", err.message);
     res.status(500).json({ message: "Server error during signup" });

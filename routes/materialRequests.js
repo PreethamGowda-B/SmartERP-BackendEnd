@@ -8,7 +8,7 @@ const { authenticateToken } = require('../middleware/authMiddleware');
 router.post('/', authenticateToken, async (req, res) => {
     try {
         const { item_name, quantity, urgency, description } = req.body;
-        const userId = req.user.userId;
+        const userId = req.user.userId || req.user.id;
 
         if (!item_name || !item_name.trim()) {
             return res.status(400).json({ message: 'Item name is required' });
@@ -23,20 +23,25 @@ router.post('/', authenticateToken, async (req, res) => {
             'SELECT name, email FROM users WHERE id = $1',
             [userId]
         );
+
+        if (userResult.rows.length === 0) {
+            return res.status(404).json({ message: 'User not found' });
+        }
+
         const userName = userResult.rows[0]?.name || userResult.rows[0]?.email || 'Unknown';
 
-        // Insert material request
+        // Insert material request - use TEXT for requested_by to match integer user IDs
         const result = await pool.query(
             `INSERT INTO material_requests 
        (item_name, quantity, urgency, description, requested_by, requested_by_name, created_at) 
-       VALUES ($1, $2, $3, $4, $5, $6, NOW()) 
+       VALUES ($1, $2, $3, $4, $5::text, $6, NOW()) 
        RETURNING *`,
             [
                 item_name.trim(),
                 parseInt(quantity),
                 urgency || 'Medium',
                 description?.trim() || null,
-                userId,
+                userId.toString(),
                 userName
             ]
         );
@@ -52,7 +57,7 @@ router.post('/', authenticateToken, async (req, res) => {
 // Get material requests (owner sees all, employee sees their own)
 router.get('/', authenticateToken, async (req, res) => {
     try {
-        const userId = req.user.userId;
+        const userId = req.user.userId || req.user.id;
         const role = req.user.role;
 
         let query;
@@ -63,9 +68,9 @@ router.get('/', authenticateToken, async (req, res) => {
             query = `SELECT * FROM material_requests ORDER BY created_at DESC`;
             params = [];
         } else {
-            // Employee sees only their own requests
-            query = `SELECT * FROM material_requests WHERE requested_by = $1 ORDER BY created_at DESC`;
-            params = [userId];
+            // Employee sees only their own requests - compare as text
+            query = `SELECT * FROM material_requests WHERE requested_by = $1::text ORDER BY created_at DESC`;
+            params = [userId.toString()];
         }
 
         const result = await pool.query(query, params);
@@ -86,14 +91,14 @@ router.patch('/:id/accept', authenticateToken, async (req, res) => {
         }
 
         const { id } = req.params;
-        const userId = req.user.userId;
+        const userId = req.user.userId || req.user.id;
 
         const result = await pool.query(
             `UPDATE material_requests 
-       SET status = 'accepted', reviewed_by = $1, reviewed_at = NOW(), updated_at = NOW()
+       SET status = 'accepted', reviewed_by = $1::text, reviewed_at = NOW(), updated_at = NOW()
        WHERE id = $2 AND status = 'pending'
        RETURNING *`,
-            [userId, id]
+            [userId.toString(), id]
         );
 
         if (result.rows.length === 0) {
@@ -117,14 +122,14 @@ router.patch('/:id/decline', authenticateToken, async (req, res) => {
         }
 
         const { id } = req.params;
-        const userId = req.user.userId;
+        const userId = req.user.userId || req.user.id;
 
         const result = await pool.query(
             `UPDATE material_requests 
-       SET status = 'declined', reviewed_by = $1, reviewed_at = NOW(), updated_at = NOW()
+       SET status = 'declined', reviewed_by = $1::text, reviewed_at = NOW(), updated_at = NOW()
        WHERE id = $2 AND status = 'pending'
        RETURNING *`,
-            [userId, id]
+            [userId.toString(), id]
         );
 
         if (result.rows.length === 0) {

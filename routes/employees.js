@@ -101,6 +101,89 @@ router.post('/', DEV ? (req, res, next) => next() : authenticateToken, async (re
   }
 });
 
+// ─── PATCH /api/employees/:id ────────────────────────────────────────────────
+// Update employee department, position, and account status
+router.patch('/:id', authenticateToken, async (req, res) => {
+  // Only owners / admins can update employees
+  const role = req.user?.role;
+  if (role !== 'owner' && role !== 'admin') {
+    return res.status(403).json({ message: 'Only owners can update employees' });
+  }
+
+  const employeeId = parseInt(req.params.id, 10);
+  if (isNaN(employeeId)) {
+    return res.status(400).json({ message: 'Invalid employee ID' });
+  }
+
+  const { department, position, is_active } = req.body;
+
+  try {
+    // Verify employee exists and is not an owner/admin
+    const target = await pool.query('SELECT id, role FROM users WHERE id = $1', [employeeId]);
+    if (target.rows.length === 0) {
+      return res.status(404).json({ message: 'Employee not found' });
+    }
+    if (target.rows[0].role === 'owner' || target.rows[0].role === 'admin') {
+      return res.status(403).json({ message: 'Cannot update an owner or admin account' });
+    }
+
+    // Build update query dynamically based on provided fields
+    const updates = [];
+    const values = [];
+    let paramIndex = 1;
+
+    if (department !== undefined) {
+      updates.push(`department = $${paramIndex}`);
+      values.push(department);
+      paramIndex++;
+    }
+
+    if (position !== undefined) {
+      updates.push(`position = $${paramIndex}`);
+      values.push(position);
+      paramIndex++;
+    }
+
+    if (is_active !== undefined) {
+      updates.push(`is_active = $${paramIndex}`);
+      values.push(is_active);
+      paramIndex++;
+    }
+
+    if (updates.length === 0) {
+      return res.status(400).json({ message: 'No fields to update' });
+    }
+
+    // Add user_id to values
+    values.push(employeeId);
+
+    // Update employee_profiles
+    const updateQuery = `
+      UPDATE employee_profiles 
+      SET ${updates.join(', ')}
+      WHERE user_id = $${paramIndex}
+      RETURNING *
+    `;
+
+    await pool.query(updateQuery, values);
+
+    // Fetch updated employee data
+    const result = await pool.query(
+      `SELECT u.id, u.name, u.email, u.role, p.phone, p.position, p.department, p.hire_date, p.is_active, p.created_at AS profile_created_at
+       FROM users u
+       LEFT JOIN employee_profiles p ON u.id = p.user_id
+       WHERE u.id = $1`,
+      [employeeId]
+    );
+
+    const employee = await mapRowToEmployee(result.rows[0]);
+    res.json(employee);
+  } catch (err) {
+    console.error('Error updating employee:', err);
+    res.status(500).json({ message: 'Server error updating employee' });
+  }
+});
+
 // ─── DELETE /api/employees/:id ──────────────────────────────────────────────
 router.delete('/:id', authenticateToken, async (req, res) => {
   // Only owners / admins can delete employees

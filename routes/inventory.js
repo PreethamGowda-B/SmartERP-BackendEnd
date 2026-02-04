@@ -1,57 +1,150 @@
 const express = require('express');
 const router = express.Router();
-const pool = require('../db'); // adjust if db.js exports differently
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
+const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 
-
-// Add a new inventory item (employee)
-router.post('/', authenticateToken, async (req, res) => {
-try {
-const { name, category, quantity, description } = req.body;
-const employeeId = req.user?.id;
-const officeId = req.user?.office_id;
-
-
-const result = await pool.query(
-'INSERT INTO inventory (office_id, employee_id, name, category, quantity, description) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
-[officeId, employeeId, name, category, quantity || 0, description || null]
-);
-
-
-res.json(result.rows[0]);
-} catch (err) {
-console.error('inventory POST error', err);
-res.status(500).json({ error: 'Failed to add inventory item' });
-}
+// Configure multer for image uploads
+const storage = multer.diskStorage({
+    destination: function (req, file, cb) {
+        const uploadDir = path.join(__dirname, '../uploads/inventory');
+        // Create directory if it doesn't exist
+        if (!fs.existsSync(uploadDir)) {
+            fs.mkdirSync(uploadDir, { recursive: true });
+        }
+        cb(null, uploadDir);
+    },
+    filename: function (req, file, cb) {
+        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+        cb(null, 'inventory-' + uniqueSuffix + path.extname(file.originalname));
+    }
 });
 
+const upload = multer({
+    storage: storage,
+    limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
+    fileFilter: function (req, file, cb) {
+        const allowedTypes = /jpeg|jpg|png|gif|webp/;
+        const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
+        const mimetype = allowedTypes.test(file.mimetype);
 
-// List inventory (Owner → all, Employee → their office only)
+        if (mimetype && extname) {
+            return cb(null, true);
+        } else {
+            cb(new Error('Only image files are allowed!'));
+        }
+    }
+});
+
+// ─── POST /api/inventory ─────────────────────────────────────────────────────
+// Create inventory item (both owner and employee can add)
+router.post('/', authenticateToken, upload.single('image'), async (req, res) => {
+    try {
+        const { name, description, quantity } = req.body;
+        const userId = req.user.userId;
+
+        if (!name || !name.trim()) {
+            return res.status(400).json({ message: 'Item name is required' });
+        }
+
+        // Get image URL if file was uploaded
+        let imageUrl = null;
+        if (req.file) {
+            imageUrl = `/uploads/inventory/${req.file.filename}`;
+        }
+
+        // Get employee name
+        const userResult = await pool.query(
+            'SELECT name, email FROM users WHERE id = $1',
+            [userId]
+        );
+        const employeeName = userResult.rows[0]?.name || userResult.rows[0]?.email || 'Unknown';
+
+        // Insert inventory item
+        const result = await pool.query(
+            `INSERT INTO inventory_items 
+       (name, description, quantity, image_url, created_by, employee_name, created_at) 
+       VALUES ($1, $2, $3, $4, $5, $6, NOW()) 
+       RETURNING *`,
+            [
+                name.trim(),
+                description?.trim() || null,
+                parseInt(quantity) || 0,
+                imageUrl,
+                userId,
+                employeeName
+            ]
+        );
+
+        res.status(201).json(result.rows[0]);
+    } catch (err) {
+        console.error('Error creating inventory item:', err);
+        res.status(500).json({ message: 'Server error creating inventory item' });
+    }
+});
+
+// ─── GET /api/inventory ──────────────────────────────────────────────────────
+// Get all inventory items
 router.get('/', authenticateToken, async (req, res) => {
-try {
-const user = req.user;
-let query, params = [];
+    try {
+        const result = await pool.query(
+            `SELECT 
+        id,
+        name,
+        description,
+        quantity,
+        image_url,
+        employee_name,
+        office_name,
+        created_by,
+        created_at
+       FROM inventory_items 
+       ORDER BY created_at DESC`
+        );
 
-
-if (user?.role === 'owner') {
-query = `SELECT i.*, e.name AS employee_name, o.name AS office_name
-FROM inventory i
-LEFT JOIN employees e ON e.id = i.employee_id
-LEFT JOIN offices o ON o.id = i.office_id
-ORDER BY i.created_at DESC`;
-} else {
-query = 'SELECT * FROM inventory WHERE office_id = $1 ORDER BY created_at DESC';
-params = [user.office_id];
-}
-
-
-const result = await pool.query(query, params);
-res.json(result.rows);
-} catch (err) {
-console.error('inventory GET error', err);
-res.status(500).json({ error: 'Failed to fetch inventory' });
-}
+        res.json(result.rows);
+    } catch (err) {
+        console.error('Error fetching inventory items:', err);
+        res.status(500).json({ message: 'Server error fetching inventory items' });
+    }
 });
 
+// ─── DELETE /api/inventory/:id ───────────────────────────────────────────────
+// Delete inventory item (only owner/admin)
+router.delete('/:id', authenticateToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const role = req.user.role;
+
+        // Only owners/admins can delete
+        if (role !== 'owner' && role !== 'admin') {
+            return res.status(403).json({ message: 'Only owners can delete inventory items' });
+        }
+
+        const result = await pool.query(
+            'DELETE FROM inventory_items WHERE id = $1 RETURNING *',
+            [id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ message: 'Inventory item not found' });
+        }
+
+        // Delete image file if exists
+        if (result.rows[0].image_url) {
+            const imagePath = path.join(__dirname, '..', result.rows[0].image_url);
+            if (fs.existsSync(imagePath)) {
+                fs.unlinkSync(imagePath);
+            }
+        }
+
+        res.json({ message: 'Inventory item deleted successfully' });
+    } catch (err) {
+        console.error('Error deleting inventory item:', err);
+        res.status(500).json({ message: 'Server error' });
+    }
+});
 
 module.exports = router;

@@ -61,6 +61,9 @@ app.options("*", cors());
 app.use(cookieParser());
 app.use(express.json());
 
+// ✅ Serve uploaded files statically
+app.use('/uploads', express.static('uploads'));
+
 // Fix database constraints on startup
 async function fixDatabaseConstraints() {
   try {
@@ -99,6 +102,7 @@ app.use("/api/jobs", require("./routes/jobs"));
 app.use("/api/activities", require("./routes/activities"));
 app.use("/api/attendance", require("./routes/attendance"));
 app.use("/api/materials", require("./routes/materials"));
+app.use("/api/inventory", require("./routes/inventory"));
 app.use("/api/payroll", require("./routes/payroll"));
 app.use("/api/notifications", require("./routes/notifications"));
 app.use("/api/payments", require("./routes/payments"));
@@ -106,6 +110,7 @@ app.use("/api/analytics", require("./routes/analytics"));
 app.use("/api/employees", require("./routes/employees"));
 app.use("/api/employees-simple", require("./routes/employees-simple"));
 app.use("/api/ai", require("./routes/ai.routes"));
+
 
 
 // ✅ Health check route

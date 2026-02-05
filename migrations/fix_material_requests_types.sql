@@ -1,5 +1,11 @@
--- Create material_requests table
-CREATE TABLE IF NOT EXISTS material_requests (
+-- Migration: Fix material_requests table type mismatch
+-- Change requested_by and reviewed_by from UUID to INTEGER
+
+-- Drop the existing table if it exists (WARNING: This will delete all data)
+DROP TABLE IF EXISTS material_requests;
+
+-- Recreate with correct types
+CREATE TABLE material_requests (
   id SERIAL PRIMARY KEY,
   item_name VARCHAR(255) NOT NULL,
   quantity INTEGER NOT NULL,

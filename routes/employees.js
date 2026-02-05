@@ -27,6 +27,9 @@ async function mapRowToEmployee(row) {
     hoursThisWeek: 0,
     location: row.location || 'Unassigned',
     avatar: '/placeholder-user.jpg',
+    created_at: row.created_at || null,
+    department: row.department || null,
+    is_active: row.is_active !== false,
   };
 }
 
@@ -34,11 +37,11 @@ async function mapRowToEmployee(row) {
 router.get('/', DEV ? (req, res, next) => next() : authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT u.id, u.name, u.email, u.role, p.phone, p.position, p.department, p.hire_date, p.is_active, p.created_at AS profile_created_at
+      `SELECT u.id, u.name, u.email, u.role, u.created_at, p.phone, p.position, p.department, p.hire_date, p.is_active, p.created_at AS profile_created_at
        FROM users u
        LEFT JOIN employee_profiles p ON u.id = p.user_id
        WHERE u.role != 'owner' AND u.role != 'admin'
-       ORDER BY u.id`
+       ORDER BY u.created_at DESC NULLS LAST`
     );
     const employees = await Promise.all(result.rows.map(mapRowToEmployee));
     res.json(employees);
@@ -169,7 +172,7 @@ router.patch('/:id', authenticateToken, async (req, res) => {
 
     // Fetch updated employee data
     const result = await pool.query(
-      `SELECT u.id, u.name, u.email, u.role, p.phone, p.position, p.department, p.hire_date, p.is_active, p.created_at AS profile_created_at
+      `SELECT u.id, u.name, u.email, u.role, u.created_at, p.phone, p.position, p.department, p.hire_date, p.is_active, p.created_at AS profile_created_at
        FROM users u
        LEFT JOIN employee_profiles p ON u.id = p.user_id
        WHERE u.id = $1`,

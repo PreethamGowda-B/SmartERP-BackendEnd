@@ -60,6 +60,8 @@ router.get('/', authenticateToken, async (req, res) => {
         const userId = req.user.userId || req.user.id;
         const role = req.user.role;
 
+        console.log('🔍 Fetching material requests for:', { userId, role });
+
         let query;
         let params;
 
@@ -74,6 +76,7 @@ router.get('/', authenticateToken, async (req, res) => {
         }
 
         const result = await pool.query(query, params);
+        console.log(`✅ Found ${result.rows.length} material requests for user ${userId}`);
         res.json(result.rows);
     } catch (err) {
         console.error('Error fetching material requests:', err);

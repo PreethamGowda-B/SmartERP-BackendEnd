@@ -95,6 +95,10 @@ async function fixDatabaseConstraints() {
 }
 setTimeout(fixDatabaseConstraints, 3000); // Run after DB connection
 
+// Auto-fix material_requests schema on startup
+const { fixMaterialRequestsSchema } = require('./migrations/autoMigrate');
+setTimeout(fixMaterialRequestsSchema, 4000); // Run after DB connection
+
 // ✅ Routes
 app.use("/api/auth", require("./routes/auth"));
 app.use("/api/users", require("./routes/users"));

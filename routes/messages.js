@@ -49,9 +49,9 @@ router.post('/', authenticateToken, async (req, res) => {
 router.get('/conversation/:userId', authenticateToken, async (req, res) => {
     try {
         const currentUserId = req.user.userId || req.user.id;
-        const otherUserId = parseInt(req.params.userId, 10);
+        const otherUserId = req.params.userId;
 
-        if (isNaN(otherUserId)) {
+        if (!otherUserId) {
             return res.status(400).json({ message: 'Invalid user ID' });
         }
 
@@ -146,9 +146,9 @@ router.get('/conversations', authenticateToken, async (req, res) => {
 router.patch('/conversation/:userId/read', authenticateToken, async (req, res) => {
     try {
         const currentUserId = req.user.userId || req.user.id;
-        const otherUserId = parseInt(req.params.userId, 10);
+        const otherUserId = req.params.userId;
 
-        if (isNaN(otherUserId)) {
+        if (!otherUserId) {
             return res.status(400).json({ message: 'Invalid user ID' });
         }
 

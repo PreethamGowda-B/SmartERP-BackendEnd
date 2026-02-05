@@ -6,11 +6,11 @@ CREATE TABLE IF NOT EXISTS material_requests (
   urgency VARCHAR(50) DEFAULT 'Medium',
   description TEXT,
   status VARCHAR(50) DEFAULT 'pending',
-  requested_by INTEGER NOT NULL,
+  requested_by UUID NOT NULL,
   requested_by_name VARCHAR(255),
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW(),
-  reviewed_by INTEGER,
+  reviewed_by UUID,
   reviewed_at TIMESTAMP
 );
 

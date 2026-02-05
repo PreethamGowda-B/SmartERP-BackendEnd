@@ -30,7 +30,7 @@ router.post('/', authenticateToken, async (req, res) => {
 
         const userName = userResult.rows[0]?.name || userResult.rows[0]?.email || 'Unknown';
 
-        // Insert material request
+        // Insert material request - users table uses UUID
         const result = await pool.query(
             `INSERT INTO material_requests 
        (item_name, quantity, urgency, description, requested_by, requested_by_name, created_at) 

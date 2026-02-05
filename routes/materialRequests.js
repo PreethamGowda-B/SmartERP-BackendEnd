@@ -60,7 +60,7 @@ router.get('/', authenticateToken, async (req, res) => {
         const userId = req.user.userId || req.user.id;
         const role = req.user.role;
 
-        console.log('🔍 Fetching material requests for:', { userId, role });
+        console.log('🔍 Fetching material requests for:', { userId, role, userIdType: typeof userId });
 
         let query;
         let params;
@@ -70,16 +70,24 @@ router.get('/', authenticateToken, async (req, res) => {
             query = `SELECT * FROM material_requests ORDER BY created_at DESC`;
             params = [];
         } else {
-            // Employee sees only their own requests
-            query = `SELECT * FROM material_requests WHERE requested_by = $1 ORDER BY created_at DESC`;
+            // Employee sees only their own requests - cast to UUID explicitly
+            query = `SELECT * FROM material_requests WHERE requested_by = $1::uuid ORDER BY created_at DESC`;
             params = [userId];
         }
+
+        console.log('📝 Query:', query);
+        console.log('📝 Params:', params);
 
         const result = await pool.query(query, params);
         console.log(`✅ Found ${result.rows.length} material requests for user ${userId}`);
         res.json(result.rows);
     } catch (err) {
-        console.error('Error fetching material requests:', err);
+        console.error('❌ Error fetching material requests:', err);
+        console.error('❌ Error details:', {
+            message: err.message,
+            code: err.code,
+            detail: err.detail
+        });
         res.status(500).json({ message: 'Server error fetching material requests' });
     }
 });

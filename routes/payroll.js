@@ -47,11 +47,49 @@ router.post('/', authenticateToken, async (req, res) => {
 
     const employee = employeeResult.rows[0];
 
-    // Calculate total salary
-    const total_salary = parseFloat(base_salary) +
+    // ─── FETCH ATTENDANCE SUMMARY ────────────────────────────────────────────
+    const attendanceResult = await pool.query(
+      `SELECT 
+        COUNT(*) FILTER (WHERE status = 'present') as present_days,
+        COUNT(*) FILTER (WHERE status = 'absent') as absent_days,
+        COUNT(*) FILTER (WHERE status = 'half_day') as half_days,
+        COALESCE(SUM(working_hours), 0) as total_hours
+       FROM attendance
+       WHERE user_id = $1 
+         AND EXTRACT(MONTH FROM date) = $2
+         AND EXTRACT(YEAR FROM date) = $3`,
+      [employee.id, payroll_month, payroll_year]
+    );
+
+    const attendanceSummary = attendanceResult.rows[0] || {
+      present_days: 0,
+      absent_days: 0,
+      half_days: 0,
+      total_hours: 0
+    };
+
+    const presentDays = parseInt(attendanceSummary.present_days) || 0;
+    const absentDays = parseInt(attendanceSummary.absent_days) || 0;
+    const halfDays = parseInt(attendanceSummary.half_days) || 0;
+    const totalHours = parseFloat(attendanceSummary.total_hours) || 0;
+
+    // Calculate payable days (half days count as 0.5)
+    const payableDays = presentDays + (halfDays * 0.5);
+
+    // Assume 26 working days per month (adjust as needed)
+    const totalWorkingDays = 26;
+
+    // Adjust base salary based on attendance
+    const attendanceAdjustedSalary = (parseFloat(base_salary) / totalWorkingDays) * payableDays;
+
+    // Calculate total salary with adjustments
+    const total_salary = attendanceAdjustedSalary +
       parseFloat(extra_amount) +
       parseFloat(salary_increment) -
       parseFloat(deduction);
+
+    console.log(`📊 Payroll for ${employee.email}: Present=${presentDays}, Absent=${absentDays}, Half=${halfDays}, Payable=${payableDays} days`);
+    console.log(`💰 Base: ${base_salary}, Adjusted: ${attendanceAdjustedSalary.toFixed(2)}, Total: ${total_salary.toFixed(2)}`);
 
     // Check if payroll already exists for this employee and period
     const existingPayroll = await pool.query(
@@ -66,13 +104,14 @@ router.post('/', authenticateToken, async (req, res) => {
       });
     }
 
-    // Create payroll record
+    // Create payroll record with attendance data
     const result = await pool.query(
       `INSERT INTO payroll 
              (employee_email, employee_id, employee_name, payroll_month, payroll_year, 
               base_salary, extra_amount, salary_increment, deduction, total_salary, 
+              present_days, absent_days, half_days, total_working_hours,
               remarks, created_by, created_at, updated_at) 
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), NOW()) 
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, NOW(), NOW()) 
              RETURNING *`,
       [
         employee.email,
@@ -85,6 +124,10 @@ router.post('/', authenticateToken, async (req, res) => {
         salary_increment,
         deduction,
         total_salary,
+        presentDays,
+        absentDays,
+        halfDays,
+        totalHours,
         remarks,
         userId
       ]

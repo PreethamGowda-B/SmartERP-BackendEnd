@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
+const { createNotification } = require('../utils/notificationHelpers');
 
 // ─── POST /api/material-requests ─────────────────────────────────────────────
 // Create new material request (employee)
@@ -116,7 +117,25 @@ router.patch('/:id/accept', authenticateToken, async (req, res) => {
             return res.status(404).json({ message: 'Request not found or already processed' });
         }
 
-        res.json(result.rows[0]);
+        const request = result.rows[0];
+
+        // Send notification to employee
+        try {
+            await createNotification({
+                user_id: request.requested_by,
+                company_id: req.user.companyId,
+                type: 'material_request',
+                title: 'Material Request Approved',
+                message: `Your request for ${request.item_name} has been approved`,
+                priority: 'medium',
+                data: { request_id: request.id, item_name: request.item_name }
+            });
+            console.log(`✅ Notification sent for approved material request: ${request.item_name}`);
+        } catch (notifErr) {
+            console.error('❌ Failed to send material request notification:', notifErr);
+        }
+
+        res.json(request);
     } catch (err) {
         console.error('Error accepting material request:', err);
         res.status(500).json({ message: 'Server error accepting request' });
@@ -147,7 +166,25 @@ router.patch('/:id/decline', authenticateToken, async (req, res) => {
             return res.status(404).json({ message: 'Request not found or already processed' });
         }
 
-        res.json(result.rows[0]);
+        const request = result.rows[0];
+
+        // Send notification to employee
+        try {
+            await createNotification({
+                user_id: request.requested_by,
+                company_id: req.user.companyId,
+                type: 'material_request',
+                title: 'Material Request Declined',
+                message: `Your request for ${request.item_name} has been declined`,
+                priority: 'low',
+                data: { request_id: request.id, item_name: request.item_name }
+            });
+            console.log(`✅ Notification sent for declined material request: ${request.item_name}`);
+        } catch (notifErr) {
+            console.error('❌ Failed to send material request notification:', notifErr);
+        }
+
+        res.json(request);
     } catch (err) {
         console.error('Error declining material request:', err);
         res.status(500).json({ message: 'Server error declining request' });

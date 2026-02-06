@@ -9,6 +9,12 @@ function authenticateToken(req, res, next) {
     token = authHeader.split(" ")[1];
   }
 
+  // Try query parameter (for SSE connections)
+  if (!token && req.query && req.query.token) {
+    token = req.query.token;
+    console.log("🔗 Query token found for SSE connection");
+  }
+
   // Fallback to cookie
   if (!token && req.cookies) {
     token = req.cookies.access_token;

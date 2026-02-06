@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
+const { createNotification } = require('../utils/notificationHelpers');
 
 /**
  * Ensure the jobs table can store JSON payloads, visibility flag, and employee tracking
@@ -84,7 +85,28 @@ router.post('/', authenticateToken, async (req, res) => {
       ]
     );
 
-    res.json(result.rows[0]);
+    const createdJob = result.rows[0];
+
+    // Send notification to assigned employee
+    if (assignedTo) {
+      try {
+        await createNotification({
+          user_id: assignedTo,
+          company_id: req.user.companyId,
+          type: 'job',
+          title: 'New Job Assigned',
+          message: `You have been assigned a new job: ${title}`,
+          priority: job.priority || 'medium',
+          data: { job_id: createdJob.id, job_title: title }
+        });
+        console.log(`✅ Notification sent for new job: ${title}`);
+      } catch (notifErr) {
+        console.error('❌ Failed to send job notification:', notifErr);
+        // Don't fail the job creation if notification fails
+      }
+    }
+
+    res.json(createdJob);
   } catch (err) {
     console.error('jobs POST error', err);
     res.status(500).json({ message: 'Server error' });

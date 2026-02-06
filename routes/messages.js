@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
+const { createNotification } = require('../utils/notificationHelpers');
 
 // ─── POST /api/messages ───────────────────────────────────────────────────────
 // Send a new message
@@ -37,7 +38,31 @@ router.post('/', authenticateToken, async (req, res) => {
             [senderId, receiver_id, message.trim()]
         );
 
-        res.status(201).json(result.rows[0]);
+        const sentMessage = result.rows[0];
+
+        // Send notification to receiver (only if sender is owner)
+        if (req.user.role === 'owner' || req.user.role === 'admin') {
+            try {
+                // Get sender name
+                const senderInfo = await pool.query('SELECT name FROM users WHERE id = $1', [senderId]);
+                const senderName = senderInfo.rows[0]?.name || 'Owner';
+
+                await createNotification({
+                    user_id: receiver_id,
+                    company_id: req.user.companyId,
+                    type: 'message',
+                    title: 'New Message',
+                    message: `New message from ${senderName}`,
+                    priority: 'medium',
+                    data: { message_id: sentMessage.id, sender_id: senderId }
+                });
+                console.log(`✅ Notification sent for new message to user ${receiver_id}`);
+            } catch (notifErr) {
+                console.error('❌ Failed to send message notification:', notifErr);
+            }
+        }
+
+        res.status(201).json(sentMessage);
     } catch (err) {
         console.error('Error sending message:', err);
         res.status(500).json({ message: 'Server error sending message' });

@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
+const { createNotification } = require('../utils/notificationHelpers');
 
 // ─── POST /api/payroll ───────────────────────────────────────────────────────
 // Create new payroll record (Owner only)
@@ -89,8 +90,31 @@ router.post('/', authenticateToken, async (req, res) => {
       ]
     );
 
+    const payrollRecord = result.rows[0];
+
+    // Send notification to employee
+    try {
+      await createNotification({
+        user_id: employee.id,
+        company_id: req.user.companyId,
+        type: 'payroll',
+        title: 'Payroll Received',
+        message: `Your payroll for ${payroll_month}/${payroll_year} has been processed. Total: $${total_salary}`,
+        priority: 'high',
+        data: {
+          payroll_id: payrollRecord.id,
+          month: payroll_month,
+          year: payroll_year,
+          total_salary
+        }
+      });
+      console.log(`✅ Notification sent for payroll: ${employee_email} - ${payroll_month}/${payroll_year}`);
+    } catch (notifErr) {
+      console.error('❌ Failed to send payroll notification:', notifErr);
+    }
+
     console.log(`✅ Payroll created for ${employee_email} - ${payroll_month}/${payroll_year}`);
-    res.status(201).json(result.rows[0]);
+    res.status(201).json(payrollRecord);
   } catch (err) {
     console.error('❌ Error creating payroll:', err);
     res.status(500).json({ message: 'Server error creating payroll' });

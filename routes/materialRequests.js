@@ -70,8 +70,8 @@ router.get('/', authenticateToken, async (req, res) => {
             query = `SELECT * FROM material_requests ORDER BY created_at DESC`;
             params = [];
         } else {
-            // Employee sees only their own requests - cast to UUID explicitly
-            query = `SELECT * FROM material_requests WHERE requested_by = $1::uuid ORDER BY created_at DESC`;
+            // Employee sees only their own requests
+            query = `SELECT * FROM material_requests WHERE requested_by = $1 ORDER BY created_at DESC`;
             params = [userId];
         }
 

@@ -1,10 +1,10 @@
 -- Migration: Fix material_requests table type mismatch
--- Change requested_by and reviewed_by from UUID to INTEGER
+-- Change requested_by and reviewed_by to UUID to match users table
 
 -- Drop the existing table if it exists (WARNING: This will delete all data)
 DROP TABLE IF EXISTS material_requests;
 
--- Recreate with correct types
+-- Recreate with correct types (UUID to match users.id)
 CREATE TABLE material_requests (
   id SERIAL PRIMARY KEY,
   item_name VARCHAR(255) NOT NULL,
@@ -12,11 +12,11 @@ CREATE TABLE material_requests (
   urgency VARCHAR(50) DEFAULT 'Medium',
   description TEXT,
   status VARCHAR(50) DEFAULT 'pending',
-  requested_by INTEGER NOT NULL,
+  requested_by UUID NOT NULL,
   requested_by_name VARCHAR(255),
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW(),
-  reviewed_by INTEGER,
+  reviewed_by UUID,
   reviewed_at TIMESTAMP
 );
 

@@ -18,7 +18,7 @@ async function runMigration() {
         await pool.query(sql);
 
         console.log("✅ Migration completed successfully!");
-        console.log("📋 Material requests table has been recreated with correct INTEGER types");
+        console.log("📋 Material requests table has been recreated with UUID types matching users table");
 
         // Verify the table structure
         const result = await pool.query(`

@@ -74,6 +74,16 @@ router.post('/clock-in', authenticateToken, async (req, res) => {
     const { biometric_device_id, method = 'manual' } = req.body;
     const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
     const clockInTime = new Date();
+    const currentHour = clockInTime.getHours();
+
+    // Enterprise Rule: Block clock-in outside shift hours (9 AM - 7 PM)
+    if (currentHour < 9 || currentHour >= 19) {
+      return res.status(400).json({
+        message: 'Clock-in is only allowed between 9:00 AM and 7:00 PM',
+        current_time: clockInTime.toLocaleTimeString()
+      });
+    }
+
     const isLate = isLateCheckIn(clockInTime);
 
     // Check if already clocked in today

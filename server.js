@@ -176,6 +176,14 @@ const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
   console.log(`🚀 SmartERP backend running on port ${PORT}`);
   console.log("🌐 CORS: Accepting all Vercel preview deployments");
+
+  // ✅ Start daily attendance processor (7:30 PM IST)
+  try {
+    const { startDailyAttendanceProcessor } = require('./jobs/dailyAttendanceProcessor');
+    startDailyAttendanceProcessor();
+  } catch (err) {
+    console.error('❌ Failed to start daily attendance processor:', err.message);
+  }
 });
 
 module.exports = app;

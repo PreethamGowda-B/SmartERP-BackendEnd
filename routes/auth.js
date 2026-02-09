@@ -120,7 +120,7 @@ router.get(
 
       // Generate Tokens
       const accessToken = jwt.sign(
-        { id: user.id, userId: user.id, role: user.role },
+        { id: user.id, userId: user.id, role: user.role, companyId: user.company_id },
         ACCESS_SECRET,
         { expiresIn: "15m" }
       );
@@ -146,6 +146,7 @@ router.get(
             name: user.name,
             email: user.email,
             role: user.role,
+            companyId: user.company_id
           })
         )}`
       );
@@ -215,7 +216,7 @@ router.post("/login", async (req, res) => {
 
     // Generate JWTs
     const accessToken = jwt.sign(
-      { id: user.id, userId: user.id, role: user.role },
+      { id: user.id, userId: user.id, role: user.role, companyId: user.company_id },
       ACCESS_SECRET,
       { expiresIn: "15m" }
     );
@@ -277,12 +278,13 @@ router.post("/refresh", async (req, res) => {
       if (err) return res.status(403).json({ message: "Invalid token" });
 
       try {
-        // ✅ Fetch user role from database to include in new access token
-        const userResult = await pool.query("SELECT role FROM users WHERE id = $1", [payload.userId]);
+        // ✅ Fetch user role and company_id from database
+        const userResult = await pool.query("SELECT role, company_id FROM users WHERE id = $1", [payload.userId]);
         if (userResult.rows.length === 0) {
           return res.status(401).json({ message: "User not found" });
         }
         const userRole = userResult.rows[0].role;
+        const userCompanyId = userResult.rows[0].company_id;
 
         await pool.query("DELETE FROM refresh_tokens WHERE token = $1", [token]);
         const newRefresh = jwt.sign({ id: payload.userId, userId: payload.userId }, REFRESH_SECRET, { expiresIn: "7d" });
@@ -292,9 +294,9 @@ router.post("/refresh", async (req, res) => {
           [payload.userId, newRefresh]
         );
 
-        // ✅ Include role in access token (critical for role-based authorization)
+        // ✅ Include role and companyId in access token
         const accessToken = jwt.sign(
-          { id: payload.userId, userId: payload.userId, role: userRole },
+          { id: payload.userId, userId: payload.userId, role: userRole, companyId: userCompanyId },
           ACCESS_SECRET,
           { expiresIn: "15m" }
         );

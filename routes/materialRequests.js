@@ -119,20 +119,33 @@ router.patch('/:id/accept', authenticateToken, async (req, res) => {
 
         const request = result.rows[0];
 
+        // Ensure we have company_id (fetch from DB if missing in token)
+        let companyId = req.user.companyId;
+        if (!companyId) {
+            const userRes = await pool.query('SELECT company_id FROM users WHERE id = $1', [userId]);
+            if (userRes.rows.length > 0) {
+                companyId = userRes.rows[0].company_id;
+            }
+        }
+
         // Send notification to employee
-        try {
-            await createNotification({
-                user_id: request.requested_by,
-                company_id: req.user.companyId,
-                type: 'material_request',
-                title: 'Material Request Approved',
-                message: `Your request for ${request.item_name} has been approved`,
-                priority: 'medium',
-                data: { request_id: request.id, item_name: request.item_name }
-            });
-            console.log(`✅ Notification sent for approved material request: ${request.item_name}`);
-        } catch (notifErr) {
-            console.error('❌ Failed to send material request notification:', notifErr);
+        if (companyId) {
+            try {
+                await createNotification({
+                    user_id: request.requested_by,
+                    company_id: companyId,
+                    type: 'material_request',
+                    title: 'Material Request Approved',
+                    message: `Your request for ${request.item_name} has been approved`,
+                    priority: 'medium',
+                    data: { request_id: request.id, item_name: request.item_name }
+                });
+                console.log(`✅ Notification sent for approved material request: ${request.item_name}`);
+            } catch (notifErr) {
+                console.error('❌ Failed to send material request notification:', notifErr);
+            }
+        } else {
+            console.warn(`⚠️ Skipping notification: No company_id found for user ${userId}`);
         }
 
         res.json(request);
@@ -168,20 +181,33 @@ router.patch('/:id/decline', authenticateToken, async (req, res) => {
 
         const request = result.rows[0];
 
+        // Ensure we have company_id (fetch from DB if missing in token)
+        let companyId = req.user.companyId;
+        if (!companyId) {
+            const userRes = await pool.query('SELECT company_id FROM users WHERE id = $1', [userId]);
+            if (userRes.rows.length > 0) {
+                companyId = userRes.rows[0].company_id;
+            }
+        }
+
         // Send notification to employee
-        try {
-            await createNotification({
-                user_id: request.requested_by,
-                company_id: req.user.companyId,
-                type: 'material_request',
-                title: 'Material Request Declined',
-                message: `Your request for ${request.item_name} has been declined`,
-                priority: 'low',
-                data: { request_id: request.id, item_name: request.item_name }
-            });
-            console.log(`✅ Notification sent for declined material request: ${request.item_name}`);
-        } catch (notifErr) {
-            console.error('❌ Failed to send material request notification:', notifErr);
+        if (companyId) {
+            try {
+                await createNotification({
+                    user_id: request.requested_by,
+                    company_id: companyId,
+                    type: 'material_request',
+                    title: 'Material Request Declined',
+                    message: `Your request for ${request.item_name} has been declined`,
+                    priority: 'low',
+                    data: { request_id: request.id, item_name: request.item_name }
+                });
+                console.log(`✅ Notification sent for declined material request: ${request.item_name}`);
+            } catch (notifErr) {
+                console.error('❌ Failed to send material request notification:', notifErr);
+            }
+        } else {
+            console.warn(`⚠️ Skipping notification: No company_id found for user ${userId}`);
         }
 
         res.json(request);

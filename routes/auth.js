@@ -4,11 +4,123 @@ const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const { pool } = require("../db");
 const logActivity = require("../helpers/logActivity");
+const passport = require("passport");
+const GoogleStrategy = require("passport-google-oauth20").Strategy;
 require("dotenv").config();
 
 // JWT secrets
 const ACCESS_SECRET = process.env.JWT_SECRET;
 const REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || ACCESS_SECRET;
+
+// ---------------------------------------------
+// ✅ Google OAuth Strategy Configuration
+// ---------------------------------------------
+passport.use(
+  new GoogleStrategy(
+    {
+      clientID: process.env.GOOGLE_CLIENT_ID,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+      callbackURL: "/api/auth/google/callback",
+    },
+    async (accessToken, refreshToken, profile, done) => {
+      try {
+        const email = profile.emails[0].value;
+        const googleId = profile.id;
+        const name = profile.displayName;
+
+        // Check if user exists
+        let userResult = await pool.query("SELECT * FROM users WHERE google_id = $1 OR email = $2", [
+          googleId,
+          email,
+        ]);
+
+        let user;
+
+        if (userResult.rows.length > 0) {
+          user = userResult.rows[0];
+
+          // If user exists but no google_id, link it
+          if (!user.google_id) {
+            await pool.query("UPDATE users SET google_id = $1 WHERE id = $2", [googleId, user.id]);
+            user.google_id = googleId;
+          }
+        } else {
+          // Create new user if not exists
+          const insertResult = await pool.query(
+            `INSERT INTO users (name, email, google_id, role, created_at)
+             VALUES ($1, $2, $3, 'owner', NOW())
+             RETURNING *`,
+            [name, email, googleId]
+          );
+          user = insertResult.rows[0];
+        }
+
+        return done(null, user);
+      } catch (err) {
+        return done(err, null);
+      }
+    }
+  )
+);
+
+// ---------------------------------------------
+// ✅ Google OAuth Routes
+// ---------------------------------------------
+
+// Initiate Google Login
+router.get(
+  "/google",
+  passport.authenticate("google", { scope: ["profile", "email"], session: false })
+);
+
+// Handle Google Callback
+router.get(
+  "/google/callback",
+  passport.authenticate("google", { session: false, failureRedirect: "/login" }),
+  async (req, res) => {
+    try {
+      const user = req.user;
+
+      // Log activity
+      await logActivity(user.id, "login_google", req);
+
+      // Generate Tokens
+      const accessToken = jwt.sign(
+        { id: user.id, userId: user.id, role: user.role },
+        ACCESS_SECRET,
+        { expiresIn: "15m" }
+      );
+      const refreshToken = jwt.sign(
+        { id: user.id, userId: user.id },
+        REFRESH_SECRET,
+        { expiresIn: "7d" }
+      );
+
+      // Store Refresh Token in DB
+      await pool.query(
+        `INSERT INTO refresh_tokens (user_id, token, expires_at)
+         VALUES ($1, $2, NOW() + INTERVAL '7 days')`,
+        [user.id, refreshToken]
+      );
+
+      // Redirect to frontend with tokens
+      const frontendUrl = process.env.FRONTEND_ORIGIN || "https://smart-erp-front-end.vercel.app";
+      res.redirect(
+        `${frontendUrl}/auth/callback?accessToken=${accessToken}&refreshToken=${refreshToken}&user=${encodeURIComponent(
+          JSON.stringify({
+            id: user.id,
+            name: user.name,
+            email: user.email,
+            role: user.role,
+          })
+        )}`
+      );
+    } catch (err) {
+      console.error("Google Auth Error:", err);
+      res.redirect("/login?error=auth_failed");
+    }
+  }
+);
 
 // ---------------------------------------------
 // ✅ Signup (Register New Users)
@@ -54,6 +166,12 @@ router.post("/login", async (req, res) => {
     }
 
     const user = result.rows[0];
+
+    // Check if user has a password (google-only users won't)
+    if (!user.password_hash) {
+      return res.status(401).json({ message: "Please log in with Google" });
+    }
+
     const valid = await bcrypt.compare(password, user.password_hash);
     if (!valid) {
       return res.status(401).json({ message: "Invalid email or password" });

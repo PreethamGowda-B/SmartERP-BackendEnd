@@ -256,13 +256,32 @@ router.post('/:id/progress', authenticateToken, async (req, res) => {
 
   try {
     // Check if job is assigned to this employee and accepted
+    console.log(`🔍 Checking job access: JobID=${id}, UserID=${req.user.id}`);
+
+    // First, check if job exists at all to differentiate 404 vs 403
+    const jobExists = await pool.query('SELECT * FROM jobs WHERE id = $1', [id]);
+    if (jobExists.rows.length === 0) {
+      console.log(`❌ Job not found: ${id}`);
+      return res.status(404).json({ message: 'Job not found' });
+    }
+    console.log(`   Job found. Assigned To: ${jobExists.rows[0].assigned_to}, Employee Status: ${jobExists.rows[0].employee_status}`);
+
     const checkJob = await pool.query(
       'SELECT * FROM jobs WHERE id = $1 AND assigned_to = $2 AND employee_status = $3',
       [id, req.user.id, 'accepted']
     );
 
     if (checkJob.rows.length === 0) {
-      return res.status(403).json({ message: 'Job not assigned to you or not accepted' });
+      console.warn(`⛔ Access Denied for Job ${id} by User ${req.user.id}. Job Assigned To: ${jobExists.rows[0].assigned_to}, Status: ${jobExists.rows[0].employee_status}`);
+      return res.status(403).json({
+        message: 'Job not assigned to you or not accepted',
+        debug: {
+          jobId: id,
+          userId: req.user.id,
+          assignedTo: jobExists.rows[0].assigned_to,
+          employeeStatus: jobExists.rows[0].employee_status
+        }
+      });
     }
 
     let status = 'active';

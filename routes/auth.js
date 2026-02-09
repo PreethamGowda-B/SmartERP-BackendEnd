@@ -21,12 +21,37 @@ passport.use(
       clientID: process.env.GOOGLE_CLIENT_ID,
       clientSecret: process.env.GOOGLE_CLIENT_SECRET,
       callbackURL: "/api/auth/google/callback",
+      passReqToCallback: true, // ✅ Allow access to req in callback
     },
-    async (accessToken, refreshToken, profile, done) => {
+    async (req, accessToken, refreshToken, profile, done) => {
       try {
         const email = profile.emails[0].value;
         const googleId = profile.id;
         const name = profile.displayName;
+
+        // Extract role from state (passed from frontend)
+        // Passport decodes the state, but we need to handle it in the callback wrapper usually.
+        // However, with passReqToCallback, we might not get the state directly in req.query.state if passport consumes it.
+        // The standard way in passport-google-oauth20 is to pass state in the authenticate options.
+        // Let's rely on the fact that we will decode the state parameter in the callback handler if needed,
+        // OR we can trust that for new users, we default to 'owner' if not specified, but we want 'employee'.
+
+        // BETTER APPROACH: The state is base64 encoded by passport usually or just passed through.
+        // We will read the role from the decoded state in the route handler, NOT here in the strategy verify callback, 
+        // because the verify callback focus is on finding/creating the user. 
+        // BUT we need the role to create the user. 
+
+        // Let's parse the state from req.query.state manually if available
+        let role = "owner";
+        if (req.query.state) {
+          try {
+            // Passort-oauth2 passes state as is.
+            const stateData = JSON.parse(Buffer.from(req.query.state, 'base64').toString());
+            if (stateData.role) role = stateData.role;
+          } catch (e) {
+            // Ignore parse error
+          }
+        }
 
         // Check if user exists
         let userResult = await pool.query("SELECT * FROM users WHERE google_id = $1 OR email = $2", [
@@ -48,9 +73,9 @@ passport.use(
           // Create new user if not exists
           const insertResult = await pool.query(
             `INSERT INTO users (name, email, google_id, role, created_at)
-             VALUES ($1, $2, $3, 'owner', NOW())
+             VALUES ($1, $2, $3, $4, NOW())
              RETURNING *`,
-            [name, email, googleId]
+            [name, email, googleId, role]
           );
           user = insertResult.rows[0];
         }
@@ -70,7 +95,16 @@ passport.use(
 // Initiate Google Login
 router.get(
   "/google",
-  passport.authenticate("google", { scope: ["profile", "email"], session: false })
+  (req, res, next) => {
+    const role = req.query.role || "owner";
+    const state = Buffer.from(JSON.stringify({ role })).toString('base64');
+
+    passport.authenticate("google", {
+      scope: ["profile", "email"],
+      session: false,
+      state: state // ✅ Pass role in state
+    })(req, res, next);
+  }
 );
 
 // Handle Google Callback

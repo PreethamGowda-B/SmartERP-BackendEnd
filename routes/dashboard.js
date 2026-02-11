@@ -39,25 +39,20 @@ router.get('/owner/metrics', authenticateToken, async (req, res) => {
             companyId ? [today, companyId] : [today]
         );
 
-        // Get budget utilization
-        const budgetResult = await pool.query(
-            `SELECT 
-                COALESCE(SUM(budget), 0) as total_budget,
-                COALESCE(SUM(CASE WHEN status = 'completed' THEN budget ELSE 0 END), 0) as total_spent
-             FROM jobs
-             ${companyId ? 'WHERE company_id = $1' : ''}`,
-            companyId ? [companyId] : []
-        );
+        // Get budget utilization (simplified - no budget column exists yet)
+        const budgetResult = {
+            rows: [{ total_budget: 0, total_spent: 0 }]
+        };
 
-        const totalBudget = parseFloat(budgetResult.rows[0].total_budget) || 1;
-        const totalSpent = parseFloat(budgetResult.rows[0].total_spent) || 0;
-        const budgetUtilization = (totalSpent / totalBudget) * 100;
+        const totalBudget = 1; // Default to avoid division by zero
+        const totalSpent = 0;
+        const budgetUtilization = 0;
 
-        // Get active projects (top 3)
+        // Get active projects (top 3) - only use existing columns
         const projectsResult = await pool.query(
             `SELECT 
-                id, title, client, priority, budget, status,
-                COALESCE((SELECT SUM(amount) FROM expenses WHERE job_id = jobs.id), 0) as spent
+                id, title, description, status, priority, progress,
+                created_at, assigned_to
              FROM jobs 
              WHERE status IN ('active', 'in_progress')
              ${companyId ? 'AND company_id = $1' : ''}
@@ -66,6 +61,13 @@ router.get('/owner/metrics', authenticateToken, async (req, res) => {
             companyId ? [companyId] : []
         );
 
+        // Add mock spent/budget for frontend compatibility
+        const activeProjects = projectsResult.rows.map(job => ({
+            ...job,
+            budget: 0,
+            spent: 0
+        }));
+
         res.json({
             activeJobs: parseInt(jobsResult.rows[0].count),
             activeEmployees: parseInt(employeesResult.rows[0].count),
@@ -73,7 +75,7 @@ router.get('/owner/metrics', authenticateToken, async (req, res) => {
             budgetUtilization: budgetUtilization.toFixed(1),
             totalBudget,
             totalSpent,
-            activeProjects: projectsResult.rows
+            activeProjects
         });
     } catch (err) {
         console.error('Error fetching owner dashboard metrics:', err);

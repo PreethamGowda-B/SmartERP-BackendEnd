@@ -116,6 +116,7 @@ app.use("/api/employees-simple", require("./routes/employees-simple"));
 app.use("/api/material-requests", require("./routes/materialRequests"));
 app.use("/api/ai", require("./routes/ai.routes"));
 app.use("/api/messages", require("./routes/messages"));
+app.use("/api/dashboard", require("./routes/dashboard"));
 
 
 

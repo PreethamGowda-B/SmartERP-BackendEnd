@@ -181,6 +181,34 @@ router.post("/signup", async (req, res) => {
     const user = insert.rows[0];
     await logActivity(user.id, "signup", req);
 
+    // Send notification to all owners if employee registered
+    if (role.toLowerCase() === 'employee') {
+      try {
+        const { createNotification } = require('../utils/notificationHelpers');
+
+        // Get all owners (for now, send to all owners since we may not have company_id yet)
+        const ownersResult = await pool.query(
+          `SELECT id FROM users WHERE role IN ('owner', 'admin')`
+        );
+
+        // Send notification to each owner
+        for (const owner of ownersResult.rows) {
+          await createNotification({
+            user_id: owner.id,
+            company_id: null, // Employee may not have company_id yet
+            type: 'employee_registration',
+            title: 'New Employee Registered',
+            message: `${name || email} created an employee account`,
+            priority: 'medium',
+            data: { employee_id: user.id, employee_email: email }
+          });
+        }
+        console.log(`✅ Notified ${ownersResult.rows.length} owners about new employee registration`);
+      } catch (notifErr) {
+        console.error('❌ Failed to send employee registration notification:', notifErr);
+      }
+    }
+
     res.status(201).json({ ok: true, user });
   } catch (err) {
     console.error("Signup error:", err.message);

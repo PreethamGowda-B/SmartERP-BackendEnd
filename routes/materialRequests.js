@@ -31,7 +31,6 @@ router.post('/', authenticateToken, async (req, res) => {
 
         const userName = userResult.rows[0]?.name || userResult.rows[0]?.email || 'Unknown';
 
-        // Insert material request - users table uses UUID
         const result = await pool.query(
             `INSERT INTO material_requests 
        (item_name, quantity, urgency, description, requested_by, requested_by_name, created_at) 
@@ -47,7 +46,37 @@ router.post('/', authenticateToken, async (req, res) => {
             ]
         );
 
-        res.status(201).json(result.rows[0]);
+        const createdRequest = result.rows[0];
+
+        // Send notification to all owners about new material request
+        try {
+            const companyId = req.user.companyId;
+
+            // Get all owners
+            const ownersResult = await pool.query(
+                `SELECT id FROM users WHERE role IN ('owner', 'admin')
+                 ${companyId && companyId !== '00000000-0000-0000-0000-000000000000' ? 'AND (company_id = $1 OR company_id IS NULL)' : ''}`,
+                companyId && companyId !== '00000000-0000-0000-0000-000000000000' ? [companyId] : []
+            );
+
+            // Send notification to each owner
+            for (const owner of ownersResult.rows) {
+                await createNotification({
+                    user_id: owner.id,
+                    company_id: companyId,
+                    type: 'material_request_created',
+                    title: 'New Material Request',
+                    message: `${userName} requested ${quantity} ${item_name}`,
+                    priority: urgency === 'High' ? 'high' : 'medium',
+                    data: { request_id: createdRequest.id, item_name, quantity, urgency }
+                });
+            }
+            console.log(`✅ Notified ${ownersResult.rows.length} owners about new material request`);
+        } catch (notifErr) {
+            console.error('❌ Failed to send material request creation notification:', notifErr);
+        }
+
+        res.status(201).json(createdRequest);
     } catch (err) {
         console.error('Error creating material request:', err);
         res.status(500).json({ message: 'Server error creating material request' });

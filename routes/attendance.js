@@ -112,6 +112,36 @@ router.post('/clock-in', authenticateToken, async (req, res) => {
 
     console.log(`✅ Clock-in recorded for user ${userId} at ${clockInTime.toLocaleTimeString()} (${method})`);
 
+    // Send notification to owners about employee clock-in
+    try {
+      // Get employee name
+      const userInfo = await pool.query('SELECT name FROM users WHERE id = $1', [userId]);
+      const employeeName = userInfo.rows[0]?.name || 'Employee';
+
+      // Get all owners
+      const ownersResult = await pool.query(
+        `SELECT id FROM users WHERE role IN ('owner', 'admin')
+         ${companyId && companyId !== '00000000-0000-0000-0000-000000000000' ? 'AND (company_id = $1 OR company_id IS NULL)' : ''}`,
+        companyId && companyId !== '00000000-0000-0000-0000-000000000000' ? [companyId] : []
+      );
+
+      // Send notification to each owner
+      for (const owner of ownersResult.rows) {
+        await createNotification({
+          user_id: owner.id,
+          company_id: companyId,
+          type: 'employee_clock_in',
+          title: 'Employee Clocked In',
+          message: `${employeeName} clocked in at ${clockInTime.toLocaleTimeString()}${isLate ? ' (Late)' : ''}`,
+          priority: isLate ? 'medium' : 'low',
+          data: { employee_id: userId, attendance_id: result.rows[0].id, is_late: isLate }
+        });
+      }
+      console.log(`✅ Notified ${ownersResult.rows.length} owners about clock-in`);
+    } catch (notifErr) {
+      console.error('❌ Failed to send clock-in notification to owners:', notifErr);
+    }
+
     // Send late notification if applicable (after 9 AM)
     if (isLate) {
       try {
@@ -178,6 +208,37 @@ router.post('/clock-out', authenticateToken, async (req, res) => {
     );
 
     console.log(`✅ Clock-out recorded for user ${userId}. Hours: ${workingHours}, Status: ${status} (${method})`);
+
+    // Send notification to owners about employee clock-out
+    try {
+      // Get employee name
+      const userInfo = await pool.query('SELECT name FROM users WHERE id = $1', [userId]);
+      const employeeName = userInfo.rows[0]?.name || 'Employee';
+      const companyId = req.user.companyId || '00000000-0000-0000-0000-000000000000';
+
+      // Get all owners
+      const ownersResult = await pool.query(
+        `SELECT id FROM users WHERE role IN ('owner', 'admin')
+         ${companyId && companyId !== '00000000-0000-0000-0000-000000000000' ? 'AND (company_id = $1 OR company_id IS NULL)' : ''}`,
+        companyId && companyId !== '00000000-0000-0000-0000-000000000000' ? [companyId] : []
+      );
+
+      // Send notification to each owner
+      for (const owner of ownersResult.rows) {
+        await createNotification({
+          user_id: owner.id,
+          company_id: companyId,
+          type: 'employee_clock_out',
+          title: 'Employee Clocked Out',
+          message: `${employeeName} clocked out. Hours: ${workingHours.toFixed(2)}, Status: ${status}`,
+          priority: 'low',
+          data: { employee_id: userId, attendance_id: result.rows[0].id, working_hours: workingHours, status }
+        });
+      }
+      console.log(`✅ Notified ${ownersResult.rows.length} owners about clock-out`);
+    } catch (notifErr) {
+      console.error('❌ Failed to send clock-out notification to owners:', notifErr);
+    }
 
     res.json(result.rows[0]);
   } catch (err) {

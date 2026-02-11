@@ -203,7 +203,29 @@ router.post('/:id/accept', authenticateToken, async (req, res) => {
       [id, req.user.id]
     );
 
-    res.json(result.rows[0]);
+    const acceptedJob = result.rows[0];
+
+    // Send notification to owner about job acceptance
+    try {
+      // Get employee name and job creator
+      const userInfo = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+      const employeeName = userInfo.rows[0]?.name || 'Employee';
+
+      await createNotification({
+        user_id: acceptedJob.created_by,
+        company_id: req.user.companyId,
+        type: 'job_accepted',
+        title: 'Job Accepted',
+        message: `${employeeName} accepted the job: ${acceptedJob.title}`,
+        priority: 'medium',
+        data: { job_id: acceptedJob.id, employee_id: req.user.id }
+      });
+      console.log(`✅ Notified owner about job acceptance`);
+    } catch (notifErr) {
+      console.error('❌ Failed to send job acceptance notification:', notifErr);
+    }
+
+    res.json(acceptedJob);
   } catch (err) {
     console.error('jobs ACCEPT error', err);
     res.status(500).json({ message: 'Server error' });
@@ -236,7 +258,29 @@ router.post('/:id/decline', authenticateToken, async (req, res) => {
       [id]
     );
 
-    res.json(result.rows[0]);
+    const declinedJob = result.rows[0];
+
+    // Send notification to owner about job decline
+    try {
+      // Get employee name
+      const userInfo = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+      const employeeName = userInfo.rows[0]?.name || 'Employee';
+
+      await createNotification({
+        user_id: declinedJob.created_by,
+        company_id: req.user.companyId,
+        type: 'job_declined',
+        title: 'Job Declined',
+        message: `${employeeName} declined the job: ${declinedJob.title}`,
+        priority: 'high',
+        data: { job_id: declinedJob.id, employee_id: req.user.id }
+      });
+      console.log(`✅ Notified owner about job decline`);
+    } catch (notifErr) {
+      console.error('❌ Failed to send job decline notification:', notifErr);
+    }
+
+    res.json(declinedJob);
   } catch (err) {
     console.error('jobs DECLINE error', err);
     res.status(500).json({ message: 'Server error' });

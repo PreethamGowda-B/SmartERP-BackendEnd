@@ -79,6 +79,35 @@ router.post('/', authenticateToken, upload.single('image'), async (req, res) => 
         const newItem = result.rows[0];
         await trackCreation(newItem.id, newItem, userId, employeeName);
 
+        // Send notification to all employees about new inventory
+        try {
+            const { createNotification } = require('../utils/notificationHelpers');
+            const companyId = req.user.companyId;
+
+            // Get all employees
+            const employeesResult = await pool.query(
+                `SELECT id FROM users WHERE role = 'employee'
+                 ${companyId && companyId !== '00000000-0000-0000-0000-000000000000' ? 'AND (company_id = $1 OR company_id IS NULL)' : ''}`,
+                companyId && companyId !== '00000000-0000-0000-0000-000000000000' ? [companyId] : []
+            );
+
+            // Send notification to each employee
+            for (const employee of employeesResult.rows) {
+                await createNotification({
+                    user_id: employee.id,
+                    company_id: companyId,
+                    type: 'inventory_added',
+                    title: 'New Inventory Added',
+                    message: `${name} (${quantity} ${itemUnit}) has been added to inventory`,
+                    priority: 'low',
+                    data: { inventory_id: newItem.id, item_name: name, quantity }
+                });
+            }
+            console.log(`✅ Notified ${employeesResult.rows.length} employees about new inventory`);
+        } catch (notifErr) {
+            console.error('❌ Failed to send inventory notification:', notifErr);
+        }
+
         res.status(201).json(newItem);
     } catch (err) {
         console.error('Error creating inventory item:', err);

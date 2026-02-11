@@ -179,12 +179,16 @@ app.listen(PORT, () => {
   console.log("🌐 CORS: Accepting all Vercel preview deployments");
 
   // ✅ Start daily attendance processor (7:30 PM IST)
+  // TEMPORARILY DISABLED: Causing deployment timeouts
+  // TODO: Re-enable once dailyAttendanceProcessor.js is properly implemented
+  /*
   try {
     const { startDailyAttendanceProcessor } = require('./jobs/dailyAttendanceProcessor');
     startDailyAttendanceProcessor();
   } catch (err) {
     console.error('❌ Failed to start daily attendance processor:', err.message);
   }
+  */
 });
 
 module.exports = app;

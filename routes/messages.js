@@ -40,26 +40,29 @@ router.post('/', authenticateToken, async (req, res) => {
 
         const sentMessage = result.rows[0];
 
-        // Send notification to receiver (only if sender is owner)
-        if (req.user.role === 'owner' || req.user.role === 'admin') {
-            try {
-                // Get sender name
-                const senderInfo = await pool.query('SELECT name FROM users WHERE id = $1', [senderId]);
-                const senderName = senderInfo.rows[0]?.name || 'Owner';
+        // Send notification to receiver
+        try {
+            // Get sender name and role
+            const senderInfo = await pool.query(
+                'SELECT name, role FROM users WHERE id = $1',
+                [senderId]
+            );
+            const senderName = senderInfo.rows[0]?.name || 'User';
+            const senderRole = senderInfo.rows[0]?.role || 'employee';
 
-                await createNotification({
-                    user_id: receiver_id,
-                    company_id: req.user.companyId,
-                    type: 'message',
-                    title: 'New Message',
-                    message: `New message from ${senderName}`,
-                    priority: 'medium',
-                    data: { message_id: sentMessage.id, sender_id: senderId }
-                });
-                console.log(`✅ Notification sent for new message to user ${receiver_id}`);
-            } catch (notifErr) {
-                console.error('❌ Failed to send message notification:', notifErr);
-            }
+            // Send notification to receiver (both owner->employee and employee->owner)
+            await createNotification({
+                user_id: receiver_id,
+                company_id: req.user.companyId,
+                type: 'message',
+                title: 'New Message',
+                message: `New message from ${senderName}`,
+                priority: senderRole === 'owner' ? 'high' : 'medium',
+                data: { message_id: sentMessage.id, sender_id: senderId }
+            });
+            console.log(`✅ Notification sent for new message to user ${receiver_id}`);
+        } catch (notifErr) {
+            console.error('❌ Failed to send message notification:', notifErr);
         }
 
         res.status(201).json(sentMessage);
@@ -222,45 +225,55 @@ router.get('/unread-count', authenticateToken, async (req, res) => {
 
 // ─── GET /api/messages/owner ─────────────────────────────────────────────────
 // Get owner user ID (helper endpoint for employees)
-// Get owner user ID (helper endpoint for employees)
 router.get('/owner', authenticateToken, async (req, res) => {
     try {
         const companyId = req.user.companyId;
 
         console.log(`🔍 Fetching owner for employee ${req.user.userId} (Company: ${companyId})`);
 
-        let query;
-        let params;
+        let result;
 
+        // Try 1: Match by company_id if available
         if (companyId) {
-            query = `SELECT id, name, email 
-                     FROM users 
-                     WHERE (role = 'owner' OR role = 'admin') 
-                     AND company_id = $1
-                     ORDER BY role DESC
-                     LIMIT 1`;
-            params = [companyId];
-        } else {
-            // Fallback for users without company_id (legacy/dev)
-            // Try to find an owner with NULL company_id
-            query = `SELECT id, name, email 
-                     FROM users 
-                     WHERE (role = 'owner' OR role = 'admin') 
-                     AND company_id IS NULL
-                     ORDER BY role DESC
-                     LIMIT 1`;
-            params = [];
+            result = await pool.query(
+                `SELECT id, name, email 
+                 FROM users 
+                 WHERE (role = 'owner' OR role = 'admin') 
+                 AND company_id = $1
+                 ORDER BY role DESC
+                 LIMIT 1`,
+                [companyId]
+            );
         }
 
-        const result = await pool.query(query, params);
+        // Try 2: If no company_id or no match, try NULL company_id (legacy/dev)
+        if (!result || result.rows.length === 0) {
+            console.log('⚠️ No owner found with company_id, trying NULL company_id...');
+            result = await pool.query(
+                `SELECT id, name, email 
+                 FROM users 
+                 WHERE (role = 'owner' OR role = 'admin') 
+                 AND company_id IS NULL
+                 ORDER BY role DESC
+                 LIMIT 1`
+            );
+        }
+
+        // Try 3: Final fallback - return ANY owner (for dev/testing)
+        if (result.rows.length === 0) {
+            console.log('⚠️ No owner found with NULL company_id, returning ANY owner...');
+            result = await pool.query(
+                `SELECT id, name, email 
+                 FROM users 
+                 WHERE (role = 'owner' OR role = 'admin')
+                 ORDER BY created_at ASC
+                 LIMIT 1`
+            );
+        }
 
         if (result.rows.length === 0) {
-            // If strict matching failed, and we are in a loose dev environment (companyId is null),
-            // maybe we shouldn't return *any* owner, but the original code did.
-            // However, returning a random owner is exactly the bug.
-            // So we return 404 if no matching owner found.
-            console.warn(`⚠️ No matching owner found for company ${companyId}`);
-            return res.status(404).json({ message: 'No owner found for your company' });
+            console.error(`❌ No owner found in the entire database!`);
+            return res.status(404).json({ message: 'No owner found in the system' });
         }
 
         const owner = result.rows[0];

@@ -222,21 +222,50 @@ router.get('/unread-count', authenticateToken, async (req, res) => {
 
 // ─── GET /api/messages/owner ─────────────────────────────────────────────────
 // Get owner user ID (helper endpoint for employees)
+// Get owner user ID (helper endpoint for employees)
 router.get('/owner', authenticateToken, async (req, res) => {
     try {
-        const result = await pool.query(
-            `SELECT id, name, email 
-       FROM users 
-       WHERE role = 'owner' OR role = 'admin'
-       ORDER BY role DESC
-       LIMIT 1`
-        );
+        const companyId = req.user.companyId;
 
-        if (result.rows.length === 0) {
-            return res.status(404).json({ message: 'No owner found' });
+        console.log(`🔍 Fetching owner for employee ${req.user.userId} (Company: ${companyId})`);
+
+        let query;
+        let params;
+
+        if (companyId) {
+            query = `SELECT id, name, email 
+                     FROM users 
+                     WHERE (role = 'owner' OR role = 'admin') 
+                     AND company_id = $1
+                     ORDER BY role DESC
+                     LIMIT 1`;
+            params = [companyId];
+        } else {
+            // Fallback for users without company_id (legacy/dev)
+            // Try to find an owner with NULL company_id
+            query = `SELECT id, name, email 
+                     FROM users 
+                     WHERE (role = 'owner' OR role = 'admin') 
+                     AND company_id IS NULL
+                     ORDER BY role DESC
+                     LIMIT 1`;
+            params = [];
         }
 
-        res.json(result.rows[0]);
+        const result = await pool.query(query, params);
+
+        if (result.rows.length === 0) {
+            // If strict matching failed, and we are in a loose dev environment (companyId is null),
+            // maybe we shouldn't return *any* owner, but the original code did.
+            // However, returning a random owner is exactly the bug.
+            // So we return 404 if no matching owner found.
+            console.warn(`⚠️ No matching owner found for company ${companyId}`);
+            return res.status(404).json({ message: 'No owner found for your company' });
+        }
+
+        const owner = result.rows[0];
+        console.log(`✅ Found owner: ${owner.name} (${owner.id})`);
+        res.json(owner);
     } catch (err) {
         console.error('Error fetching owner:', err);
         res.status(500).json({ message: 'Server error fetching owner' });

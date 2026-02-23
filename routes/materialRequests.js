@@ -9,10 +9,10 @@ const { createNotification } = require('../utils/notificationHelpers');
 router.post('/', authenticateToken, async (req, res) => {
     try {
         const { item_name, quantity, urgency, description } = req.body;
-        // Support both id and userId field names in JWT payload
+        // Support both `id` (old) and `userId` (new) field names in JWT payload
         const userId = req.user.userId || req.user.id;
 
-        if (!userId || isNaN(Number(userId))) {
+        if (!userId) {
             return res.status(401).json({ message: 'Invalid authentication token — missing user ID' });
         }
 
@@ -24,10 +24,10 @@ router.post('/', authenticateToken, async (req, res) => {
             return res.status(400).json({ message: 'Valid quantity is required' });
         }
 
-        // Get user name
+        // Get user name — cast both sides to text to support UUID and integer PKs
         const userResult = await pool.query(
-            'SELECT name, email FROM users WHERE id = $1',
-            [userId]
+            'SELECT name, email FROM users WHERE id::text = $1::text',
+            [String(userId)]
         );
 
         if (userResult.rows.length === 0) {
@@ -101,9 +101,9 @@ router.get('/', authenticateToken, async (req, res) => {
         const userId = req.user.userId || req.user.id;
         const role = req.user.role;
 
-        // Guard: if userId is missing or NaN, return 401 instead of crashing DB
-        if (!userId || isNaN(Number(userId))) {
-            console.error('❌ GET /material-requests: invalid userId from JWT', req.user);
+        // Simple guard: if userId is completely missing, return 401
+        if (!userId) {
+            console.error('❌ GET /material-requests: missing userId from JWT', req.user);
             return res.status(401).json({
                 message: 'Invalid authentication token — please log out and log back in.',
                 hint: 'Your session token is missing the user ID. Re-login will fix this.'
@@ -128,17 +128,17 @@ router.get('/', authenticateToken, async (req, res) => {
             params = [];
         } else {
             // Employee sees only their own requests
-            // Pass userId directly — pg driver handles integer coercion, no parseInt needed
+            // Use ::text cast on both sides — works for both UUID and INTEGER PKs
             query = `
                 SELECT 
                     id, item_name, quantity, urgency, description, status,
                     requested_by, requested_by_name, created_at, updated_at,
                     reviewed_by, reviewed_at
                 FROM material_requests 
-                WHERE requested_by = $1
+                WHERE requested_by::text = $1::text
                 ORDER BY created_at DESC
             `;
-            params = [userId];
+            params = [String(userId)];
         }
 
         console.log('📝 Executing query with params:', params);

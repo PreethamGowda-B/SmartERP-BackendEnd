@@ -78,8 +78,13 @@ router.post('/', authenticateToken, async (req, res) => {
 
         res.status(201).json(createdRequest);
     } catch (err) {
-        console.error('Error creating material request:', err);
-        res.status(500).json({ message: 'Server error creating material request' });
+        console.error('❌ Error creating material request:', err);
+        res.status(500).json({
+            message: 'Server error creating material request',
+            error: err.message,
+            code: err.code,
+            detail: err.detail || null
+        });
     }
 });
 

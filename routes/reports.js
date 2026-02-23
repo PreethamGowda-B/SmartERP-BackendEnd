@@ -3,12 +3,60 @@ const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 
+// ─── Startup: ensure all columns used by reports exist ───────────────────────
+
+async function ensureReportColumns() {
+    const columns = [
+        // attendance
+        { table: 'attendance', column: 'is_late', type: 'BOOLEAN DEFAULT false' },
+        { table: 'attendance', column: 'working_hours', type: 'NUMERIC(5,2)' },
+        { table: 'attendance', column: 'check_in_time', type: 'TIMESTAMPTZ' },
+        { table: 'attendance', column: 'check_out_time', type: 'TIMESTAMPTZ' },
+        { table: 'attendance', column: 'notes', type: 'TEXT' },
+        // jobs
+        { table: 'jobs', column: 'employee_status', type: "TEXT DEFAULT 'pending'" },
+        { table: 'jobs', column: 'progress', type: 'INTEGER DEFAULT 0' },
+        { table: 'jobs', column: 'accepted_at', type: 'TIMESTAMPTZ' },
+        { table: 'jobs', column: 'completed_at', type: 'TIMESTAMPTZ' },
+        { table: 'jobs', column: 'priority', type: 'TEXT' },
+        { table: 'jobs', column: 'assigned_to', type: 'UUID' },
+        { table: 'jobs', column: 'company_id', type: 'TEXT' },
+        // material_requests
+        { table: 'material_requests', column: 'company_id', type: 'TEXT' },
+        { table: 'material_requests', column: 'unit', type: 'TEXT' },
+        { table: 'material_requests', column: 'notes', type: 'TEXT' },
+        // inventory_items
+        { table: 'inventory_items', column: 'reorder_point', type: 'INTEGER DEFAULT 0' },
+        { table: 'inventory_items', column: 'is_archived', type: 'BOOLEAN DEFAULT false' },
+        { table: 'inventory_items', column: 'company_id', type: 'TEXT' },
+        { table: 'inventory_items', column: 'unit', type: 'TEXT' },
+        { table: 'inventory_items', column: 'category', type: 'TEXT' },
+        // employee_profiles (in case table exists)
+        { table: 'employee_profiles', column: 'department', type: 'TEXT' },
+        { table: 'employee_profiles', column: 'position', type: 'TEXT' },
+        { table: 'employee_profiles', column: 'status', type: "TEXT DEFAULT 'active'" },
+    ];
+
+    for (const { table, column, type } of columns) {
+        try {
+            await pool.query(`
+        ALTER TABLE ${table}
+        ADD COLUMN IF NOT EXISTS ${column} ${type}
+      `);
+        } catch (e) {
+            // Table might not exist — that's OK, just skip
+        }
+    }
+    console.log('✅ Report columns ensured');
+}
+
+// Run after DB is ready
+setTimeout(ensureReportColumns, 5000);
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /**
  * Build a WHERE clause fragment + params for date range filtering.
- * Returns { clause, params, nextIdx }
- * `clause` is e.g. "AND created_at >= $2 AND created_at < $3"
  */
 function dateRangeFilter(period, dateColumn, startIdx) {
     const now = new Date();
@@ -40,6 +88,7 @@ function dateRangeFilter(period, dateColumn, startIdx) {
         nextIdx: startIdx + 2,
     };
 }
+
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // OWNER REPORTS
@@ -266,7 +315,7 @@ router.get('/materials', authenticateToken, async (req, res) => {
          COUNT(CASE WHEN status = 'rejected' THEN 1 END)         AS rejected,
          COUNT(CASE WHEN status = 'pending' THEN 1 END)          AS pending
        FROM material_requests
-       WHERE company_id = $1 ${clause}`,
+       WHERE (company_id = $1 OR company_id IS NULL) ${clause}`,
             [companyId, ...params]
         );
 
@@ -274,7 +323,7 @@ router.get('/materials', authenticateToken, async (req, res) => {
         const topItems = await pool.query(
             `SELECT item_name, COUNT(*) AS request_count, SUM(quantity) AS total_qty
        FROM material_requests
-       WHERE company_id = $1 ${clause}
+       WHERE (company_id = $1 OR company_id IS NULL) ${clause}
        GROUP BY item_name
        ORDER BY request_count DESC
        LIMIT 10`,
@@ -286,7 +335,7 @@ router.get('/materials', authenticateToken, async (req, res) => {
             `SELECT mr.id, mr.item_name, mr.quantity, mr.status, mr.created_at, u.name AS requested_by
        FROM material_requests mr
        JOIN users u ON u.id = mr.requested_by
-       WHERE mr.company_id = $1 ${clause}
+       WHERE (mr.company_id = $1 OR mr.company_id IS NULL) ${clause}
        ORDER BY mr.created_at DESC
        LIMIT 20`,
             [companyId, ...params]
@@ -313,29 +362,32 @@ router.get('/inventory', authenticateToken, async (req, res) => {
 
         const summary = await pool.query(
             `SELECT
-         COUNT(*)                                                     AS total_items,
-         COUNT(CASE WHEN quantity <= reorder_point OR quantity = 0 THEN 1 END) AS low_stock_count,
-         COUNT(CASE WHEN is_archived = true THEN 1 END)              AS archived_count,
-         COUNT(DISTINCT category)                                     AS category_count
+         COUNT(*)                                                          AS total_items,
+         COUNT(CASE WHEN quantity <= COALESCE(reorder_point, 0) AND quantity = 0 THEN 1 END) AS low_stock_count,
+         COUNT(CASE WHEN COALESCE(is_archived, false) = true THEN 1 END)  AS archived_count,
+         COUNT(DISTINCT category)                                          AS category_count
        FROM inventory_items
-       WHERE company_id = $1 AND is_archived = false`,
+       WHERE (company_id = $1 OR company_id IS NULL)
+         AND COALESCE(is_archived, false) = false`,
             [companyId]
         );
 
         const byCategory = await pool.query(
-            `SELECT category, COUNT(*) AS item_count, SUM(quantity) AS total_qty
+            `SELECT COALESCE(category, 'Uncategorised') AS category, COUNT(*) AS item_count, SUM(quantity) AS total_qty
        FROM inventory_items
-       WHERE company_id = $1 AND is_archived = false
+       WHERE (company_id = $1 OR company_id IS NULL)
+         AND COALESCE(is_archived, false) = false
        GROUP BY category
        ORDER BY item_count DESC`,
             [companyId]
         );
 
         const lowStock = await pool.query(
-            `SELECT name, quantity, reorder_point, unit, category
+            `SELECT name, quantity, COALESCE(reorder_point, 0) AS reorder_point, unit, COALESCE(category, 'Uncategorised') AS category
        FROM inventory_items
-       WHERE company_id = $1 AND is_archived = false
-         AND (quantity <= reorder_point OR quantity = 0)
+       WHERE (company_id = $1 OR company_id IS NULL)
+         AND COALESCE(is_archived, false) = false
+         AND (quantity <= COALESCE(reorder_point, 0) OR quantity = 0)
        ORDER BY quantity ASC
        LIMIT 10`,
             [companyId]

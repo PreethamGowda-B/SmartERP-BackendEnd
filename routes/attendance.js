@@ -23,10 +23,16 @@ function calculateWorkingHours(clockInTime, clockOutTime) {
  * Check if clock-in is late (after 9:00 AM)
  * Enterprise Rule: Shift starts at 9:00 AM
  */
+/**
+ * Check if clock-in is late (after 9:00 AM sharp)
+ * On-time: exactly 9:00 AM (hour=9, minute=0)
+ * Late: 9:01 AM through 11:00 AM
+ * Cutoff: after 11:00 AM
+ */
 function isLateCheckIn(clockInTime) {
   const hour = new Date(clockInTime).getHours();
   const minute = new Date(clockInTime).getMinutes();
-  // Late if after 9:00 AM (9:01 AM onwards)
+  // Late if after 9:00 AM sharp (i.e., 9:01 AM onwards)
   return hour > 9 || (hour === 9 && minute > 0);
 }
 
@@ -76,13 +82,37 @@ router.post('/clock-in', authenticateToken, async (req, res) => {
     const clockInTime = new Date();
     const currentHour = clockInTime.getHours();
 
-    // Enterprise Rule: Block clock-in outside shift hours (9 AM - 7 PM)
-    if (currentHour < 9 || currentHour >= 19) {
+    // ── Attendance window rules ─────────────────────────────────────────────
+    // Clock-in window: 9:00 AM – 11:00 AM
+    //   • Before 9:00 AM  → blocked (too early)
+    //   • 9:00 AM exactly → on time
+    //   • 9:01 – 11:00   → allowed, marked as LATE
+    //   • After 11:00 AM  → rejected (time is over for today)
+    // ────────────────────────────────────────────────────────────────────────
+
+    const clockHour = clockInTime.getHours();
+    const clockMinute = clockInTime.getMinutes();
+
+    // Too early: before 9:00 AM
+    if (clockHour < 9) {
       return res.status(400).json({
-        message: 'Clock-in is only allowed between 9:00 AM and 7:00 PM',
-        current_time: clockInTime.toLocaleTimeString()
+        message: 'Clock-in opens at 9:00 AM. You are too early!',
+        code: 'TOO_EARLY',
+        current_time: clockInTime.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })
       });
     }
+
+    // Too late: strictly after 11:00 AM (cutoff)
+    // 11:00 AM sharp = last minute allowed
+    // 11:01 AM onwards = closed
+    if (clockHour > 11 || (clockHour === 11 && clockMinute > 0)) {
+      return res.status(400).json({
+        message: "⏰ Your time is over! Clock-in closed at 11:00 AM. Come tomorrow and clock in early. Shift starts at 9:00 AM — try to be on time!",
+        code: 'CUTOFF_PASSED',
+        current_time: clockInTime.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true })
+      });
+    }
+    // 11:00 AM sharp is the last allowed minute
 
     const isLate = isLateCheckIn(clockInTime);
 

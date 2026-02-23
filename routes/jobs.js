@@ -38,6 +38,10 @@ const ensureColumns = async () => {
     await pool.query(
       "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS priority VARCHAR(50) DEFAULT 'medium'"
     );
+    // Ensure company_id column exists for multi-tenant scoping
+    await pool.query(
+      "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS company_id TEXT"
+    );
 
     console.log("✅ Jobs table schema verified/updated with employee tracking columns.");
   } catch (err) {
@@ -70,17 +74,18 @@ router.post('/', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
       `INSERT INTO jobs 
-       (title, description, assigned_to, created_by, data, visible_to_all, status, priority)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       (title, description, assigned_to, created_by, company_id, data, visible_to_all, status, priority)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        RETURNING *`,
       [
         title,
         description,
         assignedTo,
         req.user.id,
+        req.user.companyId || null,
         job,
         visibleToAll,
-        job.status || 'open',  // Changed from 'pending' to 'open' to match DB constraint
+        job.status || 'open',
         job.priority || 'medium'
       ]
     );
@@ -127,17 +132,18 @@ router.get('/', authenticateToken, async (req, res) => {
         `SELECT j.*, u.email as employee_email 
          FROM jobs j
          LEFT JOIN users u ON j.assigned_to = u.id
-         WHERE j.created_by = $1 
+         WHERE j.created_by = $1
+         AND (j.company_id = $2 OR j.company_id IS NULL)
          ORDER BY j.created_at DESC`,
-        [req.user.id]
+        [req.user.id, req.user.companyId]
       );
     } else if (req.user.role === 'employee') {
       result = await pool.query(
         `SELECT * FROM jobs 
-         WHERE visible_to_all = true 
-         OR assigned_to = $1 
+         WHERE (visible_to_all = true OR assigned_to = $1)
+         AND (company_id = $2 OR company_id IS NULL)
          ORDER BY created_at DESC`,
-        [req.user.id]
+        [req.user.id, req.user.companyId]
       );
     } else {
       result = await pool.query(

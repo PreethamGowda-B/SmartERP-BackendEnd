@@ -98,8 +98,8 @@ router.delete('/:id', authenticateToken, async (req, res) => {
         return res.status(403).json({ message: 'Only owners can delete employees' });
     }
 
-    const employeeId = parseInt(req.params.id, 10);
-    if (isNaN(employeeId)) {
+    const employeeId = req.params.id;
+    if (!employeeId) {
         return res.status(400).json({ message: 'Invalid employee ID' });
     }
 

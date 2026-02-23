@@ -232,7 +232,8 @@ router.get('/employees', authenticateToken, async (req, res) => {
     }
 
     const result = await pool.query(
-      `SELECT id, name, email FROM users WHERE role = 'employee' ORDER BY name ASC`
+      `SELECT id, name, email FROM users WHERE role = 'employee' AND company_id = $1 ORDER BY name ASC`,
+      [req.user.companyId]
     );
 
     res.json(result.rows);

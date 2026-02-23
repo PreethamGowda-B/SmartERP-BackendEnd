@@ -501,61 +501,9 @@ router.get('/calendar/:userId', authenticateToken, async (req, res) => {
 });
 
 /**
- * PATCH /api/attendance/:id
- * Manually edit attendance record (Owner only)
- */
-router.patch('/:id', authenticateToken, async (req, res) => {
-  try {
-    if (req.user.role !== 'owner' && req.user.role !== 'admin') {
-      return res.status(403).json({ message: 'Access denied' });
-    }
-
-    const { id } = req.params;
-    const { check_in_time, check_out_time, status, notes } = req.body;
-    const editedBy = req.user.userId || req.user.id;
-
-    // Check if record is processed (locked)
-    const existing = await pool.query('SELECT is_processed FROM attendance WHERE id = $1', [id]);
-    if (existing.rows.length > 0 && existing.rows[0].is_processed) {
-      return res.status(403).json({ message: 'Cannot edit processed records' });
-    }
-
-    // Calculate working hours if both times provided
-    let workingHours = null;
-    if (check_in_time && check_out_time) {
-      workingHours = calculateWorkingHours(check_in_time, check_out_time);
-    }
-
-    const result = await pool.query(
-      `UPDATE attendance 
-             SET check_in_time = COALESCE($1, check_in_time),
-                 check_out_time = COALESCE($2, check_out_time),
-                 working_hours = COALESCE($3, working_hours),
-                 status = COALESCE($4, status),
-                 notes = COALESCE($5, notes),
-                 is_manual = TRUE,
-                 edited_by = $6,
-                 updated_at = NOW()
-             WHERE id = $7
-             RETURNING *`,
-      [check_in_time, check_out_time, workingHours, status, notes, editedBy, id]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ message: 'Attendance record not found' });
-    }
-
-    console.log(`✅ Attendance ${id} manually edited by owner`);
-    res.json(result.rows[0]);
-  } catch (err) {
-    console.error('❌ Error editing attendance:', err);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-/**
  * PATCH /api/attendance/corrections/:id/approve
  * Approve correction request (Owner only)
+ * ⚠️  Must come BEFORE PATCH /:id or Express will match 'corrections' as the :id param
  */
 router.patch('/corrections/:id/approve', authenticateToken, async (req, res) => {
   try {
@@ -639,6 +587,7 @@ router.patch('/corrections/:id/approve', authenticateToken, async (req, res) => 
 /**
  * PATCH /api/attendance/corrections/:id/reject
  * Reject correction request (Owner only)
+ * ⚠️  Must come BEFORE PATCH /:id
  */
 router.patch('/corrections/:id/reject', authenticateToken, async (req, res) => {
   try {
@@ -691,6 +640,60 @@ router.patch('/corrections/:id/reject', authenticateToken, async (req, res) => {
     res.json(result.rows[0]);
   } catch (err) {
     console.error('❌ Error rejecting correction:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+/**
+ * PATCH /api/attendance/:id
+ * Manually edit attendance record (Owner only)
+ * ⚠️  Must come AFTER all named sub-routes like /corrections/:id/*
+ */
+router.patch('/:id', authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== 'owner' && req.user.role !== 'admin') {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    const { id } = req.params;
+    const { check_in_time, check_out_time, status, notes } = req.body;
+    const editedBy = req.user.userId || req.user.id;
+
+    // Check if record is processed (locked)
+    const existing = await pool.query('SELECT is_processed FROM attendance WHERE id = $1', [id]);
+    if (existing.rows.length > 0 && existing.rows[0].is_processed) {
+      return res.status(403).json({ message: 'Cannot edit processed records' });
+    }
+
+    // Calculate working hours if both times provided
+    let workingHours = null;
+    if (check_in_time && check_out_time) {
+      workingHours = calculateWorkingHours(check_in_time, check_out_time);
+    }
+
+    const result = await pool.query(
+      `UPDATE attendance 
+             SET check_in_time = COALESCE($1, check_in_time),
+                 check_out_time = COALESCE($2, check_out_time),
+                 working_hours = COALESCE($3, working_hours),
+                 status = COALESCE($4, status),
+                 notes = COALESCE($5, notes),
+                 is_manual = TRUE,
+                 edited_by = $6,
+                 updated_at = NOW()
+             WHERE id = $7
+             RETURNING *`,
+      [check_in_time, check_out_time, workingHours, status, notes, editedBy, id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Attendance record not found' });
+    }
+
+    console.log(`✅ Attendance ${id} manually edited by owner`);
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('❌ Error editing attendance:', err);
     res.status(500).json({ message: 'Server error' });
   }
 });

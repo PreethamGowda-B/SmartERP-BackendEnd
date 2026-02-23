@@ -81,7 +81,7 @@ router.post('/', DEV ? (req, res, next) => next() : authenticateToken, async (re
       await client.query('BEGIN');
       const insertUser = await client.query(
         'INSERT INTO users (name, email, password_hash, role) VALUES ($1, $2, $3, $4) RETURNING id, name, email',
-        [name, email, hash, 'user']
+        [name, email, hash, 'employee']
       );
       const userId = insertUser.rows[0].id;
       await client.query(
@@ -113,8 +113,8 @@ router.patch('/:id', authenticateToken, async (req, res) => {
     return res.status(403).json({ message: 'Only owners can update employees' });
   }
 
-  const employeeId = parseInt(req.params.id, 10);
-  if (isNaN(employeeId)) {
+  const employeeId = req.params.id;
+  if (!employeeId) {
     return res.status(400).json({ message: 'Invalid employee ID' });
   }
 
@@ -195,8 +195,8 @@ router.delete('/:id', authenticateToken, async (req, res) => {
     return res.status(403).json({ message: 'Only owners can delete employees' });
   }
 
-  const employeeId = parseInt(req.params.id, 10);
-  if (isNaN(employeeId)) {
+  const employeeId = req.params.id;
+  if (!employeeId) {
     return res.status(400).json({ message: 'Invalid employee ID' });
   }
 

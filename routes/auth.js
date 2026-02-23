@@ -408,8 +408,12 @@ router.post("/refresh", async (req, res) => {
       if (err) return res.status(403).json({ message: "Invalid token" });
 
       try {
+        // Support old refresh tokens that only had `id` (not `userId`) in payload
+        const payloadUserId = payload.userId || payload.id;
+        if (!payloadUserId) return res.status(401).json({ message: "Invalid token payload" });
+
         // ✅ Fetch user role and company_id from database
-        const userResult = await pool.query("SELECT role, company_id FROM users WHERE id = $1", [payload.userId]);
+        const userResult = await pool.query("SELECT role, company_id FROM users WHERE id = $1", [payloadUserId]);
         if (userResult.rows.length === 0) {
           return res.status(401).json({ message: "User not found" });
         }
@@ -417,16 +421,16 @@ router.post("/refresh", async (req, res) => {
         const userCompanyId = userResult.rows[0].company_id;
 
         await pool.query("DELETE FROM refresh_tokens WHERE token = $1", [token]);
-        const newRefresh = jwt.sign({ id: payload.userId, userId: payload.userId }, REFRESH_SECRET, { expiresIn: "7d" });
+        const newRefresh = jwt.sign({ id: payloadUserId, userId: payloadUserId }, REFRESH_SECRET, { expiresIn: "7d" });
         await pool.query(
           `INSERT INTO refresh_tokens (user_id, token, expires_at)
            VALUES ($1, $2, NOW() + INTERVAL '7 days')`,
-          [payload.userId, newRefresh]
+          [payloadUserId, newRefresh]
         );
 
         // ✅ Include role and companyId in access token
         const accessToken = jwt.sign(
-          { id: payload.userId, userId: payload.userId, role: userRole, companyId: userCompanyId },
+          { id: payloadUserId, userId: payloadUserId, role: userRole, companyId: userCompanyId },
           ACCESS_SECRET,
           { expiresIn: "15m" }
         );

@@ -118,6 +118,8 @@ app.use("/api/ai", require("./routes/ai.routes"));
 app.use("/api/messages", require("./routes/messages"));
 app.use("/api/dashboard", require("./routes/dashboard"));
 app.use("/api/reports", require("./routes/reports"));
+app.use("/api/settings", require("./routes/settings"));
+
 
 
 

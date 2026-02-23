@@ -96,29 +96,44 @@ router.get('/', authenticateToken, async (req, res) => {
         let params;
 
         if (role === 'owner' || role === 'admin') {
-            // Owner sees all requests
-            query = `SELECT * FROM material_requests ORDER BY created_at DESC`;
+            // Owner sees all requests — use explicit column list to avoid hidden bad columns
+            query = `
+                SELECT 
+                    id, item_name, quantity, urgency, description, status,
+                    requested_by, requested_by_name, created_at, updated_at,
+                    reviewed_by, reviewed_at
+                FROM material_requests 
+                ORDER BY created_at DESC
+            `;
             params = [];
         } else {
             // Employee sees only their own requests
-            query = `SELECT * FROM material_requests WHERE requested_by = $1 ORDER BY created_at DESC`;
-            params = [userId];
+            query = `
+                SELECT 
+                    id, item_name, quantity, urgency, description, status,
+                    requested_by, requested_by_name, created_at, updated_at,
+                    reviewed_by, reviewed_at
+                FROM material_requests 
+                WHERE requested_by = $1::integer
+                ORDER BY created_at DESC
+            `;
+            params = [parseInt(userId, 10)];
         }
 
-        console.log('📝 Query:', query);
-        console.log('📝 Params:', params);
+        console.log('📝 Executing query with params:', params);
 
         const result = await pool.query(query, params);
         console.log(`✅ Found ${result.rows.length} material requests for user ${userId}`);
         res.json(result.rows);
     } catch (err) {
         console.error('❌ Error fetching material requests:', err);
-        console.error('❌ Error details:', {
-            message: err.message,
+        // Return detailed error info so it shows in browser console (not just "Object")
+        res.status(500).json({
+            message: 'Server error fetching material requests',
+            error: err.message,
             code: err.code,
-            detail: err.detail
+            detail: err.detail || null
         });
-        res.status(500).json({ message: 'Server error fetching material requests' });
     }
 });
 

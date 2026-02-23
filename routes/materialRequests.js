@@ -9,7 +9,12 @@ const { createNotification } = require('../utils/notificationHelpers');
 router.post('/', authenticateToken, async (req, res) => {
     try {
         const { item_name, quantity, urgency, description } = req.body;
+        // Support both id and userId field names in JWT payload
         const userId = req.user.userId || req.user.id;
+
+        if (!userId || isNaN(Number(userId))) {
+            return res.status(401).json({ message: 'Invalid authentication token — missing user ID' });
+        }
 
         if (!item_name || !item_name.trim()) {
             return res.status(400).json({ message: 'Item name is required' });
@@ -41,7 +46,7 @@ router.post('/', authenticateToken, async (req, res) => {
                 parseInt(quantity),
                 urgency || 'Medium',
                 description?.trim() || null,
-                userId,
+                userId,     // integer — passed directly, no parseInt needed
                 userName
             ]
         );
@@ -92,8 +97,18 @@ router.post('/', authenticateToken, async (req, res) => {
 // Get material requests (owner sees all, employee sees their own)
 router.get('/', authenticateToken, async (req, res) => {
     try {
+        // Support both id and userId field names in JWT payload (handle stale tokens)
         const userId = req.user.userId || req.user.id;
         const role = req.user.role;
+
+        // Guard: if userId is missing or NaN, return 401 instead of crashing DB
+        if (!userId || isNaN(Number(userId))) {
+            console.error('❌ GET /material-requests: invalid userId from JWT', req.user);
+            return res.status(401).json({
+                message: 'Invalid authentication token — please log out and log back in.',
+                hint: 'Your session token is missing the user ID. Re-login will fix this.'
+            });
+        }
 
         console.log('🔍 Fetching material requests for:', { userId, role, userIdType: typeof userId });
 
@@ -113,16 +128,17 @@ router.get('/', authenticateToken, async (req, res) => {
             params = [];
         } else {
             // Employee sees only their own requests
+            // Pass userId directly — pg driver handles integer coercion, no parseInt needed
             query = `
                 SELECT 
                     id, item_name, quantity, urgency, description, status,
                     requested_by, requested_by_name, created_at, updated_at,
                     reviewed_by, reviewed_at
                 FROM material_requests 
-                WHERE requested_by = $1::integer
+                WHERE requested_by = $1
                 ORDER BY created_at DESC
             `;
-            params = [parseInt(userId, 10)];
+            params = [userId];
         }
 
         console.log('📝 Executing query with params:', params);

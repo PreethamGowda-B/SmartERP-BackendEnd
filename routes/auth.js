@@ -29,25 +29,15 @@ passport.use(
         const googleId = profile.id;
         const name = profile.displayName;
 
-        // Extract role from state (passed from frontend)
-        // Passport decodes the state, but we need to handle it in the callback wrapper usually.
-        // However, with passReqToCallback, we might not get the state directly in req.query.state if passport consumes it.
-        // The standard way in passport-google-oauth20 is to pass state in the authenticate options.
-        // Let's rely on the fact that we will decode the state parameter in the callback handler if needed,
-        // OR we can trust that for new users, we default to 'owner' if not specified, but we want 'employee'.
-
-        // BETTER APPROACH: The state is base64 encoded by passport usually or just passed through.
-        // We will read the role from the decoded state in the route handler, NOT here in the strategy verify callback, 
-        // because the verify callback focus is on finding/creating the user. 
-        // BUT we need the role to create the user. 
-
-        // Let's parse the state from req.query.state manually if available
+        // Extract role and company_code from state (passed from frontend)
         let role = "owner";
+        let company_code = null;
+
         if (req.query.state) {
           try {
-            // Passort-oauth2 passes state as is.
             const stateData = JSON.parse(Buffer.from(req.query.state, 'base64').toString());
             if (stateData.role) role = stateData.role;
+            if (stateData.company_code) company_code = stateData.company_code;
           } catch (e) {
             // Ignore parse error
           }
@@ -60,24 +50,69 @@ passport.use(
         ]);
 
         let user;
+        let companyId = null;
+        let companyCode = null;
 
         if (userResult.rows.length > 0) {
+          // Existing user - just link Google ID if needed
           user = userResult.rows[0];
 
-          // If user exists but no google_id, link it
           if (!user.google_id) {
             await pool.query("UPDATE users SET google_id = $1 WHERE id = $2", [googleId, user.id]);
             user.google_id = googleId;
           }
         } else {
-          // Create new user if not exists
+          // New user - handle company creation/linking
+
+          // OWNER FLOW: Auto-create company
+          if (role === 'owner') {
+            const { generateCompanyId } = require('../utils/companyIdGenerator');
+            companyCode = await generateCompanyId();
+            const companyName = `${name}'s Company`;
+
+            const companyResult = await pool.query(
+              `INSERT INTO companies (company_id, company_name, created_at)
+               VALUES ($1, $2, NOW())
+               RETURNING id, company_id`,
+              [companyCode, companyName]
+            );
+
+            companyId = companyResult.rows[0].id;
+            console.log(`✅ Created company ${companyCode} for Google owner ${email}`);
+          }
+
+          // EMPLOYEE FLOW: Validate and link to company
+          if (role === 'employee') {
+            if (company_code) {
+              const { validateCompanyCode } = require('../utils/companyIdGenerator');
+              const validation = await validateCompanyCode(company_code);
+
+              if (validation.valid) {
+                companyId = validation.company.id;
+                companyCode = validation.company.company_id;
+                console.log(`✅ Google employee ${email} validated for company ${companyCode}`);
+              } else {
+                return done(new Error('Invalid company code'), null);
+              }
+            }
+          }
+
+          // Create new user with company linkage
           const insertResult = await pool.query(
-            `INSERT INTO users (name, email, google_id, role, created_at)
-             VALUES ($1, $2, $3, $4, NOW())
+            `INSERT INTO users (name, email, google_id, role, company_id, company_code, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, NOW())
              RETURNING *`,
-            [name, email, googleId, role]
+            [name, email, googleId, role, companyId, companyCode]
           );
           user = insertResult.rows[0];
+
+          // If owner, update company with owner_id
+          if (role === 'owner' && companyId) {
+            await pool.query(
+              'UPDATE companies SET owner_id = $1 WHERE id = $2',
+              [user.id, companyId]
+            );
+          }
         }
 
         return done(null, user);
@@ -97,12 +132,13 @@ router.get(
   "/google",
   (req, res, next) => {
     const role = req.query.role || "owner";
-    const state = Buffer.from(JSON.stringify({ role })).toString('base64');
+    const company_code = req.query.company_code || null;
+    const state = Buffer.from(JSON.stringify({ role, company_code })).toString('base64');
 
     passport.authenticate("google", {
       scope: ["profile", "email"],
       session: false,
-      state: state // ✅ Pass role in state
+      state: state // ✅ Pass role and company_code in state
     })(req, res, next);
   }
 );
@@ -161,7 +197,7 @@ router.get(
 // ✅ Signup (Register New Users)
 // ---------------------------------------------
 router.post("/signup", async (req, res) => {
-  const { name, email, password, role = "owner", phone, position, department } = req.body;
+  const { name, email, password, role = "owner", phone, position, department, company_code } = req.body;
 
   try {
     const existing = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
@@ -170,46 +206,111 @@ router.post("/signup", async (req, res) => {
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
+    let companyId = null;
+    let companyCode = null;
+    let companyName = null;
 
+    // ✅ OWNER FLOW: Auto-create company
+    if (role.toLowerCase() === 'owner') {
+      const { generateCompanyId } = require('../utils/companyIdGenerator');
+
+      // Generate unique company ID
+      companyCode = await generateCompanyId();
+      companyName = `${name}'s Company` || 'My Company';
+
+      // Create company (owner_id will be set after user creation)
+      const companyResult = await pool.query(
+        `INSERT INTO companies (company_id, company_name, created_at)
+         VALUES ($1, $2, NOW())
+         RETURNING id, company_id`,
+        [companyCode, companyName]
+      );
+
+      companyId = companyResult.rows[0].id;
+      console.log(`✅ Created company ${companyCode} for owner ${email}`);
+    }
+
+    // ✅ EMPLOYEE FLOW: Validate and link to company
+    if (role.toLowerCase() === 'employee') {
+      if (!company_code) {
+        return res.status(400).json({
+          message: "Company code is required for employee registration"
+        });
+      }
+
+      const { validateCompanyCode } = require('../utils/companyIdGenerator');
+      const validation = await validateCompanyCode(company_code);
+
+      if (!validation.valid) {
+        return res.status(400).json({
+          message: "Invalid company code. Please check with your employer."
+        });
+      }
+
+      companyId = validation.company.id;
+      companyCode = validation.company.company_id;
+      companyName = validation.company.company_name;
+      console.log(`✅ Employee ${email} validated for company ${companyCode}`);
+    }
+
+    // Create user with company linkage
     const insert = await pool.query(
-      `INSERT INTO users (name, email, password_hash, role, phone, position, department, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-       RETURNING id, name, email, role, phone, position, department, created_at`,
-      [name, email, hashedPassword, role.toLowerCase(), phone || null, position || null, department || null]
+      `INSERT INTO users (name, email, password_hash, role, phone, position, department, company_id, company_code, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+       RETURNING id, name, email, role, phone, position, department, company_id, company_code, created_at`,
+      [name, email, hashedPassword, role.toLowerCase(), phone || null, position || null, department || null, companyId, companyCode]
     );
 
     const user = insert.rows[0];
+
+    // ✅ If owner, update company with owner_id
+    if (role.toLowerCase() === 'owner' && companyId) {
+      await pool.query(
+        'UPDATE companies SET owner_id = $1 WHERE id = $2',
+        [user.id, companyId]
+      );
+    }
+
     await logActivity(user.id, "signup", req);
 
-    // Send notification to all owners if employee registered
-    if (role.toLowerCase() === 'employee') {
+    // Send notification to owner if employee registered
+    if (role.toLowerCase() === 'employee' && companyId) {
       try {
         const { createNotification } = require('../utils/notificationHelpers');
 
-        // Get all owners (for now, send to all owners since we may not have company_id yet)
-        const ownersResult = await pool.query(
-          `SELECT id FROM users WHERE role IN ('owner', 'admin')`
+        // Get the owner of this company
+        const ownerResult = await pool.query(
+          `SELECT id FROM users WHERE role IN ('owner', 'admin') AND company_id = $1`,
+          [companyId]
         );
 
-        // Send notification to each owner
-        for (const owner of ownersResult.rows) {
+        // Send notification to owner
+        for (const owner of ownerResult.rows) {
           await createNotification({
             user_id: owner.id,
-            company_id: null, // Employee may not have company_id yet
+            company_id: companyId,
             type: 'employee_registration',
             title: 'New Employee Registered',
-            message: `${name || email} created an employee account`,
+            message: `${name || email} joined your company`,
             priority: 'medium',
-            data: { employee_id: user.id, employee_email: email }
+            data: { employee_id: user.id, employee_email: email, company_code: companyCode }
           });
         }
-        console.log(`✅ Notified ${ownersResult.rows.length} owners about new employee registration`);
+        console.log(`✅ Notified owner about new employee: ${email}`);
       } catch (notifErr) {
         console.error('❌ Failed to send employee registration notification:', notifErr);
       }
     }
 
-    res.status(201).json({ ok: true, user });
+    // Return user info with company details
+    res.status(201).json({
+      ok: true,
+      user: {
+        ...user,
+        company_name: companyName
+      },
+      company_code: companyCode  // Return company code for owner to share
+    });
   } catch (err) {
     console.error("Signup error:", err.message);
     res.status(500).json({ message: "Server error during signup" });
@@ -382,6 +483,101 @@ router.post("/logout", async (req, res) => {
   } catch (err) {
     console.error("Logout error:", err.message);
     res.status(500).json({ message: "Server error during logout" });
+  }
+});
+
+// ---------------------------------------------
+// ✅ Validate Company Code
+// ---------------------------------------------
+router.post("/validate-company", async (req, res) => {
+  const { company_code } = req.body;
+
+  if (!company_code) {
+    return res.status(400).json({ message: "Company code is required" });
+  }
+
+  try {
+    const { validateCompanyCode } = require('../utils/companyIdGenerator');
+    const validation = await validateCompanyCode(company_code);
+
+    if (validation.valid) {
+      return res.json({
+        valid: true,
+        company_name: validation.company.company_name,
+        company_id: validation.company.company_id
+      });
+    }
+
+    return res.json({ valid: false });
+  } catch (err) {
+    console.error("Company validation error:", err.message);
+    res.status(500).json({ message: "Server error during validation" });
+  }
+});
+
+// ---------------------------------------------
+// ✅ Get Company Settings (Authenticated)
+// ---------------------------------------------
+router.get("/company/settings", authenticateToken, async (req, res) => {
+  try {
+    const companyId = req.user.companyId;
+
+    if (!companyId) {
+      return res.status(404).json({ message: "No company associated with this account" });
+    }
+
+    const result = await pool.query(
+      'SELECT id, company_id, company_name, created_at FROM companies WHERE id = $1',
+      [companyId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: "Company not found" });
+    }
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error("Get company settings error:", err.message);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+// ---------------------------------------------
+// ✅ Generate Invite Link (Owner Only)
+// ---------------------------------------------
+router.post("/company/generate-invite", authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== 'owner' && req.user.role !== 'admin') {
+      return res.status(403).json({ message: "Only owners can generate invite links" });
+    }
+
+    const companyId = req.user.companyId;
+
+    if (!companyId) {
+      return res.status(404).json({ message: "No company associated with this account" });
+    }
+
+    const result = await pool.query(
+      'SELECT company_id, company_name FROM companies WHERE id = $1',
+      [companyId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: "Company not found" });
+    }
+
+    const company = result.rows[0];
+    const frontendUrl = process.env.FRONTEND_ORIGIN || "https://www.prozync.in";
+    const inviteLink = `${frontendUrl}/join?company=${company.company_id}`;
+
+    res.json({
+      invite_link: inviteLink,
+      company_id: company.company_id,
+      company_name: company.company_name
+    });
+  } catch (err) {
+    console.error("Generate invite link error:", err.message);
+    res.status(500).json({ message: "Server error" });
   }
 });
 

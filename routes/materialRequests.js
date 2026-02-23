@@ -39,14 +39,14 @@ router.post('/', authenticateToken, async (req, res) => {
         const result = await pool.query(
             `INSERT INTO material_requests 
        (item_name, quantity, urgency, description, requested_by, requested_by_name, created_at) 
-       VALUES ($1, $2, $3, $4, $5, $6, NOW()) 
+       VALUES ($1, $2, $3, $4, $5::uuid, $6, NOW()) 
        RETURNING *`,
             [
                 item_name.trim(),
                 parseInt(quantity),
                 urgency || 'Medium',
                 description?.trim() || null,
-                userId,     // integer — passed directly, no parseInt needed
+                String(userId),  // UUID string — cast to uuid in SQL
                 userName
             ]
         );

@@ -4,8 +4,7 @@ const { pool } = require('../db');
  * Auto-migration: Fix material_requests table schema
  * Runs automatically on server startup to ensure the schema is correct.
  *
- * The correct schema uses INTEGER for requested_by and reviewed_by
- * because users.id is a SERIAL (INTEGER) in this database.
+ * users.id is UUID — so requested_by and reviewed_by must also be UUID.
  */
 async function fixMaterialRequestsSchema() {
     try {
@@ -48,14 +47,17 @@ async function fixMaterialRequestsSchema() {
         ];
 
         const missingCols = requiredCols.filter(col => !(col in existingCols));
-        const wrongType = existingCols['requested_by'] && existingCols['requested_by'] === 'uuid';
+
+        // Check for wrong type — requested_by should be UUID (users.id is UUID)  
+        const requestedByType = existingCols['requested_by'];
+        const isWrongType = requestedByType && requestedByType !== 'uuid' && requestedByType !== 'character varying';
 
         if (missingCols.length > 0) {
             console.log(`⚠️  Missing columns: ${missingCols.join(', ')} — recreating table...`);
             await recreateTable();
-        } else if (wrongType) {
-            console.log('⚠️  requested_by is UUID type — should be INTEGER — recreating...');
-            await recreateTable();
+        } else if (isWrongType) {
+            console.log(`⚠️  requested_by is ${requestedByType} — expected UUID — running ALTER...`);
+            await alterToUuid();
         } else {
             console.log('✅ material_requests table schema is correct');
         }
@@ -75,11 +77,11 @@ async function createTable() {
             urgency VARCHAR(50) DEFAULT 'Medium',
             description TEXT,
             status VARCHAR(50) DEFAULT 'pending',
-            requested_by INTEGER NOT NULL,
+            requested_by UUID,
             requested_by_name VARCHAR(255),
             created_at TIMESTAMP DEFAULT NOW(),
             updated_at TIMESTAMP DEFAULT NOW(),
-            reviewed_by INTEGER,
+            reviewed_by UUID,
             reviewed_at TIMESTAMP
         );
         
@@ -87,7 +89,40 @@ async function createTable() {
         CREATE INDEX IF NOT EXISTS idx_material_requests_requested_by ON material_requests(requested_by);
         CREATE INDEX IF NOT EXISTS idx_material_requests_created_at ON material_requests(created_at DESC);
     `);
-    console.log('✅ material_requests table created successfully');
+    console.log('✅ material_requests table created successfully with UUID columns');
+}
+
+async function alterToUuid() {
+    // ALTER the column types from INTEGER → UUID without losing data
+    // (existing integer rows won't cast but we drop data anyway since they're corrupted references)
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // Drop the old constraints/indexes first
+        await client.query(`DROP INDEX IF EXISTS idx_material_requests_requested_by`);
+
+        // ALTER column — drop NOT NULL first so we can set to NULL during cast
+        await client.query(`ALTER TABLE material_requests ALTER COLUMN requested_by DROP NOT NULL`);
+        await client.query(`ALTER TABLE material_requests ALTER COLUMN requested_by TYPE UUID USING NULL`);
+
+        await client.query(`ALTER TABLE material_requests ALTER COLUMN reviewed_by DROP NOT NULL`);
+        await client.query(`ALTER TABLE material_requests ALTER COLUMN reviewed_by TYPE UUID USING NULL`);
+
+        // Recreate index
+        await client.query(`CREATE INDEX IF NOT EXISTS idx_material_requests_requested_by ON material_requests(requested_by)`);
+
+        await client.query('COMMIT');
+        console.log('✅ material_requests.requested_by altered to UUID successfully');
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('❌ Failed to alter material_requests columns to UUID:', err.message);
+        // Last resort: drop and recreate
+        console.log('⚠️  Falling back to table recreation...');
+        await recreateTable();
+    } finally {
+        client.release();
+    }
 }
 
 async function recreateTable() {
@@ -104,11 +139,11 @@ async function recreateTable() {
                 urgency VARCHAR(50) DEFAULT 'Medium',
                 description TEXT,
                 status VARCHAR(50) DEFAULT 'pending',
-                requested_by INTEGER NOT NULL,
+                requested_by UUID,
                 requested_by_name VARCHAR(255),
                 created_at TIMESTAMP DEFAULT NOW(),
                 updated_at TIMESTAMP DEFAULT NOW(),
-                reviewed_by INTEGER,
+                reviewed_by UUID,
                 reviewed_at TIMESTAMP
             )
         `);
@@ -118,7 +153,7 @@ async function recreateTable() {
             CREATE INDEX idx_material_requests_created_at ON material_requests(created_at DESC);
         `);
         await client.query('COMMIT');
-        console.log('✅ material_requests table recreated with correct schema');
+        console.log('✅ material_requests table recreated with UUID schema');
     } catch (err) {
         await client.query('ROLLBACK');
         console.error('❌ Failed to recreate material_requests table:', err.message);

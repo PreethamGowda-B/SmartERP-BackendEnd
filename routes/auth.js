@@ -593,4 +593,28 @@ router.get("/", (req, res) => {
   res.json({ message: "Auth API working fine ✅" });
 });
 
+// ─── PATCH /api/auth/update-push-token ───────────────────────────────────────
+// Update user's push notification token for mobile/web push
+router.patch('/update-push-token', authenticateToken, async (req, res) => {
+  try {
+    const { pushToken } = req.body;
+    const userId = req.user.userId || req.user.id;
+
+    if (!pushToken) {
+      return res.status(400).json({ message: 'Push token is required' });
+    }
+
+    await pool.query(
+      'UPDATE users SET push_token = $1 WHERE id = $2',
+      [pushToken, userId]
+    );
+
+    console.log(`✅ Push token updated for user ${userId}`);
+    res.json({ message: 'Push token updated successfully' });
+  } catch (err) {
+    console.error('❌ Error updating push token:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 module.exports = router;

@@ -1,10 +1,11 @@
 const { pool } = require('../db');
+const { sendPushNotification } = require('../services/firebaseService');
 
 // Store active SSE connections: { userId: [response1, response2, ...] }
 const sseConnections = new Map();
 
 /**
- * Create a notification in the database and broadcast it via SSE
+ * Create a notification in the database and broadcast it via SSE and Push
  */
 async function createNotification({ user_id, company_id, type, title, message, priority = 'medium', data = null }) {
     try {
@@ -17,11 +18,30 @@ async function createNotification({ user_id, company_id, type, title, message, p
 
         const notification = result.rows[0];
 
-        // Broadcast to user via SSE
+        // 1. Broadcast to user via SSE (Real-time Web UI)
         broadcastToUser(user_id, {
             type: 'notification',
             data: notification
         });
+
+        // 2. Send Push Notification (Real-time Background/Mobile)
+        try {
+            // Fetch user's push token from DB
+            const userResult = await pool.query('SELECT push_token FROM users WHERE id = $1', [user_id]);
+            const pushToken = userResult.rows[0]?.push_token;
+
+            if (pushToken) {
+                await sendPushNotification(pushToken, title, message, {
+                    type,
+                    notificationId: notification.id.toString(),
+                    url: `/notifications` // Default redirect
+                });
+                console.log(`📡 Push notification sent to user ${user_id}`);
+            }
+        } catch (pushErr) {
+            console.error('⚠️ Failed to send push notification:', pushErr.message);
+            // Don't throw, we don't want to break the main notification flow
+        }
 
         console.log(`✅ Notification created and broadcast to user ${user_id}:`, title);
         return notification;

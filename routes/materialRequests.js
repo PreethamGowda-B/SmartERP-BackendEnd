@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
-const { createNotification } = require('../utils/notificationHelpers');
+const { createNotification, createNotificationForOwners } = require('../utils/notificationHelpers');
 
 // ─── POST /api/material-requests ─────────────────────────────────────────────
 // Create new material request (employee)
@@ -57,26 +57,16 @@ router.post('/', authenticateToken, async (req, res) => {
         try {
             const companyId = req.user.companyId;
 
-            // Get all owners
-            const ownersResult = await pool.query(
-                `SELECT id FROM users WHERE role IN ('owner', 'admin')
-                 ${companyId && companyId !== '00000000-0000-0000-0000-000000000000' ? 'AND (company_id = $1 OR company_id IS NULL)' : ''}`,
-                companyId && companyId !== '00000000-0000-0000-0000-000000000000' ? [companyId] : []
-            );
+            await createNotificationForOwners({
+                company_id: companyId,
+                type: 'material_request_created',
+                title: 'New Material Request',
+                message: `${userName} requested ${quantity} ${item_name}`,
+                priority: urgency === 'High' ? 'high' : 'medium',
+                data: { request_id: createdRequest.id, item_name, quantity, urgency }
+            });
 
-            // Send notification to each owner
-            for (const owner of ownersResult.rows) {
-                await createNotification({
-                    user_id: owner.id,
-                    company_id: companyId,
-                    type: 'material_request_created',
-                    title: 'New Material Request',
-                    message: `${userName} requested ${quantity} ${item_name}`,
-                    priority: urgency === 'High' ? 'high' : 'medium',
-                    data: { request_id: createdRequest.id, item_name, quantity, urgency }
-                });
-            }
-            console.log(`✅ Notified ${ownersResult.rows.length} owners about new material request`);
+            console.log(`✅ Notified owners about new material request`);
         } catch (notifErr) {
             console.error('❌ Failed to send material request creation notification:', notifErr);
         }

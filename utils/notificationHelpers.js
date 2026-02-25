@@ -102,14 +102,99 @@ function unregisterSSEConnection(userId, response) {
 }
 
 /**
- * Get count of active connections for a user
+ * Create notifications for all employees in a company
  */
-function getConnectionCount(userId) {
-    return sseConnections.get(userId)?.length || 0;
+async function createNotificationForCompany({ company_id, type, title, message, priority = 'medium', data = null, exclude_user_id = null }) {
+    try {
+        // 1. Fetch all employees for the company
+        let query = 'SELECT id FROM users WHERE role = \'employee\'';
+        let params = [];
+
+        if (company_id) {
+            query += ' AND (company_id = $1 OR company_id IS NULL)';
+            params.push(company_id);
+        }
+
+        if (exclude_user_id) {
+            query += ` AND id != $${params.length + 1}`;
+            params.push(exclude_user_id);
+        }
+
+        const employeesResult = await pool.query(query, params);
+        const employees = employeesResult.rows;
+
+        console.log(`📣 Broadcasting notification to ${employees.length} employees for company ${company_id || 'Global'}`);
+
+        // 2. Create notifications for each (Parallel)
+        const notificationPromises = employees.map(emp =>
+            createNotification({
+                user_id: emp.id,
+                company_id,
+                type,
+                title,
+                message,
+                priority,
+                data
+            }).catch(err => console.error(`❌ Failed to notify employee ${emp.id}:`, err.message))
+        );
+
+        await Promise.all(notificationPromises);
+        return { success: true, count: employees.length };
+    } catch (err) {
+        console.error('❌ Error in createNotificationForCompany:', err);
+        throw err;
+    }
+}
+
+/**
+ * Create notifications for all owners/admins in a company
+ */
+async function createNotificationForOwners({ company_id, type, title, message, priority = 'medium', data = null, exclude_user_id = null }) {
+    try {
+        // 1. Fetch all owners and admins for the company
+        let query = "SELECT id FROM users WHERE role IN ('owner', 'admin')";
+        let params = [];
+
+        if (company_id && company_id !== '00000000-0000-0000-0000-000000000000') {
+            query += " AND (company_id = $1 OR company_id IS NULL)";
+            params.push(company_id);
+        }
+
+        if (exclude_user_id) {
+            query += ` AND id != $${params.length + 1}`;
+            params.push(exclude_user_id);
+        }
+
+        const ownersResult = await pool.query(query, params);
+        const owners = ownersResult.rows;
+
+        console.log(`📣 Broadcasting notification to ${owners.length} owners/admins for company ${company_id || 'Global'}`);
+
+        // 2. Create notifications for each (Parallel)
+        const notificationPromises = owners.map(owner =>
+            createNotification({
+                user_id: owner.id,
+                company_id,
+                type,
+                title,
+                message,
+                priority,
+                data
+            }).catch(err => console.error(`❌ Failed to notify owner ${owner.id}:`, err.message))
+        );
+
+        await Promise.all(notificationPromises);
+        return { success: true, count: owners.length };
+    } catch (err) {
+        console.error('❌ Error in createNotificationForOwners:', err);
+        throw err;
+    }
 }
 
 module.exports = {
     createNotification,
+    createNotificationForCompany,
+    createNotificationForOwners,
     broadcastToUser,
     registerSSEConnection,
     unregisterSSEConnection,

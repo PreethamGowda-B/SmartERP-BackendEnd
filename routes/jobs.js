@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
-const { createNotification } = require('../utils/notificationHelpers');
+const { createNotification, createNotificationForCompany } = require('../utils/notificationHelpers');
 
 /**
  * Ensure the jobs table can store JSON payloads, visibility flag, and employee tracking
@@ -92,9 +92,20 @@ router.post('/', authenticateToken, async (req, res) => {
 
     const createdJob = result.rows[0];
 
-    // Send notification to assigned employee
-    if (assignedTo) {
-      try {
+    // Send notification to assigned employee OR broadcast to all if visible to all
+    try {
+      if (visibleToAll) {
+        await createNotificationForCompany({
+          company_id: req.user.companyId,
+          type: 'job',
+          title: 'New Job Available',
+          message: `A new job is available for everyone: ${title}`,
+          priority: job.priority || 'medium',
+          data: { job_id: createdJob.id, job_title: title },
+          exclude_user_id: req.user.id // Don't notify the owner who created it
+        });
+        console.log(`✅ Broadcast notification sent for new job: ${title}`);
+      } else if (assignedTo) {
         await createNotification({
           user_id: assignedTo,
           company_id: req.user.companyId,
@@ -104,11 +115,11 @@ router.post('/', authenticateToken, async (req, res) => {
           priority: job.priority || 'medium',
           data: { job_id: createdJob.id, job_title: title }
         });
-        console.log(`✅ Notification sent for new job: ${title}`);
-      } catch (notifErr) {
-        console.error('❌ Failed to send job notification:', notifErr);
-        // Don't fail the job creation if notification fails
+        console.log(`✅ Specific notification sent to assigned employee for job: ${title}`);
       }
+    } catch (notifErr) {
+      console.error('❌ Failed to send job notification:', notifErr);
+      // Don't fail the job creation if notification fails
     }
 
     res.json(createdJob);
@@ -352,7 +363,31 @@ router.post('/:id/progress', authenticateToken, async (req, res) => {
       [progress, status, completed_at, id]
     );
 
-    res.json(result.rows[0]);
+    const updatedJob = result.rows[0];
+
+    // Notification for job completion
+    if (progress === 100) {
+      try {
+        // Get employee name
+        const userInfo = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+        const employeeName = userInfo.rows[0]?.name || 'Employee';
+
+        await createNotification({
+          user_id: updatedJob.created_by,
+          company_id: req.user.companyId,
+          type: 'job_completed',
+          title: 'Job Completed',
+          message: `${employeeName} completed the job: ${updatedJob.title}`,
+          priority: 'medium',
+          data: { job_id: updatedJob.id, employee_id: req.user.id }
+        });
+        console.log(`✅ Notified owner about job completion`);
+      } catch (notifErr) {
+        console.error('❌ Failed to send job completion notification:', notifErr);
+      }
+    }
+
+    res.json(updatedJob);
   } catch (err) {
     console.error('jobs PROGRESS error', err);
     res.status(500).json({ message: 'Server error' });

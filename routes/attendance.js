@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
-const { createNotification } = require('../utils/notificationHelpers');
+const { createNotification, createNotificationForOwners } = require('../utils/notificationHelpers');
 
 // ─── ENTERPRISE ATTENDANCE SYSTEM ────────────────────────────────────────────
 // Shift Times: 9:00 AM - 7:00 PM
@@ -148,26 +148,16 @@ router.post('/clock-in', authenticateToken, async (req, res) => {
       const userInfo = await pool.query('SELECT name FROM users WHERE id = $1', [userId]);
       const employeeName = userInfo.rows[0]?.name || 'Employee';
 
-      // Get all owners
-      const ownersResult = await pool.query(
-        `SELECT id FROM users WHERE role IN ('owner', 'admin')
-         ${companyId && companyId !== '00000000-0000-0000-0000-000000000000' ? 'AND (company_id = $1 OR company_id IS NULL)' : ''}`,
-        companyId && companyId !== '00000000-0000-0000-0000-000000000000' ? [companyId] : []
-      );
+      await createNotificationForOwners({
+        company_id: companyId,
+        type: 'employee_clock_in',
+        title: 'Employee Clocked In',
+        message: `${employeeName} clocked in at ${clockInTime.toLocaleTimeString()}${isLate ? ' (Late)' : ''}`,
+        priority: isLate ? 'medium' : 'low',
+        data: { employee_id: userId, attendance_id: result.rows[0].id, is_late: isLate }
+      });
 
-      // Send notification to each owner
-      for (const owner of ownersResult.rows) {
-        await createNotification({
-          user_id: owner.id,
-          company_id: companyId,
-          type: 'employee_clock_in',
-          title: 'Employee Clocked In',
-          message: `${employeeName} clocked in at ${clockInTime.toLocaleTimeString()}${isLate ? ' (Late)' : ''}`,
-          priority: isLate ? 'medium' : 'low',
-          data: { employee_id: userId, attendance_id: result.rows[0].id, is_late: isLate }
-        });
-      }
-      console.log(`✅ Notified ${ownersResult.rows.length} owners about clock-in`);
+      console.log(`✅ Notified owners about clock-in`);
     } catch (notifErr) {
       console.error('❌ Failed to send clock-in notification to owners:', notifErr);
     }
@@ -246,26 +236,16 @@ router.post('/clock-out', authenticateToken, async (req, res) => {
       const employeeName = userInfo.rows[0]?.name || 'Employee';
       const companyId = req.user.companyId || '00000000-0000-0000-0000-000000000000';
 
-      // Get all owners
-      const ownersResult = await pool.query(
-        `SELECT id FROM users WHERE role IN ('owner', 'admin')
-         ${companyId && companyId !== '00000000-0000-0000-0000-000000000000' ? 'AND (company_id = $1 OR company_id IS NULL)' : ''}`,
-        companyId && companyId !== '00000000-0000-0000-0000-000000000000' ? [companyId] : []
-      );
+      await createNotificationForOwners({
+        company_id: companyId,
+        type: 'employee_clock_out',
+        title: 'Employee Clocked Out',
+        message: `${employeeName} clocked out. Hours: ${workingHours.toFixed(2)}, Status: ${status}`,
+        priority: 'low',
+        data: { employee_id: userId, attendance_id: result.rows[0].id, working_hours: workingHours, status }
+      });
 
-      // Send notification to each owner
-      for (const owner of ownersResult.rows) {
-        await createNotification({
-          user_id: owner.id,
-          company_id: companyId,
-          type: 'employee_clock_out',
-          title: 'Employee Clocked Out',
-          message: `${employeeName} clocked out. Hours: ${workingHours.toFixed(2)}, Status: ${status}`,
-          priority: 'low',
-          data: { employee_id: userId, attendance_id: result.rows[0].id, working_hours: workingHours, status }
-        });
-      }
-      console.log(`✅ Notified ${ownersResult.rows.length} owners about clock-out`);
+      console.log(`✅ Notified owners about clock-out`);
     } catch (notifErr) {
       console.error('❌ Failed to send clock-out notification to owners:', notifErr);
     }
@@ -378,21 +358,15 @@ router.post('/corrections', authenticateToken, async (req, res) => {
 
     // Notify owner
     try {
-      const ownerResult = await pool.query(
-        "SELECT id FROM users WHERE role = 'owner' LIMIT 1"
-      );
-
-      if (ownerResult.rows.length > 0) {
-        await createNotification({
-          user_id: ownerResult.rows[0].id,
-          company_id: companyId,
-          type: 'attendance_correction_request',
-          title: 'Attendance Correction Request',
-          message: `Employee has requested attendance correction`,
-          priority: 'medium',
-          data: { correction_id: result.rows[0].id, user_id: userId }
-        });
-      }
+      await createNotificationForOwners({
+        company_id: companyId,
+        type: 'attendance_correction_request',
+        title: 'Attendance Correction Request',
+        message: `Employee has requested attendance correction`,
+        priority: 'medium',
+        data: { correction_id: result.rows[0].id, user_id: userId }
+      });
+      console.log(`✅ Notified owners about correction request`);
     } catch (notifErr) {
       console.error('❌ Failed to send correction request notification:', notifErr);
     }

@@ -81,29 +81,20 @@ router.post('/', authenticateToken, upload.single('image'), async (req, res) => 
 
         // Send notification to all employees about new inventory
         try {
-            const { createNotification } = require('../utils/notificationHelpers');
+            const { createNotificationForCompany } = require('../utils/notificationHelpers');
             const companyId = req.user.companyId;
 
-            // Get all employees
-            const employeesResult = await pool.query(
-                `SELECT id FROM users WHERE role = 'employee'
-                 ${companyId && companyId !== '00000000-0000-0000-0000-000000000000' ? 'AND (company_id = $1 OR company_id IS NULL)' : ''}`,
-                companyId && companyId !== '00000000-0000-0000-0000-000000000000' ? [companyId] : []
-            );
+            await createNotificationForCompany({
+                company_id: companyId,
+                type: 'inventory_added',
+                title: 'New Inventory Added',
+                message: `${name} (${quantity} ${itemUnit}) has been added to inventory`,
+                priority: 'low',
+                data: { inventory_id: newItem.id, item_name: name, quantity },
+                exclude_user_id: userId // Don't notify the person who added it
+            });
 
-            // Send notification to each employee
-            for (const employee of employeesResult.rows) {
-                await createNotification({
-                    user_id: employee.id,
-                    company_id: companyId,
-                    type: 'inventory_added',
-                    title: 'New Inventory Added',
-                    message: `${name} (${quantity} ${itemUnit}) has been added to inventory`,
-                    priority: 'low',
-                    data: { inventory_id: newItem.id, item_name: name, quantity }
-                });
-            }
-            console.log(`✅ Notified ${employeesResult.rows.length} employees about new inventory`);
+            console.log(`✅ Broadcast notification sent for new inventory: ${name}`);
         } catch (notifErr) {
             console.error('❌ Failed to send inventory notification:', notifErr);
         }

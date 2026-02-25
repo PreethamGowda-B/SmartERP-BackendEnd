@@ -197,6 +197,5 @@ module.exports = {
     createNotificationForOwners,
     broadcastToUser,
     registerSSEConnection,
-    unregisterSSEConnection,
-    getConnectionCount
+    unregisterSSEConnection
 };

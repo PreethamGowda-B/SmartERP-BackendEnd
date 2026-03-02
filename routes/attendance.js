@@ -4,6 +4,13 @@ const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 const { createNotification, createNotificationForOwners } = require('../utils/notificationHelpers');
 
+// UUID validation — guards against non-UUID values like '1' coming from older JWT tokens
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const DEFAULT_COMPANY_ID = '00000000-0000-0000-0000-000000000000';
+function safeUUID(value) {
+  return value && UUID_RE.test(value) ? value : DEFAULT_COMPANY_ID;
+}
+
 // ─── ENTERPRISE ATTENDANCE SYSTEM ────────────────────────────────────────────
 // Shift Times: 9:00 AM - 7:00 PM
 // Auto clock-out, half-day detection, biometric support, daily processing
@@ -79,7 +86,7 @@ function determineStatus(clockInTime, clockOutTime, workingHours) {
 router.post('/clock-in', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId || req.user.id;
-    const companyId = req.user.companyId || '00000000-0000-0000-0000-000000000000';
+    const companyId = safeUUID(req.user.companyId);
     const { biometric_device_id, method = 'manual' } = req.body;
     const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
     const clockInTime = new Date();
@@ -245,7 +252,7 @@ router.post('/clock-out', authenticateToken, async (req, res) => {
       // Get employee name
       const userInfo = await pool.query('SELECT name FROM users WHERE id = $1', [userId]);
       const employeeName = userInfo.rows[0]?.name || 'Employee';
-      const companyId = req.user.companyId || '00000000-0000-0000-0000-000000000000';
+      const companyId = safeUUID(req.user.companyId);
 
       await createNotificationForOwners({
         company_id: companyId,
@@ -336,7 +343,7 @@ router.get('/history', authenticateToken, async (req, res) => {
 router.post('/corrections', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId || req.user.id;
-    const companyId = req.user.companyId || '00000000-0000-0000-0000-000000000000';
+    const companyId = safeUUID(req.user.companyId);
     const { attendance_id, requested_check_in, requested_check_out, reason } = req.body;
 
     if (!attendance_id || !reason) {

@@ -21,50 +21,53 @@ function calculateWorkingHours(clockInTime, clockOutTime) {
 
 /**
  * Check if clock-in is late (after 9:00 AM)
- * Enterprise Rule: Shift starts at 9:00 AM
- */
-/**
- * Check if clock-in is late (after 9:00 AM sharp)
- * On-time: exactly 9:00 AM (hour=9, minute=0)
- * Late: 9:01 AM through 11:00 AM
- * Cutoff: after 11:00 AM
+ * Late: 9:01 AM – 12:59 PM
  */
 function isLateCheckIn(clockInTime) {
+  const d = new Date(clockInTime);
+  const hour = d.getHours();
+  const minute = d.getMinutes();
+  // Late if after 9:00 AM sharp and before 1:00 PM
+  const afterNine = hour > 9 || (hour === 9 && minute > 0);
+  const beforeOne = hour < 13;
+  return afterNine && beforeOne;
+}
+
+/**
+ * Check if clock-in qualifies as Half Day (at or after 1:00 PM)
+ */
+function isHalfDayClockIn(clockInTime) {
   const hour = new Date(clockInTime).getHours();
-  const minute = new Date(clockInTime).getMinutes();
-  // Late if after 9:00 AM sharp (i.e., 9:01 AM onwards)
-  return hour > 9 || (hour === 9 && minute > 0);
+  return hour >= 13;
 }
 
 /**
  * Check if clock-out is before shift end (7:00 PM)
- * Used for half-day detection
  */
 function isEarlyClockOut(clockOutTime) {
   const hour = new Date(clockOutTime).getHours();
-  // Early if before 7:00 PM (before 19:00)
   return hour < 19;
 }
 
 /**
- * Determine attendance status based on clock times and working hours
- * Enterprise Rules:
- * - Clock out before 7 PM → Half Day
- * - Clock out at/after 7 PM with >= 8 hours → Present
- * - Clock out at/after 7 PM with < 8 hours → Half Day
+ * Determine final attendance status.
+ * Rules (in priority order):
+ *  1. Clocked in at/after 1:00 PM                      → half_day
+ *  2. Clocked out before 7:00 PM                        → half_day
+ *  3. Clocked in between 9:01 AM and 12:59 PM           → late
+ *  4. Clocked in before 9:00 AM, out at/after 7:00 PM  → present
  */
 function determineStatus(clockInTime, clockOutTime, workingHours) {
-  const isEarly = isEarlyClockOut(clockOutTime);
-
-  if (isEarly) {
-    return 'half_day'; // Clocked out before 7 PM
+  if (isHalfDayClockIn(clockInTime)) {
+    return 'half_day'; // Came in after 1 PM
   }
-
-  if (workingHours >= 8) {
-    return 'present'; // Full day
+  if (isEarlyClockOut(clockOutTime)) {
+    return 'half_day'; // Left before 7 PM
   }
-
-  return 'half_day'; // Less than 8 hours
+  if (isLateCheckIn(clockInTime)) {
+    return 'late';    // 9:01 AM – 12:59 PM
+  }
+  return 'present';   // On time and stayed till 7 PM
 }
 
 // ─── EMPLOYEE ENDPOINTS ──────────────────────────────────────────────────────
@@ -80,41 +83,28 @@ router.post('/clock-in', authenticateToken, async (req, res) => {
     const { biometric_device_id, method = 'manual' } = req.body;
     const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
     const clockInTime = new Date();
-    const currentHour = clockInTime.getHours();
-
-    // ── Attendance window rules ─────────────────────────────────────────────
-    // Clock-in window: 9:00 AM – 11:00 AM
-    //   • Before 9:00 AM  → blocked (too early)
-    //   • 9:00 AM exactly → on time
-    //   • 9:01 – 11:00   → allowed, marked as LATE
-    //   • After 11:00 AM  → rejected (time is over for today)
-    // ────────────────────────────────────────────────────────────────────────
 
     const clockHour = clockInTime.getHours();
     const clockMinute = clockInTime.getMinutes();
 
-    // Too early: before 9:00 AM
-    if (clockHour < 9) {
-      return res.status(400).json({
-        message: 'Clock-in opens at 9:00 AM. You are too early!',
-        code: 'TOO_EARLY',
-        current_time: clockInTime.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })
-      });
-    }
+    // ── Attendance window rules ─────────────────────────────────────────────
+    // Before 9:00 AM  → Present (on time / early)
+    // 9:01 – 12:59    → Late
+    // 13:00 – 18:59   → Half Day (came in after 1 PM)
+    // 19:00+          → Blocked (shift is over)
+    // ────────────────────────────────────────────────────────────────────────
 
-    // Too late: strictly after 11:00 AM (cutoff)
-    // 11:00 AM sharp = last minute allowed
-    // 11:01 AM onwards = closed
-    if (clockHour > 11 || (clockHour === 11 && clockMinute > 0)) {
+    // Shift over: at or after 7:00 PM
+    if (clockHour >= 19) {
       return res.status(400).json({
-        message: "⏰ Your time is over! Clock-in closed at 11:00 AM. Come tomorrow and clock in early. Shift starts at 9:00 AM — try to be on time!",
-        code: 'CUTOFF_PASSED',
+        message: '⏰ Shift is over for today! Clock-in closed at 7:00 PM. See you tomorrow — try to clock in before 9:00 AM!',
+        code: 'SHIFT_OVER',
         current_time: clockInTime.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true })
       });
     }
-    // 11:00 AM sharp is the last allowed minute
 
-    const isLate = isLateCheckIn(clockInTime);
+    const isLate = isLateCheckIn(clockInTime);           // 9:01 AM – 12:59 PM
+    const isHalfDay = isHalfDayClockIn(clockInTime);    // 1:00 PM+
 
     // Check if already clocked in today
     const existing = await pool.query(
@@ -129,22 +119,28 @@ router.post('/clock-in', authenticateToken, async (req, res) => {
       });
     }
 
-    // Create or update attendance record with enterprise fields
+    // Determine provisional status at clock-in time
+    let provisionalStatus = 'present';
+    if (isHalfDay) provisionalStatus = 'half_day';
+    else if (isLate) provisionalStatus = 'late';
+
+    // Create or update attendance record
     const result = await pool.query(
       `INSERT INTO attendance 
-             (user_id, company_id, date, check_in_time, is_late, clock_in_method, biometric_device_id, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+             (user_id, company_id, date, check_in_time, is_late, status, clock_in_method, biometric_device_id, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
              ON CONFLICT (user_id, date) 
-             DO UPDATE SET check_in_time = $4, is_late = $5, clock_in_method = $6, biometric_device_id = $7, updated_at = NOW()
+             DO UPDATE SET check_in_time = $4, is_late = $5, status = $6, clock_in_method = $7, biometric_device_id = $8, updated_at = NOW()
              RETURNING *`,
-      [userId, companyId, today, clockInTime, isLate, method, biometric_device_id]
+      [userId, companyId, today, clockInTime, isLate, provisionalStatus, method, biometric_device_id]
     );
 
-    console.log(`✅ Clock-in recorded for user ${userId} at ${clockInTime.toLocaleTimeString()} (${method})`);
+    // Build human-readable status label
+    const statusLabel = isHalfDay ? 'Half Day' : isLate ? 'Late' : 'Present';
+    console.log(`✅ Clock-in recorded for user ${userId} at ${clockInTime.toLocaleTimeString()} — ${statusLabel} (${method})`);
 
     // Send notification to owners about employee clock-in
     try {
-      // Get employee name
       const userInfo = await pool.query('SELECT name FROM users WHERE id = $1', [userId]);
       const employeeName = userInfo.rows[0]?.name || 'Employee';
 
@@ -152,9 +148,9 @@ router.post('/clock-in', authenticateToken, async (req, res) => {
         company_id: companyId,
         type: 'employee_clock_in',
         title: 'Employee Clocked In',
-        message: `${employeeName} clocked in at ${clockInTime.toLocaleTimeString()}${isLate ? ' (Late)' : ''}`,
-        priority: isLate ? 'medium' : 'low',
-        data: { employee_id: userId, attendance_id: result.rows[0].id, is_late: isLate }
+        message: `${employeeName} clocked in at ${clockInTime.toLocaleTimeString()} (${statusLabel})`,
+        priority: isHalfDay ? 'high' : isLate ? 'medium' : 'low',
+        data: { employee_id: userId, attendance_id: result.rows[0].id, is_late: isLate, status: provisionalStatus }
       });
 
       console.log(`✅ Notified owners about clock-in`);
@@ -162,8 +158,22 @@ router.post('/clock-in', authenticateToken, async (req, res) => {
       console.error('❌ Failed to send clock-in notification to owners:', notifErr);
     }
 
-    // Send late notification if applicable (after 9 AM)
-    if (isLate) {
+    // Send late / half-day notification to employee
+    if (isHalfDay) {
+      try {
+        await createNotification({
+          user_id: userId,
+          company_id: companyId,
+          type: 'attendance_half_day',
+          title: 'Half Day Recorded',
+          message: `You clocked in at ${clockInTime.toLocaleTimeString()} — recorded as Half Day. Shift started at 9:00 AM.`,
+          priority: 'medium',
+          data: { attendance_id: result.rows[0].id }
+        });
+      } catch (notifErr) {
+        console.error('❌ Failed to send half-day notification:', notifErr);
+      }
+    } else if (isLate) {
       try {
         await createNotification({
           user_id: userId,
@@ -179,7 +189,8 @@ router.post('/clock-in', authenticateToken, async (req, res) => {
       }
     }
 
-    res.json(result.rows[0]);
+    // Return record with status label for the frontend
+    res.json({ ...result.rows[0], status_label: statusLabel });
   } catch (err) {
     console.error('❌ Clock-in error:', err);
     res.status(500).json({ message: 'Server error during clock-in' });

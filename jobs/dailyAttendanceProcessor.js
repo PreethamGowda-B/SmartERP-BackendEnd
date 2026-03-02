@@ -30,9 +30,12 @@ function startDailyAttendanceProcessor() {
                     working_hours = EXTRACT(EPOCH FROM (
                         (date || ' 19:00:00')::timestamp - check_in_time
                     )) / 3600,
-                    status = CASE 
-                        WHEN EXTRACT(EPOCH FROM ((date || ' 19:00:00')::timestamp - check_in_time)) / 3600 >= 8 THEN 'present'
-                        ELSE 'half_day'
+                    status = CASE
+                        WHEN EXTRACT(HOUR FROM check_in_time) >= 13 THEN 'half_day'
+                        WHEN EXTRACT(HOUR FROM check_in_time) > 9
+                          OR (EXTRACT(HOUR FROM check_in_time) = 9 AND EXTRACT(MINUTE FROM check_in_time) > 0)
+                          THEN 'late'
+                        ELSE 'present'
                     END,
                     updated_at = NOW()
                 WHERE date = $1 

@@ -110,17 +110,36 @@ router.put('/notification-prefs', authenticateToken, async (req, res) => {
 });
 
 // ─── GET /api/settings/company ────────────────────────────────────────────────
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 router.get('/company', authenticateToken, async (req, res) => {
     try {
         if (req.user.role !== 'owner' && req.user.role !== 'admin') {
             return res.status(403).json({ message: 'Access denied' });
         }
-        const companyId = req.user.companyId;
-        const result = await pool.query(
-            `SELECT id, name, company_id, address, phone, contact_email, settings, created_at
-       FROM companies WHERE id = $1 OR company_id = $1`,
-            [companyId]
-        );
+        const userId = req.user.userId || req.user.id;
+        const rawCompanyId = req.user.companyId;
+        const isValidUUID = rawCompanyId && UUID_RE.test(rawCompanyId);
+
+        let result;
+        if (isValidUUID) {
+            // Normal path: companyId from JWT is a real UUID -> look up directly
+            result = await pool.query(
+                `SELECT c.id, c.name, c.company_id, c.address, c.phone, c.contact_email, c.settings, c.created_at
+                 FROM companies c WHERE c.id = $1`,
+                [rawCompanyId]
+            );
+        } else {
+            // Fallback: companyId is stale/invalid -> find via the user's record
+            result = await pool.query(
+                `SELECT c.id, c.name, c.company_id, c.address, c.phone, c.contact_email, c.settings, c.created_at
+                 FROM companies c
+                 JOIN users u ON u.company_id = c.id
+                 WHERE u.id = $1`,
+                [userId]
+            );
+        }
+
         if (!result.rows.length) return res.status(404).json({ message: 'Company not found' });
         res.json(result.rows[0]);
     } catch (err) {
@@ -135,18 +154,32 @@ router.put('/company', authenticateToken, async (req, res) => {
         if (req.user.role !== 'owner' && req.user.role !== 'admin') {
             return res.status(403).json({ message: 'Access denied' });
         }
-        const companyId = req.user.companyId;
+        const userId = req.user.userId || req.user.id;
+        const rawCompanyId = req.user.companyId;
+        const isValidUUID = rawCompanyId && UUID_RE.test(rawCompanyId);
         const { name, address, phone, contact_email, settings } = req.body;
 
         if (!name || !name.trim()) {
             return res.status(400).json({ message: 'Company name is required' });
         }
 
+        // Get the real company DB id if companyId is stale
+        let companyDbId = isValidUUID ? rawCompanyId : null;
+        if (!companyDbId) {
+            const lookup = await pool.query(
+                `SELECT c.id FROM companies c JOIN users u ON u.company_id = c.id WHERE u.id = $1`,
+                [userId]
+            );
+            if (lookup.rows.length) companyDbId = lookup.rows[0].id;
+        }
+
+        if (!companyDbId) return res.status(404).json({ message: 'Company not found' });
+
         const result = await pool.query(
             `UPDATE companies
        SET name = $1, address = $2, phone = $3, contact_email = $4,
            settings = COALESCE($5::jsonb, settings)
-       WHERE id = $6 OR company_id = $6
+       WHERE id = $6
        RETURNING id, name, company_id, address, phone, contact_email, settings`,
             [
                 name.trim(),
@@ -154,7 +187,7 @@ router.put('/company', authenticateToken, async (req, res) => {
                 phone?.trim() || null,
                 contact_email?.trim() || null,
                 settings ? JSON.stringify(settings) : null,
-                companyId
+                companyDbId
             ]
         );
         res.json({ message: 'Company settings updated', company: result.rows[0] });

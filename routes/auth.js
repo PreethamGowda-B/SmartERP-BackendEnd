@@ -7,19 +7,8 @@ const logActivity = require("../helpers/logActivity");
 const { authenticateToken } = require("../middleware/authMiddleware");
 const passport = require("passport");
 const GoogleStrategy = require("passport-google-oauth20").Strategy;
-const nodemailer = require("nodemailer");
+const { Resend } = require("resend");
 require("dotenv").config();
-
-// Creates a Gmail SMTP transporter using GMAIL_USER + GMAIL_APP_PASSWORD env vars
-function createMailTransporter() {
-  return nodemailer.createTransport({
-    service: "gmail",
-    auth: {
-      user: process.env.GMAIL_USER,
-      pass: process.env.GMAIL_APP_PASSWORD,
-    },
-  });
-}
 
 // JWT secrets
 const ACCESS_SECRET = process.env.JWT_SECRET;
@@ -210,21 +199,22 @@ router.get(
 // 🔧 DEBUG: Test email sending (remove after testing)
 // ---------------------------------------------
 router.get("/test-email", async (req, res) => {
-  const testTo = req.query.to || process.env.GMAIL_USER;
+  const testTo = req.query.to;
+  if (!testTo) return res.json({ ok: false, error: "Pass ?to=youremail@gmail.com" });
   try {
-    if (!process.env.GMAIL_USER || !process.env.GMAIL_APP_PASSWORD) {
-      return res.json({ ok: false, error: "GMAIL_USER or GMAIL_APP_PASSWORD not set", GMAIL_USER: process.env.GMAIL_USER || "NOT SET" });
+    if (!process.env.RESEND_API_KEY) {
+      return res.json({ ok: false, error: "RESEND_API_KEY not set" });
     }
-    const transporter = createMailTransporter();
-    const info = await transporter.sendMail({
-      from: `"SmartERP Test" <${process.env.GMAIL_USER}>`,
+    const resend = new Resend(process.env.RESEND_API_KEY);
+    const result = await resend.emails.send({
+      from: "SmartERP <onboarding@resend.dev>",
       to: testTo,
       subject: "SmartERP Test Email",
-      text: "If you received this, Gmail SMTP is working!",
+      text: "If you received this, Resend is working correctly!",
     });
-    res.json({ ok: true, messageId: info.messageId, to: testTo });
+    res.json({ ok: true, result, to: testTo });
   } catch (err) {
-    res.json({ ok: false, error: err.message, code: err.code });
+    res.json({ ok: false, error: err.message });
   }
 });
 
@@ -235,9 +225,8 @@ router.post("/send-otp", async (req, res) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ message: "Email is required" });
 
-
-  if (!process.env.GMAIL_USER || !process.env.GMAIL_APP_PASSWORD) {
-    console.error("GMAIL_USER or GMAIL_APP_PASSWORD is not set");
+  if (!process.env.RESEND_API_KEY) {
+    console.error("RESEND_API_KEY is not set");
     return res.status(500).json({ message: "Email service not configured. Contact support." });
   }
 
@@ -267,10 +256,10 @@ router.post("/send-otp", async (req, res) => {
       [email, otp, expiresAt]
     );
 
-    // Send email via Nodemailer + Gmail SMTP
-    const transporter = createMailTransporter();
-    await transporter.sendMail({
-      from: `"SmartERP" <${process.env.GMAIL_USER}>`,
+    // Send email via Resend HTTP API
+    const resend = new Resend(process.env.RESEND_API_KEY);
+    const sendResult = await resend.emails.send({
+      from: "SmartERP <onboarding@resend.dev>",
       to: email,
       subject: "Your SmartERP Verification Code",
       html: `
@@ -291,7 +280,12 @@ router.post("/send-otp", async (req, res) => {
       `,
     });
 
-    console.log(`✅ OTP sent to ${email}`);
+    if (sendResult.error) {
+      console.error("Resend error:", sendResult.error);
+      return res.status(500).json({ message: "Failed to send OTP: " + sendResult.error.message });
+    }
+
+    console.log(`✅ OTP sent to ${email}`, sendResult.data?.id);
     res.json({ ok: true, message: "OTP sent to your email" });
   } catch (err) {
     console.error("Send OTP error:", err.message);

@@ -460,7 +460,8 @@ router.post("/refresh", async (req, res) => {
 // ---------------------------------------------
 router.post("/logout", async (req, res) => {
   try {
-    const token = req.cookies?.refresh_token;
+    // Accept refresh token from cookie OR request body (for cross-domain auth)
+    const token = req.cookies?.refresh_token || req.body?.refreshToken;
 
     if (token) {
       const rt = await pool.query("SELECT * FROM refresh_tokens WHERE token = $1", [token]);

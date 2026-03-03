@@ -2,60 +2,74 @@ require("dotenv").config(); // Load environment variables early
 
 const express = require("express");
 const cors = require("cors");
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
 const cookieParser = require("cookie-parser");
 const { pool } = require("./db"); // ✅ Make sure db.js exports { pool }
 
 const app = express();
 
+// ✅ Security headers
+app.use(helmet({ contentSecurityPolicy: false }));
+
+// ✅ Rate limiting on auth routes (20 requests per 15 minutes)
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: "Too many requests, please try again later." },
+});
+app.use("/api/auth/login", authLimiter);
+app.use("/api/auth/signup", authLimiter);
+app.use("/api/auth/refresh", authLimiter);
+
 // ✅ Trust proxy (required for HTTPS cookies on Render)
 app.set("trust proxy", 1);
 
-// ✅ FIXED: Dynamic CORS configuration that accepts all Vercel preview URLs
-app.use(
-  cors({
-    origin: function (origin, callback) {
-      // Allow requests with no origin (like Postman or server-to-server)
-      if (!origin) {
-        return callback(null, true);
-      }
+// ✅ CORS configuration — shared config used for both main and preflight
+const corsOptions = {
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like Postman or server-to-server)
+    if (!origin) {
+      return callback(null, true);
+    }
 
-      // List of explicitly allowed origins
-      const allowedOrigins = [
-        "http://localhost:3000",
-        "https://smart-erp-front-end.vercel.app",
-        "https://www.prozync.in",
-        "https://prozync.in",
-      ];
+    // List of explicitly allowed origins
+    const allowedOrigins = [
+      "http://localhost:3000",
+      "https://smart-erp-front-end.vercel.app",
+      "https://www.prozync.in",
+      "https://prozync.in",
+    ];
 
-      // Check if origin is in allowed list
-      if (allowedOrigins.includes(origin)) {
-        return callback(null, true);
-      }
+    // Check if origin is in allowed list
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
 
-      // ✅ CRITICAL FIX: Allow ALL Vercel preview deployments
-      // Pattern: https://smart-erp-front-*.vercel.app
-      if (origin.match(/^https:\/\/smart-erp-front(-[a-z0-9]+)?(-[a-z0-9-]+)?\.vercel\.app$/)) {
-        return callback(null, true);
-      }
+    // Allow ALL Vercel preview deployments
+    if (origin.match(/^https:\/\/smart-erp-front(-[a-z0-9]+)?(-[a-z0-9-]+)?\.vercel\.app$/)) {
+      return callback(null, true);
+    }
+    if (origin.match(/^https:\/\/smart-erp-front-[a-z0-9]+-thepreethu01-9119s-projects\.vercel\.app$/)) {
+      return callback(null, true);
+    }
 
-      // Also allow pattern: https://smart-erp-front-*-thepreethu01-9119s-projects.vercel.app
-      if (origin.match(/^https:\/\/smart-erp-front-[a-z0-9]+-thepreethu01-9119s-projects\.vercel\.app$/)) {
-        return callback(null, true);
-      }
+    console.warn("🚫 Blocked CORS request from:", origin);
+    callback(new Error("Not allowed by CORS"));
+  },
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  exposedHeaders: ["Set-Cookie"],
+  optionsSuccessStatus: 200,
+};
 
-      console.warn("🚫 Blocked CORS request from:", origin);
-      callback(new Error("Not allowed by CORS"));
-    },
-    credentials: true,
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-    exposedHeaders: ["Set-Cookie"],
-    optionsSuccessStatus: 200,
-  })
-);
+app.use(cors(corsOptions));
 
-// ✅ Handle preflight requests globally
-app.options("*", cors());
+// ✅ Handle preflight requests with the same CORS config (not wildcard)
+app.options("*", cors(corsOptions));
 
 // ✅ Common middlewares
 app.use(cookieParser());

@@ -207,11 +207,34 @@ router.get(
 );
 
 // ---------------------------------------------
+// 🔧 DEBUG: Test email sending (remove after testing)
+// ---------------------------------------------
+router.get("/test-email", async (req, res) => {
+  const testTo = req.query.to || process.env.GMAIL_USER;
+  try {
+    if (!process.env.GMAIL_USER || !process.env.GMAIL_APP_PASSWORD) {
+      return res.json({ ok: false, error: "GMAIL_USER or GMAIL_APP_PASSWORD not set", GMAIL_USER: process.env.GMAIL_USER || "NOT SET" });
+    }
+    const transporter = createMailTransporter();
+    const info = await transporter.sendMail({
+      from: `"SmartERP Test" <${process.env.GMAIL_USER}>`,
+      to: testTo,
+      subject: "SmartERP Test Email",
+      text: "If you received this, Gmail SMTP is working!",
+    });
+    res.json({ ok: true, messageId: info.messageId, to: testTo });
+  } catch (err) {
+    res.json({ ok: false, error: err.message, code: err.code });
+  }
+});
+
+// ---------------------------------------------
 // ✅ Send OTP for email verification (signup only)
 // ---------------------------------------------
 router.post("/send-otp", async (req, res) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ message: "Email is required" });
+
 
   if (!process.env.GMAIL_USER || !process.env.GMAIL_APP_PASSWORD) {
     console.error("GMAIL_USER or GMAIL_APP_PASSWORD is not set");

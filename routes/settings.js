@@ -6,16 +6,21 @@ const { authenticateToken } = require('../middleware/authMiddleware');
 
 // ─── Ensure columns exist ─────────────────────────────────────────────────────
 async function ensureSettingsCols() {
-    try {
-        await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT`);
-        await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS notification_prefs JSONB DEFAULT '{}'::jsonb`);
-        await pool.query(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS address TEXT`);
-        await pool.query(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS phone TEXT`);
-        await pool.query(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS contact_email TEXT`);
-        await pool.query(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS settings JSONB DEFAULT '{}'::jsonb`);
-    } catch (e) {
-        console.warn('⚠️  Settings cols ensure error:', e.message);
+    const alterUser = [
+        `ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT`,
+        `ALTER TABLE users ADD COLUMN IF NOT EXISTS notification_prefs JSONB DEFAULT '{}'::jsonb`,
+    ];
+    const alterCompany = [
+        `ALTER TABLE companies ADD COLUMN IF NOT EXISTS address TEXT`,
+        `ALTER TABLE companies ADD COLUMN IF NOT EXISTS phone TEXT`,
+        `ALTER TABLE companies ADD COLUMN IF NOT EXISTS contact_email TEXT`,
+        `ALTER TABLE companies ADD COLUMN IF NOT EXISTS settings JSONB DEFAULT '{}'::jsonb`,
+        `ALTER TABLE companies ADD COLUMN IF NOT EXISTS company_id TEXT`,
+    ];
+    for (const sql of [...alterUser, ...alterCompany]) {
+        try { await pool.query(sql); } catch (e) { console.warn('⚠️  Col ensure:', e.message); }
     }
+    console.log('✅ Settings columns verified.');
 }
 ensureSettingsCols().catch(() => { });
 
@@ -121,21 +126,22 @@ router.get('/company', authenticateToken, async (req, res) => {
         const rawCompanyId = req.user.companyId;
         const isValidUUID = rawCompanyId && UUID_RE.test(rawCompanyId);
 
+        // Use COALESCE so missing optional columns don't throw
+        const safeSelect = `
+            SELECT c.id, c.name,
+                   COALESCE(c.company_id, '') as company_id,
+                   COALESCE(c.address, '')     as address,
+                   COALESCE(c.phone, '')       as phone,
+                   COALESCE(c.contact_email, '') as contact_email,
+                   c.created_at
+            FROM companies c`;
+
         let result;
         if (isValidUUID) {
-            // Normal path: companyId from JWT is a real UUID -> look up directly
-            result = await pool.query(
-                `SELECT c.id, c.name, c.company_id, c.address, c.phone, c.contact_email, c.settings, c.created_at
-                 FROM companies c WHERE c.id = $1`,
-                [rawCompanyId]
-            );
+            result = await pool.query(`${safeSelect} WHERE c.id = $1`, [rawCompanyId]);
         } else {
-            // Fallback: companyId is stale/invalid -> find via the user's record
             result = await pool.query(
-                `SELECT c.id, c.name, c.company_id, c.address, c.phone, c.contact_email, c.settings, c.created_at
-                 FROM companies c
-                 JOIN users u ON u.company_id = c.id
-                 WHERE u.id = $1`,
+                `${safeSelect} JOIN users u ON u.company_id = c.id WHERE u.id = $1`,
                 [userId]
             );
         }
@@ -156,19 +162,21 @@ router.get('/company-info', authenticateToken, async (req, res) => {
         const rawCompanyId = req.user.companyId;
         const isValidUUID = rawCompanyId && UUID_RE.test(rawCompanyId);
 
+        const safeSelect = `
+            SELECT c.id, c.name,
+                   COALESCE(c.company_id, '')      as company_id,
+                   COALESCE(c.address, '')          as address,
+                   COALESCE(c.phone, '')            as phone,
+                   COALESCE(c.contact_email, '')    as contact_email,
+                   c.created_at
+            FROM companies c`;
+
         let result;
         if (isValidUUID) {
-            result = await pool.query(
-                `SELECT c.id, c.name, c.company_id, c.address, c.phone, c.contact_email, c.created_at
-                 FROM companies c WHERE c.id = $1`,
-                [rawCompanyId]
-            );
+            result = await pool.query(`${safeSelect} WHERE c.id = $1`, [rawCompanyId]);
         } else {
             result = await pool.query(
-                `SELECT c.id, c.name, c.company_id, c.address, c.phone, c.contact_email, c.created_at
-                 FROM companies c
-                 JOIN users u ON u.company_id = c.id
-                 WHERE u.id = $1`,
+                `${safeSelect} JOIN users u ON u.company_id = c.id WHERE u.id = $1`,
                 [userId]
             );
         }
@@ -190,7 +198,7 @@ router.put('/company', authenticateToken, async (req, res) => {
         const userId = req.user.userId || req.user.id;
         const rawCompanyId = req.user.companyId;
         const isValidUUID = rawCompanyId && UUID_RE.test(rawCompanyId);
-        const { name, address, phone, contact_email, settings } = req.body;
+        const { name, address, phone, contact_email, settings, company_id } = req.body;
 
         if (!name || !name.trim()) {
             return res.status(400).json({ message: 'Company name is required' });
@@ -210,15 +218,20 @@ router.put('/company', authenticateToken, async (req, res) => {
 
         const result = await pool.query(
             `UPDATE companies
-       SET name = $1, address = $2, phone = $3, contact_email = $4,
-           settings = COALESCE($5::jsonb, settings)
-       WHERE id = $6
-       RETURNING id, name, company_id, address, phone, contact_email, settings`,
+             SET name = $1,
+                 address = $2,
+                 phone = $3,
+                 contact_email = $4,
+                 company_id = COALESCE(NULLIF($5, ''), company_id),
+                 settings = COALESCE($6::jsonb, settings)
+             WHERE id = $7
+             RETURNING id, name, company_id, address, phone, contact_email`,
             [
                 name.trim(),
                 address?.trim() || null,
                 phone?.trim() || null,
                 contact_email?.trim() || null,
+                company_id?.trim() || null,
                 settings ? JSON.stringify(settings) : null,
                 companyDbId
             ]

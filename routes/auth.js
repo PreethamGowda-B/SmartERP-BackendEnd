@@ -10,7 +10,7 @@ const GoogleStrategy = require("passport-google-oauth20").Strategy;
 const { Resend } = require("resend");
 require("dotenv").config();
 
-const resend = new Resend(process.env.RESEND_API_KEY);
+// Resend is initialized lazily inside send-otp route to avoid startup crash if key is missing
 
 // JWT secrets
 const ACCESS_SECRET = process.env.JWT_SECRET;
@@ -203,6 +203,14 @@ router.get(
 router.post("/send-otp", async (req, res) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ message: "Email is required" });
+
+  const resendKey = process.env.RESEND_API_KEY;
+  if (!resendKey) {
+    console.error("RESEND_API_KEY is not set in environment variables");
+    return res.status(500).json({ message: "Email service not configured. Contact support." });
+  }
+
+  const resend = new Resend(resendKey);
 
   try {
     // Generate 6-digit OTP

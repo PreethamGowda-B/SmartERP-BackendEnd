@@ -148,6 +148,39 @@ router.get('/company', authenticateToken, async (req, res) => {
     }
 });
 
+// ─── GET /api/settings/company-info (all authenticated users) ─────────────────
+// Employees can read their company's info (read-only, no role restriction)
+router.get('/company-info', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.userId || req.user.id;
+        const rawCompanyId = req.user.companyId;
+        const isValidUUID = rawCompanyId && UUID_RE.test(rawCompanyId);
+
+        let result;
+        if (isValidUUID) {
+            result = await pool.query(
+                `SELECT c.id, c.name, c.company_id, c.address, c.phone, c.contact_email, c.created_at
+                 FROM companies c WHERE c.id = $1`,
+                [rawCompanyId]
+            );
+        } else {
+            result = await pool.query(
+                `SELECT c.id, c.name, c.company_id, c.address, c.phone, c.contact_email, c.created_at
+                 FROM companies c
+                 JOIN users u ON u.company_id = c.id
+                 WHERE u.id = $1`,
+                [userId]
+            );
+        }
+
+        if (!result.rows.length) return res.status(404).json({ message: 'Company not found' });
+        res.json(result.rows[0]);
+    } catch (err) {
+        console.error('GET /settings/company-info error:', err.message);
+        res.status(500).json({ message: err.message });
+    }
+});
+
 // ─── PUT /api/settings/company ────────────────────────────────────────────────
 router.put('/company', authenticateToken, async (req, res) => {
     try {

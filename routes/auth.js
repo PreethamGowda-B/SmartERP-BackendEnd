@@ -7,10 +7,19 @@ const logActivity = require("../helpers/logActivity");
 const { authenticateToken } = require("../middleware/authMiddleware");
 const passport = require("passport");
 const GoogleStrategy = require("passport-google-oauth20").Strategy;
-const { Resend } = require("resend");
+const nodemailer = require("nodemailer");
 require("dotenv").config();
 
-// Resend is initialized lazily inside send-otp route to avoid startup crash if key is missing
+// Creates a Gmail SMTP transporter using GMAIL_USER + GMAIL_APP_PASSWORD env vars
+function createMailTransporter() {
+  return nodemailer.createTransport({
+    service: "gmail",
+    auth: {
+      user: process.env.GMAIL_USER,
+      pass: process.env.GMAIL_APP_PASSWORD,
+    },
+  });
+}
 
 // JWT secrets
 const ACCESS_SECRET = process.env.JWT_SECRET;
@@ -204,13 +213,10 @@ router.post("/send-otp", async (req, res) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ message: "Email is required" });
 
-  const resendKey = process.env.RESEND_API_KEY;
-  if (!resendKey) {
-    console.error("RESEND_API_KEY is not set in environment variables");
+  if (!process.env.GMAIL_USER || !process.env.GMAIL_APP_PASSWORD) {
+    console.error("GMAIL_USER or GMAIL_APP_PASSWORD is not set");
     return res.status(500).json({ message: "Email service not configured. Contact support." });
   }
-
-  const resend = new Resend(resendKey);
 
   try {
     // Generate 6-digit OTP
@@ -238,10 +244,10 @@ router.post("/send-otp", async (req, res) => {
       [email, otp, expiresAt]
     );
 
-    // Send email via Resend
-    const fromEmail = process.env.RESEND_FROM_EMAIL || "onboarding@resend.dev";
-    await resend.emails.send({
-      from: `SmartERP <${fromEmail}>`,
+    // Send email via Nodemailer + Gmail SMTP
+    const transporter = createMailTransporter();
+    await transporter.sendMail({
+      from: `"SmartERP" <${process.env.GMAIL_USER}>`,
       to: email,
       subject: "Your SmartERP Verification Code",
       html: `
@@ -269,6 +275,7 @@ router.post("/send-otp", async (req, res) => {
     res.status(500).json({ message: "Failed to send OTP. Please try again." });
   }
 });
+
 
 // ---------------------------------------------
 // ✅ Verify OTP

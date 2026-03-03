@@ -27,7 +27,8 @@
     "node-fetch": "^2.6.7",
     "passport": "^0.7.0",
     "passport-google-oauth20": "^2.0.0",
-    "pg": "^8.11.0"
+    "pg": "^8.11.0",
+    "resend": "^6.9.3"
   },
   "devDependencies": {
     "artillery": "^2.0.30",

@@ -7,7 +7,10 @@ const logActivity = require("../helpers/logActivity");
 const { authenticateToken } = require("../middleware/authMiddleware");
 const passport = require("passport");
 const GoogleStrategy = require("passport-google-oauth20").Strategy;
+const { Resend } = require("resend");
 require("dotenv").config();
+
+const resend = new Resend(process.env.RESEND_API_KEY);
 
 // JWT secrets
 const ACCESS_SECRET = process.env.JWT_SECRET;
@@ -195,16 +198,120 @@ router.get(
 );
 
 // ---------------------------------------------
+// ✅ Send OTP for email verification (signup only)
+// ---------------------------------------------
+router.post("/send-otp", async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ message: "Email is required" });
+
+  try {
+    // Generate 6-digit OTP
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+
+    // Ensure email_otps table exists
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS email_otps (
+        id SERIAL PRIMARY KEY,
+        email VARCHAR(255) NOT NULL,
+        otp_code VARCHAR(6) NOT NULL,
+        expires_at TIMESTAMP NOT NULL,
+        used BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Delete any old unused OTPs for this email
+    await pool.query("DELETE FROM email_otps WHERE email = $1", [email]);
+
+    // Store new OTP
+    await pool.query(
+      "INSERT INTO email_otps (email, otp_code, expires_at) VALUES ($1, $2, $3)",
+      [email, otp, expiresAt]
+    );
+
+    // Send email via Resend
+    const fromEmail = process.env.RESEND_FROM_EMAIL || "onboarding@resend.dev";
+    await resend.emails.send({
+      from: `SmartERP <${fromEmail}>`,
+      to: email,
+      subject: "Your SmartERP Verification Code",
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 32px; background: #f8fafc; border-radius: 12px;">
+          <div style="text-align: center; margin-bottom: 24px;">
+            <div style="background: #4F46E5; display: inline-block; padding: 12px 20px; border-radius: 8px;">
+              <span style="color: white; font-size: 20px; font-weight: bold;">SmartERP</span>
+            </div>
+          </div>
+          <h2 style="color: #1e293b; text-align: center; margin-bottom: 8px;">Email Verification</h2>
+          <p style="color: #64748b; text-align: center; margin-bottom: 32px;">Use the code below to verify your email and create your account.</p>
+          <div style="background: white; border: 2px solid #e2e8f0; border-radius: 12px; padding: 24px; text-align: center; margin-bottom: 24px;">
+            <div style="font-size: 42px; font-weight: bold; letter-spacing: 10px; color: #4F46E5; font-family: monospace;">${otp}</div>
+          </div>
+          <p style="color: #94a3b8; text-align: center; font-size: 13px;">This code expires in <strong>10 minutes</strong>. Do not share it with anyone.</p>
+          <p style="color: #cbd5e1; text-align: center; font-size: 12px; margin-top: 24px;">If you didn't request this, you can safely ignore this email.</p>
+        </div>
+      `,
+    });
+
+    console.log(`✅ OTP sent to ${email}`);
+    res.json({ ok: true, message: "OTP sent to your email" });
+  } catch (err) {
+    console.error("Send OTP error:", err.message);
+    res.status(500).json({ message: "Failed to send OTP. Please try again." });
+  }
+});
+
+// ---------------------------------------------
+// ✅ Verify OTP
+// ---------------------------------------------
+router.post("/verify-otp", async (req, res) => {
+  const { email, otp } = req.body;
+  if (!email || !otp) return res.status(400).json({ message: "Email and OTP are required" });
+
+  try {
+    const result = await pool.query(
+      "SELECT * FROM email_otps WHERE email = $1 AND otp_code = $2 AND used = FALSE AND expires_at > NOW() ORDER BY created_at DESC LIMIT 1",
+      [email, otp.toString().trim()]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(400).json({ message: "Invalid or expired OTP. Please request a new one." });
+    }
+
+    // Mark OTP as used
+    await pool.query("UPDATE email_otps SET used = TRUE WHERE id = $1", [result.rows[0].id]);
+
+    console.log(`✅ OTP verified for ${email}`);
+    res.json({ ok: true, verified: true, message: "Email verified successfully" });
+  } catch (err) {
+    console.error("Verify OTP error:", err.message);
+    res.status(500).json({ message: "Verification failed. Please try again." });
+  }
+});
+
+// ---------------------------------------------
 // ✅ Signup (Register New Users)
 // ---------------------------------------------
 router.post("/signup", async (req, res) => {
   const { name, email, password, role = "owner", phone, position, department, company_code } = req.body;
 
   try {
+    // ✅ Check email was verified via OTP before allowing signup
+    const otpCheck = await pool.query(
+      "SELECT * FROM email_otps WHERE email = $1 AND used = TRUE AND created_at > NOW() - INTERVAL '15 minutes' ORDER BY created_at DESC LIMIT 1",
+      [email]
+    ).catch(() => ({ rows: [] })); // gracefully skip if table missing
+
+    if (otpCheck.rows.length === 0) {
+      return res.status(403).json({ message: "Email not verified. Please verify your email with OTP before signing up." });
+    }
+
     const existing = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
     if (existing.rows.length > 0) {
       return res.status(400).json({ message: "Email already exists" });
     }
+
 
     const hashedPassword = await bcrypt.hash(password, 10);
     let companyId = null;

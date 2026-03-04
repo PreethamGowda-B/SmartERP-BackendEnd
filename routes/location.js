@@ -4,17 +4,43 @@ const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 
 // ─── Auto-migrate location columns on first load ──────────────────────────────
+// ─── Auto-migrate location columns and constraints on first load ──────────────
 async function ensureLocationColumns() {
     try {
+        // 1. Ensure location columns exist
         await pool.query(`
       ALTER TABLE employee_profiles
         ADD COLUMN IF NOT EXISTS latitude              DOUBLE PRECISION,
         ADD COLUMN IF NOT EXISTS longitude             DOUBLE PRECISION,
         ADD COLUMN IF NOT EXISTS location_updated_at   TIMESTAMPTZ
     `);
-        console.log('✅ Location columns verified in employee_profiles');
+
+        // 2. Ensure user_id is UNIQUE and correct type (required for ON CONFLICT)
+        await pool.query(`
+            -- Clean up duplicate user_ids if they exist (prevents unique constraint failure)
+            DELETE FROM employee_profiles a USING employee_profiles b
+            WHERE a.id < b.id AND a.user_id = b.user_id;
+
+            -- Add unique constraint if it doesn't exist
+            DO $$ 
+            BEGIN 
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint 
+                    WHERE conname = 'employee_profiles_user_id_key' 
+                    OR (contype = 'u' AND conrelid = 'employee_profiles'::regclass)
+                ) THEN
+                    BEGIN
+                        ALTER TABLE employee_profiles ADD CONSTRAINT employee_profiles_user_id_key UNIQUE (user_id);
+                    EXCEPTION WHEN others THEN
+                        RAISE NOTICE 'Could not add unique constraint: %', SQLERRM;
+                    END;
+                END IF;
+            END $$;
+        `);
+
+        console.log('✅ Location schema verified in employee_profiles');
     } catch (err) {
-        console.warn('⚠️  Could not add location columns:', err.message);
+        console.warn('⚠️  Location schema initialization warning:', err.message);
     }
 }
 ensureLocationColumns();

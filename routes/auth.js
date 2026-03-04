@@ -195,28 +195,6 @@ router.get(
   }
 );
 
-// ---------------------------------------------
-// 🔧 DEBUG: Test email sending (remove after testing)
-// ---------------------------------------------
-router.get("/test-email", async (req, res) => {
-  const testTo = req.query.to;
-  if (!testTo) return res.json({ ok: false, error: "Pass ?to=youremail@gmail.com" });
-  try {
-    if (!process.env.RESEND_API_KEY) {
-      return res.json({ ok: false, error: "RESEND_API_KEY not set" });
-    }
-    const resend = new Resend(process.env.RESEND_API_KEY);
-    const result = await resend.emails.send({
-      from: "SmartERP <noreply@prozync.in>",
-      to: testTo,
-      subject: "SmartERP Test Email",
-      text: "If you received this, Resend is working correctly!",
-    });
-    res.json({ ok: true, result, to: testTo });
-  } catch (err) {
-    res.json({ ok: false, error: err.message });
-  }
-});
 
 // ---------------------------------------------
 // ✅ Send OTP for email verification (signup only)

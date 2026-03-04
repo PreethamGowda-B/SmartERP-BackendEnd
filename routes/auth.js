@@ -207,7 +207,7 @@ router.get("/test-email", async (req, res) => {
     }
     const resend = new Resend(process.env.RESEND_API_KEY);
     const result = await resend.emails.send({
-      from: "SmartERP <onboarding@resend.dev>",
+      from: "SmartERP <noreply@prozync.in>",
       to: testTo,
       subject: "SmartERP Test Email",
       text: "If you received this, Resend is working correctly!",
@@ -259,7 +259,7 @@ router.post("/send-otp", async (req, res) => {
     // Send email via Resend HTTP API
     const resend = new Resend(process.env.RESEND_API_KEY);
     const sendResult = await resend.emails.send({
-      from: "SmartERP <onboarding@resend.dev>",
+      from: "SmartERP <noreply@prozync.in>",
       to: email,
       subject: "Your SmartERP Verification Code",
       html: `

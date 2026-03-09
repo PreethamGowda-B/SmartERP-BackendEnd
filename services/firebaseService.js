@@ -59,7 +59,6 @@ async function sendPushNotification(token, title, body, data = {}) {
             notification: {
                 channel_id: 'fcm_default_channel', // Must match the channel created in MainActivity
                 priority: 'high',
-                click_action: 'MAIN_ACTIVITY', // Opens MainActivity when tapped
                 sound: 'default',
             },
         },

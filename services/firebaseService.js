@@ -50,9 +50,22 @@ async function sendPushNotification(token, title, body, data = {}) {
 
     const message = {
         notification: { title, body },
-        data: {
-            ...data,
-            click_action: 'FLUTTER_NOTIFICATION_CLICK',
+        data: Object.fromEntries(
+            // FCM data payload values must ALL be strings
+            Object.entries({ ...data, title, body }).map(([k, v]) => [k, String(v ?? '')])
+        ),
+        android: {
+            priority: 'high', // Deliver immediately even in Doze mode
+            notification: {
+                channel_id: 'fcm_default_channel', // Must match the channel created in MainActivity
+                priority: 'high',
+                click_action: 'MAIN_ACTIVITY', // Opens MainActivity when tapped
+                sound: 'default',
+            },
+        },
+        apns: {
+            headers: { 'apns-priority': '10' },
+            payload: { aps: { sound: 'default', 'content-available': 1 } },
         },
         token,
     };

@@ -25,23 +25,27 @@ async function createNotification({ user_id, company_id, type, title, message, p
         });
 
         // 2. Send Push Notification (Real-time Background/Mobile)
-        try {
-            // Fetch user's push token from DB
-            const userResult = await pool.query('SELECT push_token FROM users WHERE id = $1', [user_id]);
-            const pushToken = userResult.rows[0]?.push_token;
+        // Fire and forget to avoid blocking the main request
+        (async () => {
+            try {
+                // Fetch user's push token from DB
+                const userResult = await pool.query('SELECT push_token FROM users WHERE id = $1', [user_id]);
+                const pushToken = userResult.rows[0]?.push_token;
 
-            if (pushToken) {
-                await sendPushNotification(pushToken, title, message, {
-                    type,
-                    notificationId: notification.id.toString(),
-                    url: `/notifications` // Default redirect
-                });
-                console.log(`📡 Push notification sent to user ${user_id}`);
+                if (pushToken) {
+                    await sendPushNotification(pushToken, title, message, {
+                        type,
+                        notificationId: notification.id.toString(),
+                        click_action: 'FLUTTER_NOTIFICATION_CLICK', // Legacy but often needed for background clicks
+                        url: data?.url || `/notifications`,
+                        ...data
+                    });
+                    console.log(`📡 Push notification sent to user ${user_id}`);
+                }
+            } catch (pushErr) {
+                console.error('⚠️ Failed to send push notification:', pushErr.message);
             }
-        } catch (pushErr) {
-            console.error('⚠️ Failed to send push notification:', pushErr.message);
-            // Don't throw, we don't want to break the main notification flow
-        }
+        })();
 
         console.log(`✅ Notification created and broadcast to user ${user_id}:`, title);
         return notification;

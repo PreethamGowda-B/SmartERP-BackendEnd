@@ -705,6 +705,14 @@ router.get("/", (req, res) => {
 // ─── PATCH /api/auth/update-push-token ───────────────────────────────────────
 // Update user's push notification token for mobile/web push
 router.patch('/update-push-token', authenticateToken, async (req, res) => {
+  updatePushToken(req, res);
+});
+
+router.post('/update-push-token', authenticateToken, async (req, res) => {
+  updatePushToken(req, res);
+});
+
+async function updatePushToken(req, res) {
   try {
     const { pushToken } = req.body;
     const userId = req.user.userId || req.user.id;
@@ -724,6 +732,6 @@ router.patch('/update-push-token', authenticateToken, async (req, res) => {
     console.error('❌ Error updating push token:', err);
     res.status(500).json({ message: 'Server error' });
   }
-});
+}
 
 module.exports = router;

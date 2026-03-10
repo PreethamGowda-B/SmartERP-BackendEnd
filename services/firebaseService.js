@@ -7,44 +7,50 @@ try {
     let serviceAccount;
 
     if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+        console.log('📡 Found FIREBASE_SERVICE_ACCOUNT env var. Length:', process.env.FIREBASE_SERVICE_ACCOUNT.length);
         // Production: credentials from environment variable
         try {
             let rawData = process.env.FIREBASE_SERVICE_ACCOUNT.trim();
             // Defensive: Remove surrounding single/double quotes if present
             if ((rawData.startsWith("'") && rawData.endsWith("'")) ||
                 (rawData.startsWith('"') && rawData.endsWith('"'))) {
+                console.log('📝 Removing surrounding quotes from env var');
                 rawData = rawData.substring(1, rawData.length - 1);
             }
             serviceAccount = JSON.parse(rawData);
-            console.log('📡 Using Firebase credentials from Environment Variable');
+            console.log('✅ FIREBASE_SERVICE_ACCOUNT parsed successfully');
         } catch (parseErr) {
             console.error('❌ Failed to parse FIREBASE_SERVICE_ACCOUNT env var:', parseErr.message);
+            console.error('📝 First 50 chars of env var:', process.env.FIREBASE_SERVICE_ACCOUNT.substring(0, 50));
         }
     } else {
+        console.warn('⚠️ FIREBASE_SERVICE_ACCOUNT env var is NOT set.');
         // Development: fallback to local JSON file
         try {
             serviceAccount = require('./firebase-service-account.json');
             console.log('📡 Using Firebase credentials from local JSON file');
         } catch (fileErr) {
-            console.warn('⚠️  firebase-service-account.json not found and FIREBASE_SERVICE_ACCOUNT env var not set.');
-            console.warn('⚠️  Push notifications will be DISABLED. Set FIREBASE_SERVICE_ACCOUNT in Render to enable them.');
-            // Do NOT throw — allow server to start without Firebase
+            console.warn('⚠️ firebase-service-account.json not found.');
         }
     }
 
     if (serviceAccount) {
+        console.log('🚀 Initializing Firebase Admin SDK...');
         if (!admin.apps.length) {
             admin.initializeApp({
                 credential: admin.credential.cert(serviceAccount)
             });
+            console.log('✅ Firebase Admin SDK initialized (First App)');
+        } else {
+            console.log('✅ Firebase Admin SDK already initialized');
         }
         firebaseInitialized = true;
-        console.log('✅ Firebase Admin initialized successfully');
+        console.log('⭐ firebaseInitialized set to TRUE');
+    } else {
+        console.error('❌ No valid Firebase service account found. Push notifications will be DISABLED.');
     }
 } catch (error) {
-    console.error('❌ Error initializing Firebase Admin:', error.message);
-    console.warn('⚠️  Push notifications will be DISABLED. Set FIREBASE_SERVICE_ACCOUNT in Render to enable them.');
-    // Server continues without Firebase
+    console.error('❌ CRITICAL Error initializing Firebase Admin:', error.stack);
 }
 
 /**

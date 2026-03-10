@@ -41,8 +41,10 @@ async function createNotification({ user_id, company_id, type, title, message, p
                     ...data
                 };
 
-                await sendPushNotification(pushToken, title, message, pushData);
-                console.log(`✅ Push notification sent successfully to user ${user_id}`);
+                const success = await sendPushNotification(pushToken, title, message, pushData);
+                if (success) {
+                    console.log(`✅ Push notification sent successfully to user ${user_id}`);
+                }
             } else {
                 console.log(`⚠️ No push token found for user ${user_id}. Skipping push.`);
             }

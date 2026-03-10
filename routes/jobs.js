@@ -113,7 +113,7 @@ router.post('/', authenticateToken, async (req, res) => {
           title: 'New Job Assigned',
           message: `You have been assigned a new job: ${title}`,
           priority: job.priority || 'medium',
-          data: { job_id: createdJob.id, job_title: title }
+          data: { job_id: createdJob.id, job_title: title, url: '/employee/notifications' }
         });
         console.log(`✅ Specific notification sent to assigned employee for job: ${title}`);
       }
@@ -234,7 +234,7 @@ router.post('/:id/accept', authenticateToken, async (req, res) => {
         title: 'Job Accepted',
         message: `${employeeName} accepted the job: ${acceptedJob.title}`,
         priority: 'medium',
-        data: { job_id: acceptedJob.id, employee_id: req.user.id }
+        data: { job_id: acceptedJob.id, employee_id: req.user.id, url: '/owner/notifications' }
       });
       console.log(`✅ Notified owner(s) about job acceptance`);
     } catch (notifErr) {
@@ -289,7 +289,7 @@ router.post('/:id/decline', authenticateToken, async (req, res) => {
         title: 'Job Declined',
         message: `${employeeName} declined the job: ${declinedJob.title}`,
         priority: 'high',
-        data: { job_id: declinedJob.id, employee_id: req.user.id }
+        data: { job_id: declinedJob.id, employee_id: req.user.id, url: '/owner/notifications' }
       });
       console.log(`✅ Notified owner about job decline`);
     } catch (notifErr) {

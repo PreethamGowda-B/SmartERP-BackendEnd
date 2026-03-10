@@ -42,13 +42,23 @@ router.post('/', authenticateToken, async (req, res) => {
 
         // Send notification to receiver
         try {
-            // Get sender name and role
-            const senderInfo = await pool.query(
-                'SELECT name, role FROM users WHERE id = $1',
-                [senderId]
+            // Get sender and receiver info
+            const usersInfo = await pool.query(
+                "SELECT id, name, role FROM users WHERE id::text IN ($1, $2)",
+                [String(senderId), String(receiver_id)]
             );
-            const senderName = senderInfo.rows[0]?.name || 'User';
-            const senderRole = senderInfo.rows[0]?.role || 'employee';
+
+            const sender = usersInfo.rows.find(u => String(u.id) === String(senderId));
+            const receiver = usersInfo.rows.find(u => String(u.id) === String(receiver_id));
+
+            const senderName = sender?.name || 'User';
+            const senderRole = sender?.role || 'employee';
+            const receiverRole = receiver?.role || 'employee';
+
+            // Determine target URL based on receiver's role
+            const targetUrl = receiverRole === 'owner' || receiverRole === 'admin'
+                ? '/owner/messages'
+                : '/employee/messages';
 
             // Send notification to receiver (both owner->employee and employee->owner)
             await createNotification({
@@ -58,9 +68,13 @@ router.post('/', authenticateToken, async (req, res) => {
                 title: 'New Message',
                 message: `New message from ${senderName}`,
                 priority: senderRole === 'owner' ? 'high' : 'medium',
-                data: { message_id: sentMessage.id, sender_id: senderId }
+                data: {
+                    message_id: sentMessage.id,
+                    sender_id: senderId,
+                    url: targetUrl
+                }
             });
-            console.log(`✅ Notification sent for new message to user ${receiver_id}`);
+            console.log(`✅ Notification sent for new message to user ${receiver_id} (${targetUrl})`);
         } catch (notifErr) {
             console.error('❌ Failed to send message notification:', notifErr);
         }

@@ -33,11 +33,17 @@ async function createNotification({ user_id, company_id, type, title, message, p
 
             if (pushToken) {
                 console.log(`✅ Found push token for user ${user_id}: ${pushToken.substring(0, 10)}...`);
-                // Ensure data payload has a url
+
+                // Determine the best URL fallback if not provided
+                let finalUrl = data?.url || '/notifications';
+
+                // If it's still just the generic fallback, we might want to try harder
+                // but for now, we'll rely on the bulk functions to provide better defaults.
+
                 const pushData = {
                     type,
                     notificationId: notification.id.toString(),
-                    url: data?.url || `/notifications`,
+                    url: finalUrl,
                     ...data
                 };
 
@@ -147,7 +153,7 @@ async function createNotificationForCompany({ company_id, type, title, message, 
                 title,
                 message,
                 priority,
-                data
+                data: { url: '/employee/notifications', ...data }
             }).catch(err => console.error(`❌ Failed to notify employee ${emp.id}:`, err.message))
         );
 
@@ -194,7 +200,7 @@ async function createNotificationForOwners({ company_id, type, title, message, p
                 title,
                 message,
                 priority,
-                data
+                data: { url: '/owner/notifications', ...data }
             }).catch(err => console.error(`❌ Failed to notify owner ${owner.id}:`, err.message))
         );
 

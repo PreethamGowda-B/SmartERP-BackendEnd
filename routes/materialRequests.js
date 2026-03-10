@@ -63,7 +63,7 @@ router.post('/', authenticateToken, async (req, res) => {
                 title: 'New Material Request',
                 message: `${userName} requested ${quantity} ${item_name}`,
                 priority: urgency === 'High' ? 'high' : 'medium',
-                data: { request_id: createdRequest.id, item_name, quantity, urgency }
+                data: { request_id: createdRequest.id, item_name, quantity, urgency, url: '/owner/notifications' }
             });
 
             console.log(`✅ Notified owners about new material request`);
@@ -193,7 +193,7 @@ router.patch('/:id/accept', authenticateToken, async (req, res) => {
                     title: 'Material Request Approved',
                     message: `Your request for ${request.item_name} has been approved`,
                     priority: 'medium',
-                    data: { request_id: request.id, item_name: request.item_name }
+                    data: { request_id: request.id, item_name: request.item_name, url: '/employee/notifications' }
                 });
                 console.log(`✅ Notification sent for approved material request: ${request.item_name}`);
             } catch (notifErr) {
@@ -255,7 +255,7 @@ router.patch('/:id/decline', authenticateToken, async (req, res) => {
                     title: 'Material Request Declined',
                     message: `Your request for ${request.item_name} has been declined`,
                     priority: 'low',
-                    data: { request_id: request.id, item_name: request.item_name }
+                    data: { request_id: request.id, item_name: request.item_name, url: '/employee/notifications' }
                 });
                 console.log(`✅ Notification sent for declined material request: ${request.item_name}`);
             } catch (notifErr) {

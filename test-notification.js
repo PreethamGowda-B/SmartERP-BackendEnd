@@ -31,7 +31,9 @@ async function sendTestNotification(userId) {
             }
         });
 
-        console.log('✅ Test notification triggered successfully!');
+        console.log('✅ Notification record created in DB.');
+        console.log('⏳ Waiting 5 seconds for background push task to complete...');
+        await new Promise(resolve => setTimeout(resolve, 5000));
         process.exit(0);
     } catch (err) {
         console.error('❌ Error sending test notification:', err.message);

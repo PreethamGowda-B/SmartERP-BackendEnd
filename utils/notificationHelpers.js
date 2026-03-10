@@ -26,11 +26,13 @@ async function createNotification({ user_id, company_id, type, title, message, p
 
         // 2. Send Push Notification (Real-time Background/Mobile)
         try {
+            console.log(`📡 Attempting push for user ${user_id} (Type: ${type})`);
             // Fetch user's push token from DB
             const userResult = await pool.query('SELECT push_token FROM users WHERE id = $1', [user_id]);
             const pushToken = userResult.rows[0]?.push_token;
 
             if (pushToken) {
+                console.log(`✅ Found push token for user ${user_id}: ${pushToken.substring(0, 10)}...`);
                 // Ensure data payload has a url
                 const pushData = {
                     type,
@@ -40,10 +42,12 @@ async function createNotification({ user_id, company_id, type, title, message, p
                 };
 
                 await sendPushNotification(pushToken, title, message, pushData);
-                console.log(`📡 Push notification sent to user ${user_id}`);
+                console.log(`✅ Push notification sent successfully to user ${user_id}`);
+            } else {
+                console.log(`⚠️ No push token found for user ${user_id}. Skipping push.`);
             }
         } catch (pushErr) {
-            console.error('⚠️ Failed to send push notification:', pushErr.message);
+            console.error('❌ Failed to send push notification during createNotification:', pushErr.message);
         }
 
         console.log(`✅ Notification created and broadcast to user ${user_id}:`, title);
@@ -110,12 +114,16 @@ function unregisterSSEConnection(userId, response) {
 async function createNotificationForCompany({ company_id, type, title, message, priority = 'medium', data = null, exclude_user_id = null }) {
     try {
         // 1. Fetch all employees for the company
-        let query = 'SELECT id FROM users WHERE role = \'employee\'';
+        let query = "SELECT id FROM users WHERE role = 'employee'";
         let params = [];
 
-        if (company_id) {
-            query += ' AND (company_id = $1 OR company_id IS NULL)';
+        // If company_id is provided, try to match it but also include '1' (default company)
+        // This handles cases where some users have '1' and some have UUIDs
+        if (company_id && company_id !== '1') {
+            query += " AND (company_id = $1 OR company_id = '1' OR company_id IS NULL)";
             params.push(company_id);
+        } else if (company_id === '1') {
+            query += " AND (company_id = '1' OR company_id IS NULL)";
         }
 
         if (exclude_user_id) {
@@ -158,9 +166,11 @@ async function createNotificationForOwners({ company_id, type, title, message, p
         let query = "SELECT id FROM users WHERE role IN ('owner', 'admin')";
         let params = [];
 
-        if (company_id && company_id !== '00000000-0000-0000-0000-000000000000') {
-            query += " AND (company_id = $1 OR company_id IS NULL)";
+        if (company_id && company_id !== '00000000-0000-0000-0000-000000000000' && company_id !== '1') {
+            query += " AND (company_id = $1 OR company_id = '1' OR company_id IS NULL)";
             params.push(company_id);
+        } else if (company_id === '1') {
+            query += " AND (company_id = '1' OR company_id IS NULL)";
         }
 
         if (exclude_user_id) {

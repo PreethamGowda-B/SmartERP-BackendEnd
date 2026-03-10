@@ -1,9 +1,9 @@
 const { pool } = require('./db');
 require('dotenv').config();
 
-async function checkOwners() {
+async function checkUsersSchema() {
     try {
-        const res = await pool.query("SELECT id, email, role, push_token FROM users WHERE role = 'owner'");
+        const res = await pool.query("SELECT id, email, role, company_id FROM users");
         console.log(JSON.stringify(res.rows, null, 2));
     } catch (err) {
         console.error(err);
@@ -12,4 +12,4 @@ async function checkOwners() {
     }
 }
 
-checkOwners();
+checkUsersSchema();

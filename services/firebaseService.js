@@ -8,8 +8,18 @@ try {
 
     if (process.env.FIREBASE_SERVICE_ACCOUNT) {
         // Production: credentials from environment variable
-        serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-        console.log('📡 Using Firebase credentials from Environment Variable');
+        try {
+            let rawData = process.env.FIREBASE_SERVICE_ACCOUNT.trim();
+            // Defensive: Remove surrounding single/double quotes if present
+            if ((rawData.startsWith("'") && rawData.endsWith("'")) ||
+                (rawData.startsWith('"') && rawData.endsWith('"'))) {
+                rawData = rawData.substring(1, rawData.length - 1);
+            }
+            serviceAccount = JSON.parse(rawData);
+            console.log('📡 Using Firebase credentials from Environment Variable');
+        } catch (parseErr) {
+            console.error('❌ Failed to parse FIREBASE_SERVICE_ACCOUNT env var:', parseErr.message);
+        }
     } else {
         // Development: fallback to local JSON file
         try {
@@ -42,11 +52,16 @@ try {
  * Silently skips if Firebase is not initialized.
  */
 async function sendPushNotification(token, title, body, data = {}) {
-    if (!token) return;
-    if (!firebaseInitialized) {
-        console.warn('⚠️  Push notification skipped — Firebase not initialized.');
+    if (!token) {
+        console.warn('⚠️ Push notification skipped — No token provided.');
         return;
     }
+    if (!firebaseInitialized) {
+        console.warn('⚠️ Push notification skipped — Firebase not initialized in this process.');
+        return;
+    }
+
+    console.log(`🚀 FCM: Sending to token ${token.substring(0, 10)}... Title: ${title}`);
 
     const message = {
         notification: { title, body },

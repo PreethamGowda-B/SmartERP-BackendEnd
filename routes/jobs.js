@@ -228,16 +228,15 @@ router.post('/:id/accept', authenticateToken, async (req, res) => {
       const userInfo = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
       const employeeName = userInfo.rows[0]?.name || 'Employee';
 
-      await createNotification({
-        user_id: acceptedJob.created_by,
-        company_id: req.user.companyId,
+      await createNotificationForOwners({
+        company_id: req.user.companyId || acceptedJob.company_id,
         type: 'job_accepted',
         title: 'Job Accepted',
         message: `${employeeName} accepted the job: ${acceptedJob.title}`,
         priority: 'medium',
         data: { job_id: acceptedJob.id, employee_id: req.user.id }
       });
-      console.log(`✅ Notified owner about job acceptance`);
+      console.log(`✅ Notified owner(s) about job acceptance`);
     } catch (notifErr) {
       console.error('❌ Failed to send job acceptance notification:', notifErr);
     }

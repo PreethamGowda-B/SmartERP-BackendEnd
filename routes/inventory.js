@@ -16,9 +16,24 @@ const upload = multer({
 const VALID_CATEGORIES = ['Raw Materials', 'Finished Goods', 'Tools', 'Supplies', 'Uncategorized'];
 const VALID_UNITS = ['bags', 'kg', 'pieces', 'liters', 'boxes', 'meters', 'units'];
 
+const { body, validationResult } = require('express-validator');
+
 // ─── POST /api/inventory ─────────────────────────────────────────────────────
 // Create inventory item (both owner and employee can add)
-router.post('/', authenticateToken, upload.single('image'), async (req, res) => {
+router.post('/', authenticateToken, upload.single('image'), [
+  body('name').trim().notEmpty().withMessage('Item name is required').escape(),
+  body('description').optional({ checkFalsy: true }).trim().escape(),
+  body('quantity').optional({ checkFalsy: true }).isInt().toInt(),
+  body('min_quantity').optional({ checkFalsy: true }).isInt().toInt(),
+  body('supplier_name').optional({ checkFalsy: true }).trim().escape(),
+  body('supplier_contact').optional({ checkFalsy: true }).trim().escape(),
+  body('supplier_email').optional({ checkFalsy: true }).trim().isEmail().normalizeEmail(),
+], async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ message: "Validation failed", errors: errors.array() });
+    }
+
     try {
         const {
             name, description, quantity, category, unit, min_quantity,
@@ -187,7 +202,20 @@ router.delete('/:id', authenticateToken, async (req, res) => {
 
 // ─── PUT /api/inventory/:id ──────────────────────────────────────────────────
 // Update inventory item
-router.put('/:id', authenticateToken, upload.single('image'), async (req, res) => {
+router.put('/:id', authenticateToken, upload.single('image'), [
+  body('name').optional({ checkFalsy: true }).trim().escape(),
+  body('description').optional({ checkFalsy: true }).trim().escape(),
+  body('quantity').optional({ checkFalsy: true }).isInt().toInt(),
+  body('min_quantity').optional({ checkFalsy: true }).isInt().toInt(),
+  body('supplier_name').optional({ checkFalsy: true }).trim().escape(),
+  body('supplier_contact').optional({ checkFalsy: true }).trim().escape(),
+  body('supplier_email').optional({ checkFalsy: true }).trim().isEmail().normalizeEmail(),
+], async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ message: "Validation failed", errors: errors.array() });
+    }
+
     try {
         const { id } = req.params;
         const {

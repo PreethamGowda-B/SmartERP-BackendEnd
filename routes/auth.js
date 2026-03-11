@@ -303,7 +303,21 @@ router.post("/verify-otp", async (req, res) => {
 // ---------------------------------------------
 // ✅ Signup (Register New Users)
 // ---------------------------------------------
-router.post("/signup", async (req, res) => {
+router.post("/signup", [
+  body("name").trim().notEmpty().withMessage("Name is required").escape(),
+  body("email").isEmail().withMessage("Valid email is required").normalizeEmail(),
+  body("password").isLength({ min: 6 }).withMessage("Password must be at least 6 characters long"),
+  body("role").optional().isIn(["owner", "employee"]).withMessage("Invalid role"),
+  body("phone").optional({ checkFalsy: true }).isMobilePhone().withMessage("Invalid phone number").escape(),
+  body("position").optional({ checkFalsy: true }).trim().escape(),
+  body("department").optional({ checkFalsy: true }).trim().escape(),
+  body("company_code").optional({ checkFalsy: true }).trim().escape(),
+], async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ message: "Validation failed", errors: errors.array() });
+  }
+
   const { name, email, password, role = "owner", phone, position, department, company_code } = req.body;
 
   try {
@@ -337,15 +351,24 @@ router.post("/signup", async (req, res) => {
       companyName = `${name}'s Company` || 'My Company';
 
       // Create company (owner_id will be set after user creation)
+      // Defaults to plan_id = 1 (Free) due to database schema defaults
       const companyResult = await pool.query(
-        `INSERT INTO companies (company_id, company_name, created_at)
-         VALUES ($1, $2, NOW())
+        `INSERT INTO companies (company_id, company_name, plan_id, subscription_status, created_at)
+         VALUES ($1, $2, 1, 'active', NOW())
          RETURNING id, company_id`,
         [companyCode, companyName]
       );
 
       companyId = companyResult.rows[0].id;
-      console.log(`✅ Created company ${companyCode} for owner ${email}`);
+
+      // Insert initial subscription record
+      await pool.query(
+        `INSERT INTO subscriptions (company_id, plan_id, start_date, status)
+         VALUES ($1, 1, NOW(), 'active')`,
+        [companyId]
+      );
+
+      console.log(`✅ Created company ${companyCode} for owner ${email} (Free Plan)`);
     }
 
     // ✅ EMPLOYEE FLOW: Validate and link to company
@@ -368,6 +391,42 @@ router.post("/signup", async (req, res) => {
       companyId = validation.company.id;
       companyCode = validation.company.company_id;
       companyName = validation.company.company_name;
+
+      // 🛑 CUSTOM SUBSCRIPTION CHECK: Check employee limit for the company's plan
+      try {
+        const planResult = await pool.query(
+          `SELECT p.name as plan_name, p.employee_limit 
+           FROM companies c
+           JOIN plans p ON c.plan_id = p.id
+           WHERE c.id = $1`,
+          [companyId]
+        );
+
+        if (planResult.rows.length > 0) {
+          const plan = planResult.rows[0];
+
+          if (plan.employee_limit !== null) { // If not unlimited
+            // Count current employees
+            const countResult = await pool.query(
+              `SELECT COUNT(*) as count FROM users WHERE company_id = $1 AND role = 'employee'`,
+              [companyId]
+            );
+
+            const currentEmployees = parseInt(countResult.rows[0].count, 10);
+
+            if (currentEmployees >= plan.employee_limit) {
+              return res.status(403).json({
+                message: `Employee limit reached. Your company is currently using the ${plan.plan_name} plan (${plan.employee_limit} employees). Please ask your company owner to upgrade the subscription plan to add more employees.`
+              });
+            }
+          }
+        }
+      } catch (checkErr) {
+        console.error("Error checking employee limit:", checkErr);
+        // We'll proceed if there's an error rather than blocking completely, 
+        // but log it prominently
+      }
+
       console.log(`✅ Employee ${email} validated for company ${companyCode}`);
     }
 
@@ -426,10 +485,19 @@ router.post("/signup", async (req, res) => {
   }
 });
 
+const { body, validationResult } = require("express-validator");
 // ---------------------------------------------
 // ✅ Login Route
 // ---------------------------------------------
-router.post("/login", async (req, res) => {
+router.post("/login", [
+  body("email").isEmail().withMessage("Valid email is required").normalizeEmail(),
+  body("password").notEmpty().withMessage("Password is required")
+], async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ message: "Validation failed", errors: errors.array() });
+  }
+
   const { email, password } = req.body;
 
   try {

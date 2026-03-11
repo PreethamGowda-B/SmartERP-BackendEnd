@@ -51,8 +51,21 @@ router.get('/', DEV ? (req, res, next) => next() : authenticateToken, async (req
   }
 });
 
+const { body, validationResult } = require('express-validator');
+
 // ─── POST /api/employees ────────────────────────────────────────────────────
-router.post('/', DEV ? (req, res, next) => next() : authenticateToken, async (req, res) => {
+router.post('/', DEV ? (req, res, next) => next() : authenticateToken, [
+  body('email').isEmail().withMessage('Valid email is required').normalizeEmail(),
+  body('name').trim().notEmpty().withMessage('Name is required').escape(),
+  body('password').optional({ checkFalsy: true }).isString(),
+  body('position').optional({ checkFalsy: true }).trim().escape(),
+  body('phone').optional({ checkFalsy: true }).isMobilePhone().withMessage('Invalid phone number').escape()
+], async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ message: "Validation failed", errors: errors.array() });
+  }
+
   // Role guard (skip in DEV mode)
   if (!DEV) {
     const role = req.user?.role;
@@ -106,7 +119,16 @@ router.post('/', DEV ? (req, res, next) => next() : authenticateToken, async (re
 
 // ─── PATCH /api/employees/:id ────────────────────────────────────────────────
 // Update employee department, position, and account status
-router.patch('/:id', authenticateToken, async (req, res) => {
+router.patch('/:id', authenticateToken, [
+  body('department').optional({ checkFalsy: true }).trim().escape(),
+  body('position').optional({ checkFalsy: true }).trim().escape(),
+  body('is_active').optional().isBoolean().withMessage('is_active must be a boolean')
+], async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ message: "Validation failed", errors: errors.array() });
+  }
+
   // Only owners / admins can update employees
   const role = req.user?.role;
   if (role !== 'owner' && role !== 'admin') {

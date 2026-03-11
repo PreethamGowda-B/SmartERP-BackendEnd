@@ -92,6 +92,8 @@ router.get('/all', authenticateToken, async (req, res) => {
             return res.status(403).json({ message: 'Only owners can view employee locations' });
         }
 
+        const companyId = req.user.companyId;
+
         const result = await pool.query(
             `SELECT
          u.id,
@@ -105,8 +107,9 @@ router.get('/all', authenticateToken, async (req, res) => {
          ep.is_active
        FROM users u
        LEFT JOIN employee_profiles ep ON ep.user_id = u.id
-       WHERE u.role = 'employee'
-       ORDER BY ep.location_updated_at DESC NULLS LAST, u.name ASC`
+       WHERE u.role = 'employee' AND u.company_id = $1
+       ORDER BY ep.location_updated_at DESC NULLS LAST, u.name ASC`,
+            [companyId]
         );
 
         const employees = result.rows.map(row => ({
@@ -154,8 +157,8 @@ router.get('/:employeeId', authenticateToken, async (req, res) => {
          ep.position
        FROM users u
        LEFT JOIN employee_profiles ep ON ep.user_id = u.id
-       WHERE u.id = $1 AND u.role = 'employee'`,
-            [employeeId]
+       WHERE u.id = $1 AND u.role = 'employee' AND u.company_id = $2`,
+            [employeeId, req.user.companyId]
         );
 
         if (!result.rows.length) {

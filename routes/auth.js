@@ -175,7 +175,9 @@ router.get(
         [user.id, refreshToken]
       );
 
-      // Redirect to frontend with tokens
+      // ✅ Redirect to frontend with tokens in URL so the frontend can exchange
+      // them for HttpOnly cookies via POST /api/auth/set-cookie
+      // (Required for cross-domain: Render backend → Vercel frontend)
       const frontendUrl = process.env.FRONTEND_ORIGIN || "https://smart-erp-front-end.vercel.app";
       res.redirect(
         `${frontendUrl}/auth/callback?accessToken=${accessToken}&refreshToken=${refreshToken}&user=${encodeURIComponent(
@@ -760,6 +762,38 @@ router.post("/company/generate-invite", authenticateToken, async (req, res) => {
   } catch (err) {
     console.error("Generate invite link error:", err.message);
     res.status(500).json({ message: "Server error" });
+  }
+});
+
+// ---------------------------------------------
+// ✅ Set Cookie Route (used after Google OAuth callback)
+// Frontend calls this with tokens from URL to get HttpOnly cookies set on the backend domain
+// ---------------------------------------------
+router.post("/set-cookie", async (req, res) => {
+  const { accessToken, refreshToken } = req.body;
+  if (!accessToken || !refreshToken) {
+    return res.status(400).json({ message: "Tokens are required" });
+  }
+
+  try {
+    // Validate their structure before setting (lightweight check)
+    jwt.verify(accessToken, ACCESS_SECRET);
+
+    const cookieOpts = {
+      httpOnly: true,
+      sameSite: "none",
+      secure: true,
+      path: "/",
+    };
+
+    res.cookie("access_token", accessToken, { ...cookieOpts, maxAge: 15 * 60 * 1000 });
+    res.cookie("refresh_token", refreshToken, { ...cookieOpts, maxAge: 7 * 24 * 60 * 60 * 1000 });
+
+    console.log("✅ Cookies set via /set-cookie exchange");
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("Invalid token in /set-cookie:", err.message);
+    return res.status(401).json({ message: "Invalid token" });
   }
 });
 

@@ -4,6 +4,7 @@ require("dotenv").config();
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: true },
+  max: 50, // Added explicit connection limit for concurrent users
 });
 
 // Test DB connection

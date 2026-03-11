@@ -8,6 +8,7 @@ const { authenticateToken } = require("../middleware/authMiddleware");
 const passport = require("passport");
 const GoogleStrategy = require("passport-google-oauth20").Strategy;
 const { Resend } = require("resend");
+const { body, validationResult } = require("express-validator");
 require("dotenv").config();
 
 // JWT secrets
@@ -487,7 +488,6 @@ router.post("/signup", [
   }
 });
 
-const { body, validationResult } = require("express-validator");
 // ---------------------------------------------
 // ✅ Login Route
 // ---------------------------------------------

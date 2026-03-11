@@ -162,7 +162,13 @@ router.get('/', authenticateToken, async (req, res) => {
 
         const result = await pool.query(query, params);
 
-        res.json(result.rows);
+        // Sanitize image_url: any non-Cloudinary local paths no longer exist on Render's ephemeral fs
+        const rows = result.rows.map(item => ({
+            ...item,
+            image_url: item.image_url && item.image_url.startsWith('https://') ? item.image_url : null
+        }));
+
+        res.json(rows);
     } catch (err) {
         console.error('Error fetching inventory items:', err);
         res.status(500).json({ message: 'Server error fetching inventory items' });

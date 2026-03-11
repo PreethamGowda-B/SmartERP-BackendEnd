@@ -856,13 +856,13 @@ router.post('/process-daily', authenticateToken, async (req, res) => {
     // 1. Auto clock-out employees who didn't clock out
     const autoClockOutResult = await pool.query(`
             UPDATE attendance
-            SET check_out_time = (date || ' 19:00:00')::timestamp,
+            SET check_out_time = (date || ' 19:00:00 Asia/Kolkata')::timestamptz AT TIME ZONE 'UTC',
                 is_auto_clocked_out = TRUE,
                 working_hours = EXTRACT(EPOCH FROM (
-                    (date || ' 19:00:00')::timestamp - check_in_time
+                    ((date || ' 19:00:00 Asia/Kolkata')::timestamptz AT TIME ZONE 'UTC') - check_in_time
                 )) / 3600,
                 status = CASE 
-                    WHEN EXTRACT(EPOCH FROM ((date || ' 19:00:00')::timestamp - check_in_time)) / 3600 >= 8 THEN 'present'
+                    WHEN EXTRACT(EPOCH FROM (((date || ' 19:00:00 Asia/Kolkata')::timestamptz AT TIME ZONE 'UTC') - check_in_time)) / 3600 >= 8 THEN 'present'
                     ELSE 'half_day'
                 END,
                 updated_at = NOW()

@@ -161,7 +161,7 @@ router.get('/jobs', authenticateToken, async (req, res) => {
            END
          )::numeric, 1) AS avg_completion_hours
        FROM jobs
-       WHERE (company_id = $1 OR company_id IS NULL) ${clause}`,
+       WHERE company_id = $1 ${clause}`,
             [companyId, ...params],
             [{}]
         );
@@ -169,7 +169,7 @@ router.get('/jobs', authenticateToken, async (req, res) => {
         const byPriority = await safeQuery(
             `SELECT COALESCE(priority,'none') AS priority, COUNT(*) AS count
        FROM jobs
-       WHERE (company_id = $1 OR company_id IS NULL) ${clause}
+       WHERE company_id = $1 ${clause}
        GROUP BY priority ORDER BY count DESC`,
             [companyId, ...params],
             []
@@ -180,7 +180,7 @@ router.get('/jobs', authenticateToken, async (req, res) => {
        FROM jobs j
        JOIN users u ON u.id = j.assigned_to
        WHERE j.status = 'completed'
-         AND (j.company_id = $1 OR j.company_id IS NULL) ${clause}
+         AND j.company_id = $1 ${clause}
        GROUP BY u.name
        ORDER BY completed_jobs DESC
        LIMIT 5`,
@@ -290,7 +290,7 @@ router.get('/materials', authenticateToken, async (req, res) => {
          COUNT(CASE WHEN status = 'rejected' THEN 1 END)          AS rejected,
          COUNT(CASE WHEN status = 'pending'  THEN 1 END)          AS pending
        FROM material_requests
-       WHERE (company_id = $1 OR company_id IS NULL) ${clause}`,
+       WHERE company_id = $1 ${clause}`,
             [companyId, ...params],
             [{}]
         );
@@ -298,7 +298,7 @@ router.get('/materials', authenticateToken, async (req, res) => {
         const topItems = await safeQuery(
             `SELECT item_name, COUNT(*) AS request_count, SUM(quantity) AS total_qty
        FROM material_requests
-       WHERE (company_id = $1 OR company_id IS NULL) ${clause}
+       WHERE company_id = $1 ${clause}
        GROUP BY item_name
        ORDER BY request_count DESC LIMIT 10`,
             [companyId, ...params],
@@ -311,7 +311,7 @@ router.get('/materials', authenticateToken, async (req, res) => {
               COALESCE(mr.requested_by_name, u.name, 'Unknown') AS requested_by
        FROM material_requests mr
        LEFT JOIN users u ON u.id::text = mr.requested_by::text
-       WHERE (mr.company_id = $1 OR mr.company_id IS NULL) ${clause}
+       WHERE mr.company_id = $1 ${clause}
        ORDER BY mr.created_at DESC LIMIT 20`,
             [companyId, ...params],
             []
@@ -343,7 +343,7 @@ router.get('/inventory', authenticateToken, async (req, res) => {
          COUNT(CASE WHEN COALESCE(is_archived, false) = true THEN 1 END) AS archived_count,
          COUNT(DISTINCT COALESCE(category, 'Uncategorised')) AS category_count
        FROM inventory_items
-       WHERE (company_id = $1 OR company_id IS NULL)
+       WHERE company_id = $1
          AND COALESCE(is_archived, false) = false`,
             [companyId],
             [{}]
@@ -353,7 +353,7 @@ router.get('/inventory', authenticateToken, async (req, res) => {
             `SELECT COALESCE(category, 'Uncategorised') AS category,
               COUNT(*) AS item_count, SUM(quantity) AS total_qty
        FROM inventory_items
-       WHERE (company_id = $1 OR company_id IS NULL)
+       WHERE company_id = $1
          AND COALESCE(is_archived, false) = false
        GROUP BY category ORDER BY item_count DESC`,
             [companyId],
@@ -366,7 +366,7 @@ router.get('/inventory', authenticateToken, async (req, res) => {
               COALESCE(unit, '') AS unit,
               COALESCE(category, 'Uncategorised') AS category
        FROM inventory_items
-       WHERE (company_id = $1 OR company_id IS NULL)
+       WHERE company_id = $1
          AND COALESCE(is_archived, false) = false
          AND (quantity <= COALESCE(reorder_point, 5) OR quantity = 0)
        ORDER BY quantity ASC LIMIT 10`,

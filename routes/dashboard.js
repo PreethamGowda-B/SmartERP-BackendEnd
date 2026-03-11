@@ -23,7 +23,7 @@ router.get('/owner/metrics', authenticateToken, async (req, res) => {
             `SELECT COUNT(*) AS count
        FROM jobs
        WHERE status IN ('active', 'in_progress', 'open', 'accepted')
-         AND (company_id = $1 OR company_id IS NULL)`,
+         AND company_id = $1`,
             [companyId]
         );
 
@@ -69,7 +69,7 @@ router.get('/owner/metrics', authenticateToken, async (req, res) => {
            status IN ('active', 'in_progress', 'open')
            OR COALESCE(employee_status, '') = 'accepted'
          )
-         AND (company_id = $1 OR company_id IS NULL)
+         AND company_id = $1
        ORDER BY created_at DESC
        LIMIT 5`,
             [companyId]
@@ -114,7 +114,7 @@ router.get('/owner/recent-activity', authenticateToken, async (req, res) => {
             const recentJobs = await pool.query(
                 `SELECT id, title, status, created_at, 'job' AS type, priority
          FROM jobs
-         WHERE (company_id = $1 OR company_id IS NULL)
+         WHERE company_id = $1
          ORDER BY created_at DESC LIMIT 5`,
                 [companyId]
             );

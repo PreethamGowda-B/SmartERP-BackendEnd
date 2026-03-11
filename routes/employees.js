@@ -36,12 +36,17 @@ async function mapRowToEmployee(row) {
 // ─── GET /api/employees ─────────────────────────────────────────────────────
 router.get('/', DEV ? (req, res, next) => next() : authenticateToken, async (req, res) => {
   try {
+    const companyId = req.user?.companyId;
+    if (!companyId) {
+      return res.status(400).json({ message: 'No company associated with your account' });
+    }
     const result = await pool.query(
       `SELECT u.id, u.name, u.email, u.role, u.created_at, p.phone, p.position, p.department, p.hire_date, p.is_active, p.created_at AS profile_created_at
        FROM users u
        LEFT JOIN employee_profiles p ON u.id = p.user_id
-       WHERE u.role != 'owner' AND u.role != 'admin'
-       ORDER BY u.created_at DESC NULLS LAST`
+       WHERE u.company_id = $1 AND u.role != 'owner' AND u.role != 'admin'
+       ORDER BY u.created_at DESC NULLS LAST`,
+      [companyId]
     );
     const employees = await Promise.all(result.rows.map(mapRowToEmployee));
     res.json(employees);
@@ -88,18 +93,25 @@ router.post('/', DEV ? (req, res, next) => next() : authenticateToken, [
       return res.status(409).json({ message: 'An account with this email already exists' });
     }
 
+    const companyId = req.user?.companyId;
+    const companyCode = req.user?.companyCode || null;
+
+    if (!companyId) {
+      return res.status(400).json({ message: 'No company associated with your account' });
+    }
+
     const hash = await bcrypt.hash(pwd, 10);
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
       const insertUser = await client.query(
-        'INSERT INTO users (name, email, password_hash, role) VALUES ($1, $2, $3, $4) RETURNING id, name, email',
-        [name, email, hash, 'employee']
+        'INSERT INTO users (name, email, password_hash, role, company_id, company_code) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, name, email',
+        [name, email, hash, 'employee', companyId, companyCode]
       );
       const userId = insertUser.rows[0].id;
       await client.query(
-        'INSERT INTO employee_profiles (user_id, phone, position) VALUES ($1, $2, $3)',
-        [userId, phone || null, position || null]
+        'INSERT INTO employee_profiles (user_id, phone, position, company_id) VALUES ($1, $2, $3, $4)',
+        [userId, phone || null, position || null, companyId]
       );
       await client.query('COMMIT');
 
@@ -143,13 +155,17 @@ router.patch('/:id', authenticateToken, [
   const { department, position, is_active } = req.body;
 
   try {
-    // Verify employee exists and is not an owner/admin
-    const target = await pool.query('SELECT id, role FROM users WHERE id = $1', [employeeId]);
+    // Verify employee exists, belongs to same company, and is not an owner/admin
+    const companyId = req.user?.companyId;
+    const target = await pool.query('SELECT id, role, company_id FROM users WHERE id = $1', [employeeId]);
     if (target.rows.length === 0) {
       return res.status(404).json({ message: 'Employee not found' });
     }
     if (target.rows[0].role === 'owner' || target.rows[0].role === 'admin') {
       return res.status(403).json({ message: 'Cannot update an owner or admin account' });
+    }
+    if (String(target.rows[0].company_id) !== String(companyId)) {
+      return res.status(403).json({ message: 'Access denied: employee does not belong to your company' });
     }
 
     // Build update query dynamically based on provided fields
@@ -228,13 +244,17 @@ router.delete('/:id', authenticateToken, async (req, res) => {
   }
 
   try {
-    // Confirm the target user exists and is not an owner/admin
-    const target = await pool.query('SELECT id, role FROM users WHERE id = $1', [employeeId]);
+    // Confirm the target user exists, belongs to same company, and is not an owner/admin
+    const companyId = req.user?.companyId;
+    const target = await pool.query('SELECT id, role, company_id FROM users WHERE id = $1', [employeeId]);
     if (target.rows.length === 0) {
       return res.status(404).json({ message: 'Employee not found' });
     }
     if (target.rows[0].role === 'owner' || target.rows[0].role === 'admin') {
       return res.status(403).json({ message: 'Cannot delete an owner or admin account' });
+    }
+    if (String(target.rows[0].company_id) !== String(companyId)) {
+      return res.status(403).json({ message: 'Access denied: employee does not belong to your company' });
     }
 
     // employee_profiles has ON DELETE CASCADE, so deleting from users removes the profile too.

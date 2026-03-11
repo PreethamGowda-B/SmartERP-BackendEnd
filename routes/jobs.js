@@ -143,22 +143,22 @@ router.get('/', authenticateToken, async (req, res) => {
         `SELECT j.*, u.email as employee_email 
          FROM jobs j
          LEFT JOIN users u ON j.assigned_to = u.id
-         WHERE j.created_by = $1
-         AND (j.company_id = $2 OR j.company_id IS NULL)
+         WHERE j.company_id = $1
          ORDER BY j.created_at DESC`,
-        [req.user.id, req.user.companyId]
+        [req.user.companyId]
       );
     } else if (req.user.role === 'employee') {
       result = await pool.query(
         `SELECT * FROM jobs 
          WHERE (visible_to_all = true OR assigned_to = $1)
-         AND (company_id = $2 OR company_id IS NULL)
+         AND company_id = $2
          ORDER BY created_at DESC`,
         [req.user.id, req.user.companyId]
       );
     } else {
       result = await pool.query(
-        `SELECT * FROM jobs WHERE visible_to_all = true`
+        `SELECT * FROM jobs WHERE visible_to_all = true AND company_id = $1`,
+        [req.user.companyId]
       );
     }
 
@@ -399,6 +399,7 @@ router.post('/:id/progress', authenticateToken, async (req, res) => {
 router.put('/:id', authenticateToken, async (req, res) => {
   const { id } = req.params;
   const updates = req.body || {};
+  const companyId = req.user.companyId;
 
   try {
     const result = await pool.query(
@@ -411,7 +412,7 @@ router.put('/:id', authenticateToken, async (req, res) => {
            WHEN data IS NULL THEN $5 
            ELSE data || $5 
          END
-       WHERE id = $6
+       WHERE id = $6 AND company_id = $7
        RETURNING *`,
       [
         updates.title,
@@ -424,9 +425,13 @@ router.put('/:id', authenticateToken, async (req, res) => {
           : null,
         updates,
         id,
+        companyId,
       ]
     );
 
+    if (!result.rows[0]) {
+      return res.status(404).json({ message: 'Job not found or access denied' });
+    }
     res.json(result.rows[0]);
   } catch (err) {
     console.error('jobs PUT error', err);
@@ -439,12 +444,16 @@ router.put('/:id', authenticateToken, async (req, res) => {
  */
 router.delete('/:id', authenticateToken, async (req, res) => {
   const { id } = req.params;
+  const companyId = req.user.companyId;
 
   try {
-    await pool.query(
-      'DELETE FROM jobs WHERE id = $1',
-      [id]
+    const result = await pool.query(
+      'DELETE FROM jobs WHERE id = $1 AND company_id = $2 RETURNING id',
+      [id, companyId]
     );
+    if (result.rowCount === 0) {
+      return res.status(404).json({ message: 'Job not found or access denied' });
+    }
     res.json({ success: true });
   } catch (err) {
     console.error('jobs DELETE error', err);

@@ -38,16 +38,17 @@ router.post('/', authenticateToken, async (req, res) => {
 
         const result = await pool.query(
             `INSERT INTO material_requests 
-       (item_name, quantity, urgency, description, requested_by, requested_by_name, created_at) 
-       VALUES ($1, $2, $3, $4, $5::uuid, $6, NOW()) 
+       (item_name, quantity, urgency, description, requested_by, requested_by_name, company_id, created_at) 
+       VALUES ($1, $2, $3, $4, $5::uuid, $6, $7, NOW()) 
        RETURNING *`,
             [
                 item_name.trim(),
                 parseInt(quantity),
                 urgency || 'Medium',
                 description?.trim() || null,
-                String(userId),  // UUID string — cast to uuid in SQL
-                userName
+                String(userId),
+                userName,
+                req.user.companyId || null
             ]
         );
 
@@ -106,16 +107,18 @@ router.get('/', authenticateToken, async (req, res) => {
         let params;
 
         if (role === 'owner' || role === 'admin') {
-            // Owner sees all requests — use explicit column list to avoid hidden bad columns
+            // Owner sees all requests for their company
+            const companyId = req.user.companyId;
             query = `
                 SELECT 
                     id, item_name, quantity, urgency, description, status,
                     requested_by, requested_by_name, created_at, updated_at,
                     reviewed_by, reviewed_at
                 FROM material_requests 
+                WHERE company_id = $1
                 ORDER BY created_at DESC
             `;
-            params = [];
+            params = [companyId];
         } else {
             // Employee sees only their own requests
             // Use ::text cast on both sides — works for both UUID and INTEGER PKs
@@ -163,13 +166,13 @@ router.patch('/:id/accept', authenticateToken, async (req, res) => {
         const result = await pool.query(
             `UPDATE material_requests 
        SET status = 'accepted', reviewed_by = $1, reviewed_at = NOW(), updated_at = NOW()
-       WHERE id = $2 AND status = 'pending'
+       WHERE id = $2 AND status = 'pending' AND company_id = $3
        RETURNING *`,
-            [userId, id]
+            [userId, id, req.user.companyId]
         );
 
         if (result.rows.length === 0) {
-            return res.status(404).json({ message: 'Request not found or already processed' });
+            return res.status(404).json({ message: 'Request not found, already processed, or access denied' });
         }
 
         const request = result.rows[0];
@@ -225,13 +228,13 @@ router.patch('/:id/decline', authenticateToken, async (req, res) => {
         const result = await pool.query(
             `UPDATE material_requests 
        SET status = 'declined', reviewed_by = $1, reviewed_at = NOW(), updated_at = NOW()
-       WHERE id = $2 AND status = 'pending'
+       WHERE id = $2 AND status = 'pending' AND company_id = $3
        RETURNING *`,
-            [userId, id]
+            [userId, id, req.user.companyId]
         );
 
         if (result.rows.length === 0) {
-            return res.status(404).json({ message: 'Request not found or already processed' });
+            return res.status(404).json({ message: 'Request not found, already processed, or access denied' });
         }
 
         const request = result.rows[0];

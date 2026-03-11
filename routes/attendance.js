@@ -410,6 +410,7 @@ router.get('/overview', authenticateToken, async (req, res) => {
     }
 
     const today = new Date().toISOString().split('T')[0];
+    const companyId = req.user.companyId || safeUUID(req.user.companyId);
 
     const result = await pool.query(
       `SELECT 
@@ -426,9 +427,9 @@ router.get('/overview', authenticateToken, async (req, res) => {
                 a.is_auto_clocked_out
              FROM users u
              LEFT JOIN attendance a ON u.id = a.user_id AND a.date = $1
-             WHERE u.role = 'employee'
+             WHERE u.role = 'employee' AND u.company_id = $2
              ORDER BY u.name ASC`,
-      [today]
+      [today, companyId]
     );
 
     // Calculate summary
@@ -458,6 +459,16 @@ router.get('/employee/:userId', authenticateToken, async (req, res) => {
 
     const { userId } = req.params;
     const { month, year } = req.query;
+    const companyId = req.user.companyId;
+
+    // Verify the requested employee belongs to this owner's company
+    const empCheck = await pool.query(
+      'SELECT id FROM users WHERE id = $1 AND company_id = $2',
+      [userId, companyId]
+    );
+    if (empCheck.rows.length === 0) {
+      return res.status(403).json({ message: 'Employee not found in your company' });
+    }
 
     const currentMonth = month || new Date().getMonth() + 1;
     const currentYear = year || new Date().getFullYear();
@@ -501,6 +512,16 @@ router.get('/calendar/:userId', authenticateToken, async (req, res) => {
 
     const { userId } = req.params;
     const { month, year } = req.query;
+    const companyId = req.user.companyId;
+
+    // Verify the requested employee belongs to this owner's company
+    const empCheck = await pool.query(
+      'SELECT id FROM users WHERE id = $1 AND company_id = $2',
+      [userId, companyId]
+    );
+    if (empCheck.rows.length === 0) {
+      return res.status(403).json({ message: 'Employee not found in your company' });
+    }
 
     const currentMonth = month || new Date().getMonth() + 1;
     const currentYear = year || new Date().getFullYear();
@@ -743,14 +764,15 @@ router.get('/report', authenticateToken, async (req, res) => {
             FROM users u
             LEFT JOIN attendance a ON u.id = a.user_id
             WHERE u.role = 'employee'
+              AND u.company_id = $3
               AND EXTRACT(MONTH FROM a.date) = $1
               AND EXTRACT(YEAR FROM a.date) = $2
         `;
 
-    const params = [currentMonth, currentYear];
+    const params = [currentMonth, currentYear, req.user.companyId];
 
     if (employee_id) {
-      query += ' AND u.id = $3';
+      query += ' AND u.id = $4';
       params.push(employee_id);
     }
 

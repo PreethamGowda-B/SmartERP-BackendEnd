@@ -71,8 +71,8 @@ router.post('/', authenticateToken, upload.single('image'), [
         const result = await pool.query(
             `INSERT INTO inventory_items 
        (name, description, quantity, image_url, created_by, employee_name, 
-        category, unit, min_quantity, supplier_name, supplier_contact, supplier_email, created_at) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW()) 
+        category, unit, min_quantity, supplier_name, supplier_contact, supplier_email, company_id, created_at) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW()) 
        RETURNING *`,
             [
                 name.trim(),
@@ -86,7 +86,8 @@ router.post('/', authenticateToken, upload.single('image'), [
                 parseInt(min_quantity) || 0,
                 supplier_name?.trim() || null,
                 supplier_contact?.trim() || null,
-                supplier_email?.trim() || null
+                supplier_email?.trim() || null,
+                req.user.companyId || null
             ]
         );
 
@@ -127,6 +128,7 @@ router.get('/', authenticateToken, async (req, res) => {
     try {
         const { include_deleted, category, supplier } = req.query;
 
+        const companyId = req.user.companyId;
         let query = `SELECT 
         id, name, description, quantity, image_url, employee_name, office_name,
         created_by, created_at, updated_at, updated_by,
@@ -134,10 +136,10 @@ router.get('/', authenticateToken, async (req, res) => {
         supplier_name, supplier_contact, supplier_email,
         is_deleted, deleted_at
        FROM inventory_items 
-       WHERE 1=1`;
+       WHERE company_id = $1`;
 
-        const params = [];
-        let paramIndex = 1;
+        const params = [companyId];
+        let paramIndex = 2;
 
         // Filter deleted items unless explicitly requested
         if (include_deleted !== 'true') {
@@ -188,12 +190,12 @@ router.delete('/:id', authenticateToken, async (req, res) => {
         }
 
         const result = await pool.query(
-            'DELETE FROM inventory_items WHERE id = $1 RETURNING *',
-            [id]
+            'DELETE FROM inventory_items WHERE id = $1 AND company_id = $2 RETURNING *',
+            [id, req.user.companyId]
         );
 
         if (result.rows.length === 0) {
-            return res.status(404).json({ message: 'Inventory item not found' });
+            return res.status(404).json({ message: 'Inventory item not found or access denied' });
         }
 
         // Note: Cloudinary images persist even after deletion
@@ -230,14 +232,14 @@ router.put('/:id', authenticateToken, upload.single('image'), [
         } = req.body;
         const userId = req.user.userId;
 
-        // Get current item for history tracking
+        // Get current item for history tracking (scoped to company)
         const currentResult = await pool.query(
-            'SELECT * FROM inventory_items WHERE id = $1',
-            [id]
+            'SELECT * FROM inventory_items WHERE id = $1 AND company_id = $2',
+            [id, req.user.companyId]
         );
 
         if (currentResult.rows.length === 0) {
-            return res.status(404).json({ message: 'Inventory item not found' });
+            return res.status(404).json({ message: 'Inventory item not found or access denied' });
         }
 
         const oldItem = currentResult.rows[0];
@@ -320,13 +322,13 @@ router.patch('/:id/archive', authenticateToken, async (req, res) => {
         const result = await pool.query(
             `UPDATE inventory_items 
              SET is_deleted = TRUE, deleted_at = NOW(), deleted_by = $1
-             WHERE id = $2 AND (is_deleted = FALSE OR is_deleted IS NULL)
+             WHERE id = $2 AND company_id = $3 AND (is_deleted = FALSE OR is_deleted IS NULL)
              RETURNING *`,
-            [userId, id]
+            [userId, id, req.user.companyId]
         );
 
         if (result.rows.length === 0) {
-            return res.status(404).json({ message: 'Inventory item not found or already archived' });
+            return res.status(404).json({ message: 'Inventory item not found or access denied' });
         }
 
         // Track deletion in history
@@ -361,13 +363,13 @@ router.patch('/:id/restore', authenticateToken, async (req, res) => {
         const result = await pool.query(
             `UPDATE inventory_items 
              SET is_deleted = FALSE, deleted_at = NULL, deleted_by = NULL
-             WHERE id = $1 AND is_deleted = TRUE
+             WHERE id = $1 AND company_id = $2 AND is_deleted = TRUE
              RETURNING *`,
-            [id]
+            [id, req.user.companyId]
         );
 
         if (result.rows.length === 0) {
-            return res.status(404).json({ message: 'Inventory item not found or not archived' });
+            return res.status(404).json({ message: 'Inventory item not found or access denied' });
         }
 
         // Track restoration in history
@@ -399,12 +401,15 @@ router.get('/:id/history', authenticateToken, async (req, res) => {
 // Get low-stock items (quantity < min_quantity)
 router.get('/low-stock', authenticateToken, async (req, res) => {
     try {
+        const companyId = req.user.companyId;
         const result = await pool.query(
             `SELECT * FROM inventory_items 
-             WHERE (is_deleted = FALSE OR is_deleted IS NULL)
+             WHERE company_id = $1
+             AND (is_deleted = FALSE OR is_deleted IS NULL)
              AND quantity < min_quantity
              AND min_quantity > 0
-             ORDER BY (quantity::float / NULLIF(min_quantity, 0)) ASC`
+             ORDER BY (quantity::float / NULLIF(min_quantity, 0)) ASC`,
+            [companyId]
         );
 
         res.json(result.rows);

@@ -33,15 +33,15 @@ router.post('/', authenticateToken, async (req, res) => {
       });
     }
 
-    // Validate employee exists and get their details
+    // Validate employee exists within the same company
     const employeeResult = await pool.query(
-      `SELECT id, name, email FROM users WHERE email = $1 AND role = 'employee'`,
-      [employee_email]
+      `SELECT id, name, email FROM users WHERE email = $1 AND role = 'employee' AND company_id = $2`,
+      [employee_email, req.user.companyId]
     );
 
     if (employeeResult.rows.length === 0) {
       return res.status(404).json({
-        message: 'Employee not found with this email address'
+        message: 'Employee not found with this email address in your company'
       });
     }
 
@@ -110,8 +110,8 @@ router.post('/', authenticateToken, async (req, res) => {
              (employee_email, employee_id, employee_name, payroll_month, payroll_year, 
               base_salary, extra_amount, salary_increment, deduction, total_salary, 
               present_days, absent_days, half_days, total_working_hours,
-              remarks, created_by, created_at, updated_at) 
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, NOW(), NOW()) 
+              remarks, created_by, company_id, created_at, updated_at) 
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, NOW(), NOW()) 
              RETURNING *`,
       [
         employee.email,
@@ -129,7 +129,8 @@ router.post('/', authenticateToken, async (req, res) => {
         halfDays,
         totalHours,
         remarks,
-        userId
+        userId,
+        req.user.companyId || null
       ]
     );
 
@@ -175,9 +176,9 @@ router.get('/', authenticateToken, async (req, res) => {
     let params;
 
     if (role === 'owner' || role === 'admin') {
-      // Owner sees all payroll records
-      query = `SELECT * FROM payroll WHERE 1=1`;
-      params = [];
+      // Owner sees payroll records for their company only
+      query = `SELECT * FROM payroll WHERE company_id = $1`;
+      params = [req.user.companyId];
 
       // Add optional filters
       if (month) {

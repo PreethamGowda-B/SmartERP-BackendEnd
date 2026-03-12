@@ -638,6 +638,30 @@ router.post("/refresh", async (req, res) => {
 });
 
 // ---------------------------------------------
+// ✅ Get Current User Profile (Fresh from DB)
+// ---------------------------------------------
+router.get("/me", authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId || req.user.id;
+    const result = await pool.query(
+      `SELECT id, name, email, role, company_id, company_code 
+       FROM users WHERE id = $1`, 
+      [userId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const user = result.rows[0];
+    res.json(user);
+  } catch (err) {
+    console.error("GET /me error:", err.message);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+// ---------------------------------------------
 // ✅ Logout Route
 // ---------------------------------------------
 router.post("/logout", async (req, res) => {

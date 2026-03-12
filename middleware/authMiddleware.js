@@ -22,7 +22,7 @@ function authenticateToken(req, res, next) {
   }
 
   if (!token) {
-    console.log("❌ No token found in request from:", req.headers.origin || req.headers.host);
+    console.log(`❌ No token found in ${req.method} ${req.path} from: ${req.headers.origin || req.headers.host}`);
     return res.status(401).json({ message: "Not authenticated" });
   }
 

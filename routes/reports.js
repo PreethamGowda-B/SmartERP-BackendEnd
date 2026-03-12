@@ -2,6 +2,8 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
+const { loadPlan } = require('../middleware/planMiddleware');
+const { requireFeature } = require('../middleware/featureGuard');
 
 // ─── Startup: ensure all columns used by reports exist ───────────────────────
 
@@ -82,8 +84,9 @@ async function safeQuery(sql, params, fallback = []) {
 
 /**
  * GET /api/reports/attendance?period=week|month|quarter|year
+ * Requires: advanced_reports (Basic+ plan)
  */
-router.get('/attendance', authenticateToken, async (req, res) => {
+router.get('/attendance', authenticateToken, loadPlan, requireFeature('advanced_reports'), async (req, res) => {
     try {
         if (req.user.role !== 'owner' && req.user.role !== 'admin') {
             return res.status(403).json({ message: 'Access denied' });
@@ -136,8 +139,9 @@ router.get('/attendance', authenticateToken, async (req, res) => {
 
 /**
  * GET /api/reports/jobs?period=week|month|quarter|year
+ * Requires: advanced_reports (Basic+ plan)
  */
-router.get('/jobs', authenticateToken, async (req, res) => {
+router.get('/jobs', authenticateToken, loadPlan, requireFeature('advanced_reports'), async (req, res) => {
     try {
         if (req.user.role !== 'owner' && req.user.role !== 'admin') {
             return res.status(403).json({ message: 'Access denied' });
@@ -202,8 +206,9 @@ router.get('/jobs', authenticateToken, async (req, res) => {
 
 /**
  * GET /api/reports/employees?period=week|month|quarter|year
+ * Requires: advanced_reports (Basic+ plan)
  */
-router.get('/employees', authenticateToken, async (req, res) => {
+router.get('/employees', authenticateToken, loadPlan, requireFeature('advanced_reports'), async (req, res) => {
     try {
         if (req.user.role !== 'owner' && req.user.role !== 'admin') {
             return res.status(403).json({ message: 'Access denied' });
@@ -271,8 +276,9 @@ router.get('/employees', authenticateToken, async (req, res) => {
 
 /**
  * GET /api/reports/materials?period=week|month|quarter|year
+ * Requires: advanced_reports (Basic+ plan)
  */
-router.get('/materials', authenticateToken, async (req, res) => {
+router.get('/materials', authenticateToken, loadPlan, requireFeature('advanced_reports'), async (req, res) => {
     try {
         if (req.user.role !== 'owner' && req.user.role !== 'admin') {
             return res.status(403).json({ message: 'Access denied' });
@@ -326,8 +332,9 @@ router.get('/materials', authenticateToken, async (req, res) => {
 
 /**
  * GET /api/reports/inventory
+ * Requires: advanced_reports (Basic+ plan)
  */
-router.get('/inventory', authenticateToken, async (req, res) => {
+router.get('/inventory', authenticateToken, loadPlan, requireFeature('advanced_reports'), async (req, res) => {
     try {
         if (req.user.role !== 'owner' && req.user.role !== 'admin') {
             return res.status(403).json({ message: 'Access denied' });

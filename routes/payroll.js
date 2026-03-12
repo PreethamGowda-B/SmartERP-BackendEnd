@@ -3,10 +3,12 @@ const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 const { createNotification } = require('../utils/notificationHelpers');
+const { loadPlan } = require('../middleware/planMiddleware');
+const { requireFeature } = require('../middleware/featureGuard');
 
 // ─── POST /api/payroll ───────────────────────────────────────────────────────
-// Create new payroll record (Owner only)
-router.post('/', authenticateToken, async (req, res) => {
+// Create new payroll record (Owner only, Basic+ plan)
+router.post('/', authenticateToken, loadPlan, requireFeature('payroll'), async (req, res) => {
   try {
     const { role, userId } = req.user;
 

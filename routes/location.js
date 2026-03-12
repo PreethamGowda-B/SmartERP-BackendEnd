@@ -2,6 +2,8 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
+const { loadPlan } = require('../middleware/planMiddleware');
+const { requireFeature } = require('../middleware/featureGuard');
 
 // ─── Auto-migrate location columns on first load ──────────────────────────────
 // ─── Auto-migrate location columns and constraints on first load ──────────────
@@ -47,7 +49,8 @@ ensureLocationColumns();
 
 // ─── POST /api/location/update ────────────────────────────────────────────────
 // Employee pushes their current GPS coordinates
-router.post('/update', authenticateToken, async (req, res) => {
+// Gated: Basic plan or higher (location_tracking feature)
+router.post('/update', authenticateToken, loadPlan, requireFeature('location_tracking'), async (req, res) => {
     try {
         const userId = req.user.userId || req.user.id;
         const { latitude, longitude } = req.body;
@@ -85,7 +88,8 @@ router.post('/update', authenticateToken, async (req, res) => {
 
 // ─── GET /api/location/all ────────────────────────────────────────────────────
 // Owner/admin: get all employees with their latest known location
-router.get('/all', authenticateToken, async (req, res) => {
+// Gated: Basic plan or higher (location_tracking feature)
+router.get('/all', authenticateToken, loadPlan, requireFeature('location_tracking'), async (req, res) => {
     try {
         const role = req.user.role;
         if (role !== 'owner' && role !== 'admin') {

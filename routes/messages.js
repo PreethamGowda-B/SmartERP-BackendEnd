@@ -3,6 +3,7 @@ const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 const { createNotification } = require('../utils/notificationHelpers');
+const { loadPlan } = require('../middleware/planMiddleware');
 
 // ─── POST /api/messages ───────────────────────────────────────────────────────
 // Send a new message
@@ -88,16 +89,21 @@ router.post('/', authenticateToken, async (req, res) => {
 
 // ─── GET /api/messages/conversation/:userId ──────────────────────────────────
 // Get all messages in a conversation with a specific user
-router.get('/conversation/:userId', authenticateToken, async (req, res) => {
+// Message history is filtered by plan's messages_history_days (parameterized - safe from SQL injection)
+router.get('/conversation/:userId', authenticateToken, loadPlan, async (req, res) => {
     try {
         const currentUserId = req.user.userId || req.user.id;
         const otherUserId = req.params.userId;
+
+        // History cutoff based on plan (9999 days for Pro = effectively unlimited)
+        const historyDays = req.plan?.messages_history_days ?? 30;
 
         if (!otherUserId) {
             return res.status(400).json({ message: 'Invalid user ID' });
         }
 
-        // Get all messages between current user and other user
+        // Get messages between current user and other user within allowed history window
+        // Uses parameterized interval to prevent SQL injection
         const result = await pool.query(
             `SELECT 
         m.id,
@@ -110,10 +116,11 @@ router.get('/conversation/:userId', authenticateToken, async (req, res) => {
         CASE WHEN m.sender_id = $1 THEN true ELSE false END as is_mine
        FROM messages m
        JOIN users u ON m.sender_id = u.id
-       WHERE (m.sender_id = $1 AND m.receiver_id = $2)
-          OR (m.sender_id = $2 AND m.receiver_id = $1)
+       WHERE ((m.sender_id = $1 AND m.receiver_id = $2)
+          OR (m.sender_id = $2 AND m.receiver_id = $1))
+         AND m.created_at >= NOW() - ($3 * INTERVAL '1 day')
        ORDER BY m.created_at ASC`,
-            [currentUserId, otherUserId]
+            [currentUserId, otherUserId, historyDays]
         );
 
         res.json(result.rows);

@@ -158,6 +158,7 @@ app.use("/api/dashboard", require("./routes/dashboard"));
 app.use("/api/reports", require("./routes/reports"));
 app.use("/api/settings", require("./routes/settings"));
 app.use("/api/location", require("./routes/location"));
+app.use("/api/subscription", require("./routes/subscription"));
 
 
 
@@ -226,6 +227,14 @@ app.listen(PORT, () => {
     startDailyAttendanceProcessor();
   } catch (err) {
     console.error('❌ Failed to start daily attendance processor:', err.message);
+  }
+
+  // ✅ Start trial expiry processor (9:00 AM IST)
+  try {
+    const { startTrialExpiryProcessor } = require('./jobs/trialExpiryProcessor');
+    startTrialExpiryProcessor();
+  } catch (err) {
+    console.error('❌ Failed to start trial expiry processor:', err.message);
   }
 });
 

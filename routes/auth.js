@@ -74,14 +74,25 @@ passport.use(
             const companyName = `${name}'s Company`;
 
             const companyResult = await pool.query(
-              `INSERT INTO companies (company_id, company_name, created_at)
-               VALUES ($1, $2, NOW())
+              `INSERT INTO companies (company_id, company_name, plan_id, subscription_status,
+                                      is_on_trial, trial_started_at, trial_ends_at,
+                                      subscription_expires_at, is_first_login, created_at)
+               VALUES ($1, $2, 3, 'trial', TRUE, NOW(), NOW() + INTERVAL '30 days',
+                       NOW() + INTERVAL '30 days', TRUE, NOW())
                RETURNING id, company_id`,
               [companyCode, companyName]
             );
 
             companyId = companyResult.rows[0].id;
-            console.log(`✅ Created company ${companyCode} for Google owner ${email}`);
+
+            // Log the trial start event
+            pool.query(
+              `INSERT INTO subscription_events (company_id, event_type, old_plan_id, new_plan_id, metadata, created_at)
+               VALUES ($1, 'trial_started', NULL, 3, $2, NOW())`,
+              [companyId, JSON.stringify({ source: 'google_oauth', email })]
+            ).catch(e => console.error('sub_event log error:', e.message));
+
+            console.log(`✅ Created company ${companyCode} for Google owner ${email} (30-day Pro trial)`);
           }
 
           // EMPLOYEE FLOW: Validate and link to company
@@ -348,25 +359,34 @@ router.post("/signup", [
       companyCode = await generateCompanyId();
       companyName = `${name}'s Company` || 'My Company';
 
-      // Create company (owner_id will be set after user creation)
-      // Defaults to plan_id = 1 (Free) due to database schema defaults
+      // Create company with 30-day Pro trial
       const companyResult = await pool.query(
-        `INSERT INTO companies (company_id, company_name, plan_id, subscription_status, created_at)
-         VALUES ($1, $2, 1, 'active', NOW())
+        `INSERT INTO companies (company_id, company_name, plan_id, subscription_status,
+                                is_on_trial, trial_started_at, trial_ends_at,
+                                subscription_expires_at, is_first_login, created_at)
+         VALUES ($1, $2, 3, 'trial', TRUE, NOW(), NOW() + INTERVAL '30 days',
+                 NOW() + INTERVAL '30 days', TRUE, NOW())
          RETURNING id, company_id`,
         [companyCode, companyName]
       );
 
       companyId = companyResult.rows[0].id;
 
-      // Insert initial subscription record
+      // Insert subscription record for Pro trial
       await pool.query(
         `INSERT INTO subscriptions (company_id, plan_id, start_date, status)
-         VALUES ($1, 1, NOW(), 'active')`,
+         VALUES ($1, 3, NOW(), 'trial')`,
         [companyId]
       );
 
-      console.log(`✅ Created company ${companyCode} for owner ${email} (Free Plan)`);
+      // Log the trial start event
+      pool.query(
+        `INSERT INTO subscription_events (company_id, event_type, old_plan_id, new_plan_id, metadata, created_at)
+         VALUES ($1, 'trial_started', NULL, 3, $2, NOW())`,
+        [companyId, JSON.stringify({ source: 'email_signup', email })]
+      ).catch(e => console.error('sub_event log error:', e.message));
+
+      console.log(`✅ Created company ${companyCode} for owner ${email} (30-day Pro trial)`);
     }
 
     // ✅ EMPLOYEE FLOW: Validate and link to company

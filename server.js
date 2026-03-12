@@ -113,6 +113,30 @@ setTimeout(fixDatabaseConstraints, 3000); // Run after DB connection
 const { fixMaterialRequestsSchema } = require('./migrations/autoMigrate');
 setTimeout(fixMaterialRequestsSchema, 4000); // Run after DB connection
 
+// 🚀 Performance Optimization & Schema Verification
+const { optimizeDatabase } = require('./scripts/optimizeDb');
+setTimeout(async () => {
+  try {
+    // Ensure essential tables that might be missing from older setups exist
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS email_otps (
+        id SERIAL PRIMARY KEY,
+        email VARCHAR(255) NOT NULL,
+        otp_code VARCHAR(6) NOT NULL,
+        expires_at TIMESTAMP NOT NULL,
+        used BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_email_otps_email ON email_otps(email);
+    `);
+    
+    await optimizeDatabase();
+    console.log('✅ Database optimization complete');
+  } catch (err) {
+    console.error('❌ Database initialization error:', err.message);
+  }
+}, 6000); // Run after DB connections and migrations
+
 // ✅ Routes
 app.use("/api/auth", require("./routes/auth"));
 app.use("/api/users", require("./routes/users"));

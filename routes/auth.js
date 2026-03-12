@@ -216,19 +216,7 @@ router.post("/send-otp", async (req, res) => {
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
 
-    // Ensure email_otps table exists
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS email_otps (
-        id SERIAL PRIMARY KEY,
-        email VARCHAR(255) NOT NULL,
-        otp_code VARCHAR(6) NOT NULL,
-        expires_at TIMESTAMP NOT NULL,
-        used BOOLEAN DEFAULT FALSE,
-        created_at TIMESTAMP DEFAULT NOW()
-      )
-    `);
-
-    // Delete any old unused OTPs for this email
+    // Old OTP cleanup and storage (Table is now ensured on server startup)
     await pool.query("DELETE FROM email_otps WHERE email = $1", [email]);
 
     // Store new OTP
@@ -237,9 +225,11 @@ router.post("/send-otp", async (req, res) => {
       [email, otp, expiresAt]
     );
 
-    // Send email via Resend HTTP API
+    // Send email via Resend with a 10s timeout safety
     const resend = new Resend(process.env.RESEND_API_KEY);
-    const sendResult = await resend.emails.send({
+    
+    // We race the email send with a timeout to avoid hanging the UI
+    const sendPromise = resend.emails.send({
       from: "SmartERP <noreply@prozync.in>",
       to: email,
       subject: "Your SmartERP Verification Code",
@@ -260,6 +250,11 @@ router.post("/send-otp", async (req, res) => {
         </div>
       `,
     });
+
+    const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Email service timeout')), 12000));
+    
+    const sendResult = await Promise.race([sendPromise, timeoutPromise]);
+
 
     if (sendResult.error) {
       console.error("Resend error:", sendResult.error);

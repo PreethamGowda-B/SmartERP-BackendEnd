@@ -146,31 +146,31 @@ router.get('/jobs', authenticateToken, async (req, res) => {
 
         const companyId = req.user.companyId;
         const period = req.query.period || 'month';
-        const { clause, params } = dateRangeFilter(period, 'created_at', 2);
+        const { clause, params } = dateRangeFilter(period, 'j.created_at', 2);
 
         const summaryRows = await safeQuery(
             `SELECT
          COUNT(*)                                                              AS total,
-         COUNT(CASE WHEN status = 'completed' THEN 1 END)                     AS completed,
-         COUNT(CASE WHEN status IN ('open','in_progress','active') THEN 1 END) AS in_progress,
-         COUNT(CASE WHEN COALESCE(employee_status,'') = 'declined' THEN 1 END) AS declined,
-         COUNT(CASE WHEN COALESCE(employee_status,'') = 'pending'  THEN 1 END) AS pending,
+         COUNT(CASE WHEN j.status = 'completed' THEN 1 END)                     AS completed,
+         COUNT(CASE WHEN j.status IN ('open','in_progress','active') THEN 1 END) AS in_progress,
+         COUNT(CASE WHEN COALESCE(j.employee_status,'') = 'declined' THEN 1 END) AS declined,
+         COUNT(CASE WHEN COALESCE(j.employee_status,'') = 'pending'  THEN 1 END) AS pending,
          ROUND(AVG(
-           CASE WHEN completed_at IS NOT NULL AND accepted_at IS NOT NULL
-             THEN EXTRACT(EPOCH FROM (completed_at - accepted_at)) / 3600
+           CASE WHEN j.completed_at IS NOT NULL AND j.accepted_at IS NOT NULL
+             THEN EXTRACT(EPOCH FROM (j.completed_at - j.accepted_at)) / 3600
            END
          )::numeric, 1) AS avg_completion_hours
-       FROM jobs
-       WHERE company_id = $1 ${clause}`,
+       FROM jobs j
+       WHERE j.company_id = $1 ${clause}`,
             [companyId, ...params],
             [{}]
         );
 
         const byPriority = await safeQuery(
-            `SELECT COALESCE(priority,'none') AS priority, COUNT(*) AS count
-       FROM jobs
-       WHERE company_id = $1 ${clause}
-       GROUP BY priority ORDER BY count DESC`,
+            `SELECT COALESCE(j.priority,'none') AS priority, COUNT(*) AS count
+       FROM jobs j
+       WHERE j.company_id = $1 ${clause}
+       GROUP BY j.priority ORDER BY count DESC`,
             [companyId, ...params],
             []
         );
@@ -281,25 +281,25 @@ router.get('/materials', authenticateToken, async (req, res) => {
 
         const companyId = req.user.companyId;
         const period = req.query.period || 'month';
-        const { clause, params } = dateRangeFilter(period, 'created_at', 2);
+        const { clause, params } = dateRangeFilter(period, 'mr.created_at', 2);
 
         const summaryRows = await safeQuery(
             `SELECT
          COUNT(*)                                                  AS total,
-         COUNT(CASE WHEN status = 'approved' THEN 1 END)          AS approved,
-         COUNT(CASE WHEN status = 'rejected' THEN 1 END)          AS rejected,
-         COUNT(CASE WHEN status = 'pending'  THEN 1 END)          AS pending
-       FROM material_requests
-       WHERE company_id = $1 ${clause}`,
+         COUNT(CASE WHEN mr.status = 'approved' THEN 1 END)          AS approved,
+         COUNT(CASE WHEN mr.status = 'rejected' THEN 1 END)          AS rejected,
+         COUNT(CASE WHEN mr.status = 'pending'  THEN 1 END)          AS pending
+       FROM material_requests mr
+       WHERE mr.company_id = $1 ${clause}`,
             [companyId, ...params],
             [{}]
         );
 
         const topItems = await safeQuery(
-            `SELECT item_name, COUNT(*) AS request_count, SUM(quantity) AS total_qty
-       FROM material_requests
-       WHERE company_id = $1 ${clause}
-       GROUP BY item_name
+            `SELECT mr.item_name, COUNT(*) AS request_count, SUM(mr.quantity) AS total_qty
+       FROM material_requests mr
+       WHERE mr.company_id = $1 ${clause}
+       GROUP BY mr.item_name
        ORDER BY request_count DESC LIMIT 10`,
             [companyId, ...params],
             []

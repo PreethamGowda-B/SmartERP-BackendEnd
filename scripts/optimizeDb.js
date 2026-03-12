@@ -16,8 +16,8 @@ async function optimizeDatabase() {
       'CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at DESC)',
       
       // Attendance (Growth table)
-      'CREATE INDEX IF NOT EXISTS idx_attendance_user_id ON attendance_records(user_id)',
-      'CREATE INDEX IF NOT EXISTS idx_attendance_clock_in ON attendance_records(clock_in)',
+      'CREATE INDEX IF NOT EXISTS idx_attendance_user_id ON attendance(user_id)',
+      'CREATE INDEX IF NOT EXISTS idx_attendance_clock_in ON attendance(check_in_time)',
       
       // Notifications (High volume)
       'CREATE INDEX IF NOT EXISTS idx_notifications_user_id_read ON notifications(user_id, read)',

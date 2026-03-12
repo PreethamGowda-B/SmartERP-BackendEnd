@@ -452,14 +452,14 @@ router.get('/my-jobs', authenticateToken, async (req, res) => {
         );
 
         const history = await safeQuery(
-            `SELECT id, title, description, status,
-              COALESCE(employee_status,'pending') AS employee_status,
-              COALESCE(priority,'medium') AS priority,
-              COALESCE(progress, 0) AS progress,
-              created_at, accepted_at, completed_at
-       FROM jobs
-       WHERE assigned_to = $1 ${clause}
-       ORDER BY created_at DESC`,
+            `SELECT j.id, j.title, j.description, j.status,
+              COALESCE(j.employee_status,'pending') AS employee_status,
+              COALESCE(j.priority,'medium') AS priority,
+              COALESCE(j.progress, 0) AS progress,
+              j.created_at, j.accepted_at, j.completed_at
+       FROM jobs j
+       WHERE j.assigned_to = $1 ${clause}
+       ORDER BY j.created_at DESC`,
             [userId, ...params],
             []
         );

@@ -9,35 +9,11 @@ const { pool } = require("./db"); // ✅ Make sure db.js exports { pool }
 
 const app = express();
 
-// ✅ Security headers
-app.use(helmet({ contentSecurityPolicy: false }));
-
-// ✅ Rate limiting on auth routes (20 requests per 15 minutes)
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 20,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { message: "Too many requests, please try again later." },
-});
-app.use("/api/auth/login", authLimiter);
-app.use("/api/auth/signup", authLimiter);
-app.use("/api/auth/refresh", authLimiter);
-app.use("/api/subscription", authLimiter); // ✅ Rate limit payments/subs
-app.use("/api/payments", authLimiter);
-
-// ✅ Trust proxy (required for HTTPS cookies on Render)
-app.set("trust proxy", 1);
-
-// ✅ CORS configuration — shared config used for both main and preflight
+// ✅ CORS configuration — MUST be before rate limiters and other security headers
 const corsOptions = {
   origin: function (origin, callback) {
-    // Allow requests with no origin (like Postman or server-to-server)
-    if (!origin) {
-      return callback(null, true);
-    }
+    if (!origin) return callback(null, true);
 
-    // List of explicitly allowed origins
     const allowedOrigins = [
       "http://localhost:3000",
       "https://smart-erp-front-end.vercel.app",
@@ -45,12 +21,10 @@ const corsOptions = {
       "https://prozync.in",
     ];
 
-    // Check if origin is in allowed list
     if (allowedOrigins.includes(origin)) {
       return callback(null, true);
     }
 
-    // Allow ALL Vercel preview deployments
     if (origin.match(/^https:\/\/smart-erp-front(-[a-z0-9]+)?(-[a-z0-9-]+)?\.vercel\.app$/)) {
       return callback(null, true);
     }
@@ -69,9 +43,36 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
-
-// ✅ Handle preflight requests with the same CORS config (not wildcard)
 app.options("*", cors(corsOptions));
+
+// ✅ Security headers
+app.use(helmet({ contentSecurityPolicy: false }));
+
+// ✅ Rate limiting
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20, // Strict for login/signup
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: "Too many requests, please try again later." },
+});
+
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100, // More relaxed for status checks
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: "Too many requests, please try again later." },
+});
+
+app.use("/api/auth/login", authLimiter);
+app.use("/api/auth/signup", authLimiter);
+app.use("/api/auth/refresh", authLimiter);
+app.use("/api/subscription", apiLimiter); // ✅ Relaxed limit for subs
+app.use("/api/payments", apiLimiter);
+
+// ✅ Trust proxy (required for HTTPS cookies on Render)
+app.set("trust proxy", 1);
 
 // ✅ Common middlewares
 app.use(cookieParser());

@@ -13,7 +13,14 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
-const { loadPlan } = require('../middleware/planMiddleware');
+const { loadPlan, invalidatePlanCache } = require('../middleware/planMiddleware');
+const Razorpay = require('razorpay');
+const crypto = require('crypto');
+
+const razorpay = new Razorpay({
+  key_id: process.env.RAZORPAY_KEY_ID,
+  key_secret: process.env.RAZORPAY_KEY_SECRET,
+});
 
 // ── Owner-only guard ──────────────────────────────────────────────────────────
 router.use(authenticateToken);
@@ -147,14 +154,120 @@ router.post('/welcome-dismissed', requireOwner, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// POST /api/subscription/create-order
+// Create a Razorpay order for a plan upgrade
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/create-order', requireOwner, async (req, res) => {
+  try {
+    const { planId, billingCycle } = req.body; // billingCycle: 'monthly' or 'yearly'
+
+    if (![2, 3].includes(planId)) {
+      return res.status(400).json({ message: 'Invalid plan selected.' });
+    }
+
+    const planResult = await pool.query('SELECT * FROM plans WHERE id = $1', [planId]);
+    if (planResult.rows.length === 0) {
+      return res.status(404).json({ message: 'Plan not found.' });
+    }
+
+    const plan = planResult.rows[0];
+    const amount = billingCycle === 'yearly' ? parseFloat(plan.price_yearly) : parseFloat(plan.price_monthly);
+
+    if (amount <= 0) {
+      return res.status(400).json({ message: 'Invalid amount for paid plan.' });
+    }
+
+    const options = {
+      amount: Math.round(amount * 100), // amount in the smallest currency unit (paise)
+      currency: "INR",
+      receipt: `receipt_plan_${planId}_${Date.now()}`,
+      notes: {
+        companyId: req.user.companyId,
+        planId: planId,
+        billingCycle: billingCycle,
+        userId: req.user.id
+      }
+    };
+
+    const order = await razorpay.orders.create(options);
+    res.json(order);
+  } catch (err) {
+    console.error('Razorpay Create Order Error:', err);
+    res.status(500).json({ message: 'Failed to create payment order.' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/subscription/verify-payment
+// Verify Razorpay payment signature and update company plan
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/verify-payment', requireOwner, async (req, res) => {
+  try {
+    const {
+      razorpay_order_id,
+      razorpay_payment_id,
+      razorpay_signature,
+      planId,
+      billingCycle
+    } = req.body;
+
+    const companyId = req.user.companyId;
+
+    // Verify signature
+    const body = razorpay_order_id + "|" + razorpay_payment_id;
+    const expectedSignature = crypto
+      .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
+      .update(body.toString())
+      .digest("hex");
+
+    if (expectedSignature !== razorpay_signature) {
+      return res.status(400).json({ message: 'Invalid payment signature' });
+    }
+
+    // Update company subscription
+    const expiryInterval = billingCycle === 'yearly' ? '1 year' : '1 month';
+    
+    await pool.query('BEGIN');
+
+    await pool.query(
+      `UPDATE companies 
+       SET plan_id = $1, 
+           subscription_status = 'active', 
+           is_on_trial = FALSE, 
+           subscription_expires_at = NOW() + INTERVAL $2,
+           updated_at = NOW()
+       WHERE id = $3`,
+      [planId, expiryInterval, companyId]
+    );
+
+    // Log event
+    await pool.query(
+      `INSERT INTO subscription_events (company_id, event_type, new_plan_id, metadata, created_at)
+       VALUES ($1, 'upgrade', $2, $3, NOW())`,
+      [companyId, planId, JSON.stringify({ razorpay_payment_id, razorpay_order_id, billingCycle })]
+    );
+
+    await pool.query('COMMIT');
+
+    // Invalidate cache so changes are immediate
+    invalidatePlanCache(companyId);
+
+    res.json({ ok: true, message: 'Subscription upgraded successfully!' });
+  } catch (err) {
+    await pool.query('ROLLBACK');
+    console.error('Razorpay Verify Payment Error:', err);
+    res.status(500).json({ message: 'Payment verification failed.' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // POST /api/subscription/upgrade
-// Stub endpoint — payment gateway integration TBD (Razorpay / Stripe)
+// Redirects to billing page now that we have an active flow
 // ─────────────────────────────────────────────────────────────────────────────
 router.post('/upgrade', requireOwner, (req, res) => {
   res.json({
-    message: 'To upgrade your plan, please contact support at support@prozync.in or visit our billing page.',
-    contact_email: 'support@prozync.in',
-    billing_url: '/billing'
+    message: 'Please complete the payment on the billing page to upgrade.',
+    billing_url: '/owner/billing'
   });
 });
 

@@ -78,9 +78,13 @@ async function sendPushNotification(token, title, body, data = {}) {
         android: {
             priority: 'high', // Deliver immediately even in Doze mode
             notification: {
-                channel_id: 'fcm_default_channel', // Must match the channel created in MainActivity
+                channel_id: 'fcm_default_channel',
                 priority: 'high',
                 sound: 'default',
+                default_sound: true,
+                default_vibrate_timings: true,
+                notification_priority: 'PRIORITY_MAX',
+                visibility: 'public'
             },
         },
         apns: {

@@ -3,6 +3,7 @@ const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 const { createNotification, createNotificationForCompany } = require('../utils/notificationHelpers');
+const { body, validationResult } = require('express-validator');
 
 /**
  * Ensure the jobs table can store JSON payloads, visibility flag, and employee tracking
@@ -14,51 +15,36 @@ const ensureColumns = async () => {
   }
 
   try {
-    await pool.query(
-      "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS data JSONB"
-    );
-    await pool.query(
-      "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS visible_to_all BOOLEAN DEFAULT false"
-    );
-    await pool.query(
-      "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS employee_status VARCHAR(50) DEFAULT 'pending'"
-    );
-    await pool.query(
-      "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS progress INTEGER DEFAULT 0"
-    );
-    await pool.query(
-      "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS accepted_at TIMESTAMP"
-    );
-    await pool.query(
-      "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS declined_at TIMESTAMP"
-    );
-    await pool.query(
-      "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP"
-    );
-    await pool.query(
-      "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS priority VARCHAR(50) DEFAULT 'medium'"
-    );
-    // Ensure company_id column exists for multi-tenant scoping
-    await pool.query(
-      "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS company_id TEXT"
-    );
-
-    console.log("✅ Jobs table schema verified/updated with employee tracking columns.");
+    await pool.query("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS data JSONB");
+    await pool.query("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS visible_to_all BOOLEAN DEFAULT false");
+    await pool.query("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS employee_status VARCHAR(50) DEFAULT 'pending'");
+    await pool.query("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS progress INTEGER DEFAULT 0");
+    await pool.query("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS accepted_at TIMESTAMP");
+    await pool.query("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS declined_at TIMESTAMP");
+    await pool.query("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP");
+    await pool.query("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS priority VARCHAR(50) DEFAULT 'medium'");
+    await pool.query("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS company_id TEXT");
+    console.log("✅ Jobs table schema verified.");
   } catch (err) {
-    console.warn(
-      "⚠️ Could not ensure jobs columns exist:",
-      err.message || err
-    );
+    console.warn("⚠️ Could not ensure jobs columns exist:", err.message);
   }
 };
-
-// Run it asynchronously without blocking startup
 setTimeout(ensureColumns, 5000);
 
 /**
  * Create a new job
  */
-router.post('/', authenticateToken, async (req, res) => {
+router.post('/', authenticateToken, [
+  body('title').trim().notEmpty().withMessage('Title is required').escape(),
+  body('description').optional({ checkFalsy: true }).trim().escape(),
+  body('priority').optional().isIn(['low', 'medium', 'high', 'urgent']).withMessage('Invalid priority value'),
+  body('status').optional().isIn(['open', 'pending', 'in_progress', 'active', 'completed', 'closed', 'cancelled']).withMessage('Invalid status value')
+], async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ message: "Validation failed", errors: errors.array() });
+  }
+
   const job = req.body || {};
   const title = job.title || '';
   const description = job.description || '';
@@ -138,29 +124,46 @@ router.get('/', authenticateToken, async (req, res) => {
 
     console.log("🧩 Fetching jobs for:", req.user);
 
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 100;
+    const offset = (page - 1) * limit;
+
+    let countResult;
+    let queryParams = [req.user.companyId];
+
     if (req.user.role === 'owner') {
+      countResult = await pool.query(`SELECT COUNT(*) FROM jobs WHERE company_id = $1`, [req.user.companyId]);
       result = await pool.query(
         `SELECT j.*, u.email as employee_email 
          FROM jobs j
          LEFT JOIN users u ON j.assigned_to = u.id
          WHERE j.company_id = $1
-         ORDER BY j.created_at DESC`,
-        [req.user.companyId]
+         ORDER BY j.created_at DESC
+         LIMIT $2 OFFSET $3`,
+        [req.user.companyId, limit, offset]
       );
     } else if (req.user.role === 'employee') {
+      countResult = await pool.query(
+        `SELECT COUNT(*) FROM jobs WHERE (visible_to_all = true OR assigned_to = $1) AND company_id = $2`,
+        [req.user.id, req.user.companyId]
+      );
       result = await pool.query(
         `SELECT * FROM jobs 
          WHERE (visible_to_all = true OR assigned_to = $1)
          AND company_id = $2
-         ORDER BY created_at DESC`,
-        [req.user.id, req.user.companyId]
+         ORDER BY created_at DESC
+         LIMIT $3 OFFSET $4`,
+        [req.user.id, req.user.companyId, limit, offset]
       );
     } else {
+      countResult = await pool.query(`SELECT COUNT(*) FROM jobs WHERE visible_to_all = true AND company_id = $1`, [req.user.companyId]);
       result = await pool.query(
-        `SELECT * FROM jobs WHERE visible_to_all = true AND company_id = $1`,
-        [req.user.companyId]
+        `SELECT * FROM jobs WHERE visible_to_all = true AND company_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
+        [req.user.companyId, limit, offset]
       );
     }
+
+    const total = parseInt(countResult.rows[0].count);
 
     const rows = result.rows.map((r) => {
       const job = r.data && typeof r.data === 'object' ? r.data : {};

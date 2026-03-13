@@ -141,7 +141,7 @@ router.get('/all', authenticateToken, loadPlan, requireFeature('location_trackin
 
 // ─── GET /api/location/:employeeId ────────────────────────────────────────────
 // Owner/admin: get a single employee's latest location
-router.get('/:employeeId', authenticateToken, async (req, res) => {
+router.get('/:employeeId', authenticateToken, loadPlan, requireFeature('location_tracking'), async (req, res) => {
     try {
         const role = req.user.role;
         if (role !== 'owner' && role !== 'admin') {

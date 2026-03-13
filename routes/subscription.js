@@ -229,12 +229,27 @@ router.post('/verify-payment', requireOwner, async (req, res) => {
     
     await pool.query('BEGIN');
 
+    // ── Check for duplicate payment processing ─────────────────────────────
+    // Prevent re-processing the same Razorpay payment ID
+    const duplicateCheck = await pool.query(
+      `SELECT id FROM subscription_events WHERE metadata->>'razorpay_payment_id' = $1`,
+      [razorpay_payment_id]
+    );
+
+    if (duplicateCheck.rows.length > 0) {
+      await pool.query('ROLLBACK');
+      return res.status(400).json({ 
+        message: 'This payment has already been processed and your subscription updated.',
+        is_duplicate: true 
+      });
+    }
+
     await pool.query(
       `UPDATE companies 
        SET plan_id = $1, 
            subscription_status = 'active', 
            is_on_trial = FALSE, 
-           subscription_expires_at = NOW() + INTERVAL $2,
+           subscription_expires_at = COALESCE(GREATEST(subscription_expires_at, NOW()), NOW()) + INTERVAL $2,
            updated_at = NOW()
        WHERE id = $3`,
       [planId, expiryInterval, companyId]
@@ -248,6 +263,12 @@ router.post('/verify-payment', requireOwner, async (req, res) => {
     );
 
     await pool.query('COMMIT');
+
+    // 📣 Push Notification: Notify owner of successful upgrade
+    const { notifyPlanUpgrade } = require('../services/smartNotificationService');
+    const { invalidatePlanCache } = require('../middleware/planMiddleware');
+    const planName = planId === 1 ? 'Free' : planId === 2 ? 'Basic' : 'Pro';
+    notifyPlanUpgrade(req.user.userId || req.user.id, companyId, planName).catch(e => console.error('Push Error:', e.message));
 
     // Invalidate cache so changes are immediate
     invalidatePlanCache(companyId);

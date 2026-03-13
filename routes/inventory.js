@@ -95,24 +95,36 @@ router.post('/', authenticateToken, upload.single('image'), [
         const newItem = result.rows[0];
         await trackCreation(newItem.id, newItem, userId, employeeName);
 
-        // Send notification to all employees about new inventory
+        // Send notification to all employees and owner about new inventory
         try {
-            const { createNotificationForCompany } = require('../utils/notificationHelpers');
+            const { createNotificationForCompany, createNotificationForOwners } = require('../utils/notificationHelpers');
             const companyId = req.user.companyId;
 
+            // Notify Employees
             await createNotificationForCompany({
                 company_id: companyId,
                 type: 'inventory_added',
                 title: 'New Inventory Added',
-                message: `${name} (${quantity} ${itemUnit}) has been added to inventory`,
+                message: `${name} (${quantity} ${itemUnit}) has been added to inventory by ${employeeName}`,
                 priority: 'low',
-                data: { inventory_id: newItem.id, item_name: name, quantity },
+                data: { inventory_id: newItem.id, item_name: name, quantity, url: '/employee/inventory' },
                 exclude_user_id: userId // Don't notify the person who added it
             });
 
-            console.log(`✅ Broadcast notification sent for new inventory: ${name}`);
+            // Notify Owners
+            await createNotificationForOwners({
+                company_id: companyId,
+                type: 'action_inventory_added',
+                title: '📦 Inventory Updated',
+                message: `${employeeName} added ${newItem.name} to the stock.`,
+                priority: 'medium',
+                data: { inventory_id: newItem.id, item_name: name, url: '/owner/inventory' },
+                exclude_user_id: userId
+            });
+
+            console.log(`✅ Broadcast notifications sent for new inventory: ${name}`);
         } catch (notifErr) {
-            console.error('❌ Failed to send inventory notification:', notifErr);
+            console.error('❌ Failed to send inventory notifications:', notifErr);
         }
 
         res.status(201).json(newItem);
@@ -141,28 +153,30 @@ router.get('/', authenticateToken, async (req, res) => {
         const params = [companyId];
         let paramIndex = 2;
 
-        // Filter deleted items unless explicitly requested
-        if (include_deleted !== 'true') {
-            query += ` AND (is_deleted = FALSE OR is_deleted IS NULL)`;
-        }
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 100;
+        const offset = (page - 1) * limit;
 
-        // Filter by category
-        if (category) {
-            query += ` AND category = $${paramIndex}`;
-            params.push(category);
-            paramIndex++;
-        }
+        // ── Count Query (Replicate filters) ──────────────────────────────────
+        let countQuery = `SELECT COUNT(*) FROM inventory_items WHERE company_id = $1`;
+        const countParams = [companyId];
+        let cIdx = 2;
+        if (include_deleted !== 'true') countQuery += ` AND (is_deleted = FALSE OR is_deleted IS NULL)`;
+        if (category) { countQuery += ` AND category = $${cIdx++}`; countParams.push(category); }
+        if (supplier) { countQuery += ` AND supplier_name ILIKE $${cIdx++}`; countParams.push(`%${supplier}%`); }
+        
+        const countResult = await pool.query(countQuery, countParams);
+        const total = parseInt(countResult.rows[0].count);
 
-        // Filter by supplier
-        if (supplier) {
-            query += ` AND supplier_name ILIKE $${paramIndex}`;
-            params.push(`%${supplier}%`);
-            paramIndex++;
-        }
-
-        query += ` ORDER BY created_at DESC`;
+        query += ` ORDER BY created_at DESC LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
+        params.push(limit, offset);
 
         const result = await pool.query(query, params);
+
+        // Set pagination header
+        res.set('X-Total-Count', total);
+        res.set('X-Page', page);
+        res.set('X-Limit', limit);
 
         // Sanitize image_url: any non-Cloudinary local paths no longer exist on Render's ephemeral fs
         const rows = result.rows.map(item => ({

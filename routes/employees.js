@@ -115,6 +115,11 @@ router.post('/', DEV ? (req, res, next) => next() : authenticateToken, [
       );
       await client.query('COMMIT');
 
+      // 📣 Push Notification: Notify owner that a new employee was added
+      const { notifyEmployeeAdded } = require('../services/smartNotificationService');
+      const ownerId = req.user.userId || req.user.id;
+      notifyEmployeeAdded(ownerId, companyId, name).catch(e => console.error('Push Error:', e.message));
+
       const employee = await mapRowToEmployee({ id: userId, name, email, phone, position, is_active: true });
       res.status(201).json(employee);
     } catch (err) {

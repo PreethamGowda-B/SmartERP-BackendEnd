@@ -138,6 +138,24 @@ router.post('/', authenticateToken, loadPlan, requireFeature('payroll'), async (
 
     const payrollRecord = result.rows[0];
 
+    // 📣 Push Notification: Notify owner and employee
+    const { notifyPayrollGenerated } = require('../services/smartNotificationService');
+    const { createNotification } = require('../utils/notificationHelpers');
+    
+    // Notify Owner
+    notifyPayrollGenerated(userId, req.user.companyId || null).catch(e => console.error('Push Error (Owner):', e.message));
+    
+    // Notify Employee
+    createNotification({
+      user_id: employee.id,
+      company_id: req.user.companyId || null,
+      type: 'payroll_received',
+      title: "💰 Salary Credited",
+      message: `Your payroll for ${payroll_month}/${payroll_year} has been processed!`,
+      priority: 'high',
+      data: { url: '/employee/payroll' }
+    }).catch(e => console.error('Push Error (Employee):', e.message));
+
     // Send notification to employee
     try {
       await createNotification({
@@ -225,9 +243,47 @@ router.get('/', authenticateToken, async (req, res) => {
   }
 });
 
+// ─── GET /api/payroll/all ────────────────────────────────────────────────────
+// Get all payroll records (Owner only)
+router.get('/all', authenticateToken, loadPlan, requireFeature('payroll'), async (req, res) => {
+  try {
+    const { role, companyId } = req.user;
+    if (role !== 'owner' && role !== 'admin') {
+      return res.status(403).json({ message: 'Only owners can view payroll summaries' });
+    }
+
+    const { month, year, employee_email } = req.query;
+
+    let query = `SELECT * FROM payroll WHERE company_id = $1`;
+    const params = [companyId];
+
+    if (month) {
+      params.push(month);
+      query += ` AND payroll_month = $${params.length}`;
+    }
+    if (year) {
+      params.push(year);
+      query += ` AND payroll_year = $${params.length}`;
+    }
+    if (employee_email) {
+      params.push(employee_email);
+      query += ` AND employee_email ILIKE $${params.length}`; // Case-insensitive search
+    }
+
+    query += ` ORDER BY payroll_year DESC, payroll_month DESC, created_at DESC`;
+
+    const result = await pool.query(query, params);
+    console.log(`✅ Fetched ${result.rows.length} payroll records for company ${companyId}`);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('❌ Error fetching all payroll:', err);
+    res.status(500).json({ message: 'Server error fetching all payroll' });
+  }
+});
+
 // ─── GET /api/payroll/employees ──────────────────────────────────────────────
 // Get list of employees for payroll creation (Owner only)
-router.get('/employees', authenticateToken, async (req, res) => {
+router.get('/employees', authenticateToken, loadPlan, requireFeature('payroll'), async (req, res) => {
   try {
     const { role } = req.user;
 

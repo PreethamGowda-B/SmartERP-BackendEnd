@@ -25,7 +25,7 @@ router.post(
       res.json({ reply });
     } catch (error) {
       console.error("AI error:", error);
-      res.status(500).json({ error: "AI processing failed" });
+      res.status(500).json({ error: "AI Assistant is temporarily unavailable. Please try again in a few moments." });
     }
   }
 );

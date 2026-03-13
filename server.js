@@ -23,6 +23,8 @@ const authLimiter = rateLimit({
 app.use("/api/auth/login", authLimiter);
 app.use("/api/auth/signup", authLimiter);
 app.use("/api/auth/refresh", authLimiter);
+app.use("/api/subscription", authLimiter); // ✅ Rate limit payments/subs
+app.use("/api/payments", authLimiter);
 
 // ✅ Trust proxy (required for HTTPS cookies on Render)
 app.set("trust proxy", 1);
@@ -215,6 +217,25 @@ app.get("/", async (req, res) => {
   }
 });
 
+// ✅ Global Error Handler (MUST BE LAST)
+app.use((err, req, res, next) => {
+  console.error("❌ Global Error:", err.stack);
+  res.status(err.status || 500).json({
+    message: err.message || "An internal server error occurred.",
+    error: process.env.NODE_ENV === "development" ? err.stack : undefined,
+  });
+});
+
+// ✅ Catch uncaught exceptions to prevent silent process death
+process.on("uncaughtException", (err) => {
+  console.error("🔥 UNCAUGHT EXCEPTION:", err);
+  // Ideally, restart or exit after logging
+});
+
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("🔥 UNHANDLED REJECTION at:", promise, "reason:", reason);
+});
+
 // ✅ Start server
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
@@ -236,6 +257,46 @@ app.listen(PORT, () => {
   } catch (err) {
     console.error('❌ Failed to start trial expiry processor:', err.message);
   }
+
+  // 🔔 Smart Notification Service: Send tips/pokes periodically
+  const { sendRandomTip, sendRandomPoke } = require("./services/smartNotificationService");
+  setInterval(async () => {
+    try {
+      console.log("🕒 Running Smart Notification Check...");
+      const { pool } = require("./db");
+      const result = await pool.query(
+        "SELECT id, company_id FROM users WHERE push_token IS NOT NULL AND role = 'owner' ORDER BY RANDOM() LIMIT 5"
+      );
+
+      for (const user of result.rows) {
+        // 1. Check if attendance has been marked for his company today
+        const attendanceCheck = await pool.query(
+          "SELECT id FROM attendance WHERE company_id = $1 AND date = CURRENT_DATE LIMIT 1",
+          [user.company_id]
+        );
+
+        if (attendanceCheck.rows.length === 0) {
+          const { sendSmartNotification } = require("./services/smartNotificationService");
+          await sendSmartNotification(user.id, user.company_id, {
+            title: "📅 Attendance Reminder",
+            message: "Attendance hasn't been marked today. Don't forget to check!",
+            type: "reminder_attendance",
+            priority: "medium",
+            data: { url: "/owner/attendance" }
+          });
+        }
+
+        // 2. 50/50 chance of tip vs poke (Engagement)
+        if (Math.random() > 0.5) {
+          await sendRandomTip(user.id, user.company_id);
+        } else {
+          await sendRandomPoke(user.id, user.company_id);
+        }
+      }
+    } catch (err) {
+      console.error("❌ Smart Notification Background Job Error:", err.message);
+    }
+  }, 6 * 60 * 60 * 1000); // Every 6 hours
 });
 
 module.exports = app;

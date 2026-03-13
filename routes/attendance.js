@@ -4,11 +4,16 @@ const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 const { createNotification, createNotificationForOwners } = require('../utils/notificationHelpers');
 
-// UUID validation — guards against non-UUID values like '1' coming from older JWT tokens
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const DEFAULT_COMPANY_ID = '00000000-0000-0000-0000-000000000000';
-function safeUUID(value) {
-  return value && UUID_RE.test(value) ? value : DEFAULT_COMPANY_ID;
+// UUID validation helper (flexible for integers as well)
+function safeCompanyId(value) {
+  if (!value) return '1';
+  // If it's a number or numeric string, return as is
+  if (!isNaN(value)) return String(value);
+  // If it's a UUID, return as is
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (typeof value === 'string' && UUID_RE.test(value)) return value;
+  // Fallback to default
+  return '1';
 }
 
 // ─── ENTERPRISE ATTENDANCE SYSTEM ────────────────────────────────────────────
@@ -86,7 +91,7 @@ function determineStatus(clockInTime, clockOutTime, workingHours) {
 router.post('/clock-in', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId || req.user.id;
-    const companyId = safeUUID(req.user.companyId);
+    const companyId = safeCompanyId(req.user.companyId);
     const { biometric_device_id, method = 'manual' } = req.body;
     const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
     const clockInTime = new Date();
@@ -157,7 +162,7 @@ router.post('/clock-in', authenticateToken, async (req, res) => {
         title: 'Employee Clocked In',
         message: `${employeeName} clocked in at ${clockInTime.toLocaleTimeString()} (${statusLabel})`,
         priority: isHalfDay ? 'high' : isLate ? 'medium' : 'low',
-        data: { employee_id: userId, attendance_id: result.rows[0].id, is_late: isLate, status: provisionalStatus }
+        data: { employee_id: userId, attendance_id: result.rows[0].id, is_late: isLate, status: provisionalStatus, url: '/owner/attendance' }
       });
 
       console.log(`✅ Notified owners about clock-in`);
@@ -175,7 +180,7 @@ router.post('/clock-in', authenticateToken, async (req, res) => {
           title: 'Half Day Recorded',
           message: `You clocked in at ${clockInTime.toLocaleTimeString()} — recorded as Half Day. Shift started at 9:00 AM.`,
           priority: 'medium',
-          data: { attendance_id: result.rows[0].id }
+          data: { attendance_id: result.rows[0].id, url: '/employee/attendance' }
         });
       } catch (notifErr) {
         console.error('❌ Failed to send half-day notification:', notifErr);
@@ -189,7 +194,7 @@ router.post('/clock-in', authenticateToken, async (req, res) => {
           title: 'Late Clock-In',
           message: `You clocked in late at ${clockInTime.toLocaleTimeString()}. Shift starts at 9:00 AM.`,
           priority: 'low',
-          data: { attendance_id: result.rows[0].id }
+          data: { attendance_id: result.rows[0].id, url: '/employee/attendance' }
         });
       } catch (notifErr) {
         console.error('❌ Failed to send late notification:', notifErr);
@@ -252,7 +257,7 @@ router.post('/clock-out', authenticateToken, async (req, res) => {
       // Get employee name
       const userInfo = await pool.query('SELECT name FROM users WHERE id = $1', [userId]);
       const employeeName = userInfo.rows[0]?.name || 'Employee';
-      const companyId = safeUUID(req.user.companyId);
+      const companyId = safeCompanyId(req.user.companyId);
 
       await createNotificationForOwners({
         company_id: companyId,
@@ -260,7 +265,7 @@ router.post('/clock-out', authenticateToken, async (req, res) => {
         title: 'Employee Clocked Out',
         message: `${employeeName} clocked out. Hours: ${workingHours.toFixed(2)}, Status: ${status}`,
         priority: 'low',
-        data: { employee_id: userId, attendance_id: result.rows[0].id, working_hours: workingHours, status }
+        data: { employee_id: userId, attendance_id: result.rows[0].id, working_hours: workingHours, status, url: '/owner/attendance' }
       });
 
       console.log(`✅ Notified owners about clock-out`);
@@ -343,7 +348,7 @@ router.get('/history', authenticateToken, async (req, res) => {
 router.post('/corrections', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId || req.user.id;
-    const companyId = safeUUID(req.user.companyId);
+    const companyId = safeCompanyId(req.user.companyId);
     const { attendance_id, requested_check_in, requested_check_out, reason } = req.body;
 
     if (!attendance_id || !reason) {
@@ -382,7 +387,7 @@ router.post('/corrections', authenticateToken, async (req, res) => {
         title: 'Attendance Correction Request',
         message: `Employee has requested attendance correction`,
         priority: 'medium',
-        data: { correction_id: result.rows[0].id, user_id: userId }
+        data: { correction_id: result.rows[0].id, user_id: userId, url: '/owner/attendance' }
       });
       console.log(`✅ Notified owners about correction request`);
     } catch (notifErr) {
@@ -410,7 +415,7 @@ router.get('/overview', authenticateToken, async (req, res) => {
     }
 
     const today = new Date().toISOString().split('T')[0];
-    const companyId = req.user.companyId || safeUUID(req.user.companyId);
+    const companyId = req.user.companyId || safeCompanyId(req.user.companyId);
 
     const result = await pool.query(
       `SELECT 
@@ -613,7 +618,7 @@ router.patch('/corrections/:id/approve', authenticateToken, async (req, res) => 
         title: 'Attendance Correction Approved',
         message: 'Your attendance correction request has been approved',
         priority: 'medium',
-        data: { correction_id: id }
+        data: { correction_id: id, url: '/employee/attendance' }
       });
     } catch (notifErr) {
       console.error('❌ Failed to send approval notification:', notifErr);
@@ -673,7 +678,7 @@ router.patch('/corrections/:id/reject', authenticateToken, async (req, res) => {
         title: 'Attendance Correction Rejected',
         message: rejection_reason || 'Your attendance correction request has been rejected',
         priority: 'low',
-        data: { correction_id: id }
+        data: { correction_id: id, url: '/employee/attendance' }
       });
     } catch (notifErr) {
       console.error('❌ Failed to send rejection notification:', notifErr);

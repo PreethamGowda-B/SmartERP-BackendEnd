@@ -151,7 +151,8 @@ router.post('/', authenticateToken, loadPlan, requireFeature('payroll'), async (
           payroll_id: payrollRecord.id,
           month: payroll_month,
           year: payroll_year,
-          total_salary
+          total_salary,
+          url: '/employee/payroll'
         }
       });
       console.log(`✅ Notification sent for payroll: ${employee_email} - ${payroll_month}/${payroll_year}`);

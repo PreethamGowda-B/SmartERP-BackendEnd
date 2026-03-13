@@ -35,11 +35,27 @@ async function createNotification({ user_id, company_id, type, title, message, p
                 console.log(`✅ Found push token for user ${user_id}: ${pushToken.substring(0, 10)}...`);
 
                 // Determine the best URL fallback if not provided
-                let finalUrl = data?.url || '/notifications';
+                let finalUrl = data?.url;
+                if (!finalUrl) {
+                    // Smart defaults based on notification type
+                    if (type.startsWith('job')) {
+                        finalUrl = '/notifications'; // Will be refined by broad functions
+                    } else if (type.startsWith('attendance') || type.startsWith('employee_clock')) {
+                        finalUrl = '/attendance';
+                    } else if (type.startsWith('material_request')) {
+                        finalUrl = '/inventory';
+                    } else if (type.startsWith('payroll')) {
+                        finalUrl = '/payroll';
+                    } else if (type === 'message') {
+                        finalUrl = '/messages';
+                    } else {
+                        finalUrl = '/notifications';
+                    }
+                }
 
-                // If it's still just the generic fallback, we might want to try harder
-                // but for now, we'll rely on the bulk functions to provide better defaults.
-
+                // Append role prefix if we can determine it
+                // Note: broad functions like createNotificationForCompany already set the role prefix
+                
                 const pushData = {
                     type,
                     notificationId: notification.id.toString(),
@@ -122,21 +138,23 @@ function unregisterSSEConnection(userId, response) {
 async function createNotificationForCompany({ company_id, type, title, message, priority = 'medium', data = null, exclude_user_id = null }) {
     try {
         // 1. Fetch all employees for the company
+        // Use ::text casting to be type-agnostic (handles both Integer and UUID company_ids)
         let query = "SELECT id FROM users WHERE role = 'employee'";
         let params = [];
 
-        // If company_id is provided, try to match it but also include '1' (default company)
-        // This handles cases where some users have '1' and some have UUIDs
-        if (company_id && company_id !== '1') {
-            query += " AND (company_id = $1 OR company_id = '1' OR company_id IS NULL)";
-            params.push(company_id);
-        } else if (company_id === '1') {
-            query += " AND (company_id = '1' OR company_id IS NULL)";
+        if (company_id) {
+            const cid = String(company_id);
+            if (cid !== '1' && cid !== '0' && cid !== '00000000-0000-0000-0000-000000000000') {
+                query += " AND (company_id::text = $1 OR company_id::text = '1' OR company_id IS NULL)";
+                params.push(cid);
+            } else {
+                query += " AND (company_id::text = '1' OR company_id IS NULL)";
+            }
         }
 
         if (exclude_user_id) {
-            query += ` AND id != $${params.length + 1}`;
-            params.push(exclude_user_id);
+            query += ` AND id::text != $${params.length + 1}::text`;
+            params.push(String(exclude_user_id));
         }
 
         const employeesResult = await pool.query(query, params);
@@ -171,19 +189,25 @@ async function createNotificationForCompany({ company_id, type, title, message, 
 async function createNotificationForOwners({ company_id, type, title, message, priority = 'medium', data = null, exclude_user_id = null }) {
     try {
         // 1. Fetch all owners and admins for the company
+        // Use ::text casting to be type-agnostic (handles both Integer and UUID company_ids)
         let query = "SELECT id FROM users WHERE role IN ('owner', 'admin')";
         let params = [];
 
-        if (company_id && company_id !== '00000000-0000-0000-0000-000000000000' && company_id !== '1') {
-            query += " AND (company_id = $1 OR company_id = '1' OR company_id IS NULL)";
-            params.push(company_id);
-        } else if (company_id === '1') {
-            query += " AND (company_id = '1' OR company_id IS NULL)";
+        if (company_id) {
+            const cid = String(company_id);
+            const isDefault = cid === '1' || cid === '0' || cid === '00000000-0000-0000-0000-000000000000';
+            
+            if (!isDefault) {
+                query += " AND (company_id::text = $1 OR company_id::text = '1' OR company_id IS NULL)";
+                params.push(cid);
+            } else {
+                query += " AND (company_id::text = '1' OR company_id IS NULL)";
+            }
         }
 
         if (exclude_user_id) {
-            query += ` AND id != $${params.length + 1}`;
-            params.push(exclude_user_id);
+            query += ` AND id::text != $${params.length + 1}::text`;
+            params.push(String(exclude_user_id));
         }
 
         const ownersResult = await pool.query(query, params);

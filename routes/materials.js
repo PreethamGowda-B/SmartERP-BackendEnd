@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
+const { loadPlan } = require('../middleware/planMiddleware');
 
 // Create inventory item
 router.post('/items', authenticateToken, async (req, res) => {
@@ -64,13 +65,46 @@ router.delete('/items/:id', authenticateToken, async (req, res) => {
 });
 
 // Create material request - only employees can create requests
-router.post('/requests', authenticateToken, async (req, res) => {
+router.post('/requests', authenticateToken, loadPlan, async (req, res) => {
   const { requestNumber, items } = req.body; // items: [{ inventory_item_id, name, quantity, unit }]
   try {
     if (req.user.role !== 'employee' && req.user.role !== 'user') {
       return res.status(403).json({ message: 'Only employees can create material requests' });
     }
-    const result = await pool.query('INSERT INTO material_requests (request_number, requested_by) VALUES ($1,$2) RETURNING *', [requestNumber || null, req.user.userId]);
+
+    // --- Subscription Limit Check ---
+    const companyId = req.user.companyId;
+    if (companyId && req.plan) {
+      const maxRequests = req.plan.max_material_requests;
+      if (maxRequests !== null) {
+        // Count existing material requests for the company
+        // If your table lacks company_id directly, we count based on the user's company
+        // However, assuming company_id exists on material_requests:
+        const countRes = await pool.query(
+          `SELECT COUNT(*) as exact_count FROM material_requests 
+           WHERE requested_by IN (SELECT id FROM users WHERE company_id = $1)
+              OR company_id = $1`,
+          [companyId]
+        );
+        const currentCount = parseInt(countRes.rows[0].exact_count, 10);
+        
+        if (currentCount >= maxRequests) {
+          return res.status(403).json({
+            message: "Material request limit reached for your current plan.",
+            upgrade_required: true,
+            feature: "Material Requests",
+            current_plan: req.plan.name,
+            upgrade_url: "/owner/billing"
+          });
+        }
+      }
+    }
+    // --------------------------------
+
+    const result = await pool.query(
+      'INSERT INTO material_requests (request_number, requested_by, company_id) VALUES ($1,$2,$3) RETURNING *', 
+      [requestNumber || null, req.user.userId, companyId || null]
+    );
     const requestId = result.rows[0].id;
     for (const it of items || []) {
       await pool.query('INSERT INTO material_request_items (request_id, inventory_item_id, name, quantity, unit) VALUES ($1,$2,$3,$4,$5)', [requestId, it.inventory_item_id || null, it.name || null, it.quantity, it.unit || null]);

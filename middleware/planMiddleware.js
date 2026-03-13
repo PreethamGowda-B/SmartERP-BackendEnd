@@ -40,6 +40,7 @@ async function loadPlan(req, res, next) {
          p.name,
          p.employee_limit,
          p.max_inventory_items,
+         p.max_material_requests,
          p.messages_history_days,
          p.features
        FROM companies c
@@ -65,7 +66,7 @@ async function loadPlan(req, res, next) {
     if (trialActive) {
       // ── TRIAL ACTIVE: serve Pro features regardless of stored plan_id ──
       const proResult = await pool.query(
-        `SELECT id, name, employee_limit, max_inventory_items, messages_history_days, features
+        `SELECT id, name, employee_limit, max_inventory_items, max_material_requests, messages_history_days, features
          FROM plans WHERE id = 3`
       );
       const pro = proResult.rows[0];
@@ -84,6 +85,7 @@ async function loadPlan(req, res, next) {
         name: data.name,
         employee_limit: data.employee_limit,
         max_inventory_items: data.max_inventory_items,
+        max_material_requests: data.max_material_requests,
         messages_history_days: data.messages_history_days,
         features: data.features,
         is_trial: false,

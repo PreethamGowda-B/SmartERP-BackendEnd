@@ -10,6 +10,7 @@
 ALTER TABLE plans
   ADD COLUMN IF NOT EXISTS features            JSONB   DEFAULT '{}',
   ADD COLUMN IF NOT EXISTS max_inventory_items INTEGER DEFAULT NULL, -- NULL = unlimited
+  ADD COLUMN IF NOT EXISTS max_material_requests INTEGER DEFAULT NULL, -- new limit per tier
   ADD COLUMN IF NOT EXISTS messages_history_days INTEGER DEFAULT 30;
 
 -- ──────────────────────────────────────────────────────────────
@@ -49,10 +50,10 @@ CREATE INDEX IF NOT EXISTS idx_sub_events_company ON subscription_events(company
 --    Using UPSERT so this is safe to re-run
 -- ──────────────────────────────────────────────────────────────
 INSERT INTO plans
-  (id, name, employee_limit, max_inventory_items, messages_history_days, features, price_monthly, price_yearly)
+  (id, name, employee_limit, max_inventory_items, max_material_requests, messages_history_days, features, price_monthly, price_yearly)
 VALUES
   -- Free Plan
-  (1, 'Free', 15, 30, 30,
+  (1, 'Free', 15, 30, 10, 30,
    '{
      "ai_assistant":      false,
      "location_tracking": false,
@@ -61,12 +62,13 @@ VALUES
      "basic_reports":     true,
      "advanced_reports":  false,
      "export_reports":    false,
+     "messages":          false,
      "priority_support":  false
    }',
    0, 0),
 
   -- Basic Plan
-  (2, 'Basic', 50, 200, 90,
+  (2, 'Basic', 50, 200, 100, 90,
    '{
      "ai_assistant":      false,
      "location_tracking": true,
@@ -75,12 +77,13 @@ VALUES
      "basic_reports":     true,
      "advanced_reports":  true,
      "export_reports":    true,
+     "messages":          true,
      "priority_support":  false
    }',
    999, 9990),
 
   -- Pro Plan
-  (3, 'Pro', NULL, NULL, 9999,
+  (3, 'Pro', NULL, NULL, NULL, 9999,
    '{
      "ai_assistant":      true,
      "location_tracking": true,
@@ -89,6 +92,7 @@ VALUES
      "basic_reports":     true,
      "advanced_reports":  true,
      "export_reports":    true,
+     "messages":          true,
      "priority_support":  true
    }',
    2499, 24990)
@@ -97,6 +101,7 @@ ON CONFLICT (id) DO UPDATE
   SET name                  = EXCLUDED.name,
       employee_limit        = EXCLUDED.employee_limit,
       max_inventory_items   = EXCLUDED.max_inventory_items,
+      max_material_requests = EXCLUDED.max_material_requests,
       messages_history_days = EXCLUDED.messages_history_days,
       features              = EXCLUDED.features,
       price_monthly         = EXCLUDED.price_monthly,

@@ -17,14 +17,14 @@ const { loadPlan } = require('../middleware/planMiddleware');
 
 // ── Owner-only guard ──────────────────────────────────────────────────────────
 router.use(authenticateToken);
-router.use((req, res, next) => {
+const requireOwner = (req, res, next) => {
   if (req.user.role !== 'owner') {
     return res.status(403).json({
       message: 'Only the company owner can manage subscription plans.'
     });
   }
   next();
-});
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /api/subscription/status
@@ -93,7 +93,7 @@ router.get('/status', loadPlan, async (req, res) => {
 // GET /api/subscription/trial-status
 // Trial banner data for the dashboard
 // ─────────────────────────────────────────────────────────────────────────────
-router.get('/trial-status', loadPlan, async (req, res) => {
+router.get('/trial-status', requireOwner, loadPlan, async (req, res) => {
   try {
     const companyId = req.user.companyId;
     const plan = req.plan;
@@ -132,7 +132,7 @@ router.get('/trial-status', loadPlan, async (req, res) => {
 // POST /api/subscription/welcome-dismissed
 // Called once after the owner closes the trial welcome modal
 // ─────────────────────────────────────────────────────────────────────────────
-router.post('/welcome-dismissed', async (req, res) => {
+router.post('/welcome-dismissed', requireOwner, async (req, res) => {
   try {
     const companyId = req.user.companyId;
     await pool.query(
@@ -150,7 +150,7 @@ router.post('/welcome-dismissed', async (req, res) => {
 // POST /api/subscription/upgrade
 // Stub endpoint — payment gateway integration TBD (Razorpay / Stripe)
 // ─────────────────────────────────────────────────────────────────────────────
-router.post('/upgrade', (req, res) => {
+router.post('/upgrade', requireOwner, (req, res) => {
   res.json({
     message: 'To upgrade your plan, please contact support at support@prozync.in or visit our billing page.',
     contact_email: 'support@prozync.in',

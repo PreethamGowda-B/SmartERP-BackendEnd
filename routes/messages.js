@@ -4,10 +4,14 @@ const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 const { createNotification } = require('../utils/notificationHelpers');
 const { loadPlan } = require('../middleware/planMiddleware');
+const { requireFeature } = require('../middleware/featureGuard');
+
+// Global protection for all message routes
+router.use(authenticateToken, loadPlan, requireFeature('messages'));
 
 // ─── POST /api/messages ───────────────────────────────────────────────────────
 // Send a new message
-router.post('/', authenticateToken, async (req, res) => {
+router.post('/', async (req, res) => {
     try {
         const senderId = req.user.userId || req.user.id;
         const { receiver_id, message } = req.body;
@@ -90,7 +94,7 @@ router.post('/', authenticateToken, async (req, res) => {
 // ─── GET /api/messages/conversation/:userId ──────────────────────────────────
 // Get all messages in a conversation with a specific user
 // Message history is filtered by plan's messages_history_days (parameterized - safe from SQL injection)
-router.get('/conversation/:userId', authenticateToken, loadPlan, async (req, res) => {
+router.get('/conversation/:userId', async (req, res) => {
     try {
         const currentUserId = req.user.userId || req.user.id;
         const otherUserId = req.params.userId;
@@ -132,7 +136,7 @@ router.get('/conversation/:userId', authenticateToken, loadPlan, async (req, res
 
 // ─── GET /api/messages/conversations ─────────────────────────────────────────
 // Get list of all conversations (for owner)
-router.get('/conversations', authenticateToken, async (req, res) => {
+router.get('/conversations', async (req, res) => {
     try {
         const currentUserId = req.user.userId || req.user.id;
 
@@ -192,7 +196,7 @@ router.get('/conversations', authenticateToken, async (req, res) => {
 
 // ─── PATCH /api/messages/conversation/:userId/read ───────────────────────────
 // Mark all messages in a conversation as read
-router.patch('/conversation/:userId/read', authenticateToken, async (req, res) => {
+router.patch('/conversation/:userId/read', async (req, res) => {
     try {
         const currentUserId = req.user.userId || req.user.id;
         const otherUserId = req.params.userId;
@@ -224,7 +228,7 @@ router.patch('/conversation/:userId/read', authenticateToken, async (req, res) =
 
 // ─── GET /api/messages/unread-count ──────────────────────────────────────────
 // Get total unread message count
-router.get('/unread-count', authenticateToken, async (req, res) => {
+router.get('/unread-count', async (req, res) => {
     try {
         const currentUserId = req.user.userId || req.user.id;
 
@@ -246,7 +250,7 @@ router.get('/unread-count', authenticateToken, async (req, res) => {
 
 // ─── GET /api/messages/owner ─────────────────────────────────────────────────
 // Get owner user ID (helper endpoint for employees)
-router.get('/owner', authenticateToken, async (req, res) => {
+router.get('/owner', async (req, res) => {
     try {
         const companyId = req.user.companyId;
 

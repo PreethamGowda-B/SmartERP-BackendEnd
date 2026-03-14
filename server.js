@@ -110,17 +110,19 @@ async function fixDatabaseConstraints() {
     console.warn('⚠️  Could not fix constraints:', err.message);
   }
 }
-setTimeout(fixDatabaseConstraints, 3000); // Run after DB connection
-
-// Auto-fix material_requests schema on startup
-const { fixMaterialRequestsSchema } = require('./migrations/autoMigrate');
-setTimeout(fixMaterialRequestsSchema, 4000); // Run after DB connection
-
-// 🚀 Performance Optimization & Schema Verification
-const { optimizeDatabase } = require('./scripts/optimizeDb');
-setTimeout(async () => {
+// ✅ Consolidated Database Initialization (Run once per deployment)
+async function runDatabaseInitialization() {
   try {
-    // Ensure essential tables that might be missing from older setups exist
+    console.log('🏗️  Starting Database Initialization...');
+    
+    // 1. Fix constraints
+    await fixDatabaseConstraints();
+    
+    // 2. Auto-migrate schema
+    const { fixMaterialRequestsSchema } = require('./migrations/autoMigrate');
+    await fixMaterialRequestsSchema();
+    
+    // 3. OTP setup and Core optimization
     await pool.query(`
       CREATE TABLE IF NOT EXISTS email_otps (
         id SERIAL PRIMARY KEY,
@@ -133,12 +135,14 @@ setTimeout(async () => {
       CREATE INDEX IF NOT EXISTS idx_email_otps_email ON email_otps(email);
     `);
     
+    const { optimizeDatabase } = require('./scripts/optimizeDb');
     await optimizeDatabase();
-    console.log('✅ Database optimization complete');
+    
+    console.log('✅ Database Initialization & Optimization complete');
   } catch (err) {
-    console.error('❌ Database initialization error:', err.message);
+    console.error('❌ Database Initialization failed:', err.message);
   }
-}, 6000); // Run after DB connections and migrations
+}
 
 // ✅ Routes
 app.use("/api/auth", require("./routes/auth"));
@@ -244,10 +248,14 @@ if (cluster.isMaster && process.env.NODE_ENV === 'production') {
   console.log(`📡 Master process ${process.pid} is running`);
   console.log(`🧵 Spawning ${totalCPUs} workers for cluster mode...`);
 
-  // Fork workers
-  for (let i = 0; i < totalCPUs; i++) {
-    cluster.fork();
-  }
+  // Run DB initialization ONCE in the master process before forking
+  (async () => {
+    await runDatabaseInitialization();
+    
+    for (let i = 0; i < totalCPUs; i++) {
+      cluster.fork();
+    }
+  })();
 
   cluster.on('exit', (worker, code, signal) => {
     console.warn(`⚠️ Worker ${worker.process.pid} died. Spawning replacement...`);
@@ -260,21 +268,19 @@ if (cluster.isMaster && process.env.NODE_ENV === 'production') {
   app.listen(PORT, () => {
     console.log(`🚀 SmartERP worker ${process.pid} running on port ${PORT}`);
     
-    // Only run background jobs on Master or specific workers if needed
-    // But for a simple monolith, we can run them on Master or choose one worker
+    // Only run background workers and periodic jobs on worker 1
     if (!cluster.isWorker || cluster.worker.id === 1) {
-      console.log("🛠️ Starting background processors on worker 1...");
+      console.log("🛠️ Starting background processors and workers on worker 1...");
       
+      require('./jobs/workers'); // Initialize BullMQ workers
+
       try {
         const { startDailyAttendanceProcessor } = require('./jobs/dailyAttendanceProcessor');
-        const { initializeWorkers } = require('./jobs/workers'); // Placeholder for an init function if needed, or just require
-        require('./jobs/workers'); // Initialize BullMQ workers
         startDailyAttendanceProcessor();
       } catch (err) {
         console.error('❌ Failed to start daily attendance processor:', err.message);
       }
 
-      // ✅ Start trial expiry processor (9:00 AM IST)
       try {
         const { startTrialExpiryProcessor } = require('./jobs/trialExpiryProcessor');
         startTrialExpiryProcessor();
@@ -286,7 +292,6 @@ if (cluster.isMaster && process.env.NODE_ENV === 'production') {
       const { sendRandomTip, sendRandomPoke } = require("./services/smartNotificationService");
       setInterval(async () => {
         try {
-          console.log("🕒 Running Smart Notification Check...");
           const { pool } = require("./db");
           const result = await pool.query(
             "SELECT id, company_id FROM users WHERE push_token IS NOT NULL AND role = 'owner' ORDER BY RANDOM() LIMIT 5"

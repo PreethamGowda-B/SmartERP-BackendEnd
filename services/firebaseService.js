@@ -87,6 +87,24 @@ async function sendPushNotification(token, title, body, data = {}) {
                 visibility: 'public'
             },
         },
+        webpush: {
+            headers: {
+                Urgency: 'high'
+            },
+            notification: {
+                title,
+                body,
+                icon: '/icon.png',
+                badge: '/icon.png',
+                tag: 'smarterp-notification',
+                renotify: true,
+                requireInteraction: true,
+                vibrate: [200, 100, 200]
+            },
+            fcm_options: {
+                link: data?.url || '/'
+            }
+        },
         apns: {
             headers: { 'apns-priority': '10' },
             payload: { aps: { sound: 'default', 'content-available': 1 } },
@@ -123,6 +141,23 @@ async function sendMulticastPush(tokens, title, body, data = {}) {
                 priority: 'high',
                 sound: 'default'
             },
+        },
+        webpush: {
+            headers: {
+                Urgency: 'high'
+            },
+            notification: {
+                title,
+                body,
+                icon: '/icon.png',
+                badge: '/icon.png',
+                tag: 'smarterp-notification',
+                renotify: true,
+                requireInteraction: true
+            },
+            fcm_options: {
+                link: data?.url || '/'
+            }
         },
         apns: {
             headers: { 'apns-priority': '10' },

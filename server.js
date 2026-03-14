@@ -237,67 +237,90 @@ process.on("unhandledRejection", (reason, promise) => {
   console.error("🔥 UNHANDLED REJECTION at:", promise, "reason:", reason);
 });
 
-// ✅ Start server
-const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => {
-  console.log(`🚀 SmartERP backend running on port ${PORT}`);
-  console.log("🌐 CORS: Accepting all Vercel preview deployments");
+const cluster = require('cluster');
+const totalCPUs = require('os').cpus().length;
 
-  // ✅ Start daily attendance processor (7:30 PM IST)
-  try {
-    const { startDailyAttendanceProcessor } = require('./jobs/dailyAttendanceProcessor');
-    startDailyAttendanceProcessor();
-  } catch (err) {
-    console.error('❌ Failed to start daily attendance processor:', err.message);
+if (cluster.isMaster && process.env.NODE_ENV === 'production') {
+  console.log(`📡 Master process ${process.pid} is running`);
+  console.log(`🧵 Spawning ${totalCPUs} workers for cluster mode...`);
+
+  // Fork workers
+  for (let i = 0; i < totalCPUs; i++) {
+    cluster.fork();
   }
 
-  // ✅ Start trial expiry processor (9:00 AM IST)
-  try {
-    const { startTrialExpiryProcessor } = require('./jobs/trialExpiryProcessor');
-    startTrialExpiryProcessor();
-  } catch (err) {
-    console.error('❌ Failed to start trial expiry processor:', err.message);
-  }
+  cluster.on('exit', (worker, code, signal) => {
+    console.warn(`⚠️ Worker ${worker.process.pid} died. Spawning replacement...`);
+    cluster.fork();
+  });
 
-  // 🔔 Smart Notification Service: Send tips/pokes periodically
-  const { sendRandomTip, sendRandomPoke } = require("./services/smartNotificationService");
-  setInterval(async () => {
-    try {
-      console.log("🕒 Running Smart Notification Check...");
-      const { pool } = require("./db");
-      const result = await pool.query(
-        "SELECT id, company_id FROM users WHERE push_token IS NOT NULL AND role = 'owner' ORDER BY RANDOM() LIMIT 5"
-      );
-
-      for (const user of result.rows) {
-        // 1. Check if attendance has been marked for his company today
-        const attendanceCheck = await pool.query(
-          "SELECT id FROM attendance WHERE company_id = $1 AND date = CURRENT_DATE LIMIT 1",
-          [user.company_id]
-        );
-
-        if (attendanceCheck.rows.length === 0) {
-          const { sendSmartNotification } = require("./services/smartNotificationService");
-          await sendSmartNotification(user.id, user.company_id, {
-            title: "📅 Attendance Reminder",
-            message: "Attendance hasn't been marked today. Don't forget to check!",
-            type: "reminder_attendance",
-            priority: "medium",
-            data: { url: "/owner/attendance" }
-          });
-        }
-
-        // 2. 50/50 chance of tip vs poke (Engagement)
-        if (Math.random() > 0.5) {
-          await sendRandomTip(user.id, user.company_id);
-        } else {
-          await sendRandomPoke(user.id, user.company_id);
-        }
+} else {
+  // ✅ Start server
+  const PORT = process.env.PORT || 4000;
+  app.listen(PORT, () => {
+    console.log(`🚀 SmartERP worker ${process.pid} running on port ${PORT}`);
+    
+    // Only run background jobs on Master or specific workers if needed
+    // But for a simple monolith, we can run them on Master or choose one worker
+    if (!cluster.isWorker || cluster.worker.id === 1) {
+      console.log("🛠️ Starting background processors on worker 1...");
+      
+      try {
+        const { startDailyAttendanceProcessor } = require('./jobs/dailyAttendanceProcessor');
+        const { initializeWorkers } = require('./jobs/workers'); // Placeholder for an init function if needed, or just require
+        require('./jobs/workers'); // Initialize BullMQ workers
+        startDailyAttendanceProcessor();
+      } catch (err) {
+        console.error('❌ Failed to start daily attendance processor:', err.message);
       }
-    } catch (err) {
-      console.error("❌ Smart Notification Background Job Error:", err.message);
+
+      // ✅ Start trial expiry processor (9:00 AM IST)
+      try {
+        const { startTrialExpiryProcessor } = require('./jobs/trialExpiryProcessor');
+        startTrialExpiryProcessor();
+      } catch (err) {
+        console.error('❌ Failed to start trial expiry processor:', err.message);
+      }
+
+      // 🔔 Smart Notification Service: Send tips/pokes periodically
+      const { sendRandomTip, sendRandomPoke } = require("./services/smartNotificationService");
+      setInterval(async () => {
+        try {
+          console.log("🕒 Running Smart Notification Check...");
+          const { pool } = require("./db");
+          const result = await pool.query(
+            "SELECT id, company_id FROM users WHERE push_token IS NOT NULL AND role = 'owner' ORDER BY RANDOM() LIMIT 5"
+          );
+
+          for (const user of result.rows) {
+            const attendanceCheck = await pool.query(
+              "SELECT id FROM attendance WHERE company_id = $1 AND date = CURRENT_DATE LIMIT 1",
+              [user.company_id]
+            );
+
+            if (attendanceCheck.rows.length === 0) {
+              const { sendSmartNotification } = require("./services/smartNotificationService");
+              await sendSmartNotification(user.id, user.company_id, {
+                title: "📅 Attendance Reminder",
+                message: "Attendance hasn't been marked today. Don't forget to check!",
+                type: "reminder_attendance",
+                priority: "medium",
+                data: { url: "/owner/attendance" }
+              });
+            }
+
+            if (Math.random() > 0.5) {
+              await sendRandomTip(user.id, user.company_id);
+            } else {
+              await sendRandomPoke(user.id, user.company_id);
+            }
+          }
+        } catch (err) {
+          console.error("❌ Smart Notification Background Job Error:", err.message);
+        }
+      }, 6 * 60 * 60 * 1000); // Every 6 hours
     }
-  }, 6 * 60 * 60 * 1000); // Every 6 hours
-});
+  });
+}
 
 module.exports = app;

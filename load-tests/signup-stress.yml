@@ -1,0 +1,29 @@
+config:
+  target: "http://localhost:4000"
+  phases:
+    - duration: 10
+      arrivalRate: 10
+      name: "Warm up"
+    - duration: 30
+      arrivalRate: 100
+      rampTo: 1000
+      name: "Stress Test - Ramping to 1000 signups/sec"
+  payload:
+    # We need unique emails and names for each signup
+    path: "users.csv"
+    fields:
+      - "name"
+      - "email"
+      - "password"
+scenarios:
+  - name: "High-Concurrency Signup"
+    flow:
+      - post:
+          url: "/api/auth/signup"
+          json:
+            name: "{{ name }}"
+            email: "{{ email }}"
+            password: "{{ password }}"
+            role: "owner"
+          expect:
+            - statusCode: 201

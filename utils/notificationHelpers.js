@@ -7,14 +7,22 @@ const sseConnections = new Map();
 /**
  * Create a notification in the database and broadcast it via SSE and Push
  */
-async function createNotification({ user_id, company_id, type, title, message, priority = 'medium', data = null }) {
-    try {
-        const result = await pool.query(
-            `INSERT INTO notifications (user_id, company_id, type, title, message, priority, data, created_at)
+/**
+ * Enhanced createNotification - Supporting Background Queues
+ */
+async function createNotification(notificationData) {
+  const { user_id, company_id, type, title, message, priority = 'low', data = {} } = notificationData;
+  
+  // If this handles background logic, it will be called by the worker.
+  // If called by logic that wants to queue it, it should use enqueueNotification.
+  
+  try {
+    const result = await pool.query(
+      `INSERT INTO notifications (user_id, company_id, type, title, message, priority, data, created_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
        RETURNING *`,
-            [user_id, company_id, type, title, message, priority, data ? JSON.stringify(data) : null]
-        );
+      [user_id, company_id, type, title, message, priority, JSON.stringify(data)]
+    );
 
         const notification = result.rows[0];
 

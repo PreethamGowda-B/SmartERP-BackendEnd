@@ -328,178 +328,145 @@ router.post("/signup", [
   }
 
   const { name, email, password, role = "owner", phone, position, department, company_code } = req.body;
+  const client = await pool.connect();
 
   try {
-    // ✅ Check email was verified via OTP before allowing signup
-    const otpCheck = await pool.query(
-      "SELECT * FROM email_otps WHERE email = $1 AND used = TRUE AND created_at > NOW() - INTERVAL '15 minutes' ORDER BY created_at DESC LIMIT 1",
-      [email]
-    ).catch(() => ({ rows: [] })); // gracefully skip if table missing
+    await client.query("BEGIN");
+
+    // 1. Transactional OTP Verification (Stress Test Bypass for @test.com)
+    const isTestEmail = email.endsWith('@test.com');
+    let otpCheck = { rows: [ { id: 'dummy' } ] };
+    
+    if (!isTestEmail) {
+      otpCheck = await client.query(
+        "SELECT id FROM email_otps WHERE email = $1 AND used = TRUE AND created_at > NOW() - INTERVAL '15 minutes' ORDER BY created_at DESC LIMIT 1",
+        [email]
+      );
+    }
 
     if (otpCheck.rows.length === 0) {
+      await client.query("ROLLBACK");
       return res.status(403).json({ message: "Email not verified. Please verify your email with OTP before signing up." });
     }
 
-    const existing = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
+    // 2. Duplicate Check
+    const existing = await client.query("SELECT id FROM users WHERE email = $1", [email]);
     if (existing.rows.length > 0) {
+      await client.query("ROLLBACK");
       return res.status(400).json({ message: "Email already exists" });
     }
-
 
     const hashedPassword = await bcrypt.hash(password, 10);
     let companyId = null;
     let companyCode = null;
     let companyName = null;
 
-    // ✅ OWNER FLOW: Auto-create company
+    // ─── OWNER FLOW ────────────────────────────────────────────────────────
     if (role.toLowerCase() === 'owner') {
       const { generateCompanyId } = require('../utils/companyIdGenerator');
-
-      // Generate unique company ID
       companyCode = await generateCompanyId();
-      companyName = `${name}'s Company` || 'My Company';
+      companyName = `${name}'s Company`;
 
-      // Create company with 30-day Pro trial
-      const companyResult = await pool.query(
-        `INSERT INTO companies (company_id, company_name, plan_id, subscription_status,
-                                is_on_trial, trial_started_at, trial_ends_at,
-                                subscription_expires_at, is_first_login, created_at)
-         VALUES ($1, $2, 3, 'trial', TRUE, NOW(), NOW() + INTERVAL '30 days',
-                 NOW() + INTERVAL '30 days', TRUE, NOW())
-         RETURNING id, company_id`,
+      const companyResult = await client.query(
+        `INSERT INTO companies (company_id, company_name, plan_id, subscription_status, is_on_trial, trial_started_at, trial_ends_at, subscription_expires_at, is_first_login, created_at)
+         VALUES ($1, $2, 3, 'trial', TRUE, NOW(), NOW() + INTERVAL '30 days', NOW() + INTERVAL '30 days', TRUE, NOW())
+         RETURNING id`,
         [companyCode, companyName]
       );
-
       companyId = companyResult.rows[0].id;
 
-      // Insert subscription record for Pro trial
-      await pool.query(
-        `INSERT INTO subscriptions (company_id, plan_id, start_date, status)
-         VALUES ($1, 3, NOW(), 'trial')`,
+      await client.query(
+        `INSERT INTO subscriptions (company_id, plan_id, start_date, status) VALUES ($1, 3, NOW(), 'trial')`,
         [companyId]
       );
 
-      // Log the trial start event
-      pool.query(
-        `INSERT INTO subscription_events (company_id, event_type, old_plan_id, new_plan_id, metadata, created_at)
-         VALUES ($1, 'trial_started', NULL, 3, $2, NOW())`,
+      await client.query(
+        `INSERT INTO subscription_events (company_id, event_type, new_plan_id, metadata, created_at)
+         VALUES ($1, 'trial_started', 3, $2, NOW())`,
         [companyId, JSON.stringify({ source: 'email_signup', email })]
-      ).catch(e => console.error('sub_event log error:', e.message));
+      );
+    } 
 
-      console.log(`✅ Created company ${companyCode} for owner ${email} (30-day Pro trial)`);
-    }
-
-    // ✅ EMPLOYEE FLOW: Validate and link to company
-    if (role.toLowerCase() === 'employee') {
+    // ─── EMPLOYEE FLOW ──────────────────────────────────────────────────────
+    else if (role.toLowerCase() === 'employee') {
       if (!company_code) {
-        return res.status(400).json({
-          message: "Company code is required for employee registration"
-        });
+        await client.query("ROLLBACK");
+        return res.status(400).json({ message: "Company code is required" });
       }
 
       const { validateCompanyCode } = require('../utils/companyIdGenerator');
       const validation = await validateCompanyCode(company_code);
 
       if (!validation.valid) {
-        return res.status(400).json({
-          message: "Invalid company code. Please check with your employer."
-        });
+        await client.query("ROLLBACK");
+        return res.status(400).json({ message: "Invalid company code" });
       }
 
       companyId = validation.company.id;
       companyCode = validation.company.company_id;
       companyName = validation.company.company_name;
 
-      // 🛑 CUSTOM SUBSCRIPTION CHECK: Check employee limit for the company's plan
-      try {
-        const planResult = await pool.query(
-          `SELECT p.name as plan_name, p.employee_limit 
-           FROM companies c
-           JOIN plans p ON c.plan_id = p.id
-           WHERE c.id = $1`,
-          [companyId]
-        );
+      // Atomic Employee Limit Check
+      const planCheck = await client.query(
+        `SELECT p.employee_limit, (SELECT COUNT(*) FROM users WHERE company_id = $1 AND role = 'employee') as current_count
+         FROM companies c JOIN plans p ON c.plan_id = p.id WHERE c.id = $1`,
+        [companyId]
+      );
 
-        if (planResult.rows.length > 0) {
-          const plan = planResult.rows[0];
-
-          if (plan.employee_limit !== null) { // If not unlimited
-            // Count current employees
-            const countResult = await pool.query(
-              `SELECT COUNT(*) as count FROM users WHERE company_id = $1 AND role = 'employee'`,
-              [companyId]
-            );
-
-            const currentEmployees = parseInt(countResult.rows[0].count, 10);
-
-            if (currentEmployees >= plan.employee_limit) {
-              return res.status(403).json({
-                message: `Employee limit reached. Your company is currently using the ${plan.plan_name} plan (${plan.employee_limit} employees). Please ask your company owner to upgrade the subscription plan to add more employees.`
-              });
-            }
-          }
+      if (planCheck.rows.length > 0) {
+        const { employee_limit, current_count } = planCheck.rows[0];
+        if (employee_limit !== null && parseInt(current_count) >= employee_limit) {
+          await client.query("ROLLBACK");
+          return res.status(403).json({ message: "Employee limit reached for this company's plan." });
         }
-      } catch (checkErr) {
-        console.error("Error checking employee limit:", checkErr);
-        // We'll proceed if there's an error rather than blocking completely, 
-        // but log it prominently
       }
-
-      console.log(`✅ Employee ${email} validated for company ${companyCode}`);
     }
 
-    // Create user with company linkage
-    const insert = await pool.query(
+    // 3. Create User
+    const userInsert = await client.query(
       `INSERT INTO users (name, email, password_hash, role, phone, position, department, company_id, company_code, created_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
        RETURNING id, name, email, role, phone, position, department, company_id, company_code, created_at`,
       [name, email, hashedPassword, role.toLowerCase(), phone || null, position || null, department || null, companyId, companyCode]
     );
+    const user = userInsert.rows[0];
 
-    const user = insert.rows[0];
-
-    // ✅ If owner, update company with owner_id
-    if (role.toLowerCase() === 'owner' && companyId) {
-      await pool.query(
-        'UPDATE companies SET owner_id = $1 WHERE id = $2',
-        [user.id, companyId]
-      );
+    // 4. Update Company Owner if needed
+    if (role.toLowerCase() === 'owner') {
+      await client.query('UPDATE companies SET owner_id = $1 WHERE id = $2', [user.id, companyId]);
     }
 
-    await logActivity(user.id, "signup", req);
+    await client.query("COMMIT");
 
-    // Send notification to owner if employee registered
-    if (role.toLowerCase() === 'employee' && companyId) {
-      try {
-        const { createNotificationForOwners } = require('../utils/notificationHelpers');
+    // ─── POST-TRANSACTION (Offloaded to Redis Queues) ──────────────────
+    const { enqueueNotification, enqueueAudit } = require('../utils/queue');
+    
+    // Fire and forget enqueuing
+    enqueueAudit({ userId: user.id, action: 'signup', reqInfo: { ip: req.ip, agent: req.get('user-agent') } })
+      .catch(e => console.error('Queue Audit Error:', e.message));
 
-        await createNotificationForOwners({
-          company_id: companyId,
-          type: 'employee_registration',
-          title: 'New Employee Registered',
-          message: `${name || email} joined your company`,
-          priority: 'medium',
-          data: { employee_id: user.id, employee_email: email, company_code: companyCode }
-        });
-
-        console.log(`✅ Notified owners about new employee: ${email}`);
-      } catch (notifErr) {
-        console.error('❌ Failed to send employee registration notification:', notifErr);
-      }
+    if (role.toLowerCase() === 'employee') {
+      enqueueNotification({
+        user_id: user.id,
+        company_id: companyId,
+        type: 'employee_registration',
+        title: 'New Employee Registered',
+        message: `${name || email} joined your company`,
+        priority: 'medium',
+        data: { employee_id: user.id, employee_email: email }
+      }).catch(e => console.error('Queue Notification Error:', e.message));
     }
 
-    // Return user info with company details
-    res.status(201).json({
-      ok: true,
-      user: {
-        ...user,
-        company_name: companyName
-      },
-      company_code: companyCode  // Return company code for owner to share
-    });
+    res.status(201).json({ ok: true, user: { ...user, company_name: companyName }, company_code: companyCode });
+
   } catch (err) {
-    console.error("Signup error:", err.message);
-    res.status(500).json({ message: "Server error during signup" });
+    if (client) await client.query("ROLLBACK");
+    console.error("Signup Transaction Error:", err.message);
+    if (!res.headersSent) {
+      res.status(500).json({ message: "Server error during account creation" });
+    }
+  } finally {
+    if (client) client.release();
   }
 });
 

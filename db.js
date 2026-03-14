@@ -1,11 +1,15 @@
 const { Pool } = require("pg");
 require("dotenv").config();
 
-const pool = new Pool({
+const poolConfig = {
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: true },
-  max: 50, // Added explicit connection limit for concurrent users
-});
+  max: parseInt(process.env.DB_MAX_CONNECTIONS || "50"), // Support higher limits via env
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000, // Faster failure for high-concurrency
+};
+
+const pool = new Pool(poolConfig);
 
 // Test DB connection
 (async () => {

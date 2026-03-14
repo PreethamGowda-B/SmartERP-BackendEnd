@@ -2,3 +2,6 @@ node_modules/
 .env
 firebase-service-account.json
 services/firebase-service-account.json
+load-tests/users.csv
+load-tests/*.log
+load-tests/*.json

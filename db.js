@@ -3,7 +3,7 @@ require("dotenv").config();
 
 const poolConfig = {
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: true, sslmode: 'verify-full' }, // Explicitly set for new pg versions
+  ssl: { rejectUnauthorized: true },
   max: parseInt(process.env.DB_MAX_CONNECTIONS || "20"), // Reduced default to avoid hitting Neon limits too fast
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 15000, // Slightly more generous for startup spikes

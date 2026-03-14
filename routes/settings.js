@@ -7,23 +7,7 @@ const { authenticateToken } = require('../middleware/authMiddleware');
 // ─── Ensure optional columns exist ────────────────────────────────────────────
 // companies table has: id, company_id (short code VARCHAR), company_name, owner_id, created_at
 // We add optional extra cols: address, phone, contact_email, settings
-async function ensureSettingsCols() {
-    const alterUser = [
-        `ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT`,
-        `ALTER TABLE users ADD COLUMN IF NOT EXISTS notification_prefs JSONB DEFAULT '{}'::jsonb`,
-    ];
-    const alterCompany = [
-        `ALTER TABLE companies ADD COLUMN IF NOT EXISTS address TEXT`,
-        `ALTER TABLE companies ADD COLUMN IF NOT EXISTS phone TEXT`,
-        `ALTER TABLE companies ADD COLUMN IF NOT EXISTS contact_email TEXT`,
-        `ALTER TABLE companies ADD COLUMN IF NOT EXISTS settings JSONB DEFAULT '{}'::jsonb`,
-    ];
-    for (const sql of [...alterUser, ...alterCompany]) {
-        try { await pool.query(sql); } catch (e) { /* column already exists — ignore */ }
-    }
-    console.log('✅ Settings columns verified.');
-}
-ensureSettingsCols().catch(() => { });
+
 
 // ─── Helper: get company row for a user ───────────────────────────────────────
 // JWT stores companyId as the integer companies.id

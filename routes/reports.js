@@ -7,46 +7,7 @@ const { requireFeature } = require('../middleware/featureGuard');
 
 // ─── Startup: ensure all columns used by reports exist ───────────────────────
 
-let columnsEnsured = false;
 
-async function ensureReportColumns() {
-    if (columnsEnsured) return;
-    const alterations = [
-        // attendance
-        `ALTER TABLE attendance ADD COLUMN IF NOT EXISTS is_late BOOLEAN DEFAULT false`,
-        `ALTER TABLE attendance ADD COLUMN IF NOT EXISTS working_hours NUMERIC(5,2)`,
-        `ALTER TABLE attendance ADD COLUMN IF NOT EXISTS check_in_time TIMESTAMPTZ`,
-        `ALTER TABLE attendance ADD COLUMN IF NOT EXISTS check_out_time TIMESTAMPTZ`,
-        `ALTER TABLE attendance ADD COLUMN IF NOT EXISTS notes TEXT`,
-        // jobs
-        `ALTER TABLE jobs ADD COLUMN IF NOT EXISTS employee_status VARCHAR(50) DEFAULT 'pending'`,
-        `ALTER TABLE jobs ADD COLUMN IF NOT EXISTS progress INTEGER DEFAULT 0`,
-        `ALTER TABLE jobs ADD COLUMN IF NOT EXISTS accepted_at TIMESTAMP`,
-        `ALTER TABLE jobs ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP`,
-        `ALTER TABLE jobs ADD COLUMN IF NOT EXISTS priority VARCHAR(50) DEFAULT 'medium'`,
-        `ALTER TABLE jobs ADD COLUMN IF NOT EXISTS assigned_to UUID`,
-        `ALTER TABLE jobs ADD COLUMN IF NOT EXISTS company_id TEXT`,
-        // material_requests
-        `ALTER TABLE material_requests ADD COLUMN IF NOT EXISTS company_id TEXT`,
-        `ALTER TABLE material_requests ADD COLUMN IF NOT EXISTS unit TEXT`,
-        `ALTER TABLE material_requests ADD COLUMN IF NOT EXISTS notes TEXT`,
-        // inventory_items
-        `ALTER TABLE inventory_items ADD COLUMN IF NOT EXISTS reorder_point INTEGER DEFAULT 0`,
-        `ALTER TABLE inventory_items ADD COLUMN IF NOT EXISTS is_archived BOOLEAN DEFAULT false`,
-        `ALTER TABLE inventory_items ADD COLUMN IF NOT EXISTS company_id TEXT`,
-        `ALTER TABLE inventory_items ADD COLUMN IF NOT EXISTS unit TEXT`,
-        `ALTER TABLE inventory_items ADD COLUMN IF NOT EXISTS category TEXT`,
-    ];
-
-    for (const sql of alterations) {
-        try { await pool.query(sql); } catch (e) { /* ignore — column/table may not exist */ }
-    }
-    columnsEnsured = true;
-    console.log('✅ Report columns ensured');
-}
-
-// Run immediately on module load (no delay needed since routes are hit later)
-ensureReportColumns().catch(() => { });
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 

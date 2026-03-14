@@ -3,13 +3,7 @@ const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 
-;(async function ensureColumns() {
-  try {
-    await pool.query("ALTER TABLE activities ADD COLUMN IF NOT EXISTS details JSONB");
-  } catch (err) {
-    console.warn('Could not ensure activities.details column exists:', err.message || err);
-  }
-})();
+
 
 // Log activity (supports action and details payload)
 router.post('/', authenticateToken, async (req, res) => {

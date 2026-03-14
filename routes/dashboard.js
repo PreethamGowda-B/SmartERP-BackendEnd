@@ -4,14 +4,7 @@ const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 
 // Ensure columns exist
-async function ensureDashboardCols() {
-    try {
-        await pool.query(`ALTER TABLE attendance ADD COLUMN IF NOT EXISTS company_id TEXT`);
-        await pool.query(`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS progress INTEGER DEFAULT 0`);
-        await pool.query(`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS employee_status VARCHAR(50) DEFAULT 'pending'`);
-    } catch (e) { /* ignore */ }
-}
-ensureDashboardCols().catch(() => { });
+
 
 // ─── GET /api/dashboard/owner/metrics ────────────────────────────────────────
 router.get('/owner/metrics', authenticateToken, async (req, res) => {

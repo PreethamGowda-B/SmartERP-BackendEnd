@@ -104,10 +104,42 @@ app.use(express.json());
 // but for a clean v1, we should be strict.
 if (process.env.NODE_ENV === "production") {
   const csrf = require("csurf");
-  app.use(csrf({ cookie: true }));
-  // Provide token via cookie or header
+  const csrfProtection = csrf({ 
+    cookie: {
+      httpOnly: false, // Must be accessible to frontend if reading 'XSRF-TOKEN' header
+      secure: true,
+      sameSite: 'none'
+    } 
+  });
+
   app.use((req, res, next) => {
-    res.cookie('XSRF-TOKEN', req.csrfToken());
+    csrfProtection(req, res, (err) => {
+      const publicRoutes = [
+        '/api/auth/login',
+        '/api/v1/auth/login',
+        '/api/auth/signup',
+        '/api/v1/auth/signup',
+        '/api/health',
+        '/api/v1/health',
+        '/api/csrf-token'
+      ];
+
+      if (err && err.code === 'EBADCSRFTOKEN' && publicRoutes.includes(req.path)) {
+        // Ignore validation error for these routes, but keep going
+        return next();
+      }
+      next(err);
+    });
+  });
+
+  // Provide token via cookie for all requests
+  app.use((req, res, next) => {
+    if (req.csrfToken) {
+      res.cookie('XSRF-TOKEN', req.csrfToken(), {
+        secure: true,
+        sameSite: 'none'
+      });
+    }
     next();
   });
 }

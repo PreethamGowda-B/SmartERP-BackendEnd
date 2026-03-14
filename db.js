@@ -1,33 +1,31 @@
-const { Pool } = require("pg");
-require("dotenv").config();
+const { pool } = require("./db-base");
+const { storage } = require("./middleware/als");
 
-const poolConfig = {
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: true },
-  max: parseInt(process.env.DB_MAX_CONNECTIONS || "20"), // Reduced default to avoid hitting Neon limits too fast
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 15000, // Slightly more generous for startup spikes
-};
+// Store the original query function
+const originalQuery = pool.query.bind(pool);
 
-const pool = new Pool(poolConfig);
+/**
+ * Global query wrapper that enforces Row-Level Security (RLS)
+ * by pulling the companyId from AsyncLocalStorage.
+ * We monkey-patch pool.query so existing code works perfectly.
+ */
+pool.query = async function(text, params) {
+  const context = storage.getStore();
+  const companyId = context?.companyId;
 
-// DB connection pool event handling
-pool.on('error', (err) => {
-  console.error('Unexpected error on idle client', err);
-});
+  // Use standard query if no companyId (e.g. public routes, startup)
+  if (!companyId) {
+    return originalQuery(text, params);
+  }
 
-// ✅ Tenant-aware query helper for RLS
-async function tenantQuery(sql, params, companyId) {
   const client = await pool.connect();
   try {
-    if (companyId) {
-      await client.query(`SET LOCAL app.current_company_id = '${companyId}'`);
-    }
-    return await client.query(sql, params);
+    // Set the session variable for RLS
+    await client.query(`SET LOCAL app.current_company_id = '${companyId}'`);
+    return await client.query(text, params);
   } finally {
     client.release();
   }
-}
+};
 
-// ✅ Correctly export
-module.exports = { pool, tenantQuery };
+module.exports = { pool };

@@ -8,28 +8,7 @@ const { body, validationResult } = require('express-validator');
 /**
  * Ensure the jobs table can store JSON payloads, visibility flag, and employee tracking
  */
-const ensureColumns = async () => {
-  if (!pool) {
-    console.warn("⚠️ Database pool not ready yet. Skipping schema checks.");
-    return;
-  }
 
-  try {
-    await pool.query("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS data JSONB");
-    await pool.query("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS visible_to_all BOOLEAN DEFAULT false");
-    await pool.query("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS employee_status VARCHAR(50) DEFAULT 'pending'");
-    await pool.query("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS progress INTEGER DEFAULT 0");
-    await pool.query("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS accepted_at TIMESTAMP");
-    await pool.query("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS declined_at TIMESTAMP");
-    await pool.query("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP");
-    await pool.query("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS priority VARCHAR(50) DEFAULT 'medium'");
-    await pool.query("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS company_id TEXT");
-    console.log("✅ Jobs table schema verified.");
-  } catch (err) {
-    console.warn("⚠️ Could not ensure jobs columns exist:", err.message);
-  }
-};
-setTimeout(ensureColumns, 5000);
 
 /**
  * Create a new job

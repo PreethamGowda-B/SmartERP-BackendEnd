@@ -137,6 +137,9 @@ router.post('/clock-in', authenticateToken, async (req, res) => {
     else if (isLate) provisionalStatus = 'late';
 
     // Create or update attendance record
+    // Ensure companyId is a valid UUID
+    const validCompanyId = (companyId && companyId.length > 20) ? companyId : null;
+
     const result = await pool.query(
       `INSERT INTO attendance 
              (user_id, company_id, date, check_in_time, is_late, status, clock_in_method, biometric_device_id, created_at, updated_at)
@@ -144,7 +147,7 @@ router.post('/clock-in', authenticateToken, async (req, res) => {
              ON CONFLICT (user_id, date) 
              DO UPDATE SET check_in_time = $4, is_late = $5, status = $6, clock_in_method = $7, biometric_device_id = $8, updated_at = NOW()
              RETURNING *`,
-      [userId, companyId, today, clockInTime, isLate, provisionalStatus, method, biometric_device_id]
+      [userId, validCompanyId, today, clockInTime, isLate, provisionalStatus, method, biometric_device_id]
     );
 
     // Build human-readable status label

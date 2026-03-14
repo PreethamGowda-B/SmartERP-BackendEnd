@@ -133,6 +133,11 @@ async function runDatabaseInitialization() {
         created_at TIMESTAMP DEFAULT NOW()
       );
       CREATE INDEX IF NOT EXISTS idx_email_otps_email ON email_otps(email);
+
+      -- Update activities table for modern logging
+      ALTER TABLE activities ADD COLUMN IF NOT EXISTS activity_type TEXT;
+      ALTER TABLE activities ADD COLUMN IF NOT EXISTS details JSONB;
+      ALTER TABLE activities ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
     `);
     
     const { optimizeDatabase } = require('./scripts/optimizeDb');

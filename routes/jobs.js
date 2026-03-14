@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
-const { createNotification, createNotificationForCompany } = require('../utils/notificationHelpers');
+const { createNotification, createNotificationForCompany, createNotificationForOwners } = require('../utils/notificationHelpers');
 const { body, validationResult } = require('express-validator');
 
 /**

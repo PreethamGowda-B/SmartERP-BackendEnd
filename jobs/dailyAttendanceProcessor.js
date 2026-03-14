@@ -57,6 +57,7 @@ function startDailyAttendanceProcessor() {
                 SELECT u.id, u.company_id, $1, 'absent', FALSE, NOW(), NOW()
                 FROM users u
                 WHERE u.role = 'employee'
+                  AND u.company_id IS NOT NULL
                   AND NOT EXISTS (
                       SELECT 1 FROM attendance a 
                       WHERE a.user_id = u.id AND a.date = $1

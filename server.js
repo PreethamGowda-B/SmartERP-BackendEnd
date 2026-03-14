@@ -113,32 +113,42 @@ if (process.env.NODE_ENV === "production") {
   });
 
   app.use((req, res, next) => {
-    csrfProtection(req, res, (err) => {
-      const publicRoutes = [
-        '/api/auth/login',
-        '/api/v1/auth/login',
-        '/api/auth/signup',
-        '/api/v1/auth/signup',
-        '/api/health',
-        '/api/v1/health',
-        '/api/csrf-token'
-      ];
+    const publicRoutes = [
+      '/api/auth/login',
+      '/api/v1/auth/login',
+      '/api/auth/signup',
+      '/api/v1/auth/signup',
+      '/api/health',
+      '/api/v1/health',
+      '/api/csrf-token',
+      '/api/notifications/devices',
+      '/api/v1/notifications/devices'
+    ];
 
-      if (err && err.code === 'EBADCSRFTOKEN' && publicRoutes.includes(req.path)) {
-        // Ignore validation error for these routes, but keep going
-        return next();
-      }
-      next(err);
-    });
+    // 🛡️ Skip CSRF validation for:
+    // 1. Bearer token requests (Safe: attackers can't set custom headers)
+    // 2. Public auth routes (Initial entry points)
+    if (
+      (req.headers.authorization && req.headers.authorization.startsWith('Bearer ')) ||
+      publicRoutes.includes(req.path)
+    ) {
+      return next();
+    }
+
+    csrfProtection(req, res, next);
   });
 
-  // Provide token via cookie for all requests
+  // Provide token via cookie for all requests to enable CSRF for cookie-only clients if needed later
   app.use((req, res, next) => {
-    if (req.csrfToken) {
-      res.cookie('XSRF-TOKEN', req.csrfToken(), {
-        secure: true,
-        sameSite: 'none'
-      });
+    try {
+      if (req.csrfToken) {
+        res.cookie('XSRF-TOKEN', req.csrfToken(), {
+          secure: true,
+          sameSite: 'none'
+        });
+      }
+    } catch (e) {
+      // req.csrfToken() might throw if not initialized, ignore
     }
     next();
   });

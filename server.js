@@ -1,4 +1,19 @@
-require("dotenv").config(); // Load environment variables early
+require("dotenv").config();
+const Sentry = require("@sentry/node");
+const { nodeProfilingIntegration } = require("@sentry/profiling-node");
+
+// ✅ Initialize Sentry BEFORE anything else
+if (process.env.SENTRY_DSN) {
+  Sentry.init({
+    dsn: process.env.SENTRY_DSN,
+    integrations: [
+      nodeProfilingIntegration(),
+    ],
+    tracesSampleRate: 1.0,
+    profilesSampleRate: 1.0,
+  });
+  console.log("🎯 Sentry Observability initialized");
+}
 
 const express = require("express");
 const cors = require("cors");
@@ -8,6 +23,12 @@ const cookieParser = require("cookie-parser");
 const { pool } = require("./db"); // ✅ Make sure db.js exports { pool }
 
 const app = express();
+
+// ✅ Sentry Request Request Handler (MUST be first)
+if (process.env.SENTRY_DSN) {
+  app.use(Sentry.Handlers.requestHandler());
+  app.use(Sentry.Handlers.tracingHandler());
+}
 
 // ✅ CORS configuration — MUST be before rate limiters and other security headers
 const corsOptions = {
@@ -77,6 +98,19 @@ app.set("trust proxy", 1);
 // ✅ Common middlewares
 app.use(cookieParser());
 app.use(express.json());
+
+// ✅ CSRF Protection (Standard for Cookie-based Auth)
+// We only enable it if a specific header or cookie is present to avoid breaking existing clients immediately,
+// but for a clean v1, we should be strict.
+if (process.env.NODE_ENV === "production") {
+  const csrf = require("csurf");
+  app.use(csrf({ cookie: true }));
+  // Provide token via cookie or header
+  app.use((req, res, next) => {
+    res.cookie('XSRF-TOKEN', req.csrfToken());
+    next();
+  });
+}
 
 // ✅ Serve uploaded files statically
 app.use('/uploads', express.static('uploads'));
@@ -237,7 +271,16 @@ app.get("/", async (req, res) => {
 });
 
 // ✅ Global Error Handler (MUST BE LAST)
+if (process.env.SENTRY_DSN) {
+  app.use(Sentry.Handlers.errorHandler());
+}
+
 app.use((err, req, res, next) => {
+  // Handle CSRF errors specifically
+  if (err.code === 'EBADCSRFTOKEN') {
+    return res.status(403).json({ message: "Invalid CSRF token. Please refresh the page." });
+  }
+  
   console.error("❌ Global Error:", err.stack);
   res.status(err.status || 500).json({
     message: err.message || "An internal server error occurred.",

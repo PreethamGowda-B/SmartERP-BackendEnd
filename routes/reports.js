@@ -7,6 +7,28 @@ const { requireFeature } = require('../middleware/featureGuard');
 const { cacheMiddleware } = require('../middleware/cache');
 
 // ─── Startup: ensure all columns used by reports exist ───────────────────────
+async function ensureReportColumns() {
+    try {
+        // Attendance
+        await pool.query('ALTER TABLE attendance ADD COLUMN IF NOT EXISTS working_hours NUMERIC');
+        await pool.query('ALTER TABLE attendance ADD COLUMN IF NOT EXISTS is_late BOOLEAN DEFAULT false');
+        
+        // Jobs
+        await pool.query('ALTER TABLE jobs ADD COLUMN IF NOT EXISTS employee_status VARCHAR(50)');
+        await pool.query('ALTER TABLE jobs ADD COLUMN IF NOT EXISTS accepted_at TIMESTAMP');
+        await pool.query('ALTER TABLE jobs ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP');
+        await pool.query('ALTER TABLE jobs ADD COLUMN IF NOT EXISTS progress INTEGER DEFAULT 0');
+        
+        // Material Requests
+        await pool.query('ALTER TABLE material_requests ADD COLUMN IF NOT EXISTS unit VARCHAR(20)');
+        await pool.query('ALTER TABLE material_requests ADD COLUMN IF NOT EXISTS notes TEXT');
+        
+        // Inventory
+        await pool.query('ALTER TABLE inventory_items ADD COLUMN IF NOT EXISTS unit VARCHAR(20)');
+    } catch (err) {
+        console.error('⚠️  ensureReportColumns warning:', err.message);
+    }
+}
 
 
 

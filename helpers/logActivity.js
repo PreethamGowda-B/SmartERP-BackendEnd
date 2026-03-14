@@ -18,8 +18,8 @@ async function logActivity(userId, type, req = null) {
     };
 
     await pool.query(
-      `INSERT INTO activities (user_id, activity_type, details, created_at)
-       VALUES ($1, $2, $3, NOW())`,
+      `INSERT INTO activities (user_id, activity_type, action, details, created_at)
+       VALUES ($1, $2, $2, $3, NOW())`,
       [userId, type, JSON.stringify(details)]
     );
   } catch (err) {

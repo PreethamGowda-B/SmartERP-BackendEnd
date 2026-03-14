@@ -257,16 +257,23 @@ process.on("unhandledRejection", (reason, promise) => {
 
 const cluster = require('cluster');
 const totalCPUs = require('os').cpus().length;
+// Cap workers to prevent OOM on Render's 512MB RAM limit
+// We recommend 2 workers for 512MB, 4 for 1GB.
+const WORKER_COUNT = process.env.WEB_CONCURRENCY || Math.min(totalCPUs, 2);
 
 if (cluster.isMaster && process.env.NODE_ENV === 'production') {
   console.log(`📡 Master process ${process.pid} is running`);
-  console.log(`🧵 Spawning ${totalCPUs} workers for cluster mode...`);
+  console.log(`🧵 Spawning ${WORKER_COUNT} workers for cluster mode...`);
 
   // Run DB initialization ONCE in the master process before forking
   (async () => {
-    await runDatabaseInitialization();
+    try {
+      await runDatabaseInitialization();
+    } catch (err) {
+      console.error('❌ Master DB Init Error:', err.message);
+    }
     
-    for (let i = 0; i < totalCPUs; i++) {
+    for (let i = 0; i < WORKER_COUNT; i++) {
       cluster.fork();
     }
   })();

@@ -136,4 +136,31 @@ router.patch('/:id/read', authenticateToken, async (req, res) => {
   }
 });
 
+// ─── POST /api/notifications/devices ────────────────────────────────────────
+// Register/Update a device token for the current user
+router.post('/devices', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId || req.user.id;
+    const { fcmToken, deviceType } = req.body;
+
+    if (!fcmToken) {
+      return res.status(400).json({ message: 'Token is required' });
+    }
+
+    // Upsert the token
+    await pool.query(
+      `INSERT INTO user_devices (user_id, fcm_token, device_type, last_seen)
+       VALUES ($1, $2, $3, NOW())
+       ON CONFLICT (fcm_token) 
+       DO UPDATE SET user_id = $1, device_type = $3, last_seen = NOW()`,
+      [userId, fcmToken, deviceType || 'unknown']
+    );
+
+    res.json({ ok: true, message: 'Device registered successfully' });
+  } catch (err) {
+    console.error('❌ Error registering device:', err);
+    res.status(500).json({ message: 'Server error registering device' });
+  }
+});
+
 module.exports = router;

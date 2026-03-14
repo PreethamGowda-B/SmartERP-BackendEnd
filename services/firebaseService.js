@@ -104,4 +104,51 @@ async function sendPushNotification(token, title, body, data = {}) {
     }
 }
 
-module.exports = { sendPushNotification, admin };
+/**
+ * Send a push notification to multiple device tokens.
+ */
+async function sendMulticastPush(tokens, title, body, data = {}) {
+    if (!tokens || tokens.length === 0) return;
+    if (!firebaseInitialized) return;
+
+    const payload = {
+        notification: { title, body },
+        data: Object.fromEntries(
+            Object.entries({ ...data, title, body }).map(([k, v]) => [k, String(v ?? '')])
+        ),
+        android: {
+            priority: 'high',
+            notification: {
+                channel_id: 'fcm_default_channel',
+                priority: 'high',
+                sound: 'default'
+            },
+        },
+        apns: {
+            headers: { 'apns-priority': '10' },
+            payload: { aps: { sound: 'default', 'content-available': 1 } },
+        },
+        tokens,
+    };
+
+    try {
+        const response = await admin.messaging().sendEachForMulticast(payload);
+        console.log(`✅ Multicast push sent: ${response.successCount} success, ${response.failureCount} failure`);
+        
+        // Return tokens that failed so we can clean them up if needed
+        const failedTokens = [];
+        if (response.failureCount > 0) {
+            response.responses.forEach((resp, idx) => {
+                if (!resp.success) {
+                    failedTokens.push(tokens[idx]);
+                }
+            });
+        }
+        return { response, failedTokens };
+    } catch (error) {
+        console.error('❌ Error sending multicast notification:', error);
+        throw error;
+    }
+}
+
+module.exports = { sendPushNotification, sendMulticastPush, admin };

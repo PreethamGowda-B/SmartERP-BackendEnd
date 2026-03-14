@@ -34,35 +34,24 @@ async function createNotification(notificationData) {
 
         // 2. Send Push Notification (Real-time Background/Mobile)
         try {
-            console.log(`📡 Attempting push for user ${user_id} (Type: ${type})`);
-            // Fetch user's push token from DB
-            const userResult = await pool.query('SELECT push_token FROM users WHERE id = $1', [user_id]);
-            const pushToken = userResult.rows[0]?.push_token;
+            // Fetch all active devices for this user
+            const deviceResult = await pool.query(
+                'SELECT fcm_token FROM user_devices WHERE user_id = $1', 
+                [user_id]
+            );
+            const tokens = deviceResult.rows.map(r => r.fcm_token);
 
-            if (pushToken) {
-                console.log(`✅ Found push token for user ${user_id}: ${pushToken.substring(0, 10)}...`);
+            if (tokens.length > 0) {
+                console.log(`📡 Attempting multicast push for user ${user_id} to ${tokens.length} devices`);
 
-                // Determine the best URL fallback if not provided
                 let finalUrl = data?.url;
                 if (!finalUrl) {
-                    // Smart defaults based on notification type
-                    if (type.startsWith('job')) {
-                        finalUrl = '/notifications'; // Will be refined by broad functions
-                    } else if (type.startsWith('attendance') || type.startsWith('employee_clock')) {
-                        finalUrl = '/attendance';
-                    } else if (type.startsWith('material_request')) {
-                        finalUrl = '/inventory';
-                    } else if (type.startsWith('payroll')) {
-                        finalUrl = '/payroll';
-                    } else if (type === 'message') {
-                        finalUrl = '/messages';
-                    } else {
-                        finalUrl = '/notifications';
-                    }
+                    if (type.startsWith('job')) finalUrl = '/notifications';
+                    else if (type.startsWith('attendance')) finalUrl = '/attendance';
+                    else if (type.startsWith('material_request')) finalUrl = '/inventory';
+                    else if (type.startsWith('payroll')) finalUrl = '/payroll';
+                    else finalUrl = '/notifications';
                 }
-
-                // Append role prefix if we can determine it
-                // Note: broad functions like createNotificationForCompany already set the role prefix
                 
                 const pushData = {
                     type,
@@ -71,15 +60,14 @@ async function createNotification(notificationData) {
                     ...data
                 };
 
-                const success = await sendPushNotification(pushToken, title, message, pushData);
-                if (success) {
-                    console.log(`✅ Push notification sent successfully to user ${user_id}`);
-                }
+                const { sendMulticastPush } = require('../services/firebaseService');
+                await sendMulticastPush(tokens, title, message, pushData);
+                console.log(`✅ Multi-device push sent successfully to user ${user_id}`);
             } else {
-                console.log(`⚠️ No push token found for user ${user_id}. Skipping push.`);
+                console.log(`⚠️ No registered devices for user ${user_id}. Skipping push.`);
             }
         } catch (pushErr) {
-            console.error('❌ Failed to send push notification during createNotification:', pushErr.message);
+            console.error('❌ Multi-device push failed:', pushErr.message);
         }
 
         console.log(`✅ Notification created and broadcast to user ${user_id}:`, title);

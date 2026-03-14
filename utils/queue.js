@@ -22,7 +22,14 @@ async function enqueueNotification(data) {
     const { createNotification } = require('./notificationHelpers');
     return createNotification(data);
   }
-  return await notificationQueue.add('send', data, { removeOnComplete: true });
+  return await notificationQueue.add('send', data, { 
+    removeOnComplete: true,
+    attempts: 3, // Retry up to 3 times
+    backoff: {
+      type: 'exponential',
+      delay: 1000, // Wait 1s, then 2s, then 4s...
+    }
+  });
 }
 
 /**

@@ -121,6 +121,8 @@ if (process.env.NODE_ENV === "production") {
       '/api/v1/auth/login',
       '/api/auth/signup',
       '/api/v1/auth/signup',
+      '/api/auth/refresh',
+      '/api/v1/auth/refresh',
       '/api/health',
       '/api/v1/health',
       '/api/csrf-token',
@@ -219,6 +221,17 @@ async function runDatabaseInitialization() {
       ALTER TABLE activities ADD COLUMN IF NOT EXISTS activity_type TEXT;
       ALTER TABLE activities ADD COLUMN IF NOT EXISTS details JSONB;
       ALTER TABLE activities ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
+
+      -- Multi-device notification support
+      CREATE TABLE IF NOT EXISTS user_devices (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        fcm_token TEXT UNIQUE NOT NULL,
+        device_type VARCHAR(50),
+        last_seen TIMESTAMP DEFAULT NOW(),
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_user_devices_user_id ON user_devices(user_id);
     `);
     
     const { optimizeDatabase } = require('./scripts/optimizeDb');

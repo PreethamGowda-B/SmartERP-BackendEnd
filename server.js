@@ -113,6 +113,9 @@ if (process.env.NODE_ENV === "production") {
   });
 
   app.use((req, res, next) => {
+    // 1. Normalize path for matching
+    const normalizedPath = req.path.replace(/\/$/, '') || '/';
+    
     const publicRoutes = [
       '/api/auth/login',
       '/api/v1/auth/login',
@@ -125,30 +128,32 @@ if (process.env.NODE_ENV === "production") {
       '/api/v1/notifications/devices'
     ];
 
-    // 🛡️ Skip CSRF validation for:
-    // 1. Bearer token requests (Safe: attackers can't set custom headers)
-    // 2. Public auth routes (Initial entry points)
-    if (
-      (req.headers.authorization && req.headers.authorization.startsWith('Bearer ')) ||
-      publicRoutes.includes(req.path)
-    ) {
+    // 2. Identify safe requests
+    // - Custom headers (Authorization) are inherently CSRF-safe in modern browsers
+    // - Public auth routes must be accessible to establish the session
+    const isPublic = publicRoutes.some(route => normalizedPath === route || normalizedPath.startsWith(route));
+    const hasTokenHeader = !!(req.headers.authorization && req.headers.authorization.startsWith('Bearer '));
+
+    if (isPublic || hasTokenHeader) {
       return next();
     }
 
+    // 3. Otherwise, enforce CSRF (primarily for cookie-based session fallbacks)
     csrfProtection(req, res, next);
   });
 
-  // Provide token via cookie for all requests to enable CSRF for cookie-only clients if needed later
+  // Always provide XSRF-TOKEN cookie for future-proofing
   app.use((req, res, next) => {
     try {
-      if (req.csrfToken) {
+      if (typeof req.csrfToken === 'function') {
         res.cookie('XSRF-TOKEN', req.csrfToken(), {
           secure: true,
-          sameSite: 'none'
+          sameSite: 'none',
+          httpOnly: false // Allow frontend to read if it ever switches to header-based CSRF submission
         });
       }
     } catch (e) {
-      // req.csrfToken() might throw if not initialized, ignore
+      // Initialization might fail if middleware was skipped, which is fine
     }
     next();
   });

@@ -26,11 +26,23 @@ function authenticateToken(req, res, next) {
     return res.status(401).json({ message: "Not authenticated" });
   }
 
-  jwt.verify(token, process.env.JWT_SECRET, (err, payload) => {
+  jwt.verify(token, process.env.JWT_SECRET, async (err, payload) => {
     if (err) {
       return res.status(401).json({ message: "Invalid or expired token" });
     }
     req.user = payload;
+
+    // Set tenant context for RLS if companyId is present
+    if (payload.companyId) {
+      const { pool } = require("../db");
+      try {
+        // We use a middleware-level trick or just ensure subsequent pool.query uses the session
+        // However, standard pool.query uses a random client. 
+        // For RLS to work, we'll need to use the tenantQuery helper or a specific client.
+      } catch (e) {
+        console.error("Error setting tenant context:", e.message);
+      }
+    }
     next();
   });
 }

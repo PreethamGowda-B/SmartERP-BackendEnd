@@ -16,5 +16,18 @@ pool.on('error', (err) => {
   console.error('Unexpected error on idle client', err);
 });
 
+// ✅ Tenant-aware query helper for RLS
+async function tenantQuery(sql, params, companyId) {
+  const client = await pool.connect();
+  try {
+    if (companyId) {
+      await client.query(`SET LOCAL app.current_company_id = '${companyId}'`);
+    }
+    return await client.query(sql, params);
+  } finally {
+    client.release();
+  }
+}
+
 // ✅ Correctly export
-module.exports = { pool };
+module.exports = { pool, tenantQuery };

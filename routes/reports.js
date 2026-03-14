@@ -4,6 +4,7 @@ const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 const { loadPlan } = require('../middleware/planMiddleware');
 const { requireFeature } = require('../middleware/featureGuard');
+const { cacheMiddleware } = require('../middleware/cache');
 
 // ─── Startup: ensure all columns used by reports exist ───────────────────────
 
@@ -102,7 +103,7 @@ router.get('/attendance', authenticateToken, loadPlan, requireFeature('advanced_
  * GET /api/reports/jobs?period=week|month|quarter|year
  * Requires: advanced_reports (Basic+ plan)
  */
-router.get('/jobs', authenticateToken, loadPlan, requireFeature('advanced_reports'), async (req, res) => {
+router.get('/jobs', authenticateToken, loadPlan, requireFeature('advanced_reports'), cacheMiddleware(300), async (req, res) => {
     try {
         if (req.user.role !== 'owner' && req.user.role !== 'admin') {
             return res.status(403).json({ message: 'Access denied' });

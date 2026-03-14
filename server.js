@@ -149,28 +149,37 @@ async function runDatabaseInitialization() {
   }
 }
 
-// ✅ Routes
-app.use("/api/auth", require("./routes/auth"));
-app.use("/api/users", require("./routes/users"));
-app.use("/api/jobs", require("./routes/jobs"));
-app.use("/api/activities", require("./routes/activities"));
-app.use("/api/attendance", require("./routes/attendance"));
-app.use("/api/materials", require("./routes/materials"));
-app.use("/api/inventory", require("./routes/inventory"));
-app.use("/api/payroll", require("./routes/payroll"));
-app.use("/api/notifications", require("./routes/notifications"));
-app.use("/api/payments", require("./routes/payments"));
-app.use("/api/analytics", require("./routes/analytics"));
-app.use("/api/employees", require("./routes/employees"));
-app.use("/api/employees-simple", require("./routes/employees-simple"));
-app.use("/api/material-requests", require("./routes/materialRequests"));
-app.use("/api/ai", require("./routes/ai.routes"));
-app.use("/api/messages", require("./routes/messages"));
-app.use("/api/dashboard", require("./routes/dashboard"));
-app.use("/api/reports", require("./routes/reports"));
-app.use("/api/settings", require("./routes/settings"));
-app.use("/api/location", require("./routes/location"));
-app.use("/api/subscription", require("./routes/subscription"));
+// ✅ API Versioning (v1)
+const v1Router = express.Router();
+const { setTenantContext } = require("./middleware/tenantContext");
+
+v1Router.use(setTenantContext); // Enforce RLS for all v1 routes
+
+v1Router.use("/auth", require("./routes/auth"));
+v1Router.use("/users", require("./routes/users"));
+v1Router.use("/jobs", require("./routes/jobs"));
+v1Router.use("/activities", require("./routes/activities"));
+v1Router.use("/attendance", require("./routes/attendance"));
+v1Router.use("/materials", require("./routes/materials"));
+v1Router.use("/inventory", require("./routes/inventory"));
+v1Router.use("/payroll", require("./routes/payroll"));
+v1Router.use("/notifications", require("./routes/notifications"));
+v1Router.use("/payments", require("./routes/payments"));
+v1Router.use("/analytics", require("./routes/analytics"));
+v1Router.use("/employees", require("./routes/employees"));
+v1Router.use("/employees-simple", require("./routes/employees-simple"));
+v1Router.use("/material-requests", require("./routes/materialRequests"));
+v1Router.use("/ai", require("./routes/ai.routes"));
+v1Router.use("/messages", require("./routes/messages"));
+v1Router.use("/dashboard", require("./routes/dashboard"));
+v1Router.use("/reports", require("./routes/reports"));
+v1Router.use("/settings", require("./routes/settings"));
+v1Router.use("/location", require("./routes/location"));
+v1Router.use("/subscription", require("./routes/subscription"));
+
+// Mount v1 router
+app.use("/api/v1", v1Router);
+app.use("/api", v1Router); // Fallback for backward compatibility
 
 
 

@@ -2,12 +2,10 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
-
-// Ensure columns exist
-
+const { cacheMiddleware } = require('../middleware/cache');
 
 // ─── GET /api/dashboard/owner/metrics ────────────────────────────────────────
-router.get('/owner/metrics', authenticateToken, async (req, res) => {
+router.get('/owner/metrics', authenticateToken, cacheMiddleware(300), async (req, res) => {
     try {
         const companyId = req.user.companyId;
 

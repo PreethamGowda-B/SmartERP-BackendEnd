@@ -834,7 +834,23 @@ async function updatePushToken(req, res) {
       [pushToken, userId]
     );
 
-    console.log(`✅ Push token updated for user ${userId}`);
+    // ── Multi-device Sync ───────────────────────────────────────────────────
+    // Also store in user_devices so the new notification system picks it up.
+    // We assume 'mobile_android' for this legacy endpoint.
+    try {
+      await pool.query(
+        `INSERT INTO user_devices (user_id, fcm_token, device_type, last_active_at)
+         VALUES ($1, $2, 'mobile_android', NOW())
+         ON CONFLICT (fcm_token) 
+         DO UPDATE SET last_active_at = NOW(), device_type = 'mobile_android', user_id = EXCLUDED.user_id`,
+        [userId, pushToken]
+      );
+      console.log(`✅ Push token synced to user_devices for user ${userId}`);
+    } catch (syncErr) {
+      console.error('⚠️ Failed to sync push token to user_devices:', syncErr.message);
+      // We don't fail the request if sync fails, as the legacy column was updated.
+    }
+
     res.json({ message: 'Push token updated successfully' });
   } catch (err) {
     console.error('❌ Error updating push token:', err);

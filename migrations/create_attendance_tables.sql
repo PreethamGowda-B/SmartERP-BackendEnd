@@ -7,7 +7,7 @@ DROP TABLE IF EXISTS attendance CASCADE;
 CREATE TABLE attendance (
   id SERIAL PRIMARY KEY,
   user_id UUID NOT NULL,
-  company_id UUID NOT NULL,
+  company_id INTEGER NOT NULL,
   date DATE NOT NULL,
   check_in_time TIMESTAMP,
   check_out_time TIMESTAMP,

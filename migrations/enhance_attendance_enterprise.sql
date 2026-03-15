@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS biometric_devices (
     device_id VARCHAR(100) UNIQUE NOT NULL,
     device_name VARCHAR(255),
     device_type VARCHAR(50), -- 'fingerprint', 'face_scanner'
-    company_id UUID,
+    company_id INTEGER,
     location VARCHAR(255),
     is_active BOOLEAN DEFAULT TRUE,
     last_sync TIMESTAMP,

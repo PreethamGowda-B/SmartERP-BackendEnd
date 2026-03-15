@@ -4,16 +4,16 @@ const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 const { createNotification, createNotificationForOwners } = require('../utils/notificationHelpers');
 
-// UUID validation helper (flexible for integers as well)
+// company_id helper
 function safeCompanyId(value) {
   if (!value) return 1;
-  // If it's a number or numeric string, return as is
-  if (!isNaN(value)) return String(value);
-  // If it's a UUID, return as is
+  // If it's a number or numeric string, return as Number
+  if (!isNaN(value)) return Number(value);
+  // If it's a UUID, return as is (though system now expects Integers mostly)
   const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   if (typeof value === 'string' && UUID_RE.test(value)) return value;
   // Fallback to default
-  return '1';
+  return 1;
 }
 
 // ─── ENTERPRISE ATTENDANCE SYSTEM ────────────────────────────────────────────

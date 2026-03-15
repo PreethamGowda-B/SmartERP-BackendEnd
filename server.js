@@ -127,7 +127,11 @@ if (process.env.NODE_ENV === "production") {
       '/api/v1/health',
       '/api/csrf-token',
       '/api/notifications/devices',
-      '/api/v1/notifications/devices'
+      '/api/v1/notifications/devices',
+      '/api/auth/send-otp',
+      '/api/v1/auth/send-otp',
+      '/api/auth/verify-otp',
+      '/api/v1/auth/verify-otp'
     ];
 
     // 2. Identify safe requests

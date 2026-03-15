@@ -6,7 +6,7 @@ const { createNotification, createNotificationForOwners } = require('../utils/no
 
 // UUID validation helper (flexible for integers as well)
 function safeCompanyId(value) {
-  if (!value) return '1';
+  if (!value) return 1;
   // If it's a number or numeric string, return as is
   if (!isNaN(value)) return String(value);
   // If it's a UUID, return as is
@@ -138,7 +138,9 @@ router.post('/clock-in', authenticateToken, async (req, res) => {
 
     // Create or update attendance record
     // Ensure companyId is a valid UUID
-    const validCompanyId = (companyId && companyId.length > 20) ? companyId : null;
+    // Use the companyId as-is (SQL will handle type casting if it's an integer)
+    // If it's a UUID, it will work for UUID columns. If it's a numeric string, it works for Integer columns.
+    const validCompanyId = companyId;
 
     const result = await pool.query(
       `INSERT INTO attendance 
@@ -564,7 +566,7 @@ router.patch('/corrections/:id/approve', authenticateToken, async (req, res) => 
 
     const { id } = req.params;
     const reviewedBy = req.user.userId || req.user.id;
-    const companyId = req.user.companyId || '00000000-0000-0000-0000-000000000000';
+    const companyId = req.user.companyId || 1;
 
     // Get correction request
     const correction = await pool.query(
@@ -649,7 +651,7 @@ router.patch('/corrections/:id/reject', authenticateToken, async (req, res) => {
     const { id } = req.params;
     const { rejection_reason } = req.body;
     const reviewedBy = req.user.userId || req.user.id;
-    const companyId = req.user.companyId || '00000000-0000-0000-0000-000000000000';
+    const companyId = req.user.companyId || 1;
 
     // Get correction request
     const correction = await pool.query(

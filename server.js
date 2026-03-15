@@ -131,7 +131,11 @@ if (process.env.NODE_ENV === "production") {
       '/api/auth/send-otp',
       '/api/v1/auth/send-otp',
       '/api/auth/verify-otp',
-      '/api/v1/auth/verify-otp'
+      '/api/v1/auth/verify-otp',
+      '/api/auth/validate-company',
+      '/api/v1/auth/validate-company',
+      '/api/auth/set-cookie',
+      '/api/v1/auth/set-cookie'
     ];
 
     // 2. Identify safe requests
@@ -236,6 +240,18 @@ async function runDatabaseInitialization() {
         created_at TIMESTAMP DEFAULT NOW()
       );
       CREATE INDEX IF NOT EXISTS idx_user_devices_user_id ON user_devices(user_id);
+
+      -- Fix attendance company_id type mismatch if necessary
+      DO $$
+      BEGIN
+        IF EXISTS (
+          SELECT 1 FROM information_schema.columns 
+          WHERE table_name = 'attendance' AND column_name = 'company_id' AND data_type = 'uuid'
+        ) THEN
+          ALTER TABLE attendance ALTER COLUMN company_id TYPE INTEGER USING (CASE WHEN company_id::text ~ '^[0-9]+$' THEN company_id::text::integer ELSE 1 END);
+          CREATE INDEX IF NOT EXISTS idx_attendance_company_id ON attendance(company_id);
+        END IF;
+      END $$;
     `);
     
     const { optimizeDatabase } = require('./scripts/optimizeDb');

@@ -9,36 +9,82 @@ router.use(authenticateToken);
 router.use(authenticateSuperAdmin);
 
 // ─── GET /api/admin/dashboard ────────────────────────────────────────────────
-// Aggregate platform-wide statistics
+// Aggregate platform-wide statistics for the Overview page
 router.get('/dashboard', async (req, res) => {
   try {
-    // 1. Total Companies
-    const companyCount = await pool.query('SELECT COUNT(*) FROM companies');
-    
-    // 2. Total Users
-    const userCount = await pool.query('SELECT COUNT(*) FROM users');
-    
-    // 3. Active Subscriptions (Non-free plans that aren't expired)
-    const activeSubs = await pool.query(`
-      SELECT COUNT(*) FROM companies 
-      WHERE plan_id > 1 
-      AND (subscription_expires_at > NOW() OR subscription_expires_at IS NULL)
+    // 1. Basic Stats
+    const statsQuery = pool.query(`
+      SELECT 
+        (SELECT COUNT(*) FROM companies) as total_companies,
+        (SELECT COUNT(*) FROM users) as total_users,
+        (SELECT COUNT(*) FROM companies WHERE plan_id > 1 AND (subscription_expires_at > NOW() OR subscription_expires_at IS NULL)) as active_subs,
+        (SELECT COUNT(*) FROM companies WHERE is_on_trial = TRUE) as trial_users,
+        (SELECT COUNT(*) FROM activities WHERE created_at > NOW() - INTERVAL '24 hours') as activity_24h
     `);
     
-    // 4. Trial Users
-    const trialUsers = await pool.query('SELECT COUNT(*) FROM companies WHERE is_on_trial = TRUE');
-    
-    // 5. Recent Activity (Last 24h)
-    const recentActivity = await pool.query('SELECT COUNT(*) FROM activities WHERE created_at > NOW() - INTERVAL \'24 hours\'');
+    // 2. Company Growth (Last 30 days)
+    const growthQuery = pool.query(`
+      SELECT 
+        DATE(created_at) as date,
+        COUNT(*) as count
+      FROM companies
+      WHERE created_at > NOW() - INTERVAL '30 days'
+      GROUP BY DATE(created_at)
+      ORDER BY DATE(created_at) ASC
+    `);
+
+    // 3. User Growth (Last 30 days)
+    const userGrowthQuery = pool.query(`
+      SELECT 
+        DATE(created_at) as date,
+        COUNT(*) as count
+      FROM users
+      WHERE created_at > NOW() - INTERVAL '30 days'
+      GROUP BY DATE(created_at)
+      ORDER BY DATE(created_at) ASC
+    `);
+
+    // 4. Subscription Distribution
+    const distQuery = pool.query(`
+      SELECT 
+        COALESCE(p.name, 'Free') as name,
+        COUNT(c.id) as value
+      FROM companies c
+      LEFT JOIN plans p ON c.plan_id = p.id
+      GROUP BY p.name
+    `);
+
+    // 5. Recent System Pulse (10 latest activities)
+    const pulseQuery = pool.query(`
+      SELECT 
+        a.*, 
+        u.name as user_name,
+        c.company_name
+      FROM activities a
+      LEFT JOIN users u ON a.user_id = u.id
+      LEFT JOIN companies c ON a.company_id = c.id
+      ORDER BY a.created_at DESC
+      LIMIT 10
+    `);
+
+    const [stats, growth, userGrowth, dist, pulse] = await Promise.all([
+      statsQuery, growthQuery, userGrowthQuery, distQuery, pulseQuery
+    ]);
 
     res.json({
       stats: {
-        totalCompanies: parseInt(companyCount.rows[0].count),
-        totalUsers: parseInt(userCount.rows[0].count),
-        activeSubscriptions: parseInt(activeSubs.rows[0].count),
-        trialUsers: parseInt(trialUsers.rows[0].count),
-        recentActivity24h: parseInt(recentActivity.rows[0].count)
+        totalCompanies: parseInt(stats.rows[0].total_companies),
+        totalUsers: parseInt(stats.rows[0].total_users),
+        activeSubscriptions: parseInt(stats.rows[0].active_subs),
+        trialUsers: parseInt(stats.rows[0].trial_users),
+        recentActivity24h: parseInt(stats.rows[0].activity_24h)
       },
+      charts: {
+        companyGrowth: growth.rows.map(r => ({ date: r.date.toISOString().split('T')[0], count: parseInt(r.count) })),
+        userGrowth: userGrowth.rows.map(r => ({ date: r.date.toISOString().split('T')[0], count: parseInt(r.count) })),
+        subscriptionDistribution: dist.rows.map(r => ({ name: r.name, value: parseInt(r.value) }))
+      },
+      pulse: pulse.rows,
       timestamp: new Date().toISOString()
     });
   } catch (err) {

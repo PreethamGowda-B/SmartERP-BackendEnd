@@ -168,11 +168,10 @@ router.get(
       // Log activity
       await logActivity(user.id, "login_google", req);
 
-      // Generate Tokens
       const accessToken = jwt.sign(
         { id: user.id, userId: user.id, role: user.role, email: user.email, companyId: user.company_id },
         ACCESS_SECRET,
-        { expiresIn: "15m" }
+        { expiresIn: "24h" }
       );
       const refreshToken = jwt.sign(
         { id: user.id, userId: user.id },
@@ -508,7 +507,7 @@ router.post("/login", [
     const accessToken = jwt.sign(
       { id: user.id, userId: user.id, role: user.role, email: user.email, companyId: user.company_id },
       ACCESS_SECRET,
-      { expiresIn: "15m" }
+      { expiresIn: "24h" }
     );
     const refreshToken = jwt.sign(
       { id: user.id, userId: user.id },
@@ -530,7 +529,7 @@ router.post("/login", [
       path: "/",
     };
 
-    res.cookie("access_token", accessToken, { ...cookieOpts, maxAge: 15 * 60 * 1000 });
+    res.cookie("access_token", accessToken, { ...cookieOpts, maxAge: 24 * 60 * 60 * 1000 });
     res.cookie("refresh_token", refreshToken, { ...cookieOpts, maxAge: 7 * 24 * 60 * 60 * 1000 });
 
     console.log("✅ Login successful for user:", user.email);
@@ -612,7 +611,7 @@ router.post("/refresh", async (req, res) => {
         const accessToken = jwt.sign(
           { id: payloadUserId, userId: payloadUserId, role: userRole, email: userEmail, companyId: userCompanyId },
           ACCESS_SECRET,
-          { expiresIn: "15m" }
+          { expiresIn: "24h" }
         );
 
         // ✅ Consistent cookie settings
@@ -623,7 +622,7 @@ router.post("/refresh", async (req, res) => {
           path: "/",
         };
 
-        res.cookie("access_token", accessToken, { ...cookieOpts, maxAge: 15 * 60 * 1000 });
+        res.cookie("access_token", accessToken, { ...cookieOpts, maxAge: 24 * 60 * 60 * 1000 });
         res.cookie("refresh_token", newRefresh, { ...cookieOpts, maxAge: 7 * 24 * 60 * 60 * 1000 });
 
         await logActivity(payloadUserId, "refresh_token", req);
@@ -814,7 +813,7 @@ router.post("/set-cookie", async (req, res) => {
       path: "/",
     };
 
-    res.cookie("access_token", accessToken, { ...cookieOpts, maxAge: 15 * 60 * 1000 });
+    res.cookie("access_token", accessToken, { ...cookieOpts, maxAge: 24 * 60 * 60 * 1000 });
     res.cookie("refresh_token", refreshToken, { ...cookieOpts, maxAge: 7 * 24 * 60 * 60 * 1000 });
 
     console.log("✅ Cookies set via /set-cookie exchange");

@@ -5,15 +5,22 @@ const jwt = require("jsonwebtoken");
 let redisClient = null;
 try {
   if (process.env.REDIS_URL) {
-    const { createClient } = require("redis");
-    redisClient = createClient({ url: process.env.REDIS_URL });
-    redisClient.connect().catch((e) => {
-      console.warn("⚠️ Redis unavailable, suspension cache disabled:", e.message);
-      redisClient = null;
+    const Redis = require("ioredis");
+    // ioredis handles connections automatically and queues commands
+    redisClient = new Redis(process.env.REDIS_URL, {
+      maxRetriesPerRequest: 1,
+      retryStrategy(times) {
+        if (times > 3) return null; // stop retrying after 3 attempts
+        return Math.min(times * 200, 1000);
+      }
+    });
+    
+    redisClient.on("error", (err) => {
+      console.warn("⚠️ Redis cache error:", err.message);
     });
   }
 } catch (e) {
-  console.warn("⚠️ Redis module not found, suspension cache disabled:", e.message);
+  console.warn("⚠️ Redis/ioredis setup failed, suspension cache disabled:", e.message);
   redisClient = null;
 }
 
@@ -23,7 +30,7 @@ async function isCompanySuspended(companyId) {
   const cacheKey = `company_suspended:${companyId}`;
 
   // 1. Try Redis cache first (reduces DB load significantly)
-  if (redisClient && redisClient.isReady) {
+  if (redisClient && redisClient.status === 'ready') {
     try {
       const cached = await redisClient.get(cacheKey);
       if (cached !== null) {
@@ -40,7 +47,7 @@ async function isCompanySuspended(companyId) {
   const suspended = companyRes.rows.length > 0 && companyRes.rows[0].status === "suspended";
 
   // 3. Store result in Redis for subsequent requests
-  if (redisClient && redisClient.isReady) {
+  if (redisClient && redisClient.status === 'ready') {
     try {
       await redisClient.set(cacheKey, suspended ? "1" : "0", { EX: SUSPENSION_CACHE_TTL });
     } catch (e) {

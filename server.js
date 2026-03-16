@@ -67,7 +67,21 @@ app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 
 // ✅ Security headers
-app.use(helmet({ contentSecurityPolicy: false }));
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'", "https://www.prozync.in", "https://prozync.in"],
+      connectSrc: ["'self'", "https://smarterp-backendend.onrender.com", "https://www.prozync.in", "https://prozync.in", "https://*.firebaseio.com", "https://*.googleapis.com"],
+      imgSrc: ["'self'", "data:", "https:", "http:"],
+      styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+      fontSrc: ["'self'", "https://fonts.gstatic.com"],
+      upgradeInsecureRequests: [],
+    },
+  },
+  crossOriginResourcePolicy: { policy: "cross-origin" },
+  dnsPrefetchControl: { allow: true },
+}));
 
 // ✅ Rate limiting
 const authLimiter = rateLimit({

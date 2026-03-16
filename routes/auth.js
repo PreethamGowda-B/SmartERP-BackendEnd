@@ -10,6 +10,7 @@ const GoogleStrategy = require("passport-google-oauth20").Strategy;
 const { Resend } = require("resend");
 const { body, validationResult } = require("express-validator");
 require("dotenv").config();
+const crypto = require("crypto");
 
 // JWT secrets
 const ACCESS_SECRET = process.env.JWT_SECRET;
@@ -565,7 +566,7 @@ router.post("/login", [
     );
 
     // Save Refresh Token to DB
-    const tokenFamily = crypto.randomUUID?.() || require('crypto').randomUUID();
+    const tokenFamily = crypto.randomUUID();
     await pool.query(
       `INSERT INTO refresh_tokens (user_id, token, token_family, expires_at, created_at, user_agent, ip_address)
        VALUES ($1, $2, $3, NOW() + INTERVAL '30 days', NOW(), $4, $5)`,

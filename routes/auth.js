@@ -556,70 +556,88 @@ router.post("/login", [
 router.post("/refresh", async (req, res) => {
   // Try cookie first, then request body (for cross-domain scenarios)
   const token = req.cookies?.refresh_token || req.body?.refreshToken;
-  if (!token) return res.status(401).json({ message: "No refresh token provided" });
+
+  if (!token) {
+    console.warn("⚠️ Refresh attempt failed: No refresh token provided in cookies or body");
+    return res.status(401).json({ message: "No refresh token provided" });
+  }
 
   try {
     const result = await pool.query("SELECT * FROM refresh_tokens WHERE token = $1", [token]);
     if (result.rows.length === 0) {
+      console.warn("⚠️ Refresh attempt failed: Token not found in database (possibly reused or manually deleted)");
       return res.status(401).json({ message: "Invalid refresh token" });
     }
 
     jwt.verify(token, REFRESH_SECRET, async (err, payload) => {
-      if (err) return res.status(403).json({ message: "Invalid token" });
+      if (err) {
+        console.warn(`⚠️ Refresh attempt failed: JWT verification error: ${err.message}`);
+        return res.status(403).json({ message: "Invalid token" });
+      }
 
       try {
-        // Support old refresh tokens that only had `id` (not `userId`) in payload
         const payloadUserId = payload.userId || payload.id;
-        if (!payloadUserId) return res.status(401).json({ message: "Invalid token payload" });
+        if (!payloadUserId) {
+          console.warn("⚠️ Refresh attempt failed: Invalid token payload (missing user ID)");
+          return res.status(401).json({ message: "Invalid token payload" });
+        }
 
-        // ✅ Fetch user role and company_id from database
+        // ✅ Fetch user role, email, and company_id from database
         const userResult = await pool.query("SELECT role, email, company_id FROM users WHERE id = $1", [payloadUserId]);
         if (userResult.rows.length === 0) {
+          console.warn(`⚠️ Refresh attempt failed: User ${payloadUserId} not found in database`);
           return res.status(401).json({ message: "User not found" });
         }
+        
         const userRole = userResult.rows[0].role;
+        const userEmail = userResult.rows[0].email;
         const userCompanyId = userResult.rows[0].company_id;
 
+        // Rotate Refresh Token (Delete old, issue new)
         await pool.query("DELETE FROM refresh_tokens WHERE token = $1", [token]);
+        
         const newRefresh = jwt.sign({ id: payloadUserId, userId: payloadUserId }, REFRESH_SECRET, { expiresIn: "7d" });
+        
         await pool.query(
           `INSERT INTO refresh_tokens (user_id, token, expires_at)
            VALUES ($1, $2, NOW() + INTERVAL '7 days')`,
           [payloadUserId, newRefresh]
         );
 
-        // ✅ Include role, email, and companyId in access token
+        // ✅ Issue new Access Token with all claims
         const accessToken = jwt.sign(
-          { id: payloadUserId, userId: payloadUserId, role: userRole, email: userResult.rows[0].email, companyId: userCompanyId },
+          { id: payloadUserId, userId: payloadUserId, role: userRole, email: userEmail, companyId: userCompanyId },
           ACCESS_SECRET,
           { expiresIn: "15m" }
         );
 
-        // ✅ Updated cookie settings (same as /login)
+        // ✅ Consistent cookie settings
         const cookieOpts = {
           httpOnly: true,
           sameSite: "none",
           secure: true,
+          path: "/",
         };
 
         res.cookie("access_token", accessToken, { ...cookieOpts, maxAge: 15 * 60 * 1000 });
         res.cookie("refresh_token", newRefresh, { ...cookieOpts, maxAge: 7 * 24 * 60 * 60 * 1000 });
 
-        await logActivity(payload.userId, "refresh_token", req);
+        await logActivity(payloadUserId, "refresh_token", req);
 
-        // ✅ Return tokens in response body for cross-domain auth
+        console.log(`✅ Token successfully refreshed for: ${userEmail}`);
+
         res.json({
           ok: true,
           accessToken,
           refreshToken: newRefresh
         });
       } catch (error) {
-        console.error("Token rotation error:", error);
+        console.error("❌ Token rotation error:", error);
         res.status(500).json({ message: "Server error during token refresh" });
       }
     });
   } catch (err) {
-    console.error("Refresh route error:", err.message);
+    console.error("❌ Refresh route error:", err.message);
     res.status(500).json({ message: "Server error" });
   }
 });

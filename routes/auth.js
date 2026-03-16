@@ -176,12 +176,12 @@ router.get(
     try {
       const user = req.user;
 
-      // Check if company is suspended (Only if not super_admin)
       if (user.role !== 'super_admin' && user.company_id) {
         const companyRes = await pool.query("SELECT status FROM companies WHERE id = $1", [user.company_id]);
         if (companyRes.rows.length > 0 && companyRes.rows[0].status === 'suspended') {
           console.warn(`🛑 Google login blocked for suspended company user: ${user.email}`);
-          return res.redirect(`${process.env.FRONTEND_ORIGIN || 'http://localhost:3000'}/auth/login?error=account_suspended`);
+          const frontendUrl = process.env.FRONTEND_ORIGIN || "https://www.prozync.in";
+          return res.redirect(`${frontendUrl}/suspended`);
         }
       }
 

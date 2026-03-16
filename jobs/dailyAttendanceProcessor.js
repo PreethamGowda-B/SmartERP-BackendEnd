@@ -1,5 +1,6 @@
 const cron = require('node-cron');
 const { pool } = require('../db');
+const { createNotificationForOwners } = require('../utils/notificationHelpers');
 
 /**
  * Daily Attendance Processing Job
@@ -96,7 +97,14 @@ function startDailyAttendanceProcessor() {
             console.error('Stack:', err.stack);
             console.error(`${'='.repeat(60)}\n`);
 
-            // TODO: Send alert notification to admin/owner
+            // ✅ Send alert notification to admin/owner
+            await createNotificationForOwners({
+                company_id: null, // Global alert
+                type: 'alert_attendance_processor_failed',
+                title: '❌ Attendance Processor Failed',
+                message: `The daily attendance processor failed on ${targetDate}. Error: ${err.message}`,
+                priority: 'high'
+            });
         }
     }, {
         timezone: "Asia/Kolkata" // IST timezone

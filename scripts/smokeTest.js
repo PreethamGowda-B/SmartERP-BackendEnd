@@ -2,12 +2,17 @@ const fetch = require('node-fetch');
 
 const base = process.env.API_BASE || 'http://localhost:4000';
 
-function extractCookie(headers) {
-  console.log('Headers:', headers.raw ? headers.raw() : headers);
-  if (!headers.raw) return null;
-  const raw = headers.raw()['set-cookie'];
-  if (!raw) return null;
-  return raw.map(s => s.split(';')[0]).join('; ');
+function extractCookie(res) {
+  const headers = res.headers;
+  // node-fetch v2 provides .raw() for Multi-value headers like Set-Cookie
+  if (typeof headers.raw === 'function') {
+    const raw = headers.raw()['set-cookie'];
+    if (raw) return raw.map(s => s.split(';')[0]).join('; ');
+  }
+  // Fallback for standard fetch or node-fetch v3
+  const setCookie = headers.get('set-cookie');
+  if (!setCookie) return null;
+  return setCookie.split(',').map(s => s.split(';')[0]).join('; ');
 }
 
 async function run() {

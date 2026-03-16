@@ -27,26 +27,17 @@ router.get('/owner/metrics', authenticateToken, cacheMiddleware(300), async (req
             [companyId]
         );
 
-        // ── Today's Attendance — don't filter by company_id (column may not exist)
+        // ── Today's Attendance
         const today = new Date().toISOString().split('T')[0];
-        // Get employee user IDs from this company
-        const empIds = await pool.query(
-            `SELECT id FROM users WHERE role = 'employee' AND company_id = $1`,
-            [companyId]
+        const attResult = await pool.query(
+            `SELECT COUNT(DISTINCT user_id) AS count
+             FROM attendance
+             WHERE date = $1
+               AND company_id = $2
+               AND status IN ('present', 'half_day', 'late')`,
+            [today, companyId]
         );
-        let todayAttendance = 0;
-        if (empIds.rows.length > 0) {
-            const ids = empIds.rows.map(r => r.id);
-            const attResult = await pool.query(
-                `SELECT COUNT(DISTINCT user_id) AS count
-         FROM attendance
-         WHERE date = $1
-           AND status IN ('present', 'half_day')
-           AND user_id = ANY($2::uuid[])`,
-                [today, ids]
-            );
-            todayAttendance = parseInt(attResult.rows[0]?.count || 0);
-        }
+        const todayAttendance = parseInt(attResult.rows[0]?.count || 0);
 
         // ── Active Projects: jobs that are open/active AND employee has accepted
         const projectsResult = await pool.query(

@@ -15,6 +15,17 @@ require("dotenv").config();
 const ACCESS_SECRET = process.env.JWT_SECRET;
 const REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || ACCESS_SECRET;
 
+// Cookie Names & Lifetimes
+const COOKIE_ACCESS_USER = "user_access_token";
+const COOKIE_REFRESH_USER = "user_refresh_token";
+const COOKIE_ACCESS_ADMIN = "superadmin_access_token";
+const COOKIE_REFRESH_ADMIN = "superadmin_refresh_token";
+
+const ACCESS_EXPIRY = "1h";
+const REFRESH_EXPIRY = "30d";
+const ACCESS_MAX_AGE = 1 * 60 * 60 * 1000; // 1 hour
+const REFRESH_MAX_AGE = 30 * 24 * 60 * 60 * 1000; // 30 days
+
 // ---------------------------------------------
 // ✅ Google OAuth Strategy Configuration
 // ---------------------------------------------
@@ -165,26 +176,51 @@ router.get(
     try {
       const user = req.user;
 
+      // Check if company is suspended (Only if not super_admin)
+      if (user.role !== 'super_admin' && user.company_id) {
+        const companyRes = await pool.query("SELECT status FROM companies WHERE id = $1", [user.company_id]);
+        if (companyRes.rows.length > 0 && companyRes.rows[0].status === 'suspended') {
+          console.warn(`🛑 Google login blocked for suspended company user: ${user.email}`);
+          return res.redirect(`${process.env.FRONTEND_ORIGIN || 'http://localhost:3000'}/auth/login?error=account_suspended`);
+        }
+      }
+
       // Log activity
       await logActivity(user.id, "login_google", req);
 
       const accessToken = jwt.sign(
         { id: user.id, userId: user.id, role: user.role, email: user.email, companyId: user.company_id },
         ACCESS_SECRET,
-        { expiresIn: "24h" }
+        { expiresIn: ACCESS_EXPIRY }
       );
       const refreshToken = jwt.sign(
         { id: user.id, userId: user.id },
         REFRESH_SECRET,
-        { expiresIn: "7d" }
+        { expiresIn: REFRESH_EXPIRY }
       );
 
-      // Store Refresh Token in DB
+      // Store Refresh Token in DB with family and metadata
+      const tokenFamily = require('crypto').randomUUID();
       await pool.query(
-        `INSERT INTO refresh_tokens (user_id, token, expires_at)
-         VALUES ($1, $2, NOW() + INTERVAL '7 days')`,
-        [user.id, refreshToken]
+        `INSERT INTO refresh_tokens (user_id, token, token_family, expires_at, created_at, user_agent, ip_address)
+         VALUES ($1, $2, $3, NOW() + INTERVAL '30 days', NOW(), $4, $5)`,
+        [user.id, refreshToken, tokenFamily, req.headers["user-agent"], req.ip]
       );
+
+      // Set Cookies based on role (before redirect)
+      const isSuperAdmin = user.role === 'super_admin';
+      const accessCookieName = isSuperAdmin ? COOKIE_ACCESS_ADMIN : COOKIE_ACCESS_USER;
+      const refreshCookieName = isSuperAdmin ? COOKIE_REFRESH_ADMIN : COOKIE_REFRESH_USER;
+
+      const cookieOpts = {
+        httpOnly: true,
+        sameSite: "none",
+        secure: true,
+        path: "/",
+      };
+
+      res.cookie(accessCookieName, accessToken, { ...cookieOpts, maxAge: ACCESS_MAX_AGE });
+      res.cookie(refreshCookieName, refreshToken, { ...cookieOpts, maxAge: REFRESH_MAX_AGE });
 
       // ✅ Redirect to frontend with tokens in URL so the frontend can exchange
       // them for HttpOnly cookies via POST /api/auth/set-cookie
@@ -491,6 +527,19 @@ router.post("/login", [
 
     const user = result.rows[0];
 
+    // Check if company is suspended (Only if not super_admin)
+    if (user.role !== 'super_admin' && user.company_id) {
+      const companyRes = await pool.query("SELECT status FROM companies WHERE id = $1", [user.company_id]);
+      if (companyRes.rows.length > 0 && companyRes.rows[0].status === 'suspended') {
+        console.warn(`🛑 Login blocked for suspended company user: ${email}`);
+        return res.status(403).json({ 
+          message: "Account Suspended/Disabled", 
+          error: "company_suspended",
+          details: "Your account is suspended/disabled because of some unusual activities found in your account. Please contact our customer care to reactivate account. Customer care email: prozyncinnovations@gmail.com"
+        });
+      }
+    }
+
     // Check if user has a password (google-only users won't)
     if (!user.password_hash) {
       return res.status(401).json({ message: "Please log in with Google" });
@@ -503,25 +552,31 @@ router.post("/login", [
 
     await logActivity(user.id, "login", req);
 
-    // Generate JWTs
+    // Generate Tokens with new lifetimes
     const accessToken = jwt.sign(
       { id: user.id, userId: user.id, role: user.role, email: user.email, companyId: user.company_id },
       ACCESS_SECRET,
-      { expiresIn: "24h" }
+      { expiresIn: ACCESS_EXPIRY }
     );
     const refreshToken = jwt.sign(
       { id: user.id, userId: user.id },
       REFRESH_SECRET,
-      { expiresIn: "7d" }
+      { expiresIn: REFRESH_EXPIRY }
     );
 
+    // Save Refresh Token to DB
+    const tokenFamily = crypto.randomUUID?.() || require('crypto').randomUUID();
     await pool.query(
-      `INSERT INTO refresh_tokens (user_id, token, expires_at)
-       VALUES ($1, $2, NOW() + INTERVAL '7 days')`,
-      [user.id, refreshToken]
+      `INSERT INTO refresh_tokens (user_id, token, token_family, expires_at, created_at, user_agent, ip_address)
+       VALUES ($1, $2, $3, NOW() + INTERVAL '30 days', NOW(), $4, $5)`,
+      [user.id, refreshToken, tokenFamily, req.headers["user-agent"], req.ip]
     );
 
-    // ✅ Cookie config for same-domain scenarios (optional fallback)
+    // Set Cookies based on role
+    const isSuperAdmin = user.role === 'super_admin';
+    const accessCookieName = isSuperAdmin ? COOKIE_ACCESS_ADMIN : COOKIE_ACCESS_USER;
+    const refreshCookieName = isSuperAdmin ? COOKIE_REFRESH_ADMIN : COOKIE_REFRESH_USER;
+
     const cookieOpts = {
       httpOnly: true,
       sameSite: "none",
@@ -529,19 +584,19 @@ router.post("/login", [
       path: "/",
     };
 
-    res.cookie("access_token", accessToken, { ...cookieOpts, maxAge: 24 * 60 * 60 * 1000 });
-    res.cookie("refresh_token", refreshToken, { ...cookieOpts, maxAge: 7 * 24 * 60 * 60 * 1000 });
+    res.cookie(accessCookieName, accessToken, { ...cookieOpts, maxAge: ACCESS_MAX_AGE });
+    res.cookie(refreshCookieName, refreshToken, { ...cookieOpts, maxAge: REFRESH_MAX_AGE });
 
-    console.log("✅ Login successful for user:", user.email);
+    console.log(`✅ Login successful for ${user.role}: ${user.email}`);
 
     delete user.password_hash;
 
-    // ✅ CRITICAL: Return tokens in response body for cross-domain auth
     res.json({
       ok: true,
       user,
-      accessToken,  // Frontend will store this in localStorage
-      refreshToken  // Frontend will store this in localStorage
+      accessToken,
+      refreshToken,
+      isSuperAdmin
     });
   } catch (err) {
     console.error("Login error:", err.message);
@@ -550,71 +605,91 @@ router.post("/login", [
 });
 
 // ---------------------------------------------
-// ✅ Refresh Token Route
+// ✅ Refresh Token Route (Secure Rotation)
 // ---------------------------------------------
 router.post("/refresh", async (req, res) => {
-  // Try cookie first, then request body (for cross-domain scenarios)
-  const token = req.cookies?.refresh_token || req.body?.refreshToken;
+  // Try dual-context cookies first, then generic fallback, then body
+  const token = req.cookies?.[COOKIE_REFRESH_ADMIN] || 
+                req.cookies?.[COOKIE_REFRESH_USER] || 
+                req.cookies?.refresh_token || 
+                req.body?.refreshToken;
 
   if (!token) {
-    console.warn("⚠️ Refresh attempt failed: No refresh token provided in cookies or body");
+    console.warn("⚠️ Refresh attempt failed: No refresh token provided");
     return res.status(401).json({ message: "No refresh token provided" });
   }
 
-  // Masked token logging for debugging
-  const maskedToken = token.length > 10 ? `${token.substring(0, 5)}...${token.substring(token.length - 5)}` : "***";
-  console.log(`📡 Refreshing token: ${maskedToken} (Source: ${req.cookies?.refresh_token ? 'Cookie' : 'Body'})`);
-
   try {
-    const result = await pool.query("SELECT * FROM refresh_tokens WHERE token = $1", [token]);
-    if (result.rows.length === 0) {
-      console.warn("⚠️ Refresh attempt failed: Token not found in database (possibly reused or manually deleted)");
+    // 1. Check DB for the token
+    const tokenResult = await pool.query("SELECT * FROM refresh_tokens WHERE token = $1", [token]);
+    
+    if (tokenResult.rows.length === 0) {
+      console.warn("⚠️ Refresh attempt failed: Token not found in database.");
       return res.status(401).json({ message: "Invalid refresh token" });
     }
 
+    const refreshTokenData = tokenResult.rows[0];
+
+    // 2. REPLAY PROTECTION: Check if token is already revoked
+    if (refreshTokenData.revoked) {
+      console.error(`🚨 REPLAY DETECTED for user ${refreshTokenData.user_id}! Revoking all tokens in family: ${refreshTokenData.token_family}`);
+      await pool.query("UPDATE refresh_tokens SET revoked = TRUE WHERE token_family = $1", [refreshTokenData.token_family]);
+      return res.status(401).json({ message: "Security alert: Token reuse detected. Session terminated." });
+    }
+
+    // 3. Verify JWT
     jwt.verify(token, REFRESH_SECRET, async (err, payload) => {
       if (err) {
         console.warn(`⚠️ Refresh attempt failed: JWT verification error: ${err.message}`);
+        // Even if expired, if it's in DB and not revoked, we should probably just treat as invalid
         return res.status(403).json({ message: "Invalid token" });
       }
 
-      try {
-        const payloadUserId = payload.userId || payload.id;
-        if (!payloadUserId) {
-          console.warn("⚠️ Refresh attempt failed: Invalid token payload (missing user ID)");
-          return res.status(401).json({ message: "Invalid token payload" });
-        }
+      const userId = payload.userId || payload.id;
 
-        // ✅ Fetch user role, email, and company_id from database
-        const userResult = await pool.query("SELECT role, email, company_id FROM users WHERE id = $1", [payloadUserId]);
-        if (userResult.rows.length === 0) {
-          console.warn(`⚠️ Refresh attempt failed: User ${payloadUserId} not found in database`);
+      try {
+        // 4. Fetch User Data
+        const userRes = await pool.query("SELECT id, role, email, company_id FROM users WHERE id = $1", [userId]);
+        if (userRes.rows.length === 0) {
           return res.status(401).json({ message: "User not found" });
         }
-        
-        const userRole = userResult.rows[0].role;
-        const userEmail = userResult.rows[0].email;
-        const userCompanyId = userResult.rows[0].company_id;
+        const user = userRes.rows[0];
 
-        // Rotate Refresh Token (Delete old, issue new)
-        await pool.query("DELETE FROM refresh_tokens WHERE token = $1", [token]);
-        
-        const newRefresh = jwt.sign({ id: payloadUserId, userId: payloadUserId }, REFRESH_SECRET, { expiresIn: "7d" });
-        
-        await pool.query(
-          `INSERT INTO refresh_tokens (user_id, token, expires_at)
-           VALUES ($1, $2, NOW() + INTERVAL '7 days')`,
-          [payloadUserId, newRefresh]
-        );
+        // 5. Check Suspension (Role exemption still applies)
+        if (user.role !== 'super_admin' && user.company_id) {
+          const compRes = await pool.query("SELECT status FROM companies WHERE id = $1", [user.company_id]);
+          if (compRes.rows.length > 0 && compRes.rows[0].status === 'suspended') {
+            return res.status(403).json({ 
+              message: "Account Suspended/Disabled", 
+              error: "company_suspended",
+              details: "Your account is suspended/disabled. Please contact prozyncinnovations@gmail.com"
+            });
+          }
+        }
 
-        // ✅ Issue new Access Token with all claims
-        const accessToken = jwt.sign(
-          { id: payloadUserId, userId: payloadUserId, role: userRole, email: userEmail, companyId: userCompanyId },
+        // 6. ROTATION: Mark old token as revoked
+        await pool.query("UPDATE refresh_tokens SET revoked = TRUE WHERE id = $1", [refreshTokenData.id]);
+
+        // 7. Issue NEW tokens (Keep same Family)
+        const newAccessToken = jwt.sign(
+          { id: user.id, userId: user.id, role: user.role, email: user.email, companyId: user.company_id },
           ACCESS_SECRET,
-          { expiresIn: "24h" }
+          { expiresIn: ACCESS_EXPIRY }
+        );
+        const newRefreshToken = jwt.sign({ id: user.id, userId: user.id }, REFRESH_SECRET, { expiresIn: REFRESH_EXPIRY });
+
+        // Save new token to DB
+        await pool.query(
+          `INSERT INTO refresh_tokens (user_id, token, token_family, expires_at, created_at, user_agent, ip_address)
+           VALUES ($1, $2, $3, NOW() + INTERVAL '30 days', NOW(), $4, $5)`,
+          [user.id, newRefreshToken, refreshTokenData.token_family, req.headers["user-agent"], req.ip]
         );
 
-        // ✅ Consistent cookie settings
+        // 8. Set Cookies based on role
+        const isSuperAdmin = user.role === 'super_admin';
+        const accessCookieName = isSuperAdmin ? COOKIE_ACCESS_ADMIN : COOKIE_ACCESS_USER;
+        const refreshCookieName = isSuperAdmin ? COOKIE_REFRESH_ADMIN : COOKIE_REFRESH_USER;
+
         const cookieOpts = {
           httpOnly: true,
           sameSite: "none",
@@ -622,21 +697,20 @@ router.post("/refresh", async (req, res) => {
           path: "/",
         };
 
-        res.cookie("access_token", accessToken, { ...cookieOpts, maxAge: 24 * 60 * 60 * 1000 });
-        res.cookie("refresh_token", newRefresh, { ...cookieOpts, maxAge: 7 * 24 * 60 * 60 * 1000 });
+        res.cookie(accessCookieName, newAccessToken, { ...cookieOpts, maxAge: ACCESS_MAX_AGE });
+        res.cookie(refreshCookieName, newRefreshToken, { ...cookieOpts, maxAge: REFRESH_MAX_AGE });
 
-        await logActivity(payloadUserId, "refresh_token", req);
-
-        console.log(`✅ Token successfully refreshed for: ${userEmail}`);
+        console.log(`✅ Token rotated for ${user.email} (Family: ${refreshTokenData.token_family})`);
 
         res.json({
           ok: true,
-          accessToken,
-          refreshToken: newRefresh
+          accessToken: newAccessToken,
+          refreshToken: newRefreshToken,
+          isSuperAdmin
         });
-      } catch (error) {
-        console.error("❌ Token rotation error:", error);
-        res.status(500).json({ message: "Server error during token refresh" });
+      } catch (rotationErr) {
+        console.error("❌ Rotation internal error:", rotationErr);
+        res.status(500).json({ message: "Internal error during refresh" });
       }
     });
   } catch (err) {

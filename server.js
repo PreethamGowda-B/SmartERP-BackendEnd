@@ -197,6 +197,24 @@ async function fixDatabaseConstraints() {
     `);
 
     console.log('✅ Database constraints fixed');
+
+    // Step 4: Setup Periodic Refresh Token Cleanup (Every 24 hours)
+    setInterval(async () => {
+      try {
+        const cleanupResult = await pool.query(`
+          DELETE FROM refresh_tokens 
+          WHERE expires_at < NOW() 
+          OR (revoked = TRUE AND created_at < NOW() - INTERVAL '30 days')
+        `);
+        if (cleanupResult.rowCount > 0) {
+          console.log(`🧹 Periodic Cleanup: Removed ${cleanupResult.rowCount} expired/revoked refresh tokens`);
+        }
+      } catch (cleanupErr) {
+        console.error("❌ Periodic Cleanup Error:", cleanupErr.message);
+      }
+    }, 24 * 60 * 60 * 1000);
+    console.log('🧹 Scheduled daily cleanup for refresh tokens');
+
   } catch (err) {
     console.warn('⚠️  Could not fix constraints:', err.message);
   }

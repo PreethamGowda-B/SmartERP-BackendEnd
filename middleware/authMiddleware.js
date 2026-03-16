@@ -15,10 +15,13 @@ function authenticateToken(req, res, next) {
     console.log("🔗 Query token found for SSE connection");
   }
 
-  // Fallback to cookie
+  // Fallback to cookies
   if (!token && req.cookies) {
-    token = req.cookies.access_token;
-    console.log("🍪 Cookie token found:", token ? "YES" : "NO", "| Cookies:", Object.keys(req.cookies));
+    token = req.cookies.superadmin_access_token || req.cookies.user_access_token || req.cookies.access_token;
+    if (token) {
+      const source = req.cookies.superadmin_access_token ? "superadmin" : "user";
+      console.log(`🍪 ${source} cookie token found`);
+    }
   }
 
   if (!token) {
@@ -31,19 +34,26 @@ function authenticateToken(req, res, next) {
     if (err) {
       return res.status(401).json({ message: "Invalid or expired token" });
     }
-    req.user = payload;
-
-    // Set tenant context for RLS if companyId is present
-    if (payload.companyId) {
+    
+    // Check if company is suspended (Only if not super_admin)
+    if (payload.role !== 'super_admin' && payload.companyId) {
       const { pool } = require("../db");
       try {
-        // We use a middleware-level trick or just ensure subsequent pool.query uses the session
-        // However, standard pool.query uses a random client. 
-        // For RLS to work, we'll need to use the tenantQuery helper or a specific client.
+        const companyRes = await pool.query("SELECT status FROM companies WHERE id = $1", [payload.companyId]);
+        if (companyRes.rows.length > 0 && companyRes.rows[0].status === 'suspended') {
+          console.warn(`🛑 Blocked access for suspended company: ${payload.companyId} (User: ${payload.email})`);
+          return res.status(403).json({ 
+            message: "Account Suspended/Disabled", 
+            error: "your_company_is_suspended",
+            details: "Your account is suspended/disabled because of some unusual activities found in your account. Please contact our customer care to reactivate account. Customer care email: prozyncinnovations@gmail.com"
+          });
+        }
       } catch (e) {
-        console.error("Error setting tenant context:", e.message);
+        console.error("Error checking suspension status:", e.message);
       }
     }
+
+    req.user = payload;
     next();
   });
 }

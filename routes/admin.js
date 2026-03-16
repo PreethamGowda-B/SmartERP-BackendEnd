@@ -141,14 +141,31 @@ router.patch('/companies/:id/status', async (req, res) => {
 // Platform-wide user list
 router.get('/users', async (req, res) => {
   try {
-    const result = await pool.query(`
-      SELECT u.*, c.company_name 
-      FROM users u
-      LEFT JOIN companies c ON u.company_id = c.id
-      ORDER BY u.created_at DESC
-      LIMIT 1000
-    `);
-    res.json(result.rows);
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(100, parseInt(req.query.limit) || 50);
+    const offset = (page - 1) * limit;
+
+    const [result, countResult] = await Promise.all([
+      pool.query(
+        `SELECT u.id, u.name, u.email, u.role, u.created_at, c.company_name 
+         FROM users u
+         LEFT JOIN companies c ON u.company_id = c.id
+         ORDER BY u.created_at DESC
+         LIMIT $1 OFFSET $2`,
+        [limit, offset]
+      ),
+      pool.query('SELECT COUNT(*) as total FROM users')
+    ]);
+
+    res.json({
+      users: result.rows,
+      pagination: {
+        page,
+        limit,
+        total: parseInt(countResult.rows[0].total),
+        pages: Math.ceil(countResult.rows[0].total / limit)
+      }
+    });
   } catch (err) {
     console.error('❌ Error fetching platform users:', err);
     res.status(500).json({ message: 'Server error' });
@@ -177,30 +194,33 @@ router.patch('/subscriptions/:companyId', async (req, res) => {
 router.post('/announcements', async (req, res) => {
     const { title, message, priority } = req.body;
 
+    if (!message || !message.trim()) {
+      return res.status(400).json({ message: 'Announcement message is required' });
+    }
+
     try {
-        // Fetch all company owners
+        // Fetch all company owners in a single query
         const owners = await pool.query("SELECT id, company_id FROM users WHERE role = 'owner'");
         
-        const notifications = owners.rows.map(owner => ({
-            user_id: owner.id,
-            company_id: owner.company_id,
-            type: 'system_broadcast',
-            title: title || 'System Announcement',
-            message,
-            priority: priority || 'medium'
-        }));
-
-        // Batch insert or loop (simple loop for now as we don't have many companies yet)
-        for (const note of notifications) {
-            await pool.query(
-                `INSERT INTO notifications (user_id, company_id, type, title, message, priority, read)
-                 VALUES ($1, $2, $3, $4, $5, $6, FALSE)`,
-                [note.user_id, note.company_id, note.type, note.title, note.message, note.priority]
-            );
+        if (owners.rows.length === 0) {
+          return res.json({ message: 'No company owners found to notify', sent: 0 });
         }
 
-        res.json({ message: `Broadcast sent to ${owners.rows.length} company owners` });
+        // Batch INSERT all notifications in a single query using unnest for efficiency
+        const userIds = owners.rows.map(o => o.id);
+        const companyIds = owners.rows.map(o => o.company_id);
+        const noteTitle = title || 'System Announcement';
+        const notePriority = priority || 'medium';
+
+        await pool.query(
+          `INSERT INTO notifications (user_id, company_id, type, title, message, priority, read)
+           SELECT unnest($1::uuid[]), unnest($2::int[]), $3, $4, $5, $6, FALSE`,
+          [userIds, companyIds, 'system_broadcast', noteTitle, message, notePriority]
+        );
+
+        res.json({ message: `Broadcast sent to ${owners.rows.length} company owners`, sent: owners.rows.length });
     } catch (err) {
+        console.error('❌ Announcement broadcast error:', err);
         res.status(500).json({ message: 'Failed to broadcast announcement' });
     }
 });

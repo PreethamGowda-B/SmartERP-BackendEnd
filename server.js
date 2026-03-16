@@ -278,6 +278,7 @@ v1Router.use("/reports", require("./routes/reports"));
 v1Router.use("/settings", require("./routes/settings"));
 v1Router.use("/location", require("./routes/location"));
 v1Router.use("/subscription", require("./routes/subscription"));
+v1Router.use("/hr", require("./routes/hr"));
 
 // Mount v1 router
 app.use("/api/v1", v1Router);

@@ -170,7 +170,7 @@ router.get(
 
       // Generate Tokens
       const accessToken = jwt.sign(
-        { id: user.id, userId: user.id, role: user.role, companyId: user.company_id },
+        { id: user.id, userId: user.id, role: user.role, email: user.email, companyId: user.company_id },
         ACCESS_SECRET,
         { expiresIn: "15m" }
       );
@@ -506,7 +506,7 @@ router.post("/login", [
 
     // Generate JWTs
     const accessToken = jwt.sign(
-      { id: user.id, userId: user.id, role: user.role, companyId: user.company_id },
+      { id: user.id, userId: user.id, role: user.role, email: user.email, companyId: user.company_id },
       ACCESS_SECRET,
       { expiresIn: "15m" }
     );
@@ -573,7 +573,7 @@ router.post("/refresh", async (req, res) => {
         if (!payloadUserId) return res.status(401).json({ message: "Invalid token payload" });
 
         // ✅ Fetch user role and company_id from database
-        const userResult = await pool.query("SELECT role, company_id FROM users WHERE id = $1", [payloadUserId]);
+        const userResult = await pool.query("SELECT role, email, company_id FROM users WHERE id = $1", [payloadUserId]);
         if (userResult.rows.length === 0) {
           return res.status(401).json({ message: "User not found" });
         }
@@ -588,9 +588,9 @@ router.post("/refresh", async (req, res) => {
           [payloadUserId, newRefresh]
         );
 
-        // ✅ Include role and companyId in access token
+        // ✅ Include role, email, and companyId in access token
         const accessToken = jwt.sign(
-          { id: payloadUserId, userId: payloadUserId, role: userRole, companyId: userCompanyId },
+          { id: payloadUserId, userId: payloadUserId, role: userRole, email: userResult.rows[0].email, companyId: userCompanyId },
           ACCESS_SECRET,
           { expiresIn: "15m" }
         );

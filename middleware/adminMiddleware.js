@@ -19,7 +19,7 @@ function authenticateSuperAdmin(req, res, next) {
     return next();
   }
 
-  console.warn(`🚫 Unauthorized Superadmin access attempt by: ${user.email} (Role: ${user.role})`);
+  console.warn(`🚫 Unauthorized Superadmin access attempt by: ${user.email || 'undefined'} (Role: ${user.role || 'none'}) for ${req.method} ${req.path}`);
   return res.status(403).json({ 
     message: "Access Denied: You do not have platform-level administrative privileges." 
   });

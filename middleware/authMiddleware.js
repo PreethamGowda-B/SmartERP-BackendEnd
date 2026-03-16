@@ -22,7 +22,8 @@ function authenticateToken(req, res, next) {
   }
 
   if (!token) {
-    console.log(`❌ No token found in ${req.method} ${req.path} from: ${req.headers.origin || req.headers.host}`);
+    const cookiesPresent = req.cookies ? Object.keys(req.cookies).join(', ') : 'none';
+    console.log(`❌ No token found in ${req.method} ${req.path} from: ${req.headers.origin || req.headers.host} | Cookies: [ ${cookiesPresent} ]`);
     return res.status(401).json({ message: "Not authenticated" });
   }
 

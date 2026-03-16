@@ -562,6 +562,10 @@ router.post("/refresh", async (req, res) => {
     return res.status(401).json({ message: "No refresh token provided" });
   }
 
+  // Masked token logging for debugging
+  const maskedToken = token.length > 10 ? `${token.substring(0, 5)}...${token.substring(token.length - 5)}` : "***";
+  console.log(`📡 Refreshing token: ${maskedToken} (Source: ${req.cookies?.refresh_token ? 'Cookie' : 'Body'})`);
+
   try {
     const result = await pool.query("SELECT * FROM refresh_tokens WHERE token = $1", [token]);
     if (result.rows.length === 0) {

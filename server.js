@@ -242,8 +242,9 @@ async function runDatabaseInitialization() {
     await fixDatabaseConstraints();
     
     // 2. Auto-migrate schema
-    const { fixMaterialRequestsSchema } = require('./migrations/autoMigrate');
+    const { fixMaterialRequestsSchema, setupDocumentsTable } = require('./migrations/autoMigrate');
     await fixMaterialRequestsSchema();
+    await setupDocumentsTable();
     
     // 3. OTP setup and Core optimization
     await pool.query(`
@@ -312,6 +313,7 @@ v1Router.use("/location", require("./routes/location"));
 v1Router.use("/subscription", require("./routes/subscription"));
 v1Router.use("/hr", require("./routes/hr"));
 v1Router.use("/admin", require("./routes/admin"));
+v1Router.use("/documents", require("./routes/documents"));
 
 // Mount v1 router
 app.use("/api/v1", v1Router);

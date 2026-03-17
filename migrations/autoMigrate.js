@@ -163,4 +163,29 @@ async function recreateTable() {
     }
 }
 
-module.exports = { fixMaterialRequestsSchema };
+async function setupDocumentsTable() {
+    try {
+        console.log('🔧 Ensuring employee_documents table exists...');
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS employee_documents (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                company_id INTEGER NOT NULL,
+                employee_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                document_type VARCHAR(100) NOT NULL,
+                file_url TEXT NOT NULL,
+                notes TEXT,
+                uploaded_by UUID REFERENCES users(id),
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+            
+            CREATE INDEX IF NOT EXISTS idx_employee_docs_company ON employee_documents(company_id);
+            CREATE INDEX IF NOT EXISTS idx_employee_docs_employee ON employee_documents(employee_id);
+            CREATE INDEX IF NOT EXISTS idx_employee_docs_type ON employee_documents(document_type);
+        `);
+        console.log('✅ employee_documents table initialized');
+    } catch (err) {
+        console.error('❌ Error setting up employee_documents table:', err.message);
+    }
+}
+
+module.exports = { fixMaterialRequestsSchema, setupDocumentsTable };

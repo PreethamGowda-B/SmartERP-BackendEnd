@@ -161,7 +161,8 @@ router.post('/create-order', requireOwner, async (req, res) => {
   try {
     const { planId, billingCycle } = req.body; // billingCycle: 'monthly' or 'yearly'
 
-    if (![2, 3].includes(planId)) {
+    // Allow IDs 2, 3 and the new Test Plan (ID 4)
+    if (![2, 3, 4].includes(planId)) {
       return res.status(400).json({ message: 'Invalid plan selected.' });
     }
 
@@ -207,11 +208,15 @@ router.post('/verify-payment', requireOwner, async (req, res) => {
       razorpay_order_id,
       razorpay_payment_id,
       razorpay_signature,
-      planId,
+      planId: planIdInput,
       billingCycle
     } = req.body;
 
     const companyId = req.user.companyId;
+
+    // Mapping: If they bought the Test Plan (ID 4), assign them the real Basic Plan (ID 2)
+    // as per requirement (Assign "Basic" plan to the company/user).
+    const planId = parseInt(planIdInput, 10) === 4 ? 2 : parseInt(planIdInput, 10);
 
     // Verify signature
     const body = razorpay_order_id + "|" + razorpay_payment_id;
@@ -259,7 +264,12 @@ router.post('/verify-payment', requireOwner, async (req, res) => {
     await pool.query(
       `INSERT INTO subscription_events (company_id, event_type, new_plan_id, metadata, created_at)
        VALUES ($1, 'upgrade', $2, $3, NOW())`,
-      [companyId, planId, JSON.stringify({ razorpay_payment_id, razorpay_order_id, billingCycle })]
+      [companyId, planId, JSON.stringify({ 
+        razorpay_payment_id, 
+        razorpay_order_id, 
+        billingCycle,
+        purchased_test_plan: parseInt(planIdInput, 10) === 4 
+      })]
     );
 
     await pool.query('COMMIT');
@@ -267,8 +277,22 @@ router.post('/verify-payment', requireOwner, async (req, res) => {
     // 📣 Push Notification: Notify owner of successful upgrade
     const { notifyPlanUpgrade } = require('../services/smartNotificationService');
     const { invalidatePlanCache } = require('../middleware/planMiddleware');
-    const planName = planId === 1 ? 'Free' : planId === 2 ? 'Basic' : 'Pro';
-    notifyPlanUpgrade(req.user.userId || req.user.id, companyId, planName).catch(e => console.error('Push Error:', e.message));
+    
+    // Explicit plan names for logging/notification
+    const planNameMap = {
+      1: 'Free',
+      2: 'Basic',
+      3: 'Pro',
+      4: 'Basic (Test)'
+    };
+    const planName = planNameMap[planId] || (parseInt(planIdInput, 10) === 4 ? 'Basic' : 'Unknown');
+    
+    if (process.env.NODE_ENV === 'development') {
+      console.log(`[SUBSCRIPTION URL] Plan ${planName} assigned to company ${companyId}`);
+      console.log(`[PAYMENT SUCCESS] Razorpay ID: ${razorpay_payment_id}`);
+    }
+
+    notifyPlanUpgrade(req.user.userId || req.user.id, companyId, 'Basic').catch(e => console.error('Push Error:', e.message));
 
     // Invalidate cache so changes are immediate
     invalidatePlanCache(companyId);

@@ -108,7 +108,11 @@ app.set("trust proxy", 1);
 
 // ✅ Common middlewares
 app.use(cookieParser());
-app.use(express.json());
+app.use(express.json({
+  verify: (req, res, buf) => {
+    req.rawBody = buf.toString();
+  }
+}));
 
 // ✅ CSRF Protection (Standard for Cookie-based Auth)
 // We only enable it if a specific header or cookie is present to avoid breaking existing clients immediately,
@@ -146,7 +150,9 @@ if (process.env.NODE_ENV === "production") {
       '/api/auth/validate-company',
       '/api/v1/auth/validate-company',
       '/api/auth/set-cookie',
-      '/api/v1/auth/set-cookie'
+      '/api/v1/auth/set-cookie',
+      '/api/webhook',
+      '/api/v1/webhook'
     ];
 
     // 2. Identify safe requests
@@ -311,6 +317,7 @@ v1Router.use("/subscription", require("./routes/subscription"));
 v1Router.use("/hr", require("./routes/hr"));
 v1Router.use("/admin", require("./routes/admin"));
 v1Router.use("/documents", require("./routes/documents"));
+v1Router.use("/webhook", require("./routes/webhook"));
 
 // Mount v1 router
 app.use("/api/v1", v1Router);

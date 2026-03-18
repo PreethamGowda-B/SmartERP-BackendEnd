@@ -292,7 +292,7 @@ router.post('/verify-payment', requireOwner, async (req, res) => {
       console.log(`[PAYMENT SUCCESS] Razorpay ID: ${razorpay_payment_id}`);
     }
 
-    notifyPlanUpgrade(req.user.userId || req.user.id, companyId, 'Basic').catch(e => console.error('Push Error:', e.message));
+    notifyPlanUpgrade(req.user.userId || req.user.id, companyId, planName).catch(e => console.error('Push Error:', e.message));
 
     // Invalidate cache so changes are immediate
     invalidatePlanCache(companyId);

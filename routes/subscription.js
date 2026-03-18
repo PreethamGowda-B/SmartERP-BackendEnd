@@ -162,8 +162,8 @@ router.post('/create-order', requireOwner, async (req, res) => {
   try {
     const { planId, billingCycle } = req.body; // billingCycle: 'monthly' or 'yearly'
 
-    // Allow IDs 2, 3 and the new Test Plan (ID 4)
-    if (![2, 3, 4].includes(planId)) {
+    // Allow IDs 2, 3
+    if (![2, 3].includes(planId)) {
       return res.status(400).json({ message: 'Invalid plan selected.' });
     }
 
@@ -216,9 +216,7 @@ router.post('/verify-payment', requireOwner, async (req, res) => {
 
     const companyId = req.user.companyId;
 
-    // Mapping: If they bought the Test Plan (ID 4), assign them the real Basic Plan (ID 2)
-    // as per requirement (Assign "Basic" plan to the company/user).
-    const planId = parseInt(planIdInput, 10) === 4 ? 2 : parseInt(planIdInput, 10);
+    const planId = parseInt(planIdInput, 10);
 
     // Verify signature
     const body = razorpay_order_id + "|" + razorpay_payment_id;
@@ -269,8 +267,7 @@ router.post('/verify-payment', requireOwner, async (req, res) => {
       [companyId, planId, JSON.stringify({ 
         razorpay_payment_id, 
         razorpay_order_id, 
-        billingCycle,
-        purchased_test_plan: parseInt(planIdInput, 10) === 4 
+        billingCycle
       })]
     );
 
@@ -284,10 +281,9 @@ router.post('/verify-payment', requireOwner, async (req, res) => {
     const planNameMap = {
       1: 'Free',
       2: 'Basic',
-      3: 'Pro',
-      4: 'Basic (Test)'
+      3: 'Pro'
     };
-    const planName = planNameMap[planId] || (parseInt(planIdInput, 10) === 4 ? 'Basic' : 'Unknown');
+    const planName = planNameMap[planId] || 'Unknown';
     
     if (process.env.NODE_ENV === 'development') {
       console.log(`[SUBSCRIPTION URL] Plan ${planName} assigned to company ${companyId}`);

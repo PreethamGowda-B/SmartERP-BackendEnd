@@ -54,8 +54,7 @@ router.post('/razorpay', async (req, res) => {
       return res.status(400).send('Missing metadata in notes');
     }
 
-    // Mapping: Test Plan (ID 4) -> Basic (ID 2)
-    const planId = planIdInput === 4 ? 2 : planIdInput;
+    const planId = planIdInput;
     const expiryInterval = billingCycle === 'yearly' ? '1 year' : '1 month';
 
     console.log(`📡 Razorpay Webhook: Processing capture for Company ${companyId}, Plan ${planId}`);
@@ -94,8 +93,7 @@ router.post('/razorpay', async (req, res) => {
         razorpay_payment_id: paymentId, 
         razorpay_order_id: orderId, 
         billingCycle,
-        source: 'webhook',
-        purchased_test_plan: planIdInput === 4
+        source: 'webhook'
       })]
     );
 
@@ -105,7 +103,7 @@ router.post('/razorpay', async (req, res) => {
     invalidatePlanCache(companyId);
     
     if (userId) {
-      const planNameMap = { 1: 'Free', 2: 'Basic', 3: 'Pro', 4: 'Basic (Test)' };
+      const planNameMap = { 1: 'Free', 2: 'Basic', 3: 'Pro' };
       const planName = planNameMap[planId] || 'Basic';
       notifyPlanUpgrade(userId, companyId, planName).catch(e => console.error('Push Error Webhook:', e.message));
     }

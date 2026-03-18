@@ -24,11 +24,8 @@ const { pool } = require("./db"); // ✅ Make sure db.js exports { pool }
 
 const app = express();
 
-// ✅ Sentry Request Request Handler (MUST be first)
-if (process.env.SENTRY_DSN) {
-  app.use(Sentry.Handlers.requestHandler());
-  app.use(Sentry.Handlers.tracingHandler());
-}
+// ✅ Sentry Request Handling is now automatic in SDK v8+ 
+// Just ensure Sentry.init() is called before any other code (done on line 7)
 
 // ✅ CORS configuration — MUST be before rate limiters and other security headers
 const corsOptions = {
@@ -376,7 +373,7 @@ app.get("/", async (req, res) => {
 
 // ✅ Global Error Handler (MUST BE LAST)
 if (process.env.SENTRY_DSN) {
-  app.use(Sentry.Handlers.errorHandler());
+  Sentry.setupExpressErrorHandler(app);
 }
 
 app.use((err, req, res, next) => {

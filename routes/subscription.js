@@ -12,6 +12,7 @@
 const express = require('express');
 const router = express.Router();
 const { pool } = require('../db');
+const Sentry = require("@sentry/node");
 const { authenticateToken } = require('../middleware/authMiddleware');
 const { loadPlan, invalidatePlanCache } = require('../middleware/planMiddleware');
 const Razorpay = require('razorpay');
@@ -186,7 +187,7 @@ router.post('/create-order', requireOwner, async (req, res) => {
         companyId: req.user.companyId,
         planId: planId,
         billingCycle: billingCycle,
-        userId: req.user.id
+        userId: req.user.id || req.user.userId
       }
     };
 
@@ -194,6 +195,7 @@ router.post('/create-order', requireOwner, async (req, res) => {
     res.json(order);
   } catch (err) {
     console.error('Razorpay Create Order Error:', err);
+    Sentry.captureException(err, { extra: { planId, billingCycle, companyId: req.user.companyId } });
     res.status(500).json({ message: 'Failed to create payment order.' });
   }
 });
@@ -301,6 +303,7 @@ router.post('/verify-payment', requireOwner, async (req, res) => {
   } catch (err) {
     await pool.query('ROLLBACK');
     console.error('Razorpay Verify Payment Error:', err);
+    Sentry.captureException(err, { extra: { razorpay_payment_id, razorpay_order_id, companyId } });
     res.status(500).json({ message: 'Payment verification failed.' });
   }
 });

@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const crypto = require('crypto');
 const { pool } = require('../db');
+const Sentry = require("@sentry/node");
 const { notifyPlanUpgrade } = require('../services/smartNotificationService');
 const { invalidatePlanCache } = require('../middleware/planMiddleware');
 
@@ -112,6 +113,7 @@ router.post('/razorpay', async (req, res) => {
     res.json({ status: 'success' });
   } catch (err) {
     console.error('❌ Razorpay Webhook Error:', err);
+    Sentry.captureException(err);
     res.status(500).send('Internal Server Error');
   }
 });

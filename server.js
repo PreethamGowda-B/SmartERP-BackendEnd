@@ -454,6 +454,14 @@ if (cluster.isMaster && process.env.NODE_ENV === 'production') {
       } catch (err) {
         console.error('❌ Failed to start smart notification CRON processor:', err.message);
       }
+
+      // 🏓 Render Keep-Alive Pinger: Prevent cold starts by pinging /api/health every 10 min
+      try {
+        const { startKeepAlivePinger } = require('./jobs/keepAlivePinger');
+        startKeepAlivePinger();
+      } catch (err) {
+        console.error('❌ Failed to start keep-alive pinger:', err.message);
+      }
     }
   });
 }

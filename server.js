@@ -261,6 +261,20 @@ async function runDatabaseInitialization() {
         created_at TIMESTAMP DEFAULT NOW()
       );
       CREATE INDEX IF NOT EXISTS idx_user_devices_user_id ON user_devices(user_id);
+
+      -- Feedback system for users to report bugs or suggest features
+      CREATE TABLE IF NOT EXISTS feedback (
+        id SERIAL PRIMARY KEY,
+        user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+        type VARCHAR(50) DEFAULT 'general',
+        subject VARCHAR(255),
+        message TEXT NOT NULL,
+        page_url TEXT,
+        status VARCHAR(50) DEFAULT 'new',
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_feedback_status ON feedback(status);
+      CREATE INDEX IF NOT EXISTS idx_feedback_user_id ON feedback(user_id);
     `);
     
     const { optimizeDatabase } = require('./scripts/optimizeDb');

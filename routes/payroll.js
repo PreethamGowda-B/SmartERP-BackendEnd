@@ -3,6 +3,7 @@ const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 const { createNotification } = require('../utils/notificationHelpers');
+const { sendPayrollReleasedEmail } = require('../services/emailNotificationService');
 const { loadPlan } = require('../middleware/planMiddleware');
 const { requireFeature } = require('../middleware/featureGuard');
 
@@ -163,7 +164,7 @@ router.post('/', authenticateToken, loadPlan, requireFeature('payroll'), async (
         company_id: req.user.companyId,
         type: 'payroll',
         title: 'Payroll Received',
-        message: `Your payroll for ${payroll_month}/${payroll_year} has been processed. Total: $${total_salary}`,
+        message: `Your payroll for ${payroll_month}/${payroll_year} has been processed. Total: ₹${total_salary.toFixed(2)}`,
         priority: 'high',
         data: {
           payroll_id: payrollRecord.id,
@@ -173,7 +174,17 @@ router.post('/', authenticateToken, loadPlan, requireFeature('payroll'), async (
           url: '/employee/payroll'
         }
       });
-      console.log(`✅ Notification sent for payroll: ${employee_email} - ${payroll_month}/${payroll_year}`);
+
+      // 📧 Email: Send payslip email to employee
+      sendPayrollReleasedEmail({
+        employeeEmail: employee.email,
+        employeeName: employee.name,
+        month: payroll_month,
+        year: payroll_year,
+        totalSalary: total_salary,
+        presentDays: presentDays,
+        deduction: deduction
+      });
     } catch (notifErr) {
       console.error('❌ Failed to send payroll notification:', notifErr);
     }

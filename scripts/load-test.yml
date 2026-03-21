@@ -1,0 +1,97 @@
+config:
+  target: "https://smarterp-backendend.onrender.com"
+  phases:
+    # Phase 1: Warm up (30s, 10 users/sec)
+    - duration: 30
+      arrivalRate: 10
+      name: "Warm Up"
+    # Phase 2: Ramp up (60s, scale to 50 users/sec)
+    - duration: 60
+      arrivalRate: 10
+      rampTo: 50
+      name: "Ramp Up"
+    # Phase 3: Peak load (60s, 100 users/sec)
+    - duration: 60
+      arrivalRate: 100
+      name: "Peak Load"
+    # Phase 4: Cool down (30s, back to 10 users/sec)
+    - duration: 30
+      arrivalRate: 10
+      name: "Cool Down"
+  http:
+    timeout: 30
+  defaults:
+    headers:
+      Content-Type: "application/json"
+
+scenarios:
+  # ── Scenario 1: Health Check (20% of traffic) ─────────────────────────────
+  - name: "Health Check"
+    weight: 20
+    flow:
+      - get:
+          url: "/api/health"
+          expect:
+            - statusCode: 200
+
+  # ── Scenario 2: Auth Route Check (10% of traffic) ─────────────────────────
+  - name: "Auth Route Check"
+    weight: 10
+    flow:
+      - get:
+          url: "/api/auth"
+          expect:
+            - statusCode: 200
+
+  # ── Scenario 3: Login Flow (40% of traffic) ───────────────────────────────
+  - name: "Login Flow"
+    weight: 40
+    flow:
+      - post:
+          url: "/api/auth/login"
+          json:
+            email: "testing495949@gmail.com"
+            password: "Test@1234"
+          capture:
+            - json: "$.accessToken"
+              as: "accessToken"
+          expect:
+            - statusCode:
+                - 200
+                - 401
+                - 403
+
+  # ── Scenario 4: Login + Fetch Jobs (20% of traffic) ──────────────────────
+  - name: "Login and Fetch Jobs"
+    weight: 20
+    flow:
+      - post:
+          url: "/api/auth/login"
+          json:
+            email: "testing495949@gmail.com"
+            password: "Test@1234"
+          capture:
+            - json: "$.accessToken"
+              as: "accessToken"
+      - get:
+          url: "/api/jobs"
+          headers:
+            Authorization: "Bearer {{ accessToken }}"
+          expect:
+            - statusCode:
+                - 200
+                - 401
+
+  # ── Scenario 5: Token Refresh (10% of traffic) ────────────────────────────
+  - name: "Token Refresh"
+    weight: 10
+    flow:
+      - post:
+          url: "/api/auth/refresh"
+          json:
+            refreshToken: "invalid-token-for-load-test"
+          expect:
+            - statusCode:
+                - 200
+                - 401
+                - 400

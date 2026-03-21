@@ -3,6 +3,7 @@ const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 const { createNotification, createNotificationForCompany, createNotificationForOwners } = require('../utils/notificationHelpers');
+const { sendJobAssignedEmail, sendJobCompletedEmail } = require('../services/emailNotificationService');
 const { body, validationResult } = require('express-validator');
 
 /**
@@ -67,9 +68,8 @@ router.post('/', authenticateToken, [
           message: `A new job is available for everyone: ${title}`,
           priority: job.priority || 'medium',
           data: { job_id: createdJob.id, job_title: title },
-          exclude_user_id: req.user.id // Don't notify the owner who created it
+          exclude_user_id: req.user.id
         });
-        console.log(`✅ Broadcast notification sent for new job: ${title}`);
       } else if (assignedTo) {
         await createNotification({
           user_id: assignedTo,
@@ -80,11 +80,23 @@ router.post('/', authenticateToken, [
           priority: job.priority || 'medium',
           data: { job_id: createdJob.id, job_title: title, url: '/employee/notifications' }
         });
-        console.log(`✅ Specific notification sent to assigned employee for job: ${title}`);
+        // 📧 Email: Notify assigned employee
+        const empResult = await pool.query('SELECT email, name FROM users WHERE id = $1', [assignedTo]);
+        const ownerResult = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+        if (empResult.rows[0]) {
+          sendJobAssignedEmail({
+            employeeEmail: empResult.rows[0].email,
+            employeeName: empResult.rows[0].name,
+            jobTitle: title,
+            jobDescription: description,
+            priority: job.priority || 'medium',
+            deadline: job.deadline,
+            ownerName: ownerResult.rows[0]?.name
+          });
+        }
       }
     } catch (notifErr) {
       console.error('❌ Failed to send job notification:', notifErr);
-      // Don't fail the job creation if notification fails
     }
 
     res.json(createdJob);
@@ -349,9 +361,12 @@ router.post('/:id/progress', authenticateToken, async (req, res) => {
     // Notification for job completion
     if (progress === 100) {
       try {
-        // Get employee name
-        const userInfo = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+        const userInfo = await pool.query('SELECT name, email FROM users WHERE id = $1', [req.user.id]);
         const employeeName = userInfo.rows[0]?.name || 'Employee';
+        const ownerResult = await pool.query(
+          "SELECT u.email, u.name FROM users u WHERE u.id = $1",
+          [updatedJob.created_by]
+        );
 
         await createNotification({
           user_id: updatedJob.created_by,
@@ -362,7 +377,16 @@ router.post('/:id/progress', authenticateToken, async (req, res) => {
           priority: 'medium',
           data: { job_id: updatedJob.id, employee_id: req.user.id }
         });
-        console.log(`✅ Notified owner about job completion`);
+
+        // 📧 Email: Notify owner of job completion  
+        if (ownerResult.rows[0]) {
+          sendJobCompletedEmail({
+            ownerEmail: ownerResult.rows[0].email,
+            ownerName: ownerResult.rows[0].name,
+            employeeName,
+            jobTitle: updatedJob.title
+          });
+        }
       } catch (notifErr) {
         console.error('❌ Failed to send job completion notification:', notifErr);
       }

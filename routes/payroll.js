@@ -76,23 +76,16 @@ router.post('/', authenticateToken, loadPlan, requireFeature('payroll'), async (
     const halfDays = parseInt(attendanceSummary.half_days) || 0;
     const totalHours = parseFloat(attendanceSummary.total_hours) || 0;
 
-    // Calculate payable days (half days count as 0.5)
-    const payableDays = presentDays + (halfDays * 0.5);
-
-    // Assume 26 working days per month (adjust as needed)
-    const totalWorkingDays = 26;
-
-    // Adjust base salary based on attendance
-    const attendanceAdjustedSalary = (parseFloat(base_salary) / totalWorkingDays) * payableDays;
-
-    // Calculate total salary with adjustments
-    const total_salary = attendanceAdjustedSalary +
+    // ✅ Total salary = base salary + extra + increment - deduction
+    // Attendance data (presentDays, absentDays etc.) is stored for records only.
+    // If the owner wants to deduct for absences, they should use the 'deduction' field explicitly.
+    const total_salary = parseFloat(base_salary) +
       parseFloat(extra_amount) +
       parseFloat(salary_increment) -
       parseFloat(deduction);
 
-    console.log(`📊 Payroll for ${employee.email}: Present=${presentDays}, Absent=${absentDays}, Half=${halfDays}, Payable=${payableDays} days`);
-    console.log(`💰 Base: ${base_salary}, Adjusted: ${attendanceAdjustedSalary.toFixed(2)}, Total: ${total_salary.toFixed(2)}`);
+    console.log(`📊 Payroll for ${employee.email}: Present=${presentDays}, Absent=${absentDays}, Half=${halfDays}, Total Hours=${totalHours}`);
+    console.log(`💰 Base: ${base_salary}, Extra: ${extra_amount}, Increment: ${salary_increment}, Deduction: ${deduction}, Total: ${total_salary.toFixed(2)}`);
 
     // Check if payroll already exists for this employee and period
     const existingPayroll = await pool.query(

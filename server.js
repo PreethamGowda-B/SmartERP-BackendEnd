@@ -275,6 +275,13 @@ async function runDatabaseInitialization() {
       );
       CREATE INDEX IF NOT EXISTS idx_feedback_status ON feedback(status);
       CREATE INDEX IF NOT EXISTS idx_feedback_user_id ON feedback(user_id);
+
+      -- Expand notifications table for global broadcasts and metadata
+      ALTER TABLE notifications ADD COLUMN IF NOT EXISTS company_id INTEGER;
+      ALTER TABLE notifications ADD COLUMN IF NOT EXISTS type VARCHAR(100) DEFAULT 'system';
+      ALTER TABLE notifications ADD COLUMN IF NOT EXISTS priority VARCHAR(50) DEFAULT 'normal';
+      CREATE INDEX IF NOT EXISTS idx_notifications_company_id ON notifications(company_id);
+      CREATE INDEX IF NOT EXISTS idx_notifications_type ON notifications(type);
     `);
     
     const { optimizeDatabase } = require('./scripts/optimizeDb');

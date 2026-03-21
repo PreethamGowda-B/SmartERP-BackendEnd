@@ -1,13 +1,83 @@
-name: CI
-on: [push, pull_request]
+name: Backend CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
 jobs:
+  # ── Job 1: Unit Tests ────────────────────────────────────────────────────
   test:
+    name: Unit Tests
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
         with:
-          node-version: 18
-      - run: npm ci
-      - run: npm run run-schema || true
-      - run: node scripts/smokeTest.js
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run unit tests
+        run: npm test
+        env:
+          NODE_ENV: test
+          JWT_SECRET: test_secret_for_ci_only
+          JWT_REFRESH_SECRET: test_refresh_secret_for_ci_only
+
+  # ── Job 2: Smoke Tests against live API ──────────────────────────────────
+  smoke:
+    name: Smoke Tests (Live API)
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Wait for Render deploy (90s)
+        run: sleep 90
+
+      - name: Run smoke tests
+        run: node scripts/smoke-test.js
+        env:
+          API_URL: https://smarterp-backendend.onrender.com
+
+  # ── Job 3: Security Audit ────────────────────────────────────────────────
+  audit:
+    name: Dependency Security Audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run npm audit (high severity only)
+        run: npm audit --audit-level=high
+        continue-on-error: true

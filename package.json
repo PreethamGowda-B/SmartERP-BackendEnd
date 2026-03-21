@@ -5,7 +5,8 @@
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js",
-    "smoke-test": "node scripts/smokeTest.js",
+    "test": "node --test tests/*.test.js",
+    "smoke-test": "node scripts/smoke-test.js",
     "create-admin": "node scripts/createAdmin.js",
     "run-schema": "node scripts/runSchema.js"
   },

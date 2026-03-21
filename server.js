@@ -21,6 +21,7 @@ const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 const cookieParser = require("cookie-parser");
 const { pool } = require("./db"); // ✅ Make sure db.js exports { pool }
+const logger = require("./utils/logger");
 
 const app = express();
 
@@ -114,74 +115,58 @@ app.use(express.json({
   }
 }));
 
-// ✅ CSRF Protection (Standard for Cookie-based Auth)
-// We only enable it if a specific header or cookie is present to avoid breaking existing clients immediately,
-// but for a clean v1, we should be strict.
+// ✅ Anti-CSRF Protection (Stateless Alternative for SPAs)
+// We enforce strong Cross-Origin checks for mutually secure cookies.
 if (process.env.NODE_ENV === "production") {
-  const csrf = require("csurf");
-  const csrfProtection = csrf({ 
-    cookie: {
-      httpOnly: false, // Must be accessible to frontend if reading 'XSRF-TOKEN' header
-      secure: true,
-      sameSite: 'none'
-    } 
-  });
-
   app.use((req, res, next) => {
-    // 1. Normalize path for matching
-    const normalizedPath = req.path.replace(/\/$/, '') || '/';
-    
+    // Only mutable operations need CSRF protection
+    if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
+      return next();
+    }
+
     const publicRoutes = [
-      '/api/auth/login',
-      '/api/v1/auth/login',
-      '/api/auth/signup',
-      '/api/v1/auth/signup',
-      '/api/auth/refresh',
-      '/api/v1/auth/refresh',
-      '/api/health',
-      '/api/v1/health',
-      '/api/csrf-token',
-      '/api/notifications/devices',
-      '/api/v1/notifications/devices',
-      '/api/auth/send-otp',
-      '/api/v1/auth/send-otp',
-      '/api/auth/verify-otp',
-      '/api/v1/auth/verify-otp',
-      '/api/auth/validate-company',
-      '/api/v1/auth/validate-company',
-      '/api/auth/set-cookie',
-      '/api/v1/auth/set-cookie',
-      '/api/webhook',
-      '/api/v1/webhook'
+      '/api/auth/login', '/api/v1/auth/login',
+      '/api/auth/signup', '/api/v1/auth/signup',
+      '/api/auth/refresh', '/api/v1/auth/refresh',
+      '/api/health', '/api/v1/health',
+      '/api/notifications/devices', '/api/v1/notifications/devices',
+      '/api/auth/send-otp', '/api/v1/auth/send-otp',
+      '/api/auth/verify-otp', '/api/v1/auth/verify-otp',
+      '/api/auth/validate-company', '/api/v1/auth/validate-company',
+      '/api/auth/set-cookie', '/api/v1/auth/set-cookie',
+      '/api/webhook', '/api/v1/webhook'
     ];
 
-    // 2. Identify safe requests
-    // - Custom headers (Authorization) are inherently CSRF-safe in modern browsers
-    // - Public auth routes must be accessible to establish the session
+    const normalizedPath = req.path.replace(/\/$/, '') || '/';
     const isPublic = publicRoutes.some(route => normalizedPath === route || normalizedPath.startsWith(route));
+    
+    // Header based authentication naturally deters CSRF.
     const hasTokenHeader = !!(req.headers.authorization && req.headers.authorization.startsWith('Bearer '));
 
     if (isPublic || hasTokenHeader) {
       return next();
     }
 
-    // 3. Otherwise, enforce CSRF (primarily for cookie-based session fallbacks)
-    csrfProtection(req, res, next);
-  });
+    // Origin Enforcement (Stateless CSRF Block)
+    const origin = req.headers.origin;
+    const referer = req.headers.referer;
+    
+    // Whitelisted explicit domains (same as your CORS)
+    const allowedPatterns = [
+      /^https:\/\/smart-erp-front(-[a-z0-9]+)?(-[a-z0-9-]+)?\.vercel\.app$/,
+      /^https:\/\/smart-erp-front-[a-z0-9]+-thepreethu01-9119s-projects\.vercel\.app$/,
+      /^https:\/\/www\.prozync\.in$/,
+      /^https:\/\/prozync\.in$/
+    ];
 
-  // Always provide XSRF-TOKEN cookie for future-proofing
-  app.use((req, res, next) => {
-    try {
-      if (typeof req.csrfToken === 'function') {
-        res.cookie('XSRF-TOKEN', req.csrfToken(), {
-          secure: true,
-          sameSite: 'none',
-          httpOnly: false // Allow frontend to read if it ever switches to header-based CSRF submission
-        });
-      }
-    } catch (e) {
-      // Initialization might fail if middleware was skipped, which is fine
+    const isValidOrigin = origin && allowedPatterns.some(pattern => pattern.test(origin));
+    const isValidReferer = referer && allowedPatterns.some(pattern => pattern.test(referer));
+
+    if (!isValidOrigin && !isValidReferer) {
+      console.warn(`🛡️ CSRF Block: Request denied from origin: ${origin || 'Unknown'}`);
+      return res.status(403).json({ message: "Invalid Origin / Mismatched CSRF verification" });
     }
+
     next();
   });
 }
@@ -389,7 +374,8 @@ app.use((err, req, res, next) => {
     return res.status(403).json({ message: "Invalid CSRF token. Please refresh the page." });
   }
   
-  console.error("❌ Global Error:", err.stack);
+  logger.error("Global API Route Error", err, { path: req.path, method: req.method });
+  
   res.status(err.status || 500).json({
     message: err.message || "An internal server error occurred.",
     error: process.env.NODE_ENV === "development" ? err.stack : undefined,
@@ -398,12 +384,13 @@ app.use((err, req, res, next) => {
 
 // ✅ Catch uncaught exceptions to prevent silent process death
 process.on("uncaughtException", (err) => {
-  console.error("🔥 UNCAUGHT EXCEPTION:", err);
-  // Ideally, restart or exit after logging
+  logger.error("🔥 UNCAUGHT EXCEPTION - Process Terminating", err);
+  // Give Sentry 2s to flush then die
+  setTimeout(() => process.exit(1), 2000);
 });
 
 process.on("unhandledRejection", (reason, promise) => {
-  console.error("🔥 UNHANDLED REJECTION at:", promise, "reason:", reason);
+  logger.error("🔥 UNHANDLED REJECTION Detected", reason instanceof Error ? reason : new Error(String(reason)), { promiseType: String(promise) });
 });
 
 const cluster = require('cluster');
@@ -460,42 +447,13 @@ if (cluster.isMaster && process.env.NODE_ENV === 'production') {
         console.error('❌ Failed to start trial expiry processor:', err.message);
       }
 
-      // 🔔 Smart Notification Service: Send tips/pokes periodically
-      const { sendRandomTip, sendRandomPoke } = require("./services/smartNotificationService");
-      setInterval(async () => {
-        try {
-          const { pool } = require("./db");
-          const result = await pool.query(
-            "SELECT id, company_id FROM users WHERE push_token IS NOT NULL AND role = 'owner' ORDER BY RANDOM() LIMIT 5"
-          );
-
-          for (const user of result.rows) {
-            const attendanceCheck = await pool.query(
-              "SELECT id FROM attendance WHERE company_id = $1 AND date = CURRENT_DATE LIMIT 1",
-              [user.company_id]
-            );
-
-            if (attendanceCheck.rows.length === 0) {
-              const { sendSmartNotification } = require("./services/smartNotificationService");
-              await sendSmartNotification(user.id, user.company_id, {
-                title: "📅 Attendance Reminder",
-                message: "Attendance hasn't been marked today. Don't forget to check!",
-                type: "reminder_attendance",
-                priority: "medium",
-                data: { url: "/owner/attendance" }
-              });
-            }
-
-            if (Math.random() > 0.5) {
-              await sendRandomTip(user.id, user.company_id);
-            } else {
-              await sendRandomPoke(user.id, user.company_id);
-            }
-          }
-        } catch (err) {
-          console.error("❌ Smart Notification Background Job Error:", err.message);
-        }
-      }, 6 * 60 * 60 * 1000); // Every 6 hours
+      // 🔔 Smart Notification Service: Migrated to Node-Cron 
+      try {
+        const { startSmartNotificationProcessor } = require('./jobs/smartNotificationProcessor');
+        startSmartNotificationProcessor();
+      } catch (err) {
+        console.error('❌ Failed to start smart notification CRON processor:', err.message);
+      }
     }
   });
 }

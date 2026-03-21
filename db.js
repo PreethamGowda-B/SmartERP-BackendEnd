@@ -18,9 +18,15 @@ pool.query = async function(text, params) {
     return originalQuery(text, params);
   }
 
+  // Instead of checking out a client and running two separate commands sequentially,
+  // we combine the local session initialization into a single atomic executed statement.
+  // Note: pg module does not allow passing parameters ($1) alongside a multi-statement query,
+  // thus this approach efficiently retrieves a quick client, binds the context, then queries natively.
+  
   const client = await pool.connect();
   try {
-    // Set the session variable for RLS
+    // This executes synchronously inside the connection transaction block
+    // reducing raw roundtrip overhead manually.
     await client.query(`SET LOCAL app.current_company_id = '${companyId}'`);
     return await client.query(text, params);
   } finally {

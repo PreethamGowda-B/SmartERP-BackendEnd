@@ -167,4 +167,15 @@ VALUES (
 ON CONFLICT (email) DO NOTHING;
 
 -- Add image_url column to existing inventory_items table if it doesn't exist
-ALTER TABLE inventory_items ADD COLUMN IF NOT EXISTS image_url TEXT;
+
+-- Feedback and bug reports
+CREATE TABLE IF NOT EXISTS feedback (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  type VARCHAR(50) DEFAULT 'general', -- 'bug', 'feature_request', 'general'
+  subject VARCHAR(255),
+  message TEXT NOT NULL,
+  page_url TEXT,
+  status VARCHAR(50) DEFAULT 'new', -- 'new', 'reviewed', 'resolved'
+  created_at TIMESTAMP DEFAULT NOW()
+);

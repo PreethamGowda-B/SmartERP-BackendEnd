@@ -303,6 +303,8 @@ v1Router.use("/hr", require("./routes/hr"));
 v1Router.use("/admin", require("./routes/admin"));
 v1Router.use("/documents", require("./routes/documents"));
 v1Router.use("/webhook", require("./routes/webhook"));
+v1Router.use("/feedback", require("./routes/feedback"));
+
 
 // Mount v1 router
 app.use("/api/v1", v1Router);

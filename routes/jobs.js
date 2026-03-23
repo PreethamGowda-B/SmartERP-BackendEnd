@@ -195,8 +195,8 @@ router.post('/:id/accept', authenticateToken, async (req, res) => {
   try {
     // Check if job is assigned to this employee
     const checkJob = await pool.query(
-      'SELECT * FROM jobs WHERE id = $1 AND (assigned_to = $2 OR visible_to_all = true)',
-      [id, req.user.id]
+      'SELECT * FROM jobs WHERE id = $1 AND (assigned_to = $2 OR visible_to_all = true) AND company_id = $3',
+      [id, req.user.id, req.user.companyId]
     );
 
     if (checkJob.rows.length === 0) {
@@ -251,8 +251,8 @@ router.post('/:id/decline', authenticateToken, async (req, res) => {
   try {
     // Check if job is assigned to this employee
     const checkJob = await pool.query(
-      'SELECT * FROM jobs WHERE id = $1 AND (assigned_to = $2 OR visible_to_all = true)',
-      [id, req.user.id]
+      'SELECT * FROM jobs WHERE id = $1 AND (assigned_to = $2 OR visible_to_all = true) AND company_id = $3',
+      [id, req.user.id, req.user.companyId]
     );
 
     if (checkJob.rows.length === 0) {

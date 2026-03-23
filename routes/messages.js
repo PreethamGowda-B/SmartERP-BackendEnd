@@ -30,9 +30,9 @@ router.post('/', async (req, res) => {
         }
 
         // Verify receiver exists
-        const receiverCheck = await pool.query('SELECT id FROM users WHERE id = $1', [receiver_id]);
+        const receiverCheck = await pool.query('SELECT id FROM users WHERE id = $1 AND company_id = $2', [receiver_id, req.user.companyId]);
         if (receiverCheck.rows.length === 0) {
-            return res.status(404).json({ message: 'Receiver not found' });
+            return res.status(403).json({ message: 'Receiver not found or access denied (outside your company)' });
         }
 
         // Insert message

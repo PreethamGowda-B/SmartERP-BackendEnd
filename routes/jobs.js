@@ -362,14 +362,13 @@ router.post('/:id/progress', authenticateToken, async (req, res) => {
           [updatedJob.created_by]
         );
 
-        await createNotification({
-          user_id: updatedJob.created_by,
+        await createNotificationForOwners({
           company_id: req.user.companyId,
           type: 'job_completed',
           title: 'Job Completed',
           message: `${employeeName} completed the job: ${updatedJob.title}`,
           priority: 'medium',
-          data: { job_id: updatedJob.id, employee_id: req.user.id }
+          data: { job_id: updatedJob.id, employee_id: req.user.id, url: '/owner/notifications' }
         });
 
         // 📧 Email: Notify owner of job completion  

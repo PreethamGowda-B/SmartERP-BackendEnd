@@ -307,6 +307,35 @@ router.put('/:id', authenticateToken, upload.single('image'), [
         // Track changes in history
         await trackAllChanges(id, oldItem, newItem, userId, userName);
 
+        // 📣 Push Notification: Notify Owners about Inventory Update
+        try {
+            const { createNotificationForOwners } = require('../utils/notificationHelpers');
+            const companyId = req.user.companyId;
+
+            await createNotificationForOwners({
+                company_id: companyId,
+                type: 'inventory_updated',
+                title: '📦 Inventory Updated',
+                message: `${userName} updated the item: ${newItem.name}`,
+                priority: 'low',
+                data: { inventory_id: id, item_name: newItem.name, url: '/owner/inventory' }
+            });
+
+            // Trigger Low Stock warning if quantity fell below threshold
+            if (newItem.quantity < newItem.min_quantity && (oldItem.quantity >= oldItem.min_quantity || oldItem.min_quantity === 0)) {
+                await createNotificationForOwners({
+                    company_id: companyId,
+                    type: 'inventory_low_stock',
+                    title: '⚠️ Low Stock Alert',
+                    message: `${newItem.name} is running low (${newItem.quantity} ${newItem.unit} remaining).`,
+                    priority: 'high',
+                    data: { inventory_id: id, item_name: newItem.name, quantity: newItem.quantity, url: '/owner/inventory' }
+                });
+            }
+        } catch (notifErr) {
+            console.error('❌ Failed to send inventory update notification:', notifErr.message);
+        }
+
         res.json(newItem);
     } catch (err) {
         console.error('Error updating inventory item:', err);

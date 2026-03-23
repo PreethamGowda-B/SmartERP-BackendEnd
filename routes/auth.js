@@ -246,6 +246,8 @@ router.get(
 );
 
 
+const redisClient = require("../utils/redis");
+
 // ---------------------------------------------
 // ✅ Send OTP for email verification (signup only)
 // ---------------------------------------------
@@ -253,12 +255,43 @@ router.post("/send-otp", async (req, res) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ message: "Email is required" });
 
+  // 🛡️ OTP Rate Limiting (5 requests per 10 minutes)
+  const otpLimitKey = `otp_attempts:${email}`;
+  if (redisClient && redisClient.status === 'ready') {
+    try {
+      const attempts = await redisClient.get(otpLimitKey);
+      if (attempts && parseInt(attempts, 10) >= 5) {
+        const ttl = await redisClient.ttl(otpLimitKey);
+        const minutesLeft = Math.ceil(ttl / 60);
+        console.warn(`🛡️  OTP Blocked for ${email}. Too many requests.`);
+        return res.status(429).json({ 
+          message: `You have reached the OTP request limit. Please try again after ${minutesLeft} minutes.`,
+          retryAfter: ttl
+        });
+      }
+    } catch (err) {
+      console.warn("⚠️ Rate limit check failed (Redis):", err.message);
+    }
+  }
+
   if (!process.env.RESEND_API_KEY) {
     console.error("RESEND_API_KEY is not set");
     return res.status(500).json({ message: "Email service not configured. Contact support." });
   }
 
   try {
+    // Increment OTP attempts in Redis
+    if (redisClient && redisClient.status === 'ready') {
+      try {
+        const multi = redisClient.multi();
+        multi.incr(otpLimitKey);
+        multi.expire(otpLimitKey, 600); // 10 minutes TTL
+        await multi.exec();
+      } catch (err) {
+        console.warn("⚠️ Redis incr failed:", err.message);
+      }
+    }
+
     // Generate 6-digit OTP
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes

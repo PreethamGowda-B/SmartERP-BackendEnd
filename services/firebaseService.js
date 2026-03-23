@@ -79,7 +79,7 @@ async function sendPushNotification(token, title, body, data = {}) {
             priority: 'high',
             notification: {
                 sound: 'default',
-                channelId: 'default'
+                channelId: 'fcm_default_channel'
             },
         },
         webpush: {
@@ -132,8 +132,11 @@ async function sendMulticastPush(tokens, title, body, data = {}) {
         android: {
             priority: 'high',
             notification: {
+                title,
+                body,
                 sound: 'default',
-                channelId: 'default'
+                channelId: 'fcm_default_channel',
+                icon: 'ic_launcher'
             },
         },
         webpush: {
@@ -154,8 +157,18 @@ async function sendMulticastPush(tokens, title, body, data = {}) {
             }
         },
         apns: {
-            headers: { 'apns-priority': '10' },
-            payload: { aps: { sound: 'default', 'content-available': 1 } },
+            headers: { 
+                'apns-priority': '10',
+                'apns-push-type': 'alert'
+            },
+            payload: { 
+                aps: { 
+                    alert: { title, body },
+                    sound: 'default', 
+                    'content-available': 1,
+                    badge: 1
+                } 
+            },
         },
         tokens,
     };

@@ -67,53 +67,84 @@ async function sendTrialWarning(company, daysLeft) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Helper: send a subscription expiry warning
+// ─────────────────────────────────────────────────────────────────────────────
+async function sendSubscriptionWarning(company, daysLeft) {
+  if (!company.owner_id) return;
+
+  const titles = {
+    7: `⏳ Subscription Expiring in 7 Days`,
+    3: `⏳ Subscription Expiring in 3 Days`,
+    1: `🔴 Subscription Ends Tomorrow!`
+  };
+
+  const messages = {
+    7: `Your SmartERP subscription will expire in 7 days. Renew now to avoid any interruption in service.`,
+    3: `Your subscription expires in 3 days. Please renew your plan to keep your team active.`,
+    1: `Your subscription ends tomorrow. Renew today to keep using all your premium features.`
+  };
+
+  try {
+    await createNotification({
+      user_id: company.owner_id,
+      company_id: company.id,
+      type: 'subscription_expiring',
+      title: titles[daysLeft],
+      message: messages[daysLeft],
+      priority: daysLeft === 1 ? 'high' : 'medium',
+      data: { days_remaining: daysLeft, upgrade_url: '/owner/billing' }
+    });
+  } catch (err) {
+    console.error(`❌ Failed to send subscription warning:`, err.message);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Main processor function
 // ─────────────────────────────────────────────────────────────────────────────
-async function processTrialExpiry() {
-  console.log('⏰ [Trial Expiry Processor] Starting...');
+async function processSubscriptionLifecycle() {
+  console.log('⏰ [Subscription Processor] Starting...');
   const startTime = Date.now();
   let warningsSent = 0;
   let downgraded = 0;
 
   try {
-    // ── 1. Send warning notifications (7, 3, 1 days before expiry) ───────────
+    // ── 1. TRIAL WARNINGS (7, 3, 1 days) ───────────────────────────────────
     for (const days of [7, 3, 1]) {
-      try {
-        const rows = await pool.query(
-          `SELECT c.id, c.owner_id, c.company_name
-           FROM companies c
-           WHERE c.is_on_trial = TRUE
-             AND c.trial_ends_at BETWEEN
-               NOW() + ($1 * INTERVAL '1 day') - INTERVAL '1 hour'
-               AND
-               NOW() + ($1 * INTERVAL '1 day') + INTERVAL '1 hour'`,
-          [days]
-        );
-
-        for (const company of rows.rows) {
-          await sendTrialWarning(company, days);
-          warningsSent++;
-        }
-      } catch (err) {
-        console.error(`❌ Error processing ${days}-day warnings:`, err.message);
+      const rows = await pool.query(
+        `SELECT id, owner_id, company_name FROM companies 
+         WHERE is_on_trial = TRUE 
+         AND trial_ends_at BETWEEN NOW() + ($1 * INTERVAL '1 day') - INTERVAL '1 hour' AND NOW() + ($1 * INTERVAL '1 day') + INTERVAL '1 hour'`,
+        [days]
+      );
+      for (const company of rows.rows) {
+        await sendTrialWarning(company, days);
+        warningsSent++;
       }
     }
 
-    // ── 2. Downgrade expired trials ──────────────────────────────────────────
-    const expired = await pool.query(
-      `UPDATE companies
-       SET plan_id             = 1,
-           is_on_trial         = FALSE,
-           subscription_status = 'active'
-       WHERE is_on_trial = TRUE
-         AND trial_ends_at <= NOW()
+    // ── 2. PAID SUBSCRIPTION WARNINGS (7, 3, 1 days) ────────────────────────
+    for (const days of [7, 3, 1]) {
+      const rows = await pool.query(
+        `SELECT id, owner_id, company_name FROM companies 
+         WHERE is_on_trial = FALSE AND plan_id > 1 
+         AND subscription_expires_at BETWEEN NOW() + ($1 * INTERVAL '1 day') - INTERVAL '1 hour' AND NOW() + ($1 * INTERVAL '1 day') + INTERVAL '1 hour'`,
+        [days]
+      );
+      for (const company of rows.rows) {
+        await sendSubscriptionWarning(company, days);
+        warningsSent++;
+      }
+    }
+
+    // ── 3. EXPIRED TRIALS ──────────────────────────────────────────────────
+    const expiredTrials = await pool.query(
+      `UPDATE companies SET plan_id = 1, is_on_trial = FALSE, subscription_status = 'active'
+       WHERE is_on_trial = TRUE AND trial_ends_at <= NOW()
        RETURNING id, owner_id, company_name`
     );
 
-    for (const company of expired.rows) {
-      console.log(`📉 Trial expired and downgraded to Free: "${company.company_name}"`);
-
-      // Log the event
+    for (const company of expiredTrials.rows) {
       await logSubscriptionEvent({
         company_id: company.id,
         event_type: 'trial_expired',
@@ -121,11 +152,7 @@ async function processTrialExpiry() {
         new_plan_id: 1,
         metadata: { downgraded_at: new Date().toISOString() }
       });
-
-      // Invalidate cache so next request loads Free plan
       invalidatePlanCache(company.id);
-
-      // Send expiry notification to owner
       if (company.owner_id) {
         await createNotification({
           user_id: company.owner_id,
@@ -134,16 +161,47 @@ async function processTrialExpiry() {
           title: '🔔 Your Pro Trial Has Ended',
           message: 'Your 30-day Pro trial has expired. You are now on the Free plan. Upgrade anytime to restore all Pro features.',
           priority: 'high',
-          data: { upgrade_url: '/billing' }
-        }).catch(e => console.error('❌ Trial expiry notification error:', e.message));
+          data: { upgrade_url: '/owner/billing' }
+        }).catch(e => {});
       }
-
       downgraded++;
     }
 
-    console.log(`✅ [Trial Expiry Processor] Done in ${Date.now() - startTime}ms | Warnings: ${warningsSent} | Downgraded: ${downgraded}`);
+    // ── 4. EXPIRED PAID SUBSCRIPTIONS ───────────────────────────────────────
+    // We check plan_id > 1 to avoid re-downgrading Free users
+    const expiredPaid = await pool.query(
+      `UPDATE companies SET plan_id = 1, subscription_status = 'expired'
+       WHERE is_on_trial = FALSE AND plan_id > 1 AND subscription_expires_at <= NOW()
+       RETURNING id, owner_id, company_name`
+    );
+
+    for (const company of expiredPaid.rows) {
+      console.log(`📉 Subscription expired for "${company.company_name}" - Downgraded to Free`);
+      await logSubscriptionEvent({
+        company_id: company.id,
+        event_type: 'subscription_expired',
+        old_plan_id: null, // We don't have the old plan ID easily here but we know it was > 1
+        new_plan_id: 1,
+        metadata: { downgraded_at: new Date().toISOString() }
+      });
+      invalidatePlanCache(company.id);
+      if (company.owner_id) {
+        await createNotification({
+          user_id: company.owner_id,
+          company_id: company.id,
+          type: 'subscription_expired',
+          title: '⚠️ Subscription Expired',
+          message: 'Your SmartERP subscription has expired. Your account has been moved to the Free plan. Renew now to restore full access.',
+          priority: 'high',
+          data: { upgrade_url: '/owner/billing' }
+        }).catch(e => {});
+      }
+      downgraded++;
+    }
+
+    console.log(`✅ [Subscription Processor] Done in ${Date.now() - startTime}ms | Warnings: ${warningsSent} | Downgraded: ${downgraded}`);
   } catch (err) {
-    console.error('❌ [Trial Expiry Processor] Fatal error:', err.message);
+    console.error('❌ [Subscription Processor] Fatal error:', err.message);
   }
 }
 
@@ -152,11 +210,11 @@ async function processTrialExpiry() {
 // ─────────────────────────────────────────────────────────────────────────────
 function startTrialExpiryProcessor() {
   // Run daily at 9:00 AM IST = 3:30 AM UTC
-  cron.schedule('30 3 * * *', processTrialExpiry, {
+  cron.schedule('30 3 * * *', processSubscriptionLifecycle, {
     scheduled: true,
     timezone: 'Asia/Kolkata'
   });
-  console.log('✅ Trial expiry processor scheduled (daily 9:00 AM IST)');
+  console.log('✅ Subscription lifecycle processor scheduled (daily 9:00 AM IST)');
 }
 
-module.exports = { startTrialExpiryProcessor, processTrialExpiry, logSubscriptionEvent };
+module.exports = { startTrialExpiryProcessor, processSubscriptionLifecycle, logSubscriptionEvent };

@@ -1,28 +1,6 @@
 const jwt = require("jsonwebtoken");
 
-// ─── Redis client for suspension caching ────────────────────────────────────
-// Graceful: if Redis is unavailable, falls through to DB check transparently.
-let redisClient = null;
-try {
-  if (process.env.REDIS_URL) {
-    const Redis = require("ioredis");
-    // ioredis handles connections automatically and queues commands
-    redisClient = new Redis(process.env.REDIS_URL, {
-      maxRetriesPerRequest: 1,
-      retryStrategy(times) {
-        if (times > 3) return null; // stop retrying after 3 attempts
-        return Math.min(times * 200, 1000);
-      }
-    });
-    
-    redisClient.on("error", (err) => {
-      console.warn("⚠️ Redis cache error:", err.message);
-    });
-  }
-} catch (e) {
-  console.warn("⚠️ Redis/ioredis setup failed, suspension cache disabled:", e.message);
-  redisClient = null;
-}
+const redisClient = require("../utils/redis");
 
 const SUSPENSION_CACHE_TTL = 60; // seconds
 

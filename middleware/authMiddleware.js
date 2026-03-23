@@ -83,8 +83,8 @@ function authenticateToken(req, res, next) {
   }
 
   if (!token) {
-    const cookiesPresent = req.cookies ? Object.keys(req.cookies).join(', ') : 'none';
-    console.log(`❌ No token found in ${req.method} ${req.path} from: ${req.headers.origin || req.headers.host} | Cookies: [ ${cookiesPresent} ]`);
+    const hasCookies = req.cookies && Object.keys(req.cookies).length > 0;
+    console.log(`ℹ️ No token found for ${req.method} ${req.originalUrl} (Origin: ${req.headers.origin || req.headers.host}${hasCookies ? ' | Has Cookies' : ''})`);
     return res.status(401).json({ message: "Not authenticated" });
   }
 

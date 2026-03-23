@@ -186,16 +186,16 @@ router.put('/company', authenticateToken, async (req, res) => {
         if (!companyDbId) return res.status(404).json({ message: 'Company not found' });
 
         // Update company — company_name is the real column; company_id is the short code
+        // We REMOVE company_id from the SET clause to prevent owners from changing it
         const result = await pool.query(
             `UPDATE companies
              SET company_name   = $1,
                  address        = $2,
                  phone          = $3,
                  contact_email  = $4,
-                 company_id     = CASE WHEN $5::text <> '' THEN $5 ELSE company_id END,
-                 settings       = COALESCE($6::jsonb, settings),
+                 settings       = COALESCE($5::jsonb, settings),
                  updated_at     = NOW()
-             WHERE id = $7
+             WHERE id = $6
              RETURNING id,
                        company_name         AS name,
                        company_id,
@@ -207,7 +207,6 @@ router.put('/company', authenticateToken, async (req, res) => {
                 address?.trim() || null,
                 phone?.trim() || null,
                 contact_email?.trim() || null,
-                company_id?.trim() || '',
                 settings ? JSON.stringify(settings) : null,
                 companyDbId,
             ]

@@ -113,7 +113,7 @@ router.get('/', authenticateToken, async (req, res) => {
   try {
     let result;
 
-    console.log("🧩 Fetching jobs for:", req.user);
+    console.log(`🧩 Fetching jobs for role: ${req.user.role}, company: ${req.user.companyId}`);
 
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 100;
@@ -326,15 +326,9 @@ router.post('/:id/progress', authenticateToken, async (req, res) => {
     );
 
     if (checkJob.rows.length === 0) {
-      console.warn(`⛔ Access Denied for Job ${id} by User ${req.user.id}. Job Assigned To: ${jobExists.rows[0].assigned_to}, Status: ${jobExists.rows[0].employee_status}`);
+      console.warn(`⛔ Access denied for Job ${id} by User ${req.user.id}`);
       return res.status(403).json({
-        message: 'Job not assigned to you or not accepted',
-        debug: {
-          jobId: id,
-          userId: req.user.id,
-          assignedTo: jobExists.rows[0].assigned_to,
-          employeeStatus: jobExists.rows[0].employee_status
-        }
+        message: 'Job not assigned to you or not accepted'
       });
     }
 
@@ -466,9 +460,5 @@ router.delete('/:id', authenticateToken, async (req, res) => {
     res.status(500).json({ message: 'Server error' });
   }
 });
-
-/**
- * Accept a job (Employee only)
- */
 
 module.exports = router;

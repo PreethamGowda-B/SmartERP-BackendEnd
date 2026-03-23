@@ -132,23 +132,9 @@ router.post('/', authenticateToken, loadPlan, requireFeature('payroll'), async (
 
     const payrollRecord = result.rows[0];
 
-    // 📣 Push Notification: Notify owner and employee
+    // 📣 Push Notification: Notify owner of payroll creation
     const { notifyPayrollGenerated } = require('../services/smartNotificationService');
-    const { createNotification } = require('../utils/notificationHelpers');
-    
-    // Notify Owner
     notifyPayrollGenerated(userId, req.user.companyId || null).catch(e => console.error('Push Error (Owner):', e.message));
-    
-    // Notify Employee
-    createNotification({
-      user_id: employee.id,
-      company_id: req.user.companyId || null,
-      type: 'payroll_received',
-      title: "💰 Salary Credited",
-      message: `Your payroll for ${payroll_month}/${payroll_year} has been processed!`,
-      priority: 'high',
-      data: { url: '/employee/payroll' }
-    }).catch(e => console.error('Push Error (Employee):', e.message));
 
     // Send notification to employee
     try {

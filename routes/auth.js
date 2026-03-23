@@ -921,6 +921,11 @@ async function updatePushToken(req, res) {
     const { pushToken } = req.body;
     const userId = req.user.userId || req.user.id;
 
+    console.log(`\n📲 --- APK PUSH TOKEN RECEIVED ---`);
+    console.log(`👤 User ID: ${userId}`);
+    console.log(`🔑 pushToken: ${pushToken ? pushToken.substring(0,20) + '...' : 'undefined'}`);
+    console.log(`----------------------------------\n`);
+
     if (!pushToken) {
       return res.status(400).json({ message: 'Push token is required' });
     }

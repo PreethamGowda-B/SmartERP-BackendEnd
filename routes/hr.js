@@ -16,7 +16,7 @@ router.get('/announcements', authenticateToken, async (req, res) => {
     let query = 'SELECT a.*, u.name as creator_name FROM announcements a JOIN users u ON a.created_by = u.id WHERE a.company_id = $1';
     let params = [companyId];
 
-    if (role !== 'owner' && role !== 'admin') {
+    if (role !== 'owner' && role !== 'admin' && role !== 'hr') {
       query += " AND (target_role = 'all' OR target_role = 'employee')";
     }
 
@@ -33,7 +33,7 @@ router.get('/announcements', authenticateToken, async (req, res) => {
 // POST /api/hr/announcements - Create an announcement (Owner/Admin)
 router.post('/announcements', authenticateToken, async (req, res) => {
   try {
-    if (req.user.role !== 'owner' && req.user.role !== 'admin') {
+    if (req.user.role !== 'owner' && req.user.role !== 'admin' && req.user.role !== 'hr') {
       return res.status(403).json({ message: 'Unauthorized' });
     }
 
@@ -86,7 +86,7 @@ router.post('/announcements', authenticateToken, async (req, res) => {
 // DELETE /api/hr/announcements/:id - Delete an announcement
 router.delete('/announcements/:id', authenticateToken, async (req, res) => {
   try {
-    if (req.user.role !== 'owner' && req.user.role !== 'admin') {
+    if (req.user.role !== 'owner' && req.user.role !== 'admin' && req.user.role !== 'hr') {
       return res.status(403).json({ message: 'Unauthorized' });
     }
 
@@ -126,7 +126,7 @@ router.get('/leaves', authenticateToken, async (req, res) => {
     `;
     let params = [companyId];
 
-    if (role !== 'owner' && role !== 'admin') {
+    if (role !== 'owner' && role !== 'admin' && role !== 'hr') {
       query += ' AND lr.user_id = $2';
       params.push(userId);
     }
@@ -164,7 +164,7 @@ router.post('/leaves', authenticateToken, async (req, res) => {
     // Notify company owner/admins
     try {
       const adminsRes = await pool.query(
-        "SELECT id FROM users WHERE company_id = $1 AND role IN ('owner', 'admin')",
+        "SELECT id FROM users WHERE company_id = $1 AND role IN ('owner', 'admin', 'hr')",
         [companyId]
       );
 
@@ -193,7 +193,7 @@ router.post('/leaves', authenticateToken, async (req, res) => {
 // PATCH /api/hr/leaves/:id/status - Approve or Reject leave (Owner/Admin)
 router.patch('/leaves/:id/status', authenticateToken, async (req, res) => {
   try {
-    if (req.user.role !== 'owner' && req.user.role !== 'admin') {
+    if (req.user.role !== 'owner' && req.user.role !== 'admin' && req.user.role !== 'hr') {
       return res.status(403).json({ message: 'Unauthorized' });
     }
 

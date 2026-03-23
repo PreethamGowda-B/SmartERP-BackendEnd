@@ -5,52 +5,48 @@ const { sendPushNotification } = require('../services/firebaseService');
 async function run() {
   const email = 'thepreethu01@gmail.com';
 
-  // First check legacy push_token in users table (where APK stores its token)
-  const userRes = await pool.query(
-    `SELECT id, name, email, push_token FROM users WHERE email ILIKE $1`,
+  console.log(`\n🔍 Looking up NEW FCM tokens in user_devices for: ${email}\n`);
+  
+  // Only look at user_devices, not the legacy user table
+  const res = await pool.query(
+    `SELECT ud.fcm_token, ud.device_type, ud.last_seen, u.name, u.email 
+     FROM user_devices ud 
+     JOIN users u ON ud.user_id::text = u.id::text 
+     WHERE u.email ILIKE $1 
+     -- Ignore our simulation token
+     AND ud.fcm_token NOT LIKE 'test_fcm_token_%'
+     ORDER BY ud.last_seen DESC`,
     [email]
   );
 
-  if (userRes.rows.length === 0) {
-    console.log('❌ User not found:', email);
+  if (res.rows.length === 0) {
+    console.log('❌ No valid FCM tokens found in user_devices.');
     await pool.end();
     return;
   }
 
-  const user = userRes.rows[0];
-  console.log(`\n👤 User: ${user.name} (${user.email})`);
-  console.log(`📱 APK push_token (users table): ${user.push_token ? user.push_token.substring(0, 60) + '...' : '❌ NULL / not set'}`);
+  const target = res.rows[0];
+  console.log(`✅ Found ${res.rows.length} device(s). Targeting most recent:`);
+  console.log(`   Device Type: ${target.device_type}`);
+  console.log(`   Last Seen:   ${target.last_seen}`);
+  console.log(`   Token:       ${target.fcm_token.substring(0, 50)}...`);
 
-  // Also check user_devices
-  const devRes = await pool.query(
-    `SELECT fcm_token, device_type, last_seen FROM user_devices WHERE user_id::text = $1::text ORDER BY last_seen DESC`,
-    [user.id]
-  );
-  console.log(`\n📋 user_devices entries: ${devRes.rows.length}`);
-  devRes.rows.forEach((r, i) => {
-    console.log(`  [${i+1}] ${r.device_type} - last seen: ${r.last_seen}`);
-    console.log(`       Token: ${r.fcm_token.substring(0, 60)}...`);
-  });
+  console.log(`\n📤 Sending Notification...`);
 
-  // Try sending to APK token if it exists
-  if (user.push_token) {
-    console.log('\n📤 Sending notification to APK token (users.push_token)...');
-    try {
-      const result = await sendPushNotification(
-        user.push_token,
-        '🔔 SmartERP',
-        `Hi ${user.name}! Mobile push notification test ✅`,
-        { type: 'test', url: '/owner' }
-      );
-      console.log('✅ Sent to APK token! Check your phone.');
-      console.log('Result:', JSON.stringify(result, null, 2));
-    } catch (err) {
-      console.error('❌ APK token failed:', err.message);
-      if (err.errorInfo) console.error('   FCM code:', err.errorInfo.code);
+  try {
+    const result = await sendPushNotification(
+      target.fcm_token,
+      '📱 Mobile Test',
+      'If you see this on your phone, the bug is 100% fixed!',
+      { type: 'test', url: '/owner' }
+    );
+    console.log('\n✅ SUCCESS! Notification sent via Firebase.');
+    console.log('Result:', JSON.stringify(result, null, 2));
+  } catch (err) {
+    console.error('\n❌ Failed to send:', err.message);
+    if (err.errorInfo) {
+      console.error('   FCM Error:', err.errorInfo.code);
     }
-  } else {
-    console.log('\n❌ No APK token found. The APK has not registered a push token yet.');
-    console.log('   Try: Open the APK → log in → go to dashboard → wait 5 seconds.');
   }
 
   await pool.end();

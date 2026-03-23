@@ -29,6 +29,21 @@ const permissions = {
     'messages:write',
     'jobs:read',
     'jobs:write'
+  ],
+  hr: [
+    'dashboard:read',
+    'employees:read',
+    'employees:write',
+    'attendance:read',
+    'attendance:write',
+    'payroll:read',
+    'payroll:write',
+    'documents:read',
+    'documents:write',
+    'hr:read',
+    'hr:write',
+    'messages:read',
+    'messages:write'
   ]
 };
 

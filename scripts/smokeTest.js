@@ -4,15 +4,11 @@ const base = process.env.API_BASE || 'http://localhost:4000';
 
 function extractCookie(res) {
   const headers = res.headers;
-  // node-fetch v2 provides .raw() for Multi-value headers like Set-Cookie
-  if (typeof headers.raw === 'function') {
-    const raw = headers.raw()['set-cookie'];
-    if (raw) return raw.map(s => s.split(';')[0]).join('; ');
-  }
-  // Fallback for standard fetch or node-fetch v3
+  // Use .get('set-cookie') which is standard for both node-fetch and native fetch
   const setCookie = headers.get('set-cookie');
   if (!setCookie) return null;
-  return setCookie.split(',').map(s => s.split(';')[0]).join('; ');
+  // Handle multiple set-cookie headers if they are joined by commas (standard fetch behavior)
+  return setCookie.split(',').map(s => s.split(';')[0].trim()).join('; ');
 }
 
 async function run() {

@@ -935,10 +935,10 @@ async function updatePushToken(req, res) {
     // We assume 'mobile_android' for this legacy endpoint.
     try {
       await pool.query(
-        `INSERT INTO user_devices (user_id, fcm_token, device_type, last_active_at)
+        `INSERT INTO user_devices (user_id, fcm_token, device_type, last_seen)
          VALUES ($1, $2, 'mobile_android', NOW())
          ON CONFLICT (fcm_token) 
-         DO UPDATE SET last_active_at = NOW(), device_type = 'mobile_android', user_id = EXCLUDED.user_id`,
+         DO UPDATE SET last_seen = NOW(), device_type = 'mobile_android', user_id = EXCLUDED.user_id`,
         [userId, pushToken]
       );
       console.log(`✅ Push token synced to user_devices for user ${userId}`);

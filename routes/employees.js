@@ -75,8 +75,8 @@ router.post('/', DEV ? (req, res, next) => next() : authenticateToken, [
   // Role guard (skip in DEV mode)
   if (!DEV) {
     const role = req.user?.role;
-    if (role !== 'owner' && role !== 'admin') {
-      return res.status(403).json({ message: 'Only owners can create employees' });
+    if (role !== 'owner' && role !== 'admin' && role !== 'hr') {
+      return res.status(403).json({ message: 'Only owners or HR can create employees' });
     }
   }
 
@@ -149,9 +149,10 @@ router.patch('/:id', authenticateToken, [
   }
 
   // Only owners / admins can update employees
+  // Only owners / admins / HR can update employees
   const role = req.user?.role;
-  if (role !== 'owner' && role !== 'admin') {
-    return res.status(403).json({ message: 'Only owners can update employees' });
+  if (role !== 'owner' && role !== 'admin' && role !== 'hr') {
+    return res.status(403).json({ message: 'Only owners or HR can update employees' });
   }
 
   const employeeId = req.params.id;

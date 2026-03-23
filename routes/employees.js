@@ -198,7 +198,7 @@ router.patch('/:id', authenticateToken, [
       paramIndex++;
     }
 
-    if (updates.length === 0) {
+    if (updates.length === 0 && newRole === undefined) {
       return res.status(400).json({ message: 'No fields to update' });
     }
 

@@ -30,6 +30,7 @@ async function mapRowToEmployee(row) {
     created_at: row.created_at || null,
     department: row.department || null,
     is_active: row.is_active !== false,
+    role: row.role || 'employee',
   };
 }
 
@@ -139,6 +140,7 @@ router.post('/', DEV ? (req, res, next) => next() : authenticateToken, [
 router.patch('/:id', authenticateToken, [
   body('department').optional({ checkFalsy: true }).trim().escape(),
   body('position').optional({ checkFalsy: true }).trim().escape(),
+  body('role').optional({ checkFalsy: true }).isIn(['employee', 'hr', 'owner']).withMessage('Invalid role'),
   body('is_active').optional().isBoolean().withMessage('is_active must be a boolean')
 ], async (req, res) => {
   const errors = validationResult(req);
@@ -157,7 +159,7 @@ router.patch('/:id', authenticateToken, [
     return res.status(400).json({ message: 'Invalid employee ID' });
   }
 
-  const { department, position, is_active } = req.body;
+  const { department, position, is_active, role: newRole } = req.body;
 
   try {
     // Verify employee exists, belongs to same company, and is not an owner/admin
@@ -200,18 +202,34 @@ router.patch('/:id', authenticateToken, [
       return res.status(400).json({ message: 'No fields to update' });
     }
 
-    // Add user_id to values
-    values.push(employeeId);
+    // Update both tables in a transaction
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
 
-    // Update employee_profiles
-    const updateQuery = `
-      UPDATE employee_profiles 
-      SET ${updates.join(', ')}
-      WHERE user_id = $${paramIndex}
-      RETURNING *
-    `;
+      // 1. Update users table if role is provided
+      if (newRole !== undefined) {
+        await client.query('UPDATE users SET role = $1 WHERE id = $2', [newRole, employeeId]);
+      }
 
-    await pool.query(updateQuery, values);
+      // 2. Update employee_profiles if profile fields are provided
+      if (updates.length > 0) {
+        values.push(employeeId);
+        const updateProfileQuery = `
+          UPDATE employee_profiles 
+          SET ${updates.join(', ')}
+          WHERE user_id = $${paramIndex}
+        `;
+        await client.query(updateProfileQuery, values);
+      }
+
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
 
     // Fetch updated employee data
     const result = await pool.query(

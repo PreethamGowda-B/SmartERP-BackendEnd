@@ -32,11 +32,22 @@ function calculateWorkingHours(clockInTime, clockOutTime) {
 }
 
 /**
- * Check if clock-in is late (after 9:00 AM)
+ * Get India Standard Time (IST) Date object
+ * Helper to ensure consistency across UTC servers
+ */
+function getISTTime(dateInput = new Date()) {
+  const d = new Date(dateInput);
+  // India is UTC + 5:30
+  const utc = d.getTime() + (d.getTimezoneOffset() * 60000);
+  return new Date(utc + (3600000 * 5.5));
+}
+
+/**
+ * Check if clock-in is late (after 9:00 AM IST)
  * Late: 9:01 AM – 12:59 PM
  */
 function isLateCheckIn(clockInTime) {
-  const d = new Date(clockInTime);
+  const d = getISTTime(clockInTime);
   const hour = d.getHours();
   const minute = d.getMinutes();
   // Late if after 9:00 AM sharp and before 1:00 PM
@@ -46,18 +57,18 @@ function isLateCheckIn(clockInTime) {
 }
 
 /**
- * Check if clock-in qualifies as Half Day (at or after 1:00 PM)
+ * Check if clock-in qualifies as Half Day (at or after 1:00 PM IST)
  */
 function isHalfDayClockIn(clockInTime) {
-  const hour = new Date(clockInTime).getHours();
+  const hour = getISTTime(clockInTime).getHours();
   return hour >= 13;
 }
 
 /**
- * Check if clock-out is before shift end (7:00 PM)
+ * Check if clock-out is before shift end (7:00 PM IST)
  */
 function isEarlyClockOut(clockOutTime) {
-  const hour = new Date(clockOutTime).getHours();
+  const hour = getISTTime(clockOutTime).getHours();
   return hour < 19;
 }
 
@@ -96,22 +107,22 @@ router.post('/clock-in', authenticateToken, async (req, res) => {
     const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
     const clockInTime = new Date();
 
-    const clockHour = clockInTime.getHours();
-    const clockMinute = clockInTime.getMinutes();
+    const istClockIn = getISTTime(clockInTime);
+    const clockHour = istClockIn.getHours();
 
-    // ── Attendance window rules ─────────────────────────────────────────────
+    // ── Attendance window rules (IST) ───────────────────────────────────────
     // Before 9:00 AM  → Present (on time / early)
     // 9:01 – 12:59    → Late
     // 13:00 – 18:59   → Half Day (came in after 1 PM)
     // 19:00+          → Blocked (shift is over)
     // ────────────────────────────────────────────────────────────────────────
 
-    // Shift over: at or after 7:00 PM
+    // Shift over: at or after 7:00 PM IST
     if (clockHour >= 19) {
       return res.status(400).json({
         message: 'you cannot clock in after 7:00pm come tomorrow and clockin fast clockin will open at 8:00am come fast now go and sleep',
         code: 'SHIFT_OVER',
-        current_time: clockInTime.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true })
+        current_time: istClockIn.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true })
       });
     }
 
@@ -165,7 +176,7 @@ router.post('/clock-in', authenticateToken, async (req, res) => {
         company_id: companyId,
         type: 'employee_clock_in',
         title: 'Employee Clocked In',
-        message: `${employeeName} clocked in at ${clockInTime.toLocaleTimeString()} (${statusLabel})`,
+        message: `${employeeName} clocked in at ${istClockIn.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true })} (${statusLabel})`,
         priority: isHalfDay ? 'high' : isLate ? 'medium' : 'low',
         data: { employee_id: userId, attendance_id: result.rows[0].id, is_late: isLate, status: provisionalStatus, url: '/owner/attendance' }
       });

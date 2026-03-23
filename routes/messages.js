@@ -38,7 +38,7 @@ router.post('/', async (req, res) => {
         // Insert message
         const result = await pool.query(
             `INSERT INTO messages (sender_id, receiver_id, message, created_at, updated_at)
-       VALUES ($1, $2, $3, NOW(), NOW())
+       VALUES ($1::text, $2::text, $3, NOW(), NOW())
        RETURNING id, sender_id, receiver_id, message, read, created_at`,
             [senderId, receiver_id, message.trim()]
         );
@@ -117,11 +117,11 @@ router.get('/conversation/:userId', async (req, res) => {
         m.read,
         m.created_at,
         u.name as sender_name,
-        CASE WHEN m.sender_id = $1 THEN true ELSE false END as is_mine
+        CASE WHEN m.sender_id::text = $1::text THEN true ELSE false END as is_mine
        FROM messages m
-       JOIN users u ON m.sender_id = u.id
-       WHERE ((m.sender_id = $1 AND m.receiver_id = $2)
-          OR (m.sender_id = $2 AND m.receiver_id = $1))
+       JOIN users u ON m.sender_id::text = u.id::text
+       WHERE ((m.sender_id::text = $1::text AND m.receiver_id::text = $2::text)
+          OR (m.sender_id::text = $2::text AND m.receiver_id::text = $1::text))
          AND m.created_at >= NOW() - ($3 * INTERVAL '1 day')
        ORDER BY m.created_at ASC`,
             [currentUserId, otherUserId, historyDays]

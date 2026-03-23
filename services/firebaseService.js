@@ -163,7 +163,7 @@ async function sendMulticastPush(tokens, title, body, data = {}) {
     try {
         const response = await admin.messaging().sendEachForMulticast(payload);
         console.log(`✅ Multicast push sent: ${response.successCount} success, ${response.failureCount} failure`);
-        
+
         // Return tokens that failed so we can clean them up if needed
         const failedTokens = [];
         if (response.failureCount > 0) {

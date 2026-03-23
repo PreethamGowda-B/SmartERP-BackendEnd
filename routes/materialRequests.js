@@ -39,7 +39,7 @@ router.post('/', authenticateToken, async (req, res) => {
         const result = await pool.query(
             `INSERT INTO material_requests 
        (item_name, quantity, urgency, description, requested_by, requested_by_name, company_id, created_at) 
-       VALUES ($1, $2, $3, $4, $5::uuid, $6, $7, NOW()) 
+       VALUES ($1, $2, $3, $4, $5::text, $6, $7, NOW()) 
        RETURNING *`,
             [
                 item_name.trim(),

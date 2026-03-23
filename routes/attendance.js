@@ -426,7 +426,7 @@ router.post('/corrections', authenticateToken, async (req, res) => {
  */
 router.get('/overview', authenticateToken, async (req, res) => {
   try {
-    if (req.user.role !== 'owner' && req.user.role !== 'admin') {
+    if (req.user.role !== 'owner' && req.user.role !== 'admin' && req.user.role !== 'hr') {
       return res.status(403).json({ message: 'Access denied' });
     }
 

@@ -205,9 +205,43 @@ async function sendJobCompletedEmail({ ownerEmail, ownerName, employeeName, jobT
   }
 }
 
+// ─── 5. Feedback Reply Email (from Superadmin) ─────────────────────────────
+async function sendFeedbackReplyEmail({ email, name, subject, originalMessage, replyMessage }) {
+  try {
+    const safeSubject = subject || 'No Subject';
+    const body = `
+      <h2 style="margin:0 0 8px;font-size:24px;font-weight:700;color:#1e293b;">Support Reply: ${safeSubject}</h2>
+      <p style="margin:0 0 24px;color:#64748b;font-size:15px;">Hi ${name || 'there'}, our team has replied to your feedback.</p>
+
+      <div style="background:#fff;border:1px solid #e2e8f0;border-left:4px solid #4f46e5;border-radius:8px;padding:20px;margin-bottom:24px;">
+        <p style="margin:0 0 8px;font-size:13px;color:#64748b;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;">Message from SmartERP Support</p>
+        <p style="margin:0;color:#1e293b;font-size:15px;line-height:24px;white-space:pre-wrap;">${replyMessage}</p>
+      </div>
+
+      <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:16px;margin-bottom:24px;">
+        <p style="margin:0 0 8px;font-size:12px;color:#94a3b8;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;">Your Original Message</p>
+        <p style="margin:0;color:#64748b;font-size:14px;line-height:22px;font-style:italic;">"${originalMessage}"</p>
+      </div>
+
+      <p style="margin:0;color:#64748b;font-size:14px;">If you have any further questions, please submit a new feedback ticket via the dashboard. We're here to help!</p>
+    `;
+
+    await resend.emails.send({
+      from: FROM_EMAIL,
+      to: email,
+      subject: `Reply to your feedback: ${safeSubject}`,
+      html: htmlWrapper(`Support Reply: ${safeSubject}`, body)
+    });
+    console.log(`✅ [EmailService] Feedback reply email sent to ${email}`);
+  } catch (err) {
+    console.error(`❌ [EmailService] Failed to send feedback reply email:`, err.message);
+  }
+}
+
 module.exports = {
   sendJobAssignedEmail,
   sendPayrollReleasedEmail,
   sendWelcomeEmail,
-  sendJobCompletedEmail
+  sendJobCompletedEmail,
+  sendFeedbackReplyEmail
 };

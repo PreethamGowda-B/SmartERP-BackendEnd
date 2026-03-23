@@ -62,4 +62,88 @@ router.get('/', authenticateToken, async (req, res) => {
   }
 });
 
+/**
+ * @route   PATCH /api/feedback/:id/reply
+ * @desc    Reply to a user's feedback (Superadmin only)
+ * @access  Private/SuperAdmin
+ */
+router.patch('/:id/reply', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'super_admin') {
+    return res.status(403).json({ error: 'Only superadmins can reply to feedback' });
+  }
+
+  const { id } = req.params;
+  const { replyMessage } = req.body;
+
+  if (!replyMessage || !replyMessage.trim()) {
+    return res.status(400).json({ error: 'Reply message is required' });
+  }
+
+  try {
+    // 1. Fetch the original feedback and user details
+    const feedbackRes = await pool.query(
+      `SELECT f.*, u.name as user_name, u.email as user_email, u.company_id
+       FROM feedback f
+       LEFT JOIN users u ON f.user_id = u.id
+       WHERE f.id = $1`,
+      [id]
+    );
+
+    if (feedbackRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Feedback not found' });
+    }
+
+    const feedback = feedbackRes.rows[0];
+
+    if (feedback.status === 'replied') {
+      return res.status(400).json({ error: 'Feedback has already been replied to' });
+    }
+
+    // 2. Update the feedback record
+    const updateRes = await pool.query(
+      `UPDATE feedback 
+       SET status = 'replied', admin_reply = $1, replied_at = NOW() 
+       WHERE id = $2 
+       RETURNING *`,
+      [replyMessage, id]
+    );
+
+    // 3. Send Email Notification
+    if (feedback.user_email) {
+      const { sendFeedbackReplyEmail } = require('../services/emailNotificationService');
+      await sendFeedbackReplyEmail({
+        email: feedback.user_email,
+        name: feedback.user_name,
+        subject: feedback.subject,
+        originalMessage: feedback.message,
+        replyMessage: replyMessage
+      });
+    }
+
+    // 4. Send In-App Notification using Queues (or fallback)
+    if (feedback.user_id) {
+       const { enqueueNotification } = require('../utils/queue');
+       await enqueueNotification({
+          user_id: feedback.user_id,
+          company_id: feedback.company_id, // Might be null if user has no company
+          type: 'feedback_reply',
+          title: 'Support Reply Received',
+          message: `We've responded to your feedback regarding: ${feedback.subject || 'Support Request'}`,
+          priority: 'high',
+          data: { url: '/notifications' } // Or wherever they should view it
+       }).catch(e => console.error('Queue Notification Error for feedback reply:', e.message));
+    }
+
+    res.json({
+      success: true,
+      message: 'Reply sent successfully',
+      data: updateRes.rows[0]
+    });
+
+  } catch (err) {
+    console.error('❌ Error replying to feedback:', err.message);
+    res.status(500).json({ error: 'Internal server error while sending reply' });
+  }
+});
+
 module.exports = router;

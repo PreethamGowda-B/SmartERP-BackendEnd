@@ -271,8 +271,15 @@ async function runDatabaseInitialization() {
         message TEXT NOT NULL,
         page_url TEXT,
         status VARCHAR(50) DEFAULT 'new',
+        admin_reply TEXT,
+        replied_at TIMESTAMP,
         created_at TIMESTAMP DEFAULT NOW()
       );
+      
+      -- Add columns if they don't exist (for existing databases)
+      ALTER TABLE feedback ADD COLUMN IF NOT EXISTS admin_reply TEXT;
+      ALTER TABLE feedback ADD COLUMN IF NOT EXISTS replied_at TIMESTAMP;
+
       CREATE INDEX IF NOT EXISTS idx_feedback_status ON feedback(status);
       CREATE INDEX IF NOT EXISTS idx_feedback_user_id ON feedback(user_id);
 

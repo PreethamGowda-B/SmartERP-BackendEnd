@@ -749,7 +749,13 @@ router.post("/refresh", async (req, res) => {
     });
   } catch (err) {
     console.error("❌ Refresh route error:", err.message);
-    res.status(500).json({ message: "Server error" });
+    res.status(500).json({
+      message: "Server error during refresh",
+      error: err.message,
+      code: err.code,
+      stack: err.stack,
+      detail: err.detail || null
+    });
   }
 });
 

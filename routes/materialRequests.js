@@ -79,6 +79,7 @@ router.post('/', authenticateToken, async (req, res) => {
             message: 'Server error creating material request',
             error: err.message,
             code: err.code,
+            stack: err.stack,
             detail: err.detail || null
         });
     }

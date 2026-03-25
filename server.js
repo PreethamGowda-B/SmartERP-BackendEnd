@@ -319,7 +319,6 @@ v1Router.use("/notifications", require("./routes/notifications"));
 v1Router.use("/payments", require("./routes/payments"));
 v1Router.use("/analytics", require("./routes/analytics"));
 v1Router.use("/employees", require("./routes/employees"));
-v1Router.use("/employees-simple", require("./routes/employees-simple"));
 v1Router.use("/material-requests", require("./routes/materialRequests"));
 v1Router.use("/ai", require("./routes/ai.routes"));
 v1Router.use("/messages", require("./routes/messages"));

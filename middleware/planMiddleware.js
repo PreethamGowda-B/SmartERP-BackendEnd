@@ -42,7 +42,8 @@ async function loadPlan(req, res, next) {
          p.max_inventory_items,
          p.max_material_requests,
          p.messages_history_days,
-         p.features
+         p.features,
+         c.subscription_expires_at
        FROM companies c
        JOIN plans p ON c.plan_id = p.id
        WHERE c.id = $1`,
@@ -61,9 +62,26 @@ async function loadPlan(req, res, next) {
     const trialEnds = data.trial_ends_at ? new Date(data.trial_ends_at) : null;
     const trialActive = data.is_on_trial && trialEnds && trialEnds > now;
 
+    // Real-time Expiry Check for Paid Plans
+    const subscriptionExpires = data.subscription_expires_at ? new Date(data.subscription_expires_at) : null;
+    const isActuallyExpired = !data.is_on_trial && subscriptionExpires && subscriptionExpires <= now;
+
     let planObj;
 
-    if (trialActive) {
+    if (isActuallyExpired) {
+      // ── EXPIRED PAID PLAN: instantly force Free features ──
+      const freeResult = await pool.query(
+        `SELECT id, name, employee_limit, max_inventory_items, max_material_requests, messages_history_days, features
+         FROM plans WHERE id = 1`
+      );
+      const free = freeResult.rows[0];
+      planObj = {
+        ...free,
+        is_trial: false,
+        days_remaining: 0,
+        trial_ends_at: data.trial_ends_at
+      };
+    } else if (trialActive) {
       // ── TRIAL ACTIVE: serve Pro features regardless of stored plan_id ──
       const proResult = await pool.query(
         `SELECT id, name, employee_limit, max_inventory_items, max_material_requests, messages_history_days, features

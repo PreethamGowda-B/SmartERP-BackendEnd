@@ -9,9 +9,10 @@ if (process.env.SENTRY_DSN) {
     integrations: [
       nodeProfilingIntegration(),
     ],
-    tracesSampleRate: 1.0,
-    profilesSampleRate: 1.0,
+    tracesSampleRate: 0.1,
+    profilesSampleRate: 0.1,
   });
+
   console.log("🎯 Sentry Observability initialized");
 }
 
@@ -139,7 +140,7 @@ if (process.env.NODE_ENV === "production") {
 
     const normalizedPath = req.path.replace(/\/$/, '') || '/';
     const isPublic = publicRoutes.some(route => normalizedPath === route || normalizedPath.startsWith(route));
-    
+
     // Header based authentication naturally deters CSRF.
     const hasTokenHeader = !!(req.headers.authorization && req.headers.authorization.startsWith('Bearer '));
 
@@ -150,7 +151,7 @@ if (process.env.NODE_ENV === "production") {
     // Origin Enforcement (Stateless CSRF Block)
     const origin = req.headers.origin;
     const referer = req.headers.referer;
-    
+
     // Whitelisted explicit domains (same as your CORS)
     const allowedPatterns = [
       /^https:\/\/smart-erp-front(-[a-z0-9]+)?(-[a-z0-9-]+)?\.vercel\.app$/,
@@ -225,15 +226,15 @@ async function fixDatabaseConstraints() {
 async function runDatabaseInitialization() {
   try {
     console.log('🏗️  Starting Database Initialization...');
-    
+
     // 1. Fix constraints
     await fixDatabaseConstraints();
-    
+
     // 2. Auto-migrate schema
     const { fixMaterialRequestsSchema, setupDocumentsTable } = require('./migrations/autoMigrate');
     await fixMaterialRequestsSchema();
     await setupDocumentsTable();
-    
+
     // 3. OTP setup and Core optimization
     await pool.query(`
       CREATE TABLE IF NOT EXISTS email_otps (
@@ -290,10 +291,10 @@ async function runDatabaseInitialization() {
       CREATE INDEX IF NOT EXISTS idx_notifications_company_id ON notifications(company_id);
       CREATE INDEX IF NOT EXISTS idx_notifications_type ON notifications(type);
     `);
-    
+
     const { optimizeDatabase } = require('./scripts/optimizeDb');
     await optimizeDatabase();
-    
+
     console.log('✅ Database Initialization & Optimization complete');
   } catch (err) {
     console.error('❌ Database Initialization failed:', err.message);
@@ -403,9 +404,9 @@ app.use((err, req, res, next) => {
   if (err.code === 'EBADCSRFTOKEN') {
     return res.status(403).json({ message: "Invalid CSRF token. Please refresh the page." });
   }
-  
+
   logger.error("Global API Route Error", err, { path: req.path, method: req.method });
-  
+
   res.status(err.status || 500).json({
     message: err.message || "An internal server error occurred.",
     error: process.env.NODE_ENV === "development" ? err.stack : undefined,
@@ -429,7 +430,8 @@ const totalCPUs = require('os').cpus().length;
 // We recommend 2 workers for 512MB, 4 for 1GB.
 const WORKER_COUNT = process.env.WEB_CONCURRENCY || Math.min(totalCPUs, 2);
 
-if (cluster.isMaster && process.env.NODE_ENV === 'production') {
+if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
+
   console.log(`📡 Master process ${process.pid} is running`);
   console.log(`🧵 Spawning ${WORKER_COUNT} workers for cluster mode...`);
 
@@ -440,7 +442,7 @@ if (cluster.isMaster && process.env.NODE_ENV === 'production') {
     } catch (err) {
       console.error('❌ Master DB Init Error:', err.message);
     }
-    
+
     for (let i = 0; i < WORKER_COUNT; i++) {
       cluster.fork();
     }
@@ -456,11 +458,11 @@ if (cluster.isMaster && process.env.NODE_ENV === 'production') {
   const PORT = process.env.PORT || 4000;
   app.listen(PORT, () => {
     console.log(`🚀 SmartERP worker ${process.pid} running on port ${PORT}`);
-    
+
     // Only run background workers and periodic jobs on worker 1
     if (!cluster.isWorker || cluster.worker.id === 1) {
       console.log("🛠️ Starting background processors and workers on worker 1...");
-      
+
       require('./jobs/workers'); // Initialize BullMQ workers
 
       try {

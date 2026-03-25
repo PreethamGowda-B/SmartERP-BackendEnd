@@ -2,11 +2,17 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
-
-
+const { body, validationResult } = require('express-validator');
 
 // Log activity (supports action and details payload)
-router.post('/', authenticateToken, async (req, res) => {
+router.post('/', authenticateToken, [
+  body('action').notEmpty().withMessage('action is required').isString().trim().escape(),
+  body('details').optional().isObject().withMessage('details must be an object')
+], async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ message: 'Validation failed', errors: errors.array() });
+  }
   const { action, details } = req.body;
   try {
     const result = await pool.query(
@@ -19,6 +25,7 @@ router.post('/', authenticateToken, async (req, res) => {
     res.status(500).json({ message: 'Server error' });
   }
 });
+
 
 // Get recent activities for user
 router.get('/', authenticateToken, async (req, res) => {

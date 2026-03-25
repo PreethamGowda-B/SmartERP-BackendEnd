@@ -204,7 +204,7 @@ router.get(
       const tokenFamily = require('crypto').randomUUID();
       await pool.query(
         `INSERT INTO refresh_tokens (user_id, token, token_family, expires_at, created_at, user_agent, ip_address)
-         VALUES ($1, $2, $3, NOW() + INTERVAL '30 days', NOW(), $4, $5)`,
+         VALUES ($1::uuid, $2, $3::uuid, NOW() + INTERVAL '30 days', NOW(), $4, $5)`,
         [user.id, refreshToken, tokenFamily, req.headers["user-agent"], req.ip]
       );
 
@@ -602,7 +602,7 @@ router.post("/login", [
     const tokenFamily = crypto.randomUUID();
     await pool.query(
       `INSERT INTO refresh_tokens (user_id, token, token_family, expires_at, created_at, user_agent, ip_address)
-       VALUES ($1, $2, $3, NOW() + INTERVAL '30 days', NOW(), $4, $5)`,
+       VALUES ($1::uuid, $2, $3::uuid, NOW() + INTERVAL '30 days', NOW(), $4, $5)`,
       [user.id, refreshToken, tokenFamily, req.headers["user-agent"], req.ip]
     );
 
@@ -667,7 +667,7 @@ router.post("/refresh", async (req, res) => {
     // 2. REPLAY PROTECTION: Check if token is already revoked
     if (refreshTokenData.revoked) {
       console.error(`🚨 REPLAY DETECTED for user ${refreshTokenData.user_id}! Revoking all tokens in family: ${refreshTokenData.token_family}`);
-      await pool.query("UPDATE refresh_tokens SET revoked = TRUE WHERE token_family = $1", [refreshTokenData.token_family]);
+      await pool.query("UPDATE refresh_tokens SET revoked = TRUE WHERE token_family = $1::uuid", [refreshTokenData.token_family]);
       return res.status(401).json({ message: "Security alert: Token reuse detected. Session terminated." });
     }
 
@@ -715,7 +715,7 @@ router.post("/refresh", async (req, res) => {
         // Save new token to DB
         await pool.query(
           `INSERT INTO refresh_tokens (user_id, token, token_family, expires_at, created_at, user_agent, ip_address)
-           VALUES ($1, $2, $3, NOW() + INTERVAL '30 days', NOW(), $4, $5)`,
+           VALUES ($1::uuid, $2, $3::uuid, NOW() + INTERVAL '30 days', NOW(), $4, $5)`,
           [user.id, newRefreshToken, refreshTokenData.token_family, req.headers["user-agent"], req.ip]
         );
 

@@ -33,14 +33,15 @@ router.get('/items', authenticateToken, async (req, res) => {
 // Update inventory item
 router.put('/items/:id', authenticateToken, async (req, res) => {
   const { id } = req.params;
+  const companyId = req.user.companyId;
   const { sku, name, description, quantity, unit, location, reorder_threshold, image_url } = req.body;
   try {
     const result = await pool.query(
-      'UPDATE inventory_items SET sku = COALESCE($1, sku), name = COALESCE($2, name), description = COALESCE($3, description), quantity = COALESCE($4, quantity), unit = COALESCE($5, unit), location = COALESCE($6, location), reorder_threshold = COALESCE($7, reorder_threshold), image_url = COALESCE($8, image_url) WHERE id = $9 RETURNING *',
-      [sku, name, description, quantity, unit, location, reorder_threshold, image_url, id]
+      'UPDATE inventory_items SET sku = COALESCE($1, sku), name = COALESCE($2, name), description = COALESCE($3, description), quantity = COALESCE($4, quantity), unit = COALESCE($5, unit), location = COALESCE($6, location), reorder_threshold = COALESCE($7, reorder_threshold), image_url = COALESCE($8, image_url) WHERE id = $9 AND company_id = $10 RETURNING *',
+      [sku, name, description, quantity, unit, location, reorder_threshold, image_url, id, companyId]
     );
     if (result.rows.length === 0) {
-      return res.status(404).json({ message: 'Inventory item not found' });
+      return res.status(404).json({ message: 'Inventory item not found or access denied' });
     }
     res.json(result.rows[0]);
   } catch (err) {
@@ -52,10 +53,11 @@ router.put('/items/:id', authenticateToken, async (req, res) => {
 // Delete inventory item
 router.delete('/items/:id', authenticateToken, async (req, res) => {
   const { id } = req.params;
+  const companyId = req.user.companyId;
   try {
-    const result = await pool.query('DELETE FROM inventory_items WHERE id = $1 RETURNING *', [id]);
+    const result = await pool.query('DELETE FROM inventory_items WHERE id = $1 AND company_id = $2 RETURNING *', [id, companyId]);
     if (result.rows.length === 0) {
-      return res.status(404).json({ message: 'Inventory item not found' });
+      return res.status(404).json({ message: 'Inventory item not found or access denied' });
     }
     res.json({ success: true });
   } catch (err) {
@@ -147,17 +149,23 @@ router.get('/requests', authenticateToken, async (req, res) => {
 router.put('/requests/:id', authenticateToken, async (req, res) => {
   const { id } = req.params
   const { action } = req.body // 'approve' or 'reject'
+  const companyId = req.user.companyId;
   try {
     if (req.user.role !== 'admin' && req.user.role !== 'owner') {
       return res.status(403).json({ message: 'Only owners or admins can approve or reject requests' });
     }
 
+    // Verify company matching first
+    const reqCheck = await pool.query('SELECT requested_by FROM material_requests WHERE id = $1 AND company_id = $2', [id, companyId]);
+    if (reqCheck.rows.length === 0) {
+      return res.status(404).json({ message: 'Material request not found or access denied' });
+    }
+    const requesterId = reqCheck.rows[0].requested_by;
+
     if (action === 'approve') {
-      await pool.query('UPDATE material_requests SET status = $1, approved_by = $2, updated_at = NOW() WHERE id = $3', ['approved', req.user.userId, id])
+      await pool.query('UPDATE material_requests SET status = $1, approved_by = $2, updated_at = NOW() WHERE id = $3 AND company_id = $4', ['approved', req.user.userId, id, companyId])
       // notify requester
       try {
-        const r = await pool.query('SELECT requested_by FROM material_requests WHERE id = $1', [id])
-        const requesterId = r.rows[0]?.requested_by
         if (requesterId) {
           await pool.query('INSERT INTO notifications (user_id, title, message) VALUES ($1,$2,$3)', [requesterId, 'Material Request Approved', `Your material request #${id} has been approved.`])
         }
@@ -168,10 +176,8 @@ router.put('/requests/:id', authenticateToken, async (req, res) => {
     }
 
     if (action === 'reject') {
-      await pool.query('UPDATE material_requests SET status = $1, updated_at = NOW() WHERE id = $2', ['rejected', id])
+      await pool.query('UPDATE material_requests SET status = $1, updated_at = NOW() WHERE id = $2 AND company_id = $3', ['rejected', id, companyId])
       try {
-        const r = await pool.query('SELECT requested_by FROM material_requests WHERE id = $1', [id])
-        const requesterId = r.rows[0]?.requested_by
         if (requesterId) {
           await pool.query('INSERT INTO notifications (user_id, title, message) VALUES ($1,$2,$3)', [requesterId, 'Material Request Rejected', `Your material request #${id} has been rejected.`])
         }

@@ -579,10 +579,13 @@ router.patch('/corrections/:id/approve', authenticateToken, async (req, res) => 
     const reviewedBy = req.user.userId || req.user.id;
     const companyId = req.user.companyId || 1;
 
-    // Get correction request
+    // Get correction request and verify company ownership
     const correction = await pool.query(
-      'SELECT * FROM attendance_corrections WHERE id = $1',
-      [id]
+      `SELECT ac.*, a.company_id 
+       FROM attendance_corrections ac 
+       JOIN attendance a ON ac.attendance_id = a.id 
+       WHERE ac.id = $1 AND a.company_id = $2`,
+      [id, companyId]
     );
 
     if (correction.rows.length === 0) {
@@ -611,9 +614,9 @@ router.patch('/corrections/:id/approve', authenticateToken, async (req, res) => 
                  is_manual = TRUE,
                  edited_by = $5,
                  updated_at = NOW()
-             WHERE id = $6`,
+             WHERE id = $6 AND company_id = $7`,
       [correctionData.requested_check_in, correctionData.requested_check_out,
-        workingHours, status, reviewedBy, correctionData.attendance_id]
+        workingHours, status, reviewedBy, correctionData.attendance_id, companyId]
     );
 
     // Update correction status
@@ -664,10 +667,13 @@ router.patch('/corrections/:id/reject', authenticateToken, async (req, res) => {
     const reviewedBy = req.user.userId || req.user.id;
     const companyId = req.user.companyId || 1;
 
-    // Get correction request
+    // Get correction request and verify company ownership
     const correction = await pool.query(
-      'SELECT * FROM attendance_corrections WHERE id = $1',
-      [id]
+      `SELECT ac.*, a.company_id 
+       FROM attendance_corrections ac 
+       JOIN attendance a ON ac.attendance_id = a.id 
+       WHERE ac.id = $1 AND a.company_id = $2`,
+      [id, companyId]
     );
 
     if (correction.rows.length === 0) {
@@ -723,9 +729,14 @@ router.patch('/:id', authenticateToken, async (req, res) => {
     const { check_in_time, check_out_time, status, notes } = req.body;
     const editedBy = req.user.userId || req.user.id;
 
-    // Check if record is processed (locked)
-    const existing = await pool.query('SELECT is_processed FROM attendance WHERE id = $1', [id]);
-    if (existing.rows.length > 0 && existing.rows[0].is_processed) {
+    const companyId = req.user.companyId || 1;
+
+    // Check if record is processed (locked) and verify company_id
+    const existing = await pool.query('SELECT is_processed, company_id FROM attendance WHERE id = $1 AND company_id = $2', [id, companyId]);
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ message: 'Attendance record not found or access denied' });
+    }
+    if (existing.rows[0].is_processed) {
       return res.status(403).json({ message: 'Cannot edit processed records' });
     }
 
@@ -745,9 +756,9 @@ router.patch('/:id', authenticateToken, async (req, res) => {
                  is_manual = TRUE,
                  edited_by = $6,
                  updated_at = NOW()
-             WHERE id = $7
+             WHERE id = $7 AND company_id = $8
              RETURNING *`,
-      [check_in_time, check_out_time, workingHours, status, notes, editedBy, id]
+      [check_in_time, check_out_time, workingHours, status, notes, editedBy, id, companyId]
     );
 
     if (result.rows.length === 0) {

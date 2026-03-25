@@ -67,12 +67,21 @@ router.get('/status', loadPlan, async (req, res) => {
     const employeeLimit = plan.employee_limit;
     const inventoryLimit = plan.max_inventory_items;
 
+    // Calculate exact days remaining for paid plans (or fallback to trial days)
+    let daysRemaining = plan.days_remaining || 0;
+    if (!plan.is_trial && company.subscription_expires_at) {
+      const now = new Date();
+      const expiry = new Date(company.subscription_expires_at);
+      const diffMs = expiry.getTime() - now.getTime();
+      daysRemaining = Math.max(0, Math.ceil(diffMs / (1000 * 60 * 60 * 24)));
+    }
+
     res.json({
       plan: {
         id: plan.id,
         name: plan.name,
         is_trial: plan.is_trial || false,
-        days_remaining: plan.days_remaining || 0,
+        days_remaining: daysRemaining,
         trial_ends_at: plan.trial_ends_at || null,
         employee_limit: employeeLimit,
         max_inventory_items: inventoryLimit,

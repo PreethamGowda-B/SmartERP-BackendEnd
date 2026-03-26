@@ -4,16 +4,15 @@
  *
  * Key behaviours:
  *  - FAIL-CLOSED: If the DB query fails, the request is rejected with 500 (no accidental unlock).
- *  - CACHE: Plans are cached per company for 5 minutes to reduce DB load.
+ *  - REDIS CACHE: Plans are cached per company in Redis for 5 minutes to reduce DB load and support horizontal scaling.
  *  - TRIAL DETECTION: If the trial is active, req.plan reflects Pro features even if plan_id is different.
  *  - NO DB MUTATION: Middleware never writes to the DB. Expiry downgrades happen only in the cron job.
  */
 
-const NodeCache = require('node-cache');
 const { pool } = require('../db');
+const redisClient = require('../utils/redis');
 
-// 5-minute TTL cache — auto-expires so plan changes propagate within 5 min
-const planCache = new NodeCache({ stdTTL: 300, checkperiod: 60 });
+const PLAN_CACHE_TTL = 300; // 5 minutes in seconds
 
 async function loadPlan(req, res, next) {
   try {
@@ -22,12 +21,20 @@ async function loadPlan(req, res, next) {
     // No company linked (e.g. super admin or edge case) — skip gracefully
     if (!companyId) return next();
 
-    // ── Check in-memory cache ──────────────────────────────────────────────
     const cacheKey = `plan:${companyId}`;
-    const cached = planCache.get(cacheKey);
-    if (cached) {
-      req.plan = cached;
-      return next();
+
+    // ── Check Redis cache ──────────────────────────────────────────────
+    if (redisClient && redisClient.status === 'ready') {
+      try {
+        const cached = await redisClient.get(cacheKey);
+        if (cached) {
+          req.plan = JSON.parse(cached);
+          return next();
+        }
+      } catch (redisErr) {
+        console.warn('⚠️ Redis plan cache read error:', redisErr.message);
+        // Fall through to DB
+      }
     }
 
     // ── Query DB: company + plan ───────────────────────────────────────────
@@ -96,8 +103,6 @@ async function loadPlan(req, res, next) {
       };
     } else {
       // ── REGULAR / EXPIRED TRIAL: serve the actual stored plan ─────────
-      // Note: if trial expired, the cron job will downgrade plan_id;
-      // middleware just reads what's there (fail-safe read-only).
       planObj = {
         id: data.plan_db_id,
         name: data.name,
@@ -112,8 +117,15 @@ async function loadPlan(req, res, next) {
       };
     }
 
-    // Store in cache and attach to request
-    planCache.set(cacheKey, planObj);
+    // ── Store in Redis cache ───────────────────────────────────────────
+    if (redisClient && redisClient.status === 'ready') {
+      try {
+        await redisClient.set(cacheKey, JSON.stringify(planObj), 'EX', PLAN_CACHE_TTL);
+      } catch (redisErr) {
+        console.warn('⚠️ Redis plan cache write error:', redisErr.message);
+      }
+    }
+
     req.plan = planObj;
     next();
   } catch (err) {
@@ -130,7 +142,10 @@ async function loadPlan(req, res, next) {
  * @param {string|number} companyId
  */
 function invalidatePlanCache(companyId) {
-  planCache.del(`plan:${companyId}`);
+  const cacheKey = `plan:${companyId}`;
+  if (redisClient && redisClient.status === 'ready') {
+    redisClient.del(cacheKey).catch(err => console.warn('⚠️ Redis plan cache delete error:', err.message));
+  }
 }
 
 module.exports = { loadPlan, invalidatePlanCache };

@@ -576,7 +576,11 @@ router.patch('/corrections/:id/approve', authenticateToken, async (req, res) => 
 
     const { id } = req.params;
     const reviewedBy = req.user.userId || req.user.id;
-    const companyId = req.user.companyId || 1;
+    const companyId = req.user.companyId;
+
+    if (!companyId) {
+      return res.status(403).json({ message: 'Missing company affiliation' });
+    }
 
     // Get correction request and verify company ownership
     const correction = await pool.query(
@@ -664,7 +668,11 @@ router.patch('/corrections/:id/reject', authenticateToken, async (req, res) => {
     const { id } = req.params;
     const { rejection_reason } = req.body;
     const reviewedBy = req.user.userId || req.user.id;
-    const companyId = req.user.companyId || 1;
+    const companyId = req.user.companyId;
+
+    if (!companyId) {
+      return res.status(403).json({ message: 'Missing company affiliation' });
+    }
 
     // Get correction request and verify company ownership
     const correction = await pool.query(

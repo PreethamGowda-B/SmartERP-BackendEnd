@@ -12,14 +12,34 @@ router.use(authenticateSuperAdmin);
 // Aggregate platform-wide statistics for the Overview page
 router.get('/dashboard', async (req, res) => {
   try {
-    // 1. Basic Stats
+    // 1. Basic Stats + MoM Growth
     const statsQuery = pool.query(`
+      WITH monthly_stats AS (
+        SELECT
+          COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '30 days') as new_companies_30d,
+          COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '60 days' AND created_at <= NOW() - INTERVAL '30 days') as new_companies_prev_30d,
+          COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '30 days') as new_users_30d,
+          COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '60 days' AND created_at <= NOW() - INTERVAL '30 days') as new_users_prev_30d
+        FROM companies
+      ),
+      user_stats AS (
+        SELECT
+          COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '30 days') as new_users_30d,
+          COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '60 days' AND created_at <= NOW() - INTERVAL '30 days') as new_users_prev_30d
+        FROM users
+      )
       SELECT 
         (SELECT COUNT(*) FROM companies) as total_companies,
         (SELECT COUNT(*) FROM users) as total_users,
         (SELECT COUNT(*) FROM companies WHERE plan_id > 1 AND (subscription_expires_at > NOW() OR subscription_expires_at IS NULL)) as active_subs,
         (SELECT COUNT(*) FROM companies WHERE is_on_trial = TRUE) as trial_users,
-        (SELECT COUNT(*) FROM activities WHERE created_at > NOW() - INTERVAL '24 hours') as activity_24h
+        (SELECT COUNT(*) FROM activities WHERE created_at > NOW() - INTERVAL '24 hours') as activity_24h,
+        (SELECT COUNT(DISTINCT user_id) FROM activities WHERE created_at > NOW() - INTERVAL '30 days') as active_users_30d,
+        m.new_companies_30d,
+        m.new_companies_prev_30d,
+        u.new_users_30d,
+        u.new_users_prev_30d
+      FROM monthly_stats m, user_stats u
     `);
     
     // 2. Company Growth (Last 30 days)
@@ -71,13 +91,24 @@ router.get('/dashboard', async (req, res) => {
       statsQuery, growthQuery, userGrowthQuery, distQuery, pulseQuery
     ]);
 
+    const s = stats.rows[0];
+    
+    // Calculate percentage growth safely
+    const calcGrowth = (current, prev) => {
+      if (prev === 0) return current > 0 ? 100 : 0;
+      return Math.round(((current - prev) / prev) * 100);
+    };
+
     res.json({
       stats: {
-        totalCompanies: parseInt(stats.rows[0].total_companies),
-        totalUsers: parseInt(stats.rows[0].total_users),
-        activeSubscriptions: parseInt(stats.rows[0].active_subs),
-        trialUsers: parseInt(stats.rows[0].trial_users),
-        recentActivity24h: parseInt(stats.rows[0].activity_24h)
+        totalCompanies: parseInt(s.total_companies),
+        totalUsers: parseInt(s.total_users),
+        activeSubscriptions: parseInt(s.active_subs),
+        trialUsers: parseInt(s.trial_users),
+        recentActivity24h: parseInt(s.activity_24h),
+        activeUsers30d: parseInt(s.active_users_30d),
+        companyGrowthMoM: calcGrowth(parseInt(s.new_companies_30d), parseInt(s.new_companies_prev_30d)),
+        userGrowthMoM: calcGrowth(parseInt(s.new_users_30d), parseInt(s.new_users_prev_30d))
       },
       charts: {
         companyGrowth: growth.rows.map(r => ({ date: r.date.toISOString().split('T')[0], count: parseInt(r.count) })),

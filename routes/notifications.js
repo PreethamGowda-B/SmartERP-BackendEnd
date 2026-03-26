@@ -69,14 +69,14 @@ router.get('/sse', authenticateToken, (req, res) => {
   // Register this connection
   registerSSEConnection(userId, res);
 
-  // Send heartbeat every 30 seconds to keep connection alive
+  // Send heartbeat every 15 seconds to keep connection alive
   const heartbeatInterval = setInterval(() => {
     try {
       res.write(`:heartbeat\n\n`);
     } catch (err) {
       clearInterval(heartbeatInterval);
     }
-  }, 30000);
+  }, 15000);
 
   // Handle client disconnect
   req.on('close', () => {

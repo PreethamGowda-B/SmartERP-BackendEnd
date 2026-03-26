@@ -258,7 +258,7 @@ router.get('/owner', async (req, res) => {
 
         let result;
 
-        // Try 1: Match by company_id if available
+        // Strict company isolation: only return owners for the current employee's company
         if (companyId) {
             result = await pool.query(
                 `SELECT id, name, email 
@@ -271,34 +271,9 @@ router.get('/owner', async (req, res) => {
             );
         }
 
-        // Try 2: If no company_id or no match, try NULL company_id (legacy/dev)
         if (!result || result.rows.length === 0) {
-            console.log('⚠️ No owner found with company_id, trying NULL company_id...');
-            result = await pool.query(
-                `SELECT id, name, email 
-                 FROM users 
-                 WHERE (role = 'owner' OR role = 'admin') 
-                 AND company_id IS NULL
-                 ORDER BY role DESC
-                 LIMIT 1`
-            );
-        }
-
-        // Try 3: Final fallback - return ANY owner (for dev/testing)
-        if (result.rows.length === 0) {
-            console.log('⚠️ No owner found with NULL company_id, returning ANY owner...');
-            result = await pool.query(
-                `SELECT id, name, email 
-                 FROM users 
-                 WHERE (role = 'owner' OR role = 'admin')
-                 ORDER BY created_at ASC
-                 LIMIT 1`
-            );
-        }
-
-        if (result.rows.length === 0) {
-            console.error(`❌ No owner found in the entire database!`);
-            return res.status(404).json({ message: 'No owner found in the system' });
+            console.error(`❌ No owner found for company ${companyId}`);
+            return res.status(404).json({ message: 'Owner not found' });
         }
 
         const owner = result.rows[0];

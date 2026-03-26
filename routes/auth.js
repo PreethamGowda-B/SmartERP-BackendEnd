@@ -234,6 +234,7 @@ router.get(
             name: user.name,
             email: user.email,
             role: user.role,
+            company_id: user.company_id,
             companyId: user.company_id
           })
         )}`

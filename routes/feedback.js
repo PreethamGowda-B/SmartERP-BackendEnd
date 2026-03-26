@@ -49,12 +49,22 @@ router.get('/', authenticateToken, async (req, res) => {
   }
 
   try {
-    const result = await pool.query(
-      `SELECT f.*, u.name as user_name, u.email as user_email 
+    let query = `
+       SELECT f.*, u.name as user_name, u.email as user_email 
        FROM feedback f
        LEFT JOIN users u ON f.user_id = u.id
-       ORDER BY f.created_at DESC`
-    );
+    `;
+    let params = [];
+
+    // Isolation: Only super_admin sees everything. Others see only their company's feedback.
+    if (req.user.role !== 'super_admin') {
+      query += " WHERE u.company_id::text = $1";
+      params.push(String(req.user.companyId));
+    }
+
+    query += " ORDER BY f.created_at DESC";
+
+    const result = await pool.query(query, params);
     res.json(result.rows);
   } catch (err) {
     console.error('❌ Error fetching feedback:', err.message);

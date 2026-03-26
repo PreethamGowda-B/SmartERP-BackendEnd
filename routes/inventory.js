@@ -430,6 +430,17 @@ router.patch('/:id/restore', authenticateToken, async (req, res) => {
 router.get('/:id/history', authenticateToken, async (req, res) => {
     try {
         const { id } = req.params;
+        const companyId = req.user.companyId;
+
+        // Security check: verify item belongs to this company
+        const itemCheck = await pool.query(
+            'SELECT id FROM inventory_items WHERE id = $1 AND company_id = $2',
+            [id, companyId]
+        );
+
+        if (itemCheck.rows.length === 0) {
+            return res.status(404).json({ message: 'Inventory item not found or access denied' });
+        }
 
         const history = await getItemHistory(id);
 

@@ -5,6 +5,7 @@ const redisClient = require("../utils/redis");
 const SUSPENSION_CACHE_TTL = 60; // seconds
 
 async function isCompanySuspended(companyId) {
+  if (!companyId) return false;
   const cacheKey = `company_suspended:${companyId}`;
 
   // 1. Try Redis cache first (reduces DB load significantly)

@@ -140,11 +140,15 @@ async function createNotificationForCompany({ company_id, type, title, message, 
 
         if (company_id) {
             const cid = String(company_id);
-            if (cid !== '1' && cid !== '0' && cid !== '00000000-0000-0000-0000-000000000000') {
-                query += " AND (company_id::text = $1 OR company_id::text = '1' OR company_id IS NULL)";
+            const isDefault = cid === '1' || cid === '0' || cid === '00000000-0000-0000-0000-000000000000';
+            
+            if (!isDefault) {
+                // Multi-tenant: ONLY notify employees of this specific company
+                query += " AND company_id::text = $1";
                 params.push(cid);
             } else {
-                query += " AND (company_id::text = '1' OR company_id IS NULL)";
+                // Global/Default: Notify employees in the system default or unassigned company
+                query += " AND (company_id::text = '1' OR company_id::text = '0' OR company_id IS NULL)";
             }
         }
 
@@ -194,10 +198,12 @@ async function createNotificationForOwners({ company_id, type, title, message, p
             const isDefault = cid === '1' || cid === '0' || cid === '00000000-0000-0000-0000-000000000000';
             
             if (!isDefault) {
-                query += " AND (company_id::text = $1 OR company_id::text = '1' OR company_id IS NULL)";
+                // Multi-tenant: ONLY notify owners/admins of this specific company
+                query += " AND company_id::text = $1";
                 params.push(cid);
             } else {
-                query += " AND (company_id::text = '1' OR company_id IS NULL)";
+                // Global/Default: Notify owners/admins in the system default or unassigned company
+                query += " AND (company_id::text = '1' OR company_id::text = '0' OR company_id IS NULL)";
             }
         }
 

@@ -5,6 +5,7 @@ const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 const { storage, hasCloudinaryConfig } = require('../config/cloudinary');
 const { trackCreation, trackAllChanges, trackDeletion, trackRestoration, getItemHistory } = require('../utils/inventoryHistory');
+const { checkPermission } = require('../middleware/rbac');
 
 // Configure multer with Cloudinary storage or memory storage as fallback
 const upload = multer({
@@ -206,7 +207,7 @@ router.get('/', authenticateToken, async (req, res) => {
 
 // ─── DELETE /api/inventory/:id ───────────────────────────────────────────────
 // Delete inventory item (only owner/admin)
-router.delete('/:id', authenticateToken, async (req, res) => {
+router.delete('/:id', authenticateToken, checkPermission('inventory:write'), async (req, res) => {
     try {
         const { id } = req.params;
         const role = req.user.role;
@@ -237,7 +238,7 @@ router.delete('/:id', authenticateToken, async (req, res) => {
 
 // ─── PUT /api/inventory/:id ──────────────────────────────────────────────────
 // Update inventory item
-router.put('/:id', authenticateToken, upload.single('image'), [
+router.put('/:id', authenticateToken, checkPermission('inventory:write'), upload.single('image'), [
   body('name').optional({ checkFalsy: true }).trim().escape(),
   body('description').optional({ checkFalsy: true }).trim().escape(),
   body('quantity').optional({ checkFalsy: true }).isInt().toInt(),

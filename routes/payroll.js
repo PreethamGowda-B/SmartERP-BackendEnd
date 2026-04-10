@@ -6,10 +6,11 @@ const { createNotification } = require('../utils/notificationHelpers');
 const { sendPayrollReleasedEmail } = require('../services/emailNotificationService');
 const { loadPlan } = require('../middleware/planMiddleware');
 const { requireFeature } = require('../middleware/featureGuard');
+const { checkPermission } = require('../middleware/rbac');
 
 // ─── POST /api/payroll ───────────────────────────────────────────────────────
 // Create new payroll record (Owner only, Basic+ plan)
-router.post('/', authenticateToken, loadPlan, requireFeature('payroll'), async (req, res) => {
+router.post('/', authenticateToken, loadPlan, requireFeature('payroll'), checkPermission('payroll:write'), async (req, res) => {
   try {
     const { role, userId } = req.user;
 

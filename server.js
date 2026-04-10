@@ -457,7 +457,8 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
     }
 
     for (let i = 0; i < WORKER_COUNT; i++) {
-      cluster.fork();
+      const env = i === 0 ? { IS_PRIMARY_WORKER: 'true' } : {};
+      cluster.fork(env);
     }
   })();
 

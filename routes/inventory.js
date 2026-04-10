@@ -99,7 +99,10 @@ router.post('/', authenticateToken, upload.single('image'), [
         // Send notification to all employees and owner about new inventory
         try {
             const { createNotificationForCompany, createNotificationForOwners } = require('../utils/notificationHelpers');
-            const companyId = req.user.companyId;
+            const companyId = req.user?.companyId;
+        if (!companyId) {
+            return res.status(401).json({ message: 'Not authenticated or no company associated' });
+        }
 
             // Notify Employees
             await createNotificationForCompany({
@@ -141,7 +144,10 @@ router.get('/', authenticateToken, async (req, res) => {
     try {
         const { include_deleted, category, supplier } = req.query;
 
-        const companyId = req.user.companyId;
+        const companyId = req.user?.companyId;
+        if (!companyId) {
+            return res.status(401).json({ message: 'Not authenticated or no company associated' });
+        }
         let query = `SELECT 
         id, name, description, quantity, image_url, employee_name, office_name,
         created_by, created_at, updated_at, updated_by,
@@ -325,7 +331,10 @@ router.put('/:id', authenticateToken, checkPermission('inventory:write'), upload
         // 📣 Push Notification: Notify Owners about Inventory Update
         try {
             const { createNotificationForOwners } = require('../utils/notificationHelpers');
-            const companyId = req.user.companyId;
+            const companyId = req.user?.companyId;
+        if (!companyId) {
+            return res.status(401).json({ message: 'Not authenticated or no company associated' });
+        }
 
             await createNotificationForOwners({
                 company_id: companyId,
@@ -445,7 +454,10 @@ router.patch('/:id/restore', authenticateToken, async (req, res) => {
 router.get('/:id/history', authenticateToken, async (req, res) => {
     try {
         const { id } = req.params;
-        const companyId = req.user.companyId;
+        const companyId = req.user?.companyId;
+        if (!companyId) {
+            return res.status(401).json({ message: 'Not authenticated or no company associated' });
+        }
 
         // Security check: verify item belongs to this company
         const itemCheck = await pool.query(
@@ -470,7 +482,10 @@ router.get('/:id/history', authenticateToken, async (req, res) => {
 // Get low-stock items (quantity < min_quantity)
 router.get('/low-stock', authenticateToken, async (req, res) => {
     try {
-        const companyId = req.user.companyId;
+        const companyId = req.user?.companyId;
+        if (!companyId) {
+            return res.status(401).json({ message: 'Not authenticated or no company associated' });
+        }
         const result = await pool.query(
             `SELECT * FROM inventory_items 
              WHERE company_id = $1

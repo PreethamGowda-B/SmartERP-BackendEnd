@@ -413,6 +413,14 @@ if (process.env.SENTRY_DSN) {
 }
 
 app.use((err, req, res, next) => {
+  // Ensure CORS headers are present even on error responses
+  const origin = req.headers.origin;
+  const allowedOrigins = ['https://www.prozync.in', 'https://prozync.in', 'http://localhost:3000'];
+  if (origin && (allowedOrigins.includes(origin) || origin.match(/\.vercel\.app$/))) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+  }
+
   // Handle CSRF errors specifically
   if (err.code === 'EBADCSRFTOKEN') {
     return res.status(403).json({ message: "Invalid CSRF token. Please refresh the page." });

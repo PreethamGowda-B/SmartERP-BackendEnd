@@ -105,6 +105,20 @@ app.use("/api/auth/refresh", authLimiter);
 app.use("/api/subscription", apiLimiter); // ✅ Relaxed limit for subs
 app.use("/api/payments", apiLimiter);
 
+// General API rate limiter — protects all other routes (300 req/15min per IP)
+const generalApiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: "Too many requests, please try again later." },
+  skip: (req) => {
+    // Skip for already-limited auth routes
+    return req.path.startsWith('/api/auth/') || req.path.startsWith('/api/v1/auth/');
+  }
+});
+app.use("/api", generalApiLimiter);
+
 // ✅ Trust proxy (required for HTTPS cookies on Render)
 app.set("trust proxy", 1);
 

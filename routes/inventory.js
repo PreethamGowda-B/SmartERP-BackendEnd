@@ -153,6 +153,19 @@ router.get('/', authenticateToken, async (req, res) => {
         const params = [companyId];
         let paramIndex = 2;
 
+        // Apply filters to main query (was missing before)
+        if (include_deleted !== 'true') {
+            query += ' AND (is_deleted = FALSE OR is_deleted IS NULL)';
+        }
+        if (category) {
+            query += ' AND category = $' + paramIndex++;
+            params.push(category);
+        }
+        if (supplier) {
+            query += ' AND supplier_name ILIKE $' + paramIndex++;
+            params.push('%' + supplier + '%');
+        }
+
         const page = parseInt(req.query.page) || 1;
         const limit = parseInt(req.query.limit) || 100;
         const offset = (page - 1) * limit;
@@ -162,13 +175,13 @@ router.get('/', authenticateToken, async (req, res) => {
         const countParams = [companyId];
         let cIdx = 2;
         if (include_deleted !== 'true') countQuery += ` AND (is_deleted = FALSE OR is_deleted IS NULL)`;
-        if (category) { countQuery += ` AND category = $${cIdx++}`; countParams.push(category); }
-        if (supplier) { countQuery += ` AND supplier_name ILIKE $${cIdx++}`; countParams.push(`%${supplier}%`); }
+        if (category) { countQuery += ' AND category = $' + cIdx++; countParams.push(category); }
+        if (supplier) { countQuery += ' AND supplier_name ILIKE $' + cIdx++; countParams.push(`%${supplier}%`); }
         
         const countResult = await pool.query(countQuery, countParams);
         const total = parseInt(countResult.rows[0].count);
 
-        query += ` ORDER BY created_at DESC LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
+        query += ' ORDER BY created_at DESC LIMIT $' + paramIndex + ' OFFSET $' + (paramIndex + 1);
         params.push(limit, offset);
 
         const result = await pool.query(query, params);
@@ -284,7 +297,7 @@ router.put('/:id', authenticateToken, upload.single('image'), [
                  category = $5, unit = $6, min_quantity = $7,
                  supplier_name = $8, supplier_contact = $9, supplier_email = $10,
                  updated_by = $11, updated_at = NOW()
-             WHERE id = $12
+             WHERE id = $12 AND company_id = $13
              RETURNING *`,
             [
                 name?.trim() || oldItem.name,
@@ -298,7 +311,8 @@ router.put('/:id', authenticateToken, upload.single('image'), [
                 supplier_contact?.trim() || oldItem.supplier_contact,
                 supplier_email?.trim() || oldItem.supplier_email,
                 userId,
-                id
+                id,
+                req.user.companyId
             ]
         );
 

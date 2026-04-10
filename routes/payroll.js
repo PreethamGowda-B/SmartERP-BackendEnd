@@ -36,6 +36,20 @@ router.post('/', authenticateToken, loadPlan, requireFeature('payroll'), async (
       });
     }
 
+    // Validate numeric fields (safe addition)
+    const _month = parseInt(payroll_month, 10);
+    const _year = parseInt(payroll_year, 10);
+    const _baseSalary = parseFloat(base_salary);
+    if (isNaN(_month) || _month < 1 || _month > 12) {
+      return res.status(400).json({ message: 'payroll_month must be between 1 and 12' });
+    }
+    if (isNaN(_year) || _year < 2000 || _year > 2100) {
+      return res.status(400).json({ message: 'payroll_year must be a valid year' });
+    }
+    if (isNaN(_baseSalary) || _baseSalary < 0) {
+      return res.status(400).json({ message: 'base_salary must be a non-negative number' });
+    }
+
     // Validate employee exists within the same company
     const employeeResult = await pool.query(
       `SELECT id, name, email FROM users WHERE email = $1 AND role = 'employee' AND company_id = $2`,
@@ -207,9 +221,9 @@ router.get('/', authenticateToken, async (req, res) => {
 
       query += ` ORDER BY payroll_year DESC, payroll_month DESC, created_at DESC`;
     } else {
-      // Employee sees only their own payroll
-      query = `SELECT * FROM payroll WHERE employee_id = $1`;
-      params = [userId];
+      // Employee sees only their own payroll (scoped to their company)
+      query = `SELECT * FROM payroll WHERE employee_id = $1 AND company_id = $2`;
+      params = [userId, req.user.companyId];
 
       // Add optional filters
       if (month) {

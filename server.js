@@ -481,9 +481,9 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
   app.listen(PORT, () => {
     console.log(`🚀 SmartERP worker ${process.pid} running on port ${PORT}`);
 
-    // Only run background workers and periodic jobs on worker 1
-    if (!cluster.isWorker || cluster.worker.id === 1) {
-      console.log("🛠️ Starting background processors and workers on worker 1...");
+    // Only run background workers on the designated primary worker (set via IS_PRIMARY_WORKER env)
+    if (process.env.IS_PRIMARY_WORKER === 'true') {
+      console.log("🛠️ Starting background processors and workers on primary worker...");
 
       require('./jobs/workers'); // Initialize BullMQ workers
 

@@ -208,15 +208,15 @@ router.get('/', authenticateToken, async (req, res) => {
       // Add optional filters
       if (month) {
         params.push(month);
-        query += ` AND payroll_month = $${params.length}`;
+        query += ` AND payroll_month = $` + params.length;
       }
       if (year) {
         params.push(year);
-        query += ` AND payroll_year = $${params.length}`;
+        query += ` AND payroll_year = $` + params.length;
       }
       if (employee_email) {
         params.push(employee_email);
-        query += ` AND employee_email = $${params.length}`;
+        query += ` AND employee_email = $` + params.length;
       }
 
       query += ` ORDER BY payroll_year DESC, payroll_month DESC, created_at DESC`;
@@ -228,11 +228,11 @@ router.get('/', authenticateToken, async (req, res) => {
       // Add optional filters
       if (month) {
         params.push(month);
-        query += ` AND payroll_month = $${params.length}`;
+        query += ` AND payroll_month = $` + params.length;
       }
       if (year) {
         params.push(year);
-        query += ` AND payroll_year = $${params.length}`;
+        query += ` AND payroll_year = $` + params.length;
       }
 
       query += ` ORDER BY payroll_year DESC, payroll_month DESC`;
@@ -263,15 +263,15 @@ router.get('/all', authenticateToken, loadPlan, requireFeature('payroll'), async
 
     if (month) {
       params.push(month);
-      query += ` AND payroll_month = $${params.length}`;
+      query += ` AND payroll_month = $` + params.length;
     }
     if (year) {
       params.push(year);
-      query += ` AND payroll_year = $${params.length}`;
+      query += ` AND payroll_year = $` + params.length;
     }
     if (employee_email) {
       params.push(employee_email);
-      query += ` AND employee_email ILIKE $${params.length}`; // Case-insensitive search
+      query += ` AND employee_email ILIKE $` + params.length; // Case-insensitive search
     }
 
     query += ` ORDER BY payroll_year DESC, payroll_month DESC, created_at DESC`;

@@ -39,6 +39,8 @@ const corsOptions = {
       "https://smart-erp-front-end.vercel.app",
       "https://www.prozync.in",
       "https://prozync.in",
+      "http://localhost:3001",
+      "https://client.prozync.in",
     ];
 
     if (allowedOrigins.includes(origin)) {
@@ -57,7 +59,7 @@ const corsOptions = {
   },
   credentials: true,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-CSRF-Token"],
   exposedHeaders: ["Set-Cookie"],
   optionsSuccessStatus: 200,
 };
@@ -104,6 +106,17 @@ app.use("/api/auth/signup", authLimiter);
 app.use("/api/auth/refresh", authLimiter);
 app.use("/api/subscription", apiLimiter); // ✅ Relaxed limit for subs
 app.use("/api/payments", apiLimiter);
+
+// Customer Portal auth rate limiter (20 req / 15 min per IP)
+const customerAuthLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: "Too many requests, please try again later." },
+});
+app.use("/api/customer/auth", customerAuthLimiter);
+app.use("/api/v1/customer/auth", customerAuthLimiter);
 
 // General API rate limiter — protects all other routes (300 req/15min per IP)
 const generalApiLimiter = rateLimit({
@@ -171,11 +184,12 @@ if (process.env.NODE_ENV === "production") {
       /^https:\/\/smart-erp-front(-[a-z0-9]+)?(-[a-z0-9-]+)?\.vercel\.app$/,
       /^https:\/\/smart-erp-front-[a-z0-9]+-thepreethu01-9119s-projects\.vercel\.app$/,
       /^https:\/\/www\.prozync\.in$/,
-      /^https:\/\/prozync\.in$/
+      /^https:\/\/prozync\.in$/,
+      /^https:\/\/client\.prozync\.in$/,
     ];
 
-    const isValidOrigin = origin && allowedPatterns.some(pattern => pattern.test(origin));
-    const isValidReferer = referer && allowedPatterns.some(pattern => pattern.test(referer));
+    const isValidOrigin = origin && (allowedPatterns.some(pattern => pattern.test(origin)) || origin === 'http://localhost:3001');
+    const isValidReferer = referer && (allowedPatterns.some(pattern => pattern.test(referer)) || referer.startsWith('http://localhost:3001'));
 
     if (!isValidOrigin && !isValidReferer) {
       console.warn(`🛡️ CSRF Block: Request denied from origin: ${origin || 'Unknown'}`);
@@ -225,6 +239,15 @@ async function fixDatabaseConstraints() {
         `);
         if (cleanupResult.rowCount > 0) {
           console.log(`🧹 Periodic Cleanup: Removed ${cleanupResult.rowCount} expired/revoked refresh tokens`);
+        }
+        // Also clean up customer_refresh_tokens table
+        const crtCleanup = await pool.query(`
+          DELETE FROM customer_refresh_tokens
+          WHERE expires_at < NOW()
+          OR (revoked = TRUE AND created_at < NOW() - INTERVAL '30 days')
+        `).catch(() => ({ rowCount: 0 }));
+        if (crtCleanup.rowCount > 0) {
+          console.log(`🧹 Periodic Cleanup: Removed ${crtCleanup.rowCount} expired/revoked customer refresh tokens`);
         }
       } catch (cleanupErr) {
         console.error("❌ Periodic Cleanup Error:", cleanupErr.message);
@@ -309,6 +332,20 @@ async function runDatabaseInitialization() {
     const { optimizeDatabase } = require('./scripts/optimizeDb');
     await optimizeDatabase();
 
+    // 4. Customer Portal migration (additive — safe to re-run)
+    try {
+      const fs = require('fs');
+      const path = require('path');
+      const migrationSql = fs.readFileSync(
+        path.join(__dirname, 'migrations', 'customer_portal_migration.sql'),
+        'utf8'
+      );
+      await pool.query(migrationSql);
+      console.log('✅ Customer Portal migration complete');
+    } catch (cpErr) {
+      console.warn('⚠️  Customer Portal migration warning:', cpErr.message);
+    }
+
     console.log('✅ Database Initialization & Optimization complete');
   } catch (err) {
     console.error('❌ Database Initialization failed:', err.message);
@@ -351,6 +388,10 @@ v1Router.use("/feedback", require("./routes/feedback"));
 // Mount v1 router
 app.use("/api/v1", v1Router);
 app.use("/api", v1Router); // Fallback for backward compatibility
+
+// ✅ Customer Portal router (separate namespace — no tenant context middleware)
+app.use("/api/customer", require("./routes/customer/index"));
+app.use("/api/v1/customer", require("./routes/customer/index")); // v1 alias
 
 
 
@@ -415,7 +456,7 @@ if (process.env.SENTRY_DSN) {
 app.use((err, req, res, next) => {
   // Ensure CORS headers are present even on error responses
   const origin = req.headers.origin;
-  const allowedOrigins = ['https://www.prozync.in', 'https://prozync.in', 'http://localhost:3000'];
+  const allowedOrigins = ['https://www.prozync.in', 'https://prozync.in', 'http://localhost:3000', 'https://client.prozync.in', 'http://localhost:3001'];
   if (origin && (allowedOrigins.includes(origin) || origin.match(/\.vercel\.app$/))) {
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Access-Control-Allow-Credentials', 'true');

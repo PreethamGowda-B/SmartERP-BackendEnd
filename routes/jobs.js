@@ -6,6 +6,17 @@ const { createNotification, createNotificationForCompany, createNotificationForO
 const { sendJobAssignedEmail, sendJobCompletedEmail } = require('../services/emailNotificationService');
 const { body, validationResult } = require('express-validator');
 
+// ── Customer Portal SSE: publish job events to Redis pub/sub ──────────────────
+// Non-destructive: only fires when job has a customer_id; failure never affects response.
+const redisClient = require('../utils/redis');
+
+function publishCustomerJobEvent(jobId, eventPayload) {
+  if (!jobId || !redisClient || redisClient.status !== 'ready') return;
+  const channel = `customer_job_events:${jobId}`;
+  redisClient.publish(channel, JSON.stringify(eventPayload))
+    .catch(e => console.error('Customer SSE publish error:', e.message));
+}
+
 /**
  * Ensure the jobs table can store JSON payloads, visibility flag, and employee tracking
  */
@@ -216,6 +227,21 @@ router.post('/:id/accept', authenticateToken, async (req, res) => {
 
     const acceptedJob = result.rows[0];
 
+    // 🔔 Customer Portal: notify customer via Redis pub/sub if this is a customer job
+    try {
+      const redisClient = require('../utils/redis');
+      if (acceptedJob.customer_id && redisClient && redisClient.status === 'ready') {
+        const userInfo2 = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+        const empName = userInfo2.rows[0]?.name || 'Employee';
+        redisClient.publish(
+          `customer_job_events:${acceptedJob.id}`,
+          JSON.stringify({ type: 'job_accepted', jobId: acceptedJob.id, employeeName: empName, acceptedAt: new Date().toISOString() })
+        );
+      }
+    } catch (cpErr) {
+      console.error('Customer portal SSE publish error (accept):', cpErr.message);
+    }
+
     // Send notification to owner about job acceptance
     try {
       // Get employee name and job creator
@@ -351,6 +377,19 @@ router.post('/:id/progress', authenticateToken, async (req, res) => {
     );
 
     const updatedJob = result.rows[0];
+
+    // 🔔 Customer Portal: notify customer via Redis pub/sub if this is a customer job
+    try {
+      const redisClient = require('../utils/redis');
+      if (updatedJob.customer_id && redisClient && redisClient.status === 'ready') {
+        const eventPayload = progress === 100
+          ? { type: 'job_completed', jobId: updatedJob.id, completedAt: new Date().toISOString() }
+          : { type: 'job_progress', jobId: updatedJob.id, progress, status: updatedJob.status };
+        redisClient.publish(`customer_job_events:${updatedJob.id}`, JSON.stringify(eventPayload));
+      }
+    } catch (cpErr) {
+      console.error('Customer portal SSE publish error (progress):', cpErr.message);
+    }
 
     // Notification for job completion
     if (progress === 100) {

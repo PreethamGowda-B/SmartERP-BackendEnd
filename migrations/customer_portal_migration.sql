@@ -10,7 +10,7 @@ CREATE TABLE IF NOT EXISTS customers (
   email           VARCHAR(255) UNIQUE NOT NULL,
   phone           VARCHAR(50),
   password_hash   VARCHAR(255),                          -- NULL for Google-only accounts
-  company_id      UUID REFERENCES companies(id),
+  company_id      INTEGER REFERENCES companies(id),      -- INTEGER to match companies.id (SERIAL)
   auth_provider   VARCHAR(20) DEFAULT 'manual',          -- 'manual' | 'google'
   google_id       VARCHAR(255),
   is_verified     BOOLEAN DEFAULT FALSE,

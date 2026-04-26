@@ -116,6 +116,7 @@ router.post('/', [
     .isIn(['low', 'medium', 'high', 'urgent'])
     .withMessage('Invalid priority value'),
   body('description').optional({ checkFalsy: true }).trim(),
+  body('scheduled_at').optional({ checkFalsy: true }).isISO8601().withMessage('Invalid scheduled_at date'),
 ], async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
@@ -125,7 +126,7 @@ router.post('/', [
 
   const customerId = req.customer.id;
   const companyId = req.customer.companyId;
-  const { title, description, priority } = req.body;
+  const { title, description, priority, scheduled_at } = req.body;
 
   // Section 10: Redis-based rate limiting — max 10 job creations per minute per customer
   try {
@@ -185,10 +186,12 @@ router.post('/', [
       `INSERT INTO jobs
          (title, description, priority, ai_suggested_priority, priority_overridden,
           status, approval_status, approved_at,
-          customer_id, company_id, source, visible_to_all, created_by, employee_status)
+          customer_id, company_id, source, visible_to_all, created_by, employee_status,
+          scheduled_at)
        VALUES ($1, $2, $3, $4, $5,
                'open', $6, ${approvedAt},
-               $7, $8, 'customer', TRUE, NULL, 'assigned')
+               $7, $8, 'customer', TRUE, NULL, 'assigned',
+               $9)
        RETURNING *`,
       [
         title,
@@ -199,6 +202,7 @@ router.post('/', [
         approvalStatus,
         customerId,
         companyId,
+        scheduled_at || null,
       ]
     );
 
@@ -339,6 +343,98 @@ router.get('/:id/tracking', async (req, res) => {
     });
   } catch (err) {
     errorLogger.logFromRequest(req, err, { context: 'customer/jobs.GET /:id/tracking' });
+    return fail(res, 'Server error');
+  }
+});
+
+// ─── GET /:id/invoice — invoice for completed job ─────────────────────────────
+router.get('/:id/invoice', async (req, res) => {
+  const customerId = req.customer.id;
+  const companyId  = req.customer.companyId;
+  const { id }     = req.params;
+
+  try {
+    // Ownership check first
+    const jobCheck = await pool.query(
+      `SELECT id, status FROM jobs WHERE id = $1 AND customer_id = $2 AND company_id = $3`,
+      [id, customerId, companyId]
+    );
+    if (jobCheck.rows.length === 0) return fail(res, 'Job not found', 404);
+
+    // Fetch invoice
+    const invoiceResult = await pool.query(
+      `SELECT id, invoice_number, labor_hours, labor_cost, materials_cost,
+              service_charge, total_amount, status, breakdown, generated_at
+       FROM invoices
+       WHERE job_id = $1 AND company_id = $2
+       ORDER BY generated_at DESC
+       LIMIT 1`,
+      [id, companyId]
+    );
+
+    if (invoiceResult.rows.length === 0) {
+      return ok(res, null); // No invoice yet
+    }
+
+    return ok(res, invoiceResult.rows[0]);
+  } catch (err) {
+    errorLogger.logFromRequest(req, err, { context: 'customer/jobs.GET /:id/invoice' });
+    return fail(res, 'Server error');
+  }
+});
+
+// ─── GET /:id/materials — materials used on a job ─────────────────────────────
+router.get('/:id/materials', async (req, res) => {
+  const customerId = req.customer.id;
+  const companyId  = req.customer.companyId;
+  const { id }     = req.params;
+
+  try {
+    // Ownership check
+    const jobCheck = await pool.query(
+      `SELECT id FROM jobs WHERE id = $1 AND customer_id = $2 AND company_id = $3`,
+      [id, customerId, companyId]
+    );
+    if (jobCheck.rows.length === 0) return fail(res, 'Job not found', 404);
+
+    const result = await pool.query(
+      `SELECT jm.id, jm.item_name, jm.quantity_used, jm.unit_cost, jm.total_cost, jm.logged_at,
+              u.name AS logged_by_name
+       FROM job_materials jm
+       LEFT JOIN users u ON u.id = jm.logged_by
+       WHERE jm.job_id = $1 AND jm.company_id = $2
+       ORDER BY jm.logged_at ASC`,
+      [id, companyId]
+    );
+
+    return ok(res, result.rows);
+  } catch (err) {
+    errorLogger.logFromRequest(req, err, { context: 'customer/jobs.GET /:id/materials' });
+    return fail(res, 'Server error');
+  }
+});
+
+// ─── GET /notifications — customer job notifications ──────────────────────────
+router.get('/notifications', async (req, res) => {
+  const customerId = req.customer.id;
+  const companyId  = req.customer.companyId;
+  const limit = Math.min(50, parseInt(req.query.limit as string) || 20);
+
+  try {
+    const result = await pool.query(
+      `SELECT id, action AS type, details, created_at
+       FROM activities
+       WHERE activity_type = 'customer_notification'
+         AND company_id = $1
+         AND details::jsonb->>'customer_id' = $2
+       ORDER BY created_at DESC
+       LIMIT $3`,
+      [companyId, customerId, limit]
+    );
+
+    return ok(res, result.rows);
+  } catch (err) {
+    errorLogger.logFromRequest(req, err, { context: 'customer/jobs.GET /notifications' });
     return fail(res, 'Server error');
   }
 });

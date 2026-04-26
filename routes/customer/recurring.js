@@ -145,14 +145,16 @@ router.post('/:id/run', async (req, res) => {
     const autoApprove = settingResult.rows[0]?.setting_value === 'true';
     const approvalStatus = autoApprove ? 'approved' : 'pending_approval';
 
+    const approvedAt = autoApprove ? new Date() : null;
+
     const jobResult = await pool.query(
       `INSERT INTO jobs
          (title, description, priority, status, approval_status, approved_at,
           customer_id, company_id, source, visible_to_all, created_by, employee_status)
-       VALUES ($1, $2, $3, 'open', $4, ${autoApprove ? 'NOW()' : 'NULL'},
-               $5, $6, 'customer', TRUE, NULL, 'assigned')
+       VALUES ($1, $2, $3, 'open', $4, $5,
+               $6, $7, 'customer', TRUE, NULL, 'assigned')
        RETURNING *`,
-      [t.title, t.description, t.priority, approvalStatus, customerId, companyId]
+      [t.title, t.description, t.priority, approvalStatus, approvedAt, customerId, companyId]
     );
     const createdJob = jobResult.rows[0];
 

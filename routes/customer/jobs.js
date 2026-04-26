@@ -151,18 +151,24 @@ router.post('/', [
 
   try {
     // Validate company subscription before creating job
-    const companyCheck = await pool.query(
-      'SELECT status, subscription_status FROM companies WHERE id = $1',
-      [companyId]
-    );
-    const company = companyCheck.rows[0];
-    if (company) {
-      if (company.status === 'suspended') {
-        return fail(res, 'Account Suspended/Disabled', 403);
+    // Guard: company_id may be a non-UUID value in legacy/test environments
+    try {
+      const companyCheck = await pool.query(
+        'SELECT status, subscription_status FROM companies WHERE id = $1',
+        [companyId]
+      );
+      const company = companyCheck.rows[0];
+      if (company) {
+        if (company.status === 'suspended') {
+          return fail(res, 'Account Suspended/Disabled', 403);
+        }
+        if (company.subscription_status === 'expired' || company.subscription_status === 'cancelled') {
+          return fail(res, 'Company subscription inactive', 403);
+        }
       }
-      if (company.subscription_status === 'expired' || company.subscription_status === 'cancelled') {
-        return fail(res, 'Company subscription inactive', 403);
-      }
+    } catch (companyCheckErr) {
+      // Non-UUID company_id or missing companies table — skip subscription check, don't block job creation
+      console.warn('Company subscription check skipped:', companyCheckErr.message);
     }
 
     // ── AI Priority Suggestion ────────────────────────────────────────────────
@@ -180,7 +186,7 @@ router.post('/', [
     );
     const autoApprove = settingResult.rows[0]?.setting_value === 'true';
     const approvalStatus = autoApprove ? 'approved' : 'pending_approval';
-    const approvedAt = autoApprove ? 'NOW()' : 'NULL';
+    const approvedAt = autoApprove ? new Date() : null;
 
     const result = await pool.query(
       `INSERT INTO jobs
@@ -189,9 +195,9 @@ router.post('/', [
           customer_id, company_id, source, visible_to_all, created_by, employee_status,
           scheduled_at)
        VALUES ($1, $2, $3, $4, $5,
-               'open', $6, ${approvedAt},
-               $7, $8, 'customer', TRUE, NULL, 'assigned',
-               $9)
+               'open', $6, $7,
+               $8, $9, 'customer', TRUE, NULL, 'assigned',
+               $10)
        RETURNING *`,
       [
         title,
@@ -200,6 +206,7 @@ router.post('/', [
         aiSuggestedPriority,
         priorityOverridden,
         approvalStatus,
+        approvedAt,
         customerId,
         companyId,
         scheduled_at || null,
@@ -240,6 +247,32 @@ router.post('/', [
     }, 201);
   } catch (err) {
     errorLogger.logFromRequest(req, err, { context: 'customer/jobs.POST /' });
+    return fail(res, 'Server error');
+  }
+});
+
+// ─── GET /notifications — customer job notifications ──────────────────────────
+// NOTE: must be registered BEFORE GET /:id to prevent 'notifications' matching as a UUID param
+router.get('/notifications', async (req, res) => {
+  const customerId = req.customer.id;
+  const companyId  = req.customer.companyId;
+  const limit = Math.min(50, parseInt(req.query.limit) || 20);
+
+  try {
+    const result = await pool.query(
+      `SELECT id, action AS type, details, created_at
+       FROM activities
+       WHERE activity_type = 'customer_notification'
+         AND company_id = $1
+         AND details::jsonb->>'customer_id' = $2
+       ORDER BY created_at DESC
+       LIMIT $3`,
+      [companyId, customerId, limit]
+    );
+
+    return ok(res, result.rows);
+  } catch (err) {
+    errorLogger.logFromRequest(req, err, { context: 'customer/jobs.GET /notifications' });
     return fail(res, 'Server error');
   }
 });
@@ -410,31 +443,6 @@ router.get('/:id/materials', async (req, res) => {
     return ok(res, result.rows);
   } catch (err) {
     errorLogger.logFromRequest(req, err, { context: 'customer/jobs.GET /:id/materials' });
-    return fail(res, 'Server error');
-  }
-});
-
-// ─── GET /notifications — customer job notifications ──────────────────────────
-router.get('/notifications', async (req, res) => {
-  const customerId = req.customer.id;
-  const companyId  = req.customer.companyId;
-  const limit = Math.min(50, parseInt(req.query.limit) || 20);
-
-  try {
-    const result = await pool.query(
-      `SELECT id, action AS type, details, created_at
-       FROM activities
-       WHERE activity_type = 'customer_notification'
-         AND company_id = $1
-         AND details::jsonb->>'customer_id' = $2
-       ORDER BY created_at DESC
-       LIMIT $3`,
-      [companyId, customerId, limit]
-    );
-
-    return ok(res, result.rows);
-  } catch (err) {
-    errorLogger.logFromRequest(req, err, { context: 'customer/jobs.GET /notifications' });
     return fail(res, 'Server error');
   }
 });

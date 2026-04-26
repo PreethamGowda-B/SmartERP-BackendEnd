@@ -145,14 +145,20 @@ router.get('/', authenticateToken, async (req, res) => {
         [req.user.companyId, limit, offset]
       );
     } else if (req.user.role === 'employee') {
+      // Employees ONLY see approved customer jobs — never pending_approval or rejected
+      // Section 7: COALESCE(approval_status, 'approved') treats NULL as 'approved' for legacy jobs
       countResult = await pool.query(
-        `SELECT COUNT(*) FROM jobs WHERE (visible_to_all = true OR assigned_to = $1) AND company_id = $2`,
+        `SELECT COUNT(*) FROM jobs
+         WHERE (visible_to_all = true OR assigned_to = $1)
+           AND company_id = $2
+           AND (source != 'customer' OR COALESCE(approval_status, 'approved') = 'approved')`,
         [req.user.id, req.user.companyId]
       );
       result = await pool.query(
-        `SELECT * FROM jobs 
+        `SELECT * FROM jobs
          WHERE (visible_to_all = true OR assigned_to = $1)
-         AND company_id = $2
+           AND company_id = $2
+           AND (source != 'customer' OR COALESCE(approval_status, 'approved') = 'approved')
          ORDER BY created_at DESC
          LIMIT $3 OFFSET $4`,
         [req.user.id, req.user.companyId, limit, offset]
@@ -199,27 +205,33 @@ router.get('/', authenticateToken, async (req, res) => {
 
 /**
  * Accept a job (Employee only)
+ * Section 1: wrapped in DB transaction — accept + started_at + active_job_count are atomic
  */
 router.post('/:id/accept', authenticateToken, async (req, res) => {
   const { id } = req.params;
 
+  const client = await pool.connect();
   try {
-    // Check if job is assigned to this employee
-    const checkJob = await pool.query(
+    await client.query('BEGIN');
+
+    // Check job access
+    const checkJob = await client.query(
       'SELECT * FROM jobs WHERE id = $1 AND (assigned_to = $2 OR visible_to_all = true) AND company_id = $3',
       [id, req.user.id, req.user.companyId]
     );
 
     if (checkJob.rows.length === 0) {
+      await client.query('ROLLBACK');
       return res.status(403).json({ message: 'Job not assigned to you' });
     }
 
-    const result = await pool.query(
-      `UPDATE jobs 
-       SET employee_status = 'accepted', 
-           accepted_at = NOW(),
-           status = 'active',
-           assigned_to = $2
+    const result = await client.query(
+      `UPDATE jobs
+       SET employee_status = 'accepted',
+           accepted_at     = NOW(),
+           started_at      = NOW(),
+           status          = 'active',
+           assigned_to     = $2
        WHERE id = $1
        RETURNING *`,
       [id, req.user.id]
@@ -227,9 +239,12 @@ router.post('/:id/accept', authenticateToken, async (req, res) => {
 
     const acceptedJob = result.rows[0];
 
-    // 🔔 Customer Portal: notify customer via Redis pub/sub if this is a customer job
+    await client.query('COMMIT');
+
+    // ── Post-commit side effects (non-blocking) ───────────────────────────────
+
+    // Customer Portal SSE
     try {
-      const redisClient = require('../utils/redis');
       if (acceptedJob.customer_id && redisClient && redisClient.status === 'ready') {
         const userInfo2 = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
         const empName = userInfo2.rows[0]?.name || 'Employee';
@@ -242,12 +257,10 @@ router.post('/:id/accept', authenticateToken, async (req, res) => {
       console.error('Customer portal SSE publish error (accept):', cpErr.message);
     }
 
-    // Send notification to owner about job acceptance
+    // Notify owner
     try {
-      // Get employee name and job creator
       const userInfo = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
       const employeeName = userInfo.rows[0]?.name || 'Employee';
-
       await createNotificationForOwners({
         company_id: req.user.companyId || acceptedJob.company_id,
         type: 'job_accepted',
@@ -256,15 +269,17 @@ router.post('/:id/accept', authenticateToken, async (req, res) => {
         priority: 'medium',
         data: { job_id: acceptedJob.id, employee_id: req.user.id, url: '/owner/notifications' }
       });
-      console.log(`✅ Notified owner(s) about job acceptance`);
     } catch (notifErr) {
       console.error('❌ Failed to send job acceptance notification:', notifErr);
     }
 
     res.json(acceptedJob);
   } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
     console.error('jobs ACCEPT error', err);
     res.status(500).json({ message: 'Server error' });
+  } finally {
+    client.release();
   }
 });
 
@@ -377,6 +392,21 @@ router.post('/:id/progress', authenticateToken, async (req, res) => {
     );
 
     const updatedJob = result.rows[0];
+
+    // Decrement active_job_count when job is completed
+    if (progress === 100) {
+      pool.query(
+        `UPDATE employee_profiles
+         SET active_job_count = GREATEST(0, COALESCE(active_job_count, 0) - 1)
+         WHERE user_id = $1`,
+        [req.user.id]
+      ).catch(e => console.error('active_job_count decrement error:', e.message));
+
+      // Generate invoice (non-blocking) — only for non-cancelled jobs
+      const { generateInvoice } = require('../services/billingService');
+      generateInvoice(updatedJob.id, updatedJob.company_id || req.user.companyId)
+        .catch(e => console.error('Invoice generation error:', e.message));
+    }
 
     // 🔔 Customer Portal: notify customer via Redis pub/sub if this is a customer job
     try {

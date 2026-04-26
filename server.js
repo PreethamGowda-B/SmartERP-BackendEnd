@@ -333,6 +333,7 @@ async function runDatabaseInitialization() {
     await optimizeDatabase();
 
     // 4. Customer Portal migration (additive — safe to re-run)
+    // Section 6: Migration failure must NOT crash server
     try {
       const fs = require('fs');
       const path = require('path');
@@ -343,7 +344,46 @@ async function runDatabaseInitialization() {
       await pool.query(migrationSql);
       console.log('✅ Customer Portal migration complete');
     } catch (cpErr) {
-      console.warn('⚠️  Customer Portal migration warning:', cpErr.message);
+      // Section 6: Log error but continue — server stays up
+      console.error('⚠️  Customer Portal migration failed:', cpErr.message);
+      const errorLogger = require('./utils/errorLogger');
+      errorLogger.log(cpErr, { context: 'migration.customer_portal' });
+    }
+
+    // 5. Workflow Enhancement migration (approval workflow, SLA, billing, etc.)
+    // Section 6: Migration failure must NOT crash server
+    try {
+      const fs = require('fs');
+      const path = require('path');
+      const workflowSql = fs.readFileSync(
+        path.join(__dirname, 'migrations', 'workflow_enhancement_migration.sql'),
+        'utf8'
+      );
+      await pool.query(workflowSql);
+      console.log('✅ Workflow Enhancement migration complete');
+    } catch (wfErr) {
+      // Section 6: Log error but continue
+      console.error('⚠️  Workflow Enhancement migration failed:', wfErr.message);
+      const errorLogger = require('./utils/errorLogger');
+      errorLogger.log(wfErr, { context: 'migration.workflow_enhancement' });
+    }
+
+    // 6. Hardening indexes (performance optimization)
+    // Section 6: Index creation failure must NOT crash server
+    try {
+      const fs = require('fs');
+      const path = require('path');
+      const indexSql = fs.readFileSync(
+        path.join(__dirname, 'migrations', 'hardening_indexes.sql'),
+        'utf8'
+      );
+      await pool.query(indexSql);
+      console.log('✅ Hardening indexes applied');
+    } catch (idxErr) {
+      // Section 6: Log error but continue
+      console.error('⚠️  Hardening indexes failed:', idxErr.message);
+      const errorLogger = require('./utils/errorLogger');
+      errorLogger.log(idxErr, { context: 'migration.hardening_indexes' });
     }
 
     console.log('✅ Database Initialization & Optimization complete');
@@ -392,6 +432,10 @@ app.use("/api", v1Router); // Fallback for backward compatibility
 // ✅ Customer Portal router (separate namespace — no tenant context middleware)
 app.use("/api/customer", require("./routes/customer/index"));
 app.use("/api/v1/customer", require("./routes/customer/index")); // v1 alias
+
+// ✅ Customer Job Approval Workflow (Owner/HR portal)
+app.use("/api/v1/customer-jobs", require("./routes/customerJobApproval"));
+app.use("/api/customer-jobs", require("./routes/customerJobApproval")); // alias
 
 
 
@@ -556,6 +600,35 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
         startKeepAlivePinger();
       } catch (err) {
         console.error('❌ Failed to start keep-alive pinger:', err.message);
+      }
+
+      // 📍 Geofence Service: Check employee arrival every 12 seconds
+      try {
+        const geofenceService = require('./services/geofenceService');
+        geofenceService.start();
+      } catch (err) {
+        console.error('❌ Failed to start geofence service:', err.message);
+      }
+
+      // 📋 SLA Service: Check SLA breaches every 2 minutes
+      // Section 5: Only runs on primary worker — no duplicate background jobs
+      try {
+        const slaService = require('./services/slaService');
+        slaService.start();
+      } catch (err) {
+        console.error('❌ Failed to start SLA service:', err.message);
+      }
+
+      // 🗑️ Error Log Retention: Purge old error logs daily
+      // Section 9: Centralized error logging with retention
+      try {
+        const errorLogger = require('./utils/errorLogger');
+        // Run once on startup, then daily
+        errorLogger.purgeOldErrors();
+        setInterval(() => errorLogger.purgeOldErrors(), 24 * 60 * 60 * 1000);
+        console.log('🗑️  Error log retention scheduled');
+      } catch (err) {
+        console.error('❌ Failed to start error log retention:', err.message);
       }
     }
   });

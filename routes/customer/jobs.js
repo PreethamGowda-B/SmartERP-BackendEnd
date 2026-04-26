@@ -418,7 +418,7 @@ router.get('/:id/materials', async (req, res) => {
 router.get('/notifications', async (req, res) => {
   const customerId = req.customer.id;
   const companyId  = req.customer.companyId;
-  const limit = Math.min(50, parseInt(req.query.limit as string) || 20);
+  const limit = Math.min(50, parseInt(req.query.limit) || 20);
 
   try {
     const result = await pool.query(

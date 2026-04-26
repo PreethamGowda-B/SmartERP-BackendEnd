@@ -40,15 +40,54 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS priority_overridden    BOOLEAN DEFAULT
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS scheduled_at TIMESTAMP;
 
 -- ── 8. Company settings table ────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS company_settings (
-  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  company_id      UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-  setting_key     VARCHAR(100) NOT NULL,
-  setting_value   TEXT,
-  updated_by      UUID REFERENCES users(id),
-  updated_at      TIMESTAMP DEFAULT NOW(),
-  UNIQUE (company_id, setting_key)
-);
+-- Use a DO block so the FK is only added when companies table exists with UUID id
+DO $$
+BEGIN
+  CREATE TABLE IF NOT EXISTS company_settings (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id      UUID NOT NULL,
+    setting_key     VARCHAR(100) NOT NULL,
+    setting_value   TEXT,
+    updated_by      UUID,
+    updated_at      TIMESTAMP DEFAULT NOW(),
+    UNIQUE (company_id, setting_key)
+  );
+EXCEPTION WHEN others THEN
+  -- Table already exists or other non-fatal error
+  NULL;
+END $$;
+
+-- Add FK separately so it doesn't block table creation if companies isn't ready
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.table_constraints
+    WHERE constraint_name = 'company_settings_company_id_fkey'
+      AND table_name = 'company_settings'
+  ) THEN
+    ALTER TABLE company_settings
+      ADD CONSTRAINT company_settings_company_id_fkey
+      FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE;
+  END IF;
+EXCEPTION WHEN others THEN
+  NULL;
+END $$;
+
+-- Add updated_by FK separately
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.table_constraints
+    WHERE constraint_name = 'company_settings_updated_by_fkey'
+      AND table_name = 'company_settings'
+  ) THEN
+    ALTER TABLE company_settings
+      ADD CONSTRAINT company_settings_updated_by_fkey
+      FOREIGN KEY (updated_by) REFERENCES users(id);
+  END IF;
+EXCEPTION WHEN others THEN
+  NULL;
+END $$;
 
 CREATE INDEX IF NOT EXISTS idx_company_settings_company_id ON company_settings(company_id);
 

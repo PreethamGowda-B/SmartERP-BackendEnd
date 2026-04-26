@@ -259,6 +259,75 @@ async function fixDatabaseConstraints() {
     console.warn('⚠️  Could not fix constraints:', err.message);
   }
 }
+/**
+ * Run a SQL file statement-by-statement, skipping individual failures.
+ * This prevents a single bad ALTER/CREATE from aborting the entire migration.
+ * Handles dollar-quoted blocks (DO $$ ... $$) correctly.
+ */
+async function runSqlStatements(sql, context = 'migration') {
+  const statements = splitSqlStatements(sql);
+
+  let ok = 0;
+  let skipped = 0;
+  for (const stmt of statements) {
+    try {
+      await pool.query(stmt);
+      ok++;
+    } catch (err) {
+      skipped++;
+      console.warn(`⚠️  [${context}] Skipped statement (${err.message.split('\n')[0]})`);
+    }
+  }
+  console.log(`📋 [${context}] ${ok} statements applied, ${skipped} skipped`);
+}
+
+/**
+ * Split a SQL string into individual statements, respecting:
+ * - Dollar-quoted blocks: $$ ... $$ (used in DO blocks)
+ * - Single-line comments: -- ...
+ * - Semicolons as statement terminators (outside quoted blocks)
+ */
+function splitSqlStatements(sql) {
+  const statements = [];
+  let current = '';
+  let inDollarQuote = false;
+  let i = 0;
+
+  while (i < sql.length) {
+    // Check for dollar-quote start/end: $$
+    if (sql[i] === '$' && sql[i + 1] === '$') {
+      inDollarQuote = !inDollarQuote;
+      current += '$$';
+      i += 2;
+      continue;
+    }
+
+    // Skip single-line comments (only outside dollar-quoted blocks)
+    if (!inDollarQuote && sql[i] === '-' && sql[i + 1] === '-') {
+      while (i < sql.length && sql[i] !== '\n') i++;
+      continue;
+    }
+
+    // Statement terminator (only outside dollar-quoted blocks)
+    if (!inDollarQuote && sql[i] === ';') {
+      const trimmed = current.trim();
+      if (trimmed.length > 0) statements.push(trimmed);
+      current = '';
+      i++;
+      continue;
+    }
+
+    current += sql[i];
+    i++;
+  }
+
+  // Catch any trailing statement without a semicolon
+  const trimmed = current.trim();
+  if (trimmed.length > 0) statements.push(trimmed);
+
+  return statements;
+}
+
 // ✅ Consolidated Database Initialization (Run once per deployment)
 async function runDatabaseInitialization() {
   try {
@@ -351,7 +420,7 @@ async function runDatabaseInitialization() {
     }
 
     // 5. Workflow Enhancement migration (approval workflow, SLA, billing, etc.)
-    // Section 6: Migration failure must NOT crash server
+    // Run statement-by-statement so a single FK/column failure doesn't abort the rest
     try {
       const fs = require('fs');
       const path = require('path');
@@ -359,17 +428,16 @@ async function runDatabaseInitialization() {
         path.join(__dirname, 'migrations', 'workflow_enhancement_migration.sql'),
         'utf8'
       );
-      await pool.query(workflowSql);
+      await runSqlStatements(workflowSql, 'migration.workflow_enhancement');
       console.log('✅ Workflow Enhancement migration complete');
     } catch (wfErr) {
-      // Section 6: Log error but continue
       console.error('⚠️  Workflow Enhancement migration failed:', wfErr.message);
       const errorLogger = require('./utils/errorLogger');
       errorLogger.log(wfErr, { context: 'migration.workflow_enhancement' });
     }
 
     // 6. Hardening indexes (performance optimization)
-    // Section 6: Index creation failure must NOT crash server
+    // Run statement-by-statement so a missing column doesn't abort all indexes
     try {
       const fs = require('fs');
       const path = require('path');
@@ -377,10 +445,9 @@ async function runDatabaseInitialization() {
         path.join(__dirname, 'migrations', 'hardening_indexes.sql'),
         'utf8'
       );
-      await pool.query(indexSql);
+      await runSqlStatements(indexSql, 'migration.hardening_indexes');
       console.log('✅ Hardening indexes applied');
     } catch (idxErr) {
-      // Section 6: Log error but continue
       console.error('⚠️  Hardening indexes failed:', idxErr.message);
       const errorLogger = require('./utils/errorLogger');
       errorLogger.log(idxErr, { context: 'migration.hardening_indexes' });

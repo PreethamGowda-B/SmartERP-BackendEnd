@@ -259,7 +259,7 @@ async function fixDatabaseConstraints() {
     console.warn('⚠️  Could not fix constraints:', err.message);
   }
 }
-/**/**
+/**
  * Run a SQL file statement-by-statement, skipping individual failures.
  * Splits on semicolons and strips single-line comments.
  */
@@ -278,9 +278,383 @@ async function runSqlStatements(sql, context = 'migration') {
       ok++;
     } catch (err) {
       skipped++;
-      console.warn('[' + context + '] Skipped: ' + err.message.split('\n')[0]);
+      console.warn(`[${context}] Skipped: ${err.message.split('\n')[0]}`);
     }
   }
-  console.log('[' + context + '] ' + ok + ' applied, ' + skipped + ' skipped');
+  console.log(`[${context}] ${ok} applied, ${skipped} skipped`);
 }
 
+// ✅ Consolidated Database Initialization (Run once per deployment)
+async function runDatabaseInitialization() {
+  try {
+    console.log('🏗️  Starting Database Initialization...');
+
+    // 1. Fix constraints
+    await fixDatabaseConstraints();
+
+    // 2. Auto-migrate schema
+    const { fixMaterialRequestsSchema, setupDocumentsTable } = require('./migrations/autoMigrate');
+    await fixMaterialRequestsSchema();
+    await setupDocumentsTable();
+
+    // 3. OTP setup and Core optimization
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS email_otps (
+        id SERIAL PRIMARY KEY,
+        email VARCHAR(255) NOT NULL,
+        otp_code VARCHAR(6) NOT NULL,
+        expires_at TIMESTAMP NOT NULL,
+        used BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_email_otps_email ON email_otps(email);
+
+      -- Update activities table for modern logging
+      ALTER TABLE activities ADD COLUMN IF NOT EXISTS activity_type TEXT;
+      ALTER TABLE activities ADD COLUMN IF NOT EXISTS details JSONB;
+      ALTER TABLE activities ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
+
+      -- Multi-device notification support
+      CREATE TABLE IF NOT EXISTS user_devices (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        fcm_token TEXT UNIQUE NOT NULL,
+        device_type VARCHAR(50),
+        last_seen TIMESTAMP DEFAULT NOW(),
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_user_devices_user_id ON user_devices(user_id);
+
+      -- Feedback system for users to report bugs or suggest features
+      CREATE TABLE IF NOT EXISTS feedback (
+        id SERIAL PRIMARY KEY,
+        user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+        type VARCHAR(50) DEFAULT 'general',
+        subject VARCHAR(255),
+        message TEXT NOT NULL,
+        page_url TEXT,
+        status VARCHAR(50) DEFAULT 'new',
+        admin_reply TEXT,
+        replied_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+      
+      -- Add columns if they don't exist (for existing databases)
+      ALTER TABLE feedback ADD COLUMN IF NOT EXISTS admin_reply TEXT;
+      ALTER TABLE feedback ADD COLUMN IF NOT EXISTS replied_at TIMESTAMP;
+
+      CREATE INDEX IF NOT EXISTS idx_feedback_status ON feedback(status);
+      CREATE INDEX IF NOT EXISTS idx_feedback_user_id ON feedback(user_id);
+
+      -- Expand notifications table for global broadcasts and metadata
+      ALTER TABLE notifications ADD COLUMN IF NOT EXISTS company_id INTEGER;
+      ALTER TABLE notifications ADD COLUMN IF NOT EXISTS type VARCHAR(100) DEFAULT 'system';
+      ALTER TABLE notifications ADD COLUMN IF NOT EXISTS priority VARCHAR(50) DEFAULT 'normal';
+      CREATE INDEX IF NOT EXISTS idx_notifications_company_id ON notifications(company_id);
+      CREATE INDEX IF NOT EXISTS idx_notifications_type ON notifications(type);
+    `);
+
+    const { optimizeDatabase } = require('./scripts/optimizeDb');
+    await optimizeDatabase();
+
+    // 4. Customer Portal migration (additive — safe to re-run)
+    // Section 6: Migration failure must NOT crash server
+    try {
+      const fs = require('fs');
+      const path = require('path');
+      const migrationSql = fs.readFileSync(
+        path.join(__dirname, 'migrations', 'customer_portal_migration.sql'),
+        'utf8'
+      );
+      await pool.query(migrationSql);
+      console.log('✅ Customer Portal migration complete');
+    } catch (cpErr) {
+      // Section 6: Log error but continue — server stays up
+      console.error('⚠️  Customer Portal migration failed:', cpErr.message);
+      const errorLogger = require('./utils/errorLogger');
+      errorLogger.log(cpErr, { context: 'migration.customer_portal' });
+    }
+
+    // 5. Workflow Enhancement migration (approval workflow, SLA, billing, etc.)
+    // Run statement-by-statement so a single FK/column failure doesn't abort the rest
+    try {
+      const fs = require('fs');
+      const path = require('path');
+      const workflowSql = fs.readFileSync(
+        path.join(__dirname, 'migrations', 'workflow_enhancement_migration.sql'),
+        'utf8'
+      );
+      await runSqlStatements(workflowSql, 'migration.workflow_enhancement');
+      console.log('✅ Workflow Enhancement migration complete');
+    } catch (wfErr) {
+      console.error('⚠️  Workflow Enhancement migration failed:', wfErr.message);
+      const errorLogger = require('./utils/errorLogger');
+      errorLogger.log(wfErr, { context: 'migration.workflow_enhancement' });
+    }
+
+    // 6. Hardening indexes (performance optimization)
+    // Run statement-by-statement so a missing column doesn't abort all indexes
+    try {
+      const fs = require('fs');
+      const path = require('path');
+      const indexSql = fs.readFileSync(
+        path.join(__dirname, 'migrations', 'hardening_indexes.sql'),
+        'utf8'
+      );
+      await runSqlStatements(indexSql, 'migration.hardening_indexes');
+      console.log('✅ Hardening indexes applied');
+    } catch (idxErr) {
+      console.error('⚠️  Hardening indexes failed:', idxErr.message);
+      const errorLogger = require('./utils/errorLogger');
+      errorLogger.log(idxErr, { context: 'migration.hardening_indexes' });
+    }
+
+    console.log('✅ Database Initialization & Optimization complete');
+  } catch (err) {
+    console.error('❌ Database Initialization failed:', err.message);
+  }
+}
+
+// ✅ API Versioning (v1)
+const v1Router = express.Router();
+const { setTenantContext } = require("./middleware/tenantContext");
+
+v1Router.use(setTenantContext); // Enforce RLS for all v1 routes
+
+v1Router.use("/auth", require("./routes/auth"));
+v1Router.use("/users", require("./routes/users"));
+v1Router.use("/jobs", require("./routes/jobs"));
+v1Router.use("/activities", require("./routes/activities"));
+v1Router.use("/attendance", require("./routes/attendance"));
+v1Router.use("/materials", require("./routes/materials"));
+v1Router.use("/inventory", require("./routes/inventory"));
+v1Router.use("/payroll", require("./routes/payroll"));
+v1Router.use("/notifications", require("./routes/notifications"));
+v1Router.use("/payments", require("./routes/payments"));
+v1Router.use("/analytics", require("./routes/analytics"));
+v1Router.use("/employees", require("./routes/employees"));
+v1Router.use("/material-requests", require("./routes/materialRequests"));
+v1Router.use("/ai", require("./routes/ai.routes"));
+v1Router.use("/messages", require("./routes/messages"));
+v1Router.use("/dashboard", require("./routes/dashboard"));
+v1Router.use("/reports", require("./routes/reports"));
+v1Router.use("/settings", require("./routes/settings"));
+v1Router.use("/location", require("./routes/location"));
+v1Router.use("/subscription", require("./routes/subscription"));
+v1Router.use("/hr", require("./routes/hr"));
+v1Router.use("/admin", require("./routes/admin"));
+v1Router.use("/documents", require("./routes/documents"));
+v1Router.use("/webhook", require("./routes/webhook"));
+v1Router.use("/feedback", require("./routes/feedback"));
+
+
+// Mount v1 router
+app.use("/api/v1", v1Router);
+app.use("/api", v1Router); // Fallback for backward compatibility
+
+// ✅ Customer Portal router (separate namespace — no tenant context middleware)
+app.use("/api/customer", require("./routes/customer/index"));
+app.use("/api/v1/customer", require("./routes/customer/index")); // v1 alias
+
+// ✅ Customer Job Approval Workflow (Owner/HR portal)
+app.use("/api/v1/customer-jobs", require("./routes/customerJobApproval"));
+app.use("/api/customer-jobs", require("./routes/customerJobApproval")); // alias
+
+
+
+
+// ✅ Health check route
+app.get("/api/health", async (req, res) => {
+  try {
+    const result = await pool.query("SELECT NOW()");
+    res.json({
+      status: "ok",
+      database: "connected",
+      time: result.rows[0].now,
+    });
+  } catch (err) {
+    console.error("❌ Health check failed:", err.message);
+    res.status(500).json({
+      status: "error",
+      database: "disconnected",
+      message: err.message,
+    });
+  }
+});
+
+// ✅ Info route
+app.get("/api", (req, res) => {
+  res.json({
+    message: "🚀 SmartERP Backend API is running successfully!",
+    database: "connected",
+    base: "/api",
+    frontend: process.env.FRONTEND_ORIGIN,
+  });
+});
+
+// ✅ Root (for Render homepage)
+app.get("/", async (req, res) => {
+  try {
+    await pool.query("SELECT NOW()");
+    res.send(`
+      <h1>SmartERP Backend</h1>
+      <p>Status: <strong>OK ✅</strong></p>
+      <p>Database: <strong>Connected to Neon</strong></p>
+      <p>API Base: <code>/api</code></p>
+      <p>Server running on port ${process.env.PORT || 4000}</p>
+      <p>CORS: <strong>Configured for all Vercel deployments ✅</strong></p>
+    `);
+  } catch (err) {
+    console.error("❌ DB Connection Error:", err.message);
+    res.status(500).send(`
+      <h1>SmartERP Backend</h1>
+      <p>Status: <strong>ERROR</strong></p>
+      <p>Database: <strong>Disconnected</strong></p>
+      <p>Error: ${err.message}</p>
+    `);
+  }
+});
+
+// ✅ Global Error Handler (MUST BE LAST)
+if (process.env.SENTRY_DSN) {
+  Sentry.setupExpressErrorHandler(app);
+}
+
+app.use((err, req, res, next) => {
+  // Ensure CORS headers are present even on error responses
+  const origin = req.headers.origin;
+  const allowedOrigins = ['https://www.prozync.in', 'https://prozync.in', 'http://localhost:3000', 'https://client.prozync.in', 'http://localhost:3001'];
+  if (origin && (allowedOrigins.includes(origin) || origin.match(/\.vercel\.app$/))) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+  }
+
+  // Handle CSRF errors specifically
+  if (err.code === 'EBADCSRFTOKEN') {
+    return res.status(403).json({ message: "Invalid CSRF token. Please refresh the page." });
+  }
+
+  logger.error("Global API Route Error", err, { path: req.path, method: req.method });
+
+  res.status(err.status || 500).json({
+    message: err.message || "An internal server error occurred.",
+    error: process.env.NODE_ENV === "development" ? err.stack : undefined,
+  });
+});
+
+// ✅ Catch uncaught exceptions to prevent silent process death
+process.on("uncaughtException", (err) => {
+  logger.error("🔥 UNCAUGHT EXCEPTION - Process Terminating", err);
+  // Give Sentry 2s to flush then die
+  setTimeout(() => process.exit(1), 2000);
+});
+
+process.on("unhandledRejection", (reason, promise) => {
+  logger.error("🔥 UNHANDLED REJECTION Detected", reason instanceof Error ? reason : new Error(String(reason)), { promiseType: String(promise) });
+});
+
+const cluster = require('cluster');
+const totalCPUs = require('os').cpus().length;
+// Cap workers to prevent OOM on Render's 512MB RAM limit
+// We recommend 2 workers for 512MB, 4 for 1GB.
+const WORKER_COUNT = process.env.WEB_CONCURRENCY || Math.min(totalCPUs, 2);
+
+if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
+
+  console.log(`📡 Master process ${process.pid} is running`);
+  console.log(`🧵 Spawning ${WORKER_COUNT} workers for cluster mode...`);
+
+  // Run DB initialization ONCE in the master process before forking
+  (async () => {
+    try {
+      await runDatabaseInitialization();
+    } catch (err) {
+      console.error('❌ Master DB Init Error:', err.message);
+    }
+
+    for (let i = 0; i < WORKER_COUNT; i++) {
+      const env = i === 0 ? { IS_PRIMARY_WORKER: 'true' } : {};
+      cluster.fork(env);
+    }
+  })();
+
+  cluster.on('exit', (worker, code, signal) => {
+    console.warn(`⚠️ Worker ${worker.process.pid} died. Spawning replacement...`);
+    cluster.fork();
+  });
+
+} else {
+  // ✅ Start server
+  const PORT = process.env.PORT || 4000;
+  app.listen(PORT, () => {
+    console.log(`🚀 SmartERP worker ${process.pid} running on port ${PORT}`);
+
+    // Only run background workers on the designated primary worker (set via IS_PRIMARY_WORKER env)
+    if (process.env.IS_PRIMARY_WORKER === 'true') {
+      console.log("🛠️ Starting background processors and workers on primary worker...");
+
+      require('./jobs/workers'); // Initialize BullMQ workers
+
+      try {
+        const { startDailyAttendanceProcessor } = require('./jobs/dailyAttendanceProcessor');
+        startDailyAttendanceProcessor();
+      } catch (err) {
+        console.error('❌ Failed to start daily attendance processor:', err.message);
+      }
+
+      try {
+        const { startTrialExpiryProcessor } = require('./jobs/trialExpiryProcessor');
+        startTrialExpiryProcessor();
+      } catch (err) {
+        console.error('❌ Failed to start trial expiry processor:', err.message);
+      }
+
+      // 🔔 Smart Notification Service: Migrated to Node-Cron 
+      try {
+        const { startSmartNotificationProcessor } = require('./jobs/smartNotificationProcessor');
+        startSmartNotificationProcessor();
+      } catch (err) {
+        console.error('❌ Failed to start smart notification CRON processor:', err.message);
+      }
+
+      // 🏓 Render Keep-Alive Pinger: Prevent cold starts by pinging /api/health every 10 min
+      try {
+        const { startKeepAlivePinger } = require('./jobs/keepAlivePinger');
+        startKeepAlivePinger();
+      } catch (err) {
+        console.error('❌ Failed to start keep-alive pinger:', err.message);
+      }
+
+      // 📍 Geofence Service: Check employee arrival every 12 seconds
+      try {
+        const geofenceService = require('./services/geofenceService');
+        geofenceService.start();
+      } catch (err) {
+        console.error('❌ Failed to start geofence service:', err.message);
+      }
+
+      // 📋 SLA Service: Check SLA breaches every 2 minutes
+      // Section 5: Only runs on primary worker — no duplicate background jobs
+      try {
+        const slaService = require('./services/slaService');
+        slaService.start();
+      } catch (err) {
+        console.error('❌ Failed to start SLA service:', err.message);
+      }
+
+      // 🗑️ Error Log Retention: Purge old error logs daily
+      // Section 9: Centralized error logging with retention
+      try {
+        const errorLogger = require('./utils/errorLogger');
+        // Run once on startup, then daily
+        errorLogger.purgeOldErrors();
+        setInterval(() => errorLogger.purgeOldErrors(), 24 * 60 * 60 * 1000);
+        console.log('🗑️  Error log retention scheduled');
+      } catch (err) {
+        console.error('❌ Failed to start error log retention:', err.message);
+      }
+    }
+  });
+}
+
+module.exports = app;

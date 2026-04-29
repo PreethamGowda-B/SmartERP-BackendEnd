@@ -134,40 +134,39 @@ router.get('/', authenticateToken, async (req, res) => {
     let queryParams = [req.user.companyId];
 
     if (req.user.role === 'owner') {
-      countResult = await pool.query(`SELECT COUNT(*) FROM jobs WHERE company_id = $1`, [req.user.companyId]);
+      countResult = await pool.query(`SELECT COUNT(*) FROM jobs WHERE company_id::text = $1`, [String(req.user.companyId)]);
       result = await pool.query(
         `SELECT j.*, u.email as employee_email 
          FROM jobs j
          LEFT JOIN users u ON j.assigned_to = u.id
-         WHERE j.company_id = $1
+         WHERE j.company_id::text = $1
          ORDER BY j.created_at DESC
          LIMIT $2 OFFSET $3`,
-        [req.user.companyId, limit, offset]
+        [String(req.user.companyId), limit, offset]
       );
     } else if (req.user.role === 'employee') {
       // Employees ONLY see approved customer jobs — never pending_approval or rejected
-      // Section 7: COALESCE(approval_status, 'approved') treats NULL as 'approved' for legacy jobs
       countResult = await pool.query(
         `SELECT COUNT(*) FROM jobs
          WHERE (visible_to_all = true OR assigned_to = $1)
-           AND company_id = $2
+           AND company_id::text = $2
            AND (source != 'customer' OR COALESCE(approval_status, 'approved') = 'approved')`,
-        [req.user.id, req.user.companyId]
+        [req.user.id, String(req.user.companyId)]
       );
       result = await pool.query(
         `SELECT * FROM jobs
          WHERE (visible_to_all = true OR assigned_to = $1)
-           AND company_id = $2
+           AND company_id::text = $2
            AND (source != 'customer' OR COALESCE(approval_status, 'approved') = 'approved')
          ORDER BY created_at DESC
          LIMIT $3 OFFSET $4`,
-        [req.user.id, req.user.companyId, limit, offset]
+        [req.user.id, String(req.user.companyId), limit, offset]
       );
     } else {
-      countResult = await pool.query(`SELECT COUNT(*) FROM jobs WHERE visible_to_all = true AND company_id = $1`, [req.user.companyId]);
+      countResult = await pool.query(`SELECT COUNT(*) FROM jobs WHERE visible_to_all = true AND company_id::text = $1`, [String(req.user.companyId)]);
       result = await pool.query(
-        `SELECT * FROM jobs WHERE visible_to_all = true AND company_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
-        [req.user.companyId, limit, offset]
+        `SELECT * FROM jobs WHERE visible_to_all = true AND company_id::text = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
+        [String(req.user.companyId), limit, offset]
       );
     }
 
@@ -216,8 +215,8 @@ router.post('/:id/accept', authenticateToken, async (req, res) => {
 
     // Check job access — employee must be able to see the job
     const checkJob = await client.query(
-      'SELECT * FROM jobs WHERE id = $1 AND (assigned_to = $2 OR visible_to_all = true) AND company_id = $3',
-      [id, req.user.id, req.user.companyId]
+      'SELECT * FROM jobs WHERE id = $1 AND (assigned_to = $2 OR visible_to_all = true) AND company_id::text = $3',
+      [id, req.user.id, String(req.user.companyId)]
     );
 
     if (checkJob.rows.length === 0) {
@@ -309,8 +308,8 @@ router.post('/:id/decline', authenticateToken, async (req, res) => {
   try {
     // Check if job is assigned to this employee
     const checkJob = await pool.query(
-      'SELECT * FROM jobs WHERE id = $1 AND (assigned_to = $2 OR visible_to_all = true) AND company_id = $3',
-      [id, req.user.id, req.user.companyId]
+      'SELECT * FROM jobs WHERE id = $1 AND (assigned_to = $2 OR visible_to_all = true) AND company_id::text = $3',
+      [id, req.user.id, String(req.user.companyId)]
     );
 
     if (checkJob.rows.length === 0) {

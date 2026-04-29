@@ -199,6 +199,7 @@ router.post('/:id/approve', authenticateToken, requireOwnerOrHr, async (req, res
     await client.query('BEGIN');
 
     // Conditional update — atomic race condition prevention
+    // Use company_id::text comparison to handle both INTEGER and UUID company_id types
     const result = await client.query(
       'UPDATE jobs' +
       "  SET approval_status  = 'approved'," +
@@ -206,19 +207,19 @@ router.post('/:id/approve', authenticateToken, requireOwnerOrHr, async (req, res
       "      status           = 'open'," +
       "      employee_status  = 'assigned'" +
       ' WHERE id = $1' +
-      '   AND company_id = $2' +
+      '   AND company_id::text = $2' +
       "   AND source = 'customer'" +
       "   AND COALESCE(approval_status, 'pending_approval') = 'pending_approval'" +
       ' RETURNING id, title, customer_id, priority, approval_status',
-      [id, companyId]
+      [id, String(companyId)]
     );
 
     if (result.rowCount === 0) {
       await client.query('ROLLBACK');
       const check = await pool.query(
         "SELECT COALESCE(approval_status, 'pending_approval') AS approval_status" +
-        ' FROM jobs WHERE id = $1 AND company_id = $2',
-        [id, companyId]
+        ' FROM jobs WHERE id = $1 AND company_id::text = $2',
+        [id, String(companyId)]
       );
       if (check.rows.length === 0) return fail(res, 'Job not found', 404);
       const cur = check.rows[0].approval_status;
@@ -323,19 +324,19 @@ router.post('/:id/reject', authenticateToken, requireOwnerOrHr, async (req, res)
       '      rejected_at     = NOW(),' +
       "      status          = 'cancelled'" +
       ' WHERE id = $1' +
-      '   AND company_id = $2' +
+      '   AND company_id::text = $2' +
       "   AND source = 'customer'" +
       "   AND COALESCE(approval_status, 'pending_approval') = 'pending_approval'" +
       ' RETURNING id, title, customer_id',
-      [id, companyId]
+      [id, String(companyId)]
     );
 
     if (result.rowCount === 0) {
       await client.query('ROLLBACK');
       const check = await pool.query(
         "SELECT COALESCE(approval_status, 'pending_approval') AS approval_status" +
-        ' FROM jobs WHERE id = $1 AND company_id = $2',
-        [id, companyId]
+        ' FROM jobs WHERE id = $1 AND company_id::text = $2',
+        [id, String(companyId)]
       );
       if (check.rows.length === 0) return fail(res, 'Job not found', 404);
       const cur = check.rows[0].approval_status;

@@ -285,4 +285,149 @@ router.get('/owner', async (req, res) => {
     }
 });
 
+// ─── GET /api/messages/job-conversations ─────────────────────────────────────
+// Get all customer job chats where this employee is the assigned technician
+// Used by the employee Messages tab to show customer conversations
+router.get('/job-conversations', async (req, res) => {
+  try {
+    const employeeId = req.user.userId || req.user.id;
+    const companyId  = req.user.companyId;
+
+    // Find all jobs assigned to this employee that have at least one message
+    const result = await pool.query(
+      `SELECT
+         j.id          AS job_id,
+         j.title       AS job_title,
+         j.status      AS job_status,
+         j.customer_id,
+         c.name        AS customer_name,
+         c.email       AS customer_email,
+         (
+           SELECT jm.message
+           FROM job_messages jm
+           WHERE jm.job_id = j.id
+           ORDER BY jm.created_at DESC
+           LIMIT 1
+         ) AS last_message,
+         (
+           SELECT jm.created_at
+           FROM job_messages jm
+           WHERE jm.job_id = j.id
+           ORDER BY jm.created_at DESC
+           LIMIT 1
+         ) AS last_message_time,
+         (
+           SELECT COUNT(*)
+           FROM job_messages jm
+           WHERE jm.job_id = j.id
+             AND jm.sender_type = 'customer'
+         ) AS total_messages
+       FROM jobs j
+       LEFT JOIN customers c ON c.id = j.customer_id
+       WHERE j.assigned_to::text = $1
+         AND j.company_id::text = $2
+         AND j.customer_id IS NOT NULL
+         AND EXISTS (
+           SELECT 1 FROM job_messages jm WHERE jm.job_id = j.id
+         )
+       ORDER BY last_message_time DESC NULLS LAST`,
+      [String(employeeId), String(companyId)]
+    );
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching job conversations:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ─── GET /api/messages/job/:jobId ─────────────────────────────────────────────
+// Get full message history for a specific job (employee side)
+router.get('/job/:jobId', async (req, res) => {
+  try {
+    const employeeId = req.user.userId || req.user.id;
+    const companyId  = req.user.companyId;
+    const { jobId }  = req.params;
+
+    // Verify employee is assigned to this job
+    const jobCheck = await pool.query(
+      'SELECT id FROM jobs WHERE id = $1 AND assigned_to::text = $2 AND company_id::text = $3',
+      [jobId, String(employeeId), String(companyId)]
+    );
+    if (jobCheck.rows.length === 0) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    const result = await pool.query(
+      `SELECT id, sender_type, sender_id, sender_name, message, created_at
+       FROM job_messages
+       WHERE job_id = $1
+       ORDER BY created_at ASC
+       LIMIT 200`,
+      [jobId]
+    );
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching job messages:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ─── POST /api/messages/job/:jobId ────────────────────────────────────────────
+// Employee sends a message in a job chat
+router.post('/job/:jobId', async (req, res) => {
+  try {
+    const employeeId = req.user.userId || req.user.id;
+    const companyId  = req.user.companyId;
+    const { jobId }  = req.params;
+    const { message } = req.body;
+
+    if (!message || !message.trim()) {
+      return res.status(400).json({ message: 'Message cannot be empty' });
+    }
+
+    // Verify employee is assigned to this job
+    const jobCheck = await pool.query(
+      `SELECT j.id, j.customer_id, u.name AS employee_name
+       FROM jobs j
+       LEFT JOIN users u ON u.id = j.assigned_to
+       WHERE j.id = $1 AND j.assigned_to::text = $2 AND j.company_id::text = $3`,
+      [jobId, String(employeeId), String(companyId)]
+    );
+    if (jobCheck.rows.length === 0) {
+      return res.status(403).json({ message: 'Access denied — you are not assigned to this job' });
+    }
+
+    const job = jobCheck.rows[0];
+    const senderName = job.employee_name || 'Technician';
+
+    // Insert message
+    const result = await pool.query(
+      `INSERT INTO job_messages (job_id, sender_type, sender_id, sender_name, message, company_id)
+       VALUES ($1, 'employee', $2, $3, $4, $5)
+       RETURNING id, sender_type, sender_id, sender_name, message, created_at`,
+      [jobId, String(employeeId), senderName, message.trim(), String(companyId)]
+    );
+
+    const newMessage = result.rows[0];
+
+    // Publish SSE to customer portal
+    try {
+      const redisClient = require('../utils/redis');
+      if (redisClient && redisClient.status === 'ready') {
+        redisClient.publish(
+          `customer_job_events:${jobId}`,
+          JSON.stringify({ type: 'chat_message', jobId, message: newMessage })
+        ).catch(() => {});
+      }
+    } catch {}
+
+    res.status(201).json(newMessage);
+  } catch (err) {
+    console.error('Error sending job message:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 module.exports = router;

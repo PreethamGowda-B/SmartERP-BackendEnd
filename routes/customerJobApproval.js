@@ -105,8 +105,8 @@ router.get('/', authenticateToken, requireOwnerOrHr, async (req, res) => {
 
   try {
     // Build WHERE clause with correct $N placeholders
-    const conditions = ["j.company_id = $1", "j.source = 'customer'"];
-    const params = [companyId];
+    const conditions = ["j.company_id::text = $1", "j.source = 'customer'"];
+    const params = [String(companyId)];
     var idx = 2;
 
     if (approval_status) {

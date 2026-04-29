@@ -214,7 +214,7 @@ router.post('/:id/accept', authenticateToken, async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // Check job access
+    // Check job access — employee must be able to see the job
     const checkJob = await client.query(
       'SELECT * FROM jobs WHERE id = $1 AND (assigned_to = $2 OR visible_to_all = true) AND company_id = $3',
       [id, req.user.id, req.user.companyId]
@@ -225,6 +225,8 @@ router.post('/:id/accept', authenticateToken, async (req, res) => {
       return res.status(403).json({ message: 'Job not assigned to you' });
     }
 
+    // Race condition guard: only accept if employee_status is still 'assigned' (not yet accepted by anyone)
+    // The atomic UPDATE returns 0 rows if another employee already accepted
     const result = await client.query(
       `UPDATE jobs
        SET employee_status = 'accepted',
@@ -233,9 +235,24 @@ router.post('/:id/accept', authenticateToken, async (req, res) => {
            status          = 'active',
            assigned_to     = $2
        WHERE id = $1
+         AND (employee_status = 'assigned' OR employee_status IS NULL OR employee_status = 'pending')
        RETURNING *`,
       [id, req.user.id]
     );
+
+    if (result.rowCount === 0) {
+      await client.query('ROLLBACK');
+      // Check current state to give a meaningful error
+      const current = await pool.query('SELECT employee_status, assigned_to FROM jobs WHERE id = $1', [id]);
+      const cur = current.rows[0];
+      if (cur && cur.employee_status === 'accepted' && cur.assigned_to !== req.user.id) {
+        return res.status(409).json({ message: 'Job already accepted by another employee' });
+      }
+      if (cur && cur.employee_status === 'accepted' && cur.assigned_to === req.user.id) {
+        return res.status(409).json({ message: 'You have already accepted this job' });
+      }
+      return res.status(409).json({ message: 'Job is no longer available for acceptance' });
+    }
 
     const acceptedJob = result.rows[0];
 

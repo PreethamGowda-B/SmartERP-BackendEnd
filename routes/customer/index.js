@@ -14,6 +14,7 @@ router.use('/auth', require('./auth'));
 
 // ── Protected routes — require valid customer JWT ─────────────────────────────
 router.use('/jobs', authenticateCustomer, require('./jobs'));
+router.use('/jobs/:id/messages', authenticateCustomer, require('./chat'));
 router.use('/profile', authenticateCustomer, require('./profile'));
 router.use('/recurring', authenticateCustomer, require('./recurring'));
 

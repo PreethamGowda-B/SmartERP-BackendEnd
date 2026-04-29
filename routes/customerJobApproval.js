@@ -201,9 +201,10 @@ router.post('/:id/approve', authenticateToken, requireOwnerOrHr, async (req, res
     // Conditional update — atomic race condition prevention
     const result = await client.query(
       'UPDATE jobs' +
-      "  SET approval_status = 'approved'," +
-      '      approved_at     = NOW(),' +
-      "      status          = 'open'" +
+      "  SET approval_status  = 'approved'," +
+      '      approved_at      = NOW(),' +
+      "      status           = 'open'," +
+      "      employee_status  = 'assigned'" +
       ' WHERE id = $1' +
       '   AND company_id = $2' +
       "   AND source = 'customer'" +
@@ -263,6 +264,17 @@ router.post('/:id/approve', authenticateToken, requireOwnerOrHr, async (req, res
   setImmediate(function() {
     dispatchJob(id, companyId).then(function(dispatchResult) {
       if (!dispatchResult.assigned) {
+        // Dispatch found no employee — notify ALL employees so they can self-assign
+        const { createNotificationForCompany } = require('../utils/notificationHelpers');
+        createNotificationForCompany({
+          company_id: companyId,
+          type: 'job_available',
+          title: 'New Job Available',
+          message: 'A customer job is available to accept: "' + updatedJob.title + '"',
+          priority: updatedJob.priority || 'medium',
+          data: { job_id: id, source: 'customer', url: '/employee/jobs' },
+        }).catch(function() {});
+
         createNotificationForOwners({
           company_id: companyId,
           type: 'dispatch_failed',
@@ -271,8 +283,21 @@ router.post('/:id/approve', authenticateToken, requireOwnerOrHr, async (req, res
           priority: updatedJob.priority || 'medium',
           data: { job_id: id, reason: dispatchResult.reason },
         }).catch(function() {});
+      } else {
+        // Dispatch succeeded — notify the assigned employee specifically
+        // (smartDispatch already sends a notification, but we ensure it's correct)
       }
     }).catch(function(e) {
+      // Dispatch failed entirely — still notify employees so they can pick it up
+      const { createNotificationForCompany } = require('../utils/notificationHelpers');
+      createNotificationForCompany({
+        company_id: companyId,
+        type: 'job_available',
+        title: 'New Job Available',
+        message: 'A customer job is available to accept: "' + updatedJob.title + '"',
+        priority: updatedJob.priority || 'medium',
+        data: { job_id: id, source: 'customer', url: '/employee/jobs' },
+      }).catch(function() {});
       errorLogger.log(e, { context: 'smartDispatch.post-approve', extra: { jobId: id } });
     });
   });

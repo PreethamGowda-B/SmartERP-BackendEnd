@@ -71,20 +71,26 @@ async function generateInvoice(jobId, companyId) {
       laborHours = parseFloat(laborHours.toFixed(2));
     }
 
-    // 5. Get company rates (outside transaction is fine — read-only)
-    const [hourlyRateRow, serviceChargeRow] = await Promise.all([
-      pool.query(
-        `SELECT setting_value FROM company_settings WHERE company_id = $1 AND setting_key = 'hourly_rate'`,
-        [companyId]
-      ),
-      pool.query(
-        `SELECT setting_value FROM company_settings WHERE company_id = $1 AND setting_key = 'service_charge'`,
-        [companyId]
-      ),
-    ]);
-
-    const hourlyRate    = parseFloat(hourlyRateRow.rows[0]?.setting_value)    || 50;
-    const serviceCharge = parseFloat(serviceChargeRow.rows[0]?.setting_value) || 0;
+    // 5. Get company rates — wrapped in try/catch: company_id may be non-UUID in legacy envs
+    let hourlyRate    = 50;
+    let serviceCharge = 0;
+    try {
+      const [hourlyRateRow, serviceChargeRow] = await Promise.all([
+        pool.query(
+          `SELECT setting_value FROM company_settings WHERE company_id = $1 AND setting_key = 'hourly_rate'`,
+          [companyId]
+        ),
+        pool.query(
+          `SELECT setting_value FROM company_settings WHERE company_id = $1 AND setting_key = 'service_charge'`,
+          [companyId]
+        ),
+      ]);
+      hourlyRate    = parseFloat(hourlyRateRow.rows[0]?.setting_value)    || 50;
+      serviceCharge = parseFloat(serviceChargeRow.rows[0]?.setting_value) || 0;
+    } catch (rateErr) {
+      // Non-UUID company_id or missing table — use defaults, don't crash
+      console.warn(`billingService: company_settings query failed for job ${jobId} (using defaults):`, rateErr.message);
+    }
     const laborCost     = parseFloat((laborHours * hourlyRate).toFixed(2));
 
     // 6. Sum materials cost

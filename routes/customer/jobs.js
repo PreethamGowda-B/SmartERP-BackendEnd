@@ -179,12 +179,19 @@ router.post('/', [
     const priorityOverridden = !!(priority && aiSuggestedPriority && priority !== aiSuggestedPriority);
 
     // ── Check auto_approve_customer_jobs setting ──────────────────────────────
-    const settingResult = await pool.query(
-      `SELECT setting_value FROM company_settings
-       WHERE company_id = $1 AND setting_key = 'auto_approve_customer_jobs'`,
-      [companyId]
-    );
-    const autoApprove = settingResult.rows[0]?.setting_value === 'true';
+    // Guard: company_id may be a non-UUID value — wrap in try/catch to avoid 500
+    let autoApprove = false;
+    try {
+      const settingResult = await pool.query(
+        `SELECT setting_value FROM company_settings
+         WHERE company_id = $1 AND setting_key = 'auto_approve_customer_jobs'`,
+        [companyId]
+      );
+      autoApprove = settingResult.rows[0]?.setting_value === 'true';
+    } catch (settingErr) {
+      // Non-UUID company_id or missing table — default to pending_approval
+      console.warn('auto_approve setting check skipped (non-fatal):', settingErr.message);
+    }
     const approvalStatus = autoApprove ? 'approved' : 'pending_approval';
     const approvedAt = autoApprove ? new Date() : null;
 

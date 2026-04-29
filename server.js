@@ -143,6 +143,11 @@ app.use(express.json({
   }
 }));
 
+// ✅ Passport — required for customer Google OAuth (customer-google strategy)
+// session: false because we use stateless JWT cookies, not server-side sessions
+const passport = require('passport');
+app.use(passport.initialize());
+
 // ✅ Anti-CSRF Protection (Stateless Alternative for SPAs)
 // We enforce strong Cross-Origin checks for mutually secure cookies.
 if (process.env.NODE_ENV === "production") {

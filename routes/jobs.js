@@ -401,7 +401,8 @@ router.post('/:id/progress', authenticateToken, async (req, res) => {
       `UPDATE jobs 
        SET progress = $1, 
            status = $2,
-           completed_at = $3
+           completed_at = $3,
+           employee_status = CASE WHEN $1 = 100 THEN 'completed' ELSE employee_status END
        WHERE id = $4
        RETURNING *`,
       [progress, status, completed_at, id]

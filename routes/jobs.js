@@ -167,7 +167,9 @@ router.get('/', authenticateToken, async (req, res) => {
         [String(req.user.companyId), req.user.id]
       );
       result = await pool.query(
-        `SELECT j.* FROM jobs j
+        `SELECT j.*, u.name as assigned_employee_name
+         FROM jobs j
+         LEFT JOIN users u ON j.assigned_to = u.id
          WHERE ${empWhere}
          ORDER BY j.created_at DESC
          LIMIT $3 OFFSET $4`,
@@ -213,6 +215,7 @@ router.get('/', authenticateToken, async (req, res) => {
         customer_id: r.customer_id || null,
         company_id: r.company_id || null,
         started_at: r.started_at || null,
+        assigned_employee_name: r.assigned_employee_name || null,
       };
     });
 

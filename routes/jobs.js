@@ -51,8 +51,8 @@ router.post('/', authenticateToken, [
   try {
     const result = await pool.query(
       `INSERT INTO jobs 
-       (title, description, assigned_to, created_by, company_id, data, visible_to_all, status, priority)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       (title, description, assigned_to, created_by, company_id, data, visible_to_all, status, priority, employee_status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'assigned')
        RETURNING *`,
       [
         title,
@@ -158,7 +158,7 @@ router.get('/', authenticateToken, async (req, res) => {
           OR assigned_to = $2
           OR (employee_status = 'assigned' AND assigned_to IS NULL)
         )
-        AND (source != 'customer' OR COALESCE(approval_status, 'approved') = 'approved')
+        AND (source IS NULL OR source != 'customer' OR COALESCE(approval_status, 'approved') = 'approved')
         AND (status NOT IN ('cancelled') OR assigned_to = $2)
       `;
       countResult = await pool.query(

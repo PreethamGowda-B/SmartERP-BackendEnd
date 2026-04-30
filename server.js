@@ -223,6 +223,18 @@ async function fixDatabaseConstraints() {
       console.log(`✅ Updated ${updateResult.rowCount} jobs with invalid status`);
     }
 
+    // FIX 4: Backfill NULL approval_status and employee_status so API returns real values
+    await pool.query(`
+      UPDATE jobs SET approval_status = 'pending_approval'
+      WHERE approval_status IS NULL AND source = 'customer';
+
+      UPDATE jobs SET approval_status = 'approved'
+      WHERE approval_status IS NULL AND source != 'customer';
+
+      UPDATE jobs SET employee_status = 'assigned'
+      WHERE employee_status IS NULL AND status NOT IN ('completed', 'cancelled');
+    `).catch(e => console.warn('⚠️ NULL backfill skipped:', e.message));
+
     // Step 2: Drop old constraint
     await pool.query(`ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_status_check`);
 

@@ -140,6 +140,7 @@ router.get('/', authenticateToken, requireOwnerOrHr, async (req, res) => {
     const offsetIdx = idx + 1;
 
     const listSql =
+      'SELECT' +
       '  j.id, j.title, j.description, j.priority,' +
       '  j.approval_status,' +
       '  j.status, j.employee_status,' +

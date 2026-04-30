@@ -153,7 +153,7 @@ router.get('/', authenticateToken, async (req, res) => {
         `SELECT COUNT(*) FROM jobs
          WHERE company_id::text = $1
            AND (
-             (employee_status = 'assigned' AND (visible_to_all = true OR assigned_to IS NULL))
+             ((employee_status = 'assigned' OR employee_status IS NULL) AND (visible_to_all = true OR assigned_to IS NULL))
              OR assigned_to = $2
            )
            AND (source != 'customer' OR approval_status = 'approved')
@@ -165,7 +165,7 @@ router.get('/', authenticateToken, async (req, res) => {
          FROM jobs j
          WHERE j.company_id::text = $1
            AND (
-             (j.employee_status = 'assigned' AND (j.visible_to_all = true OR j.assigned_to IS NULL))
+             ((j.employee_status = 'assigned' OR j.employee_status IS NULL) AND (j.visible_to_all = true OR j.assigned_to IS NULL))
              OR j.assigned_to = $2
            )
            AND (j.source != 'customer' OR j.approval_status = 'approved')

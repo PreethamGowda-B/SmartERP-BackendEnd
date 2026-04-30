@@ -164,15 +164,15 @@ router.get('/jobs/:id/events', authenticateSSE, async (req, res) => {
         console.warn('SSE Redis subscriber error:', err.message);
       });
 
+      subscriber.on('end', () => {
+        // Connection ended gracefully — cleanup handled by req.on('close')
+      });
+
       // Cleanup on client disconnect (Requirement 11.8)
       req.on('close', () => {
         clearInterval(keepAliveInterval);
-        try {
-          subscriber.unsubscribe(channel);
-          subscriber.disconnect();
-        } catch (cleanupErr) {
-          console.error('SSE cleanup error:', cleanupErr.message);
-        }
+        try { subscriber.unsubscribe(channel); } catch {}
+        try { subscriber.disconnect(); } catch {}
         console.log(`SSE connection closed for job ${jobId}, user ${userId}`);
       });
 

@@ -9,7 +9,9 @@ try {
       retryStrategy(times) {
         if (times > 3) return null; // stop retrying after 3 attempts
         return Math.min(times * 200, 1000);
-      }
+      },
+      // Prevent ioredis from throwing unhandled rejections on connection close
+      enableOfflineQueue: false,
     });
 
     redisClient.on("error", (err) => {
@@ -18,6 +20,14 @@ try {
 
     redisClient.on("connect", () => {
       console.log("🚀 Redis connected successfully");
+    });
+
+    redisClient.on("close", () => {
+      console.warn("⚠️ Redis connection closed");
+    });
+
+    redisClient.on("end", () => {
+      console.warn("⚠️ Redis connection ended");
     });
   }
 } catch (e) {

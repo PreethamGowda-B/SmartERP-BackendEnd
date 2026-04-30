@@ -15,10 +15,10 @@ router.get('/', authenticateToken, async (req, res) => {
 
     const result = await pool.query(
       `SELECT * FROM notifications 
-       WHERE user_id = $1 AND company_id = $2 
+       WHERE user_id = $1 AND company_id::text = $2 
        ORDER BY created_at DESC 
        LIMIT 100`,
-      [userId, companyId]
+      [userId, String(companyId)]
     );
 
     console.log(`✅ Found ${result.rows.length} notifications`);
@@ -39,8 +39,8 @@ router.get('/unread-count', authenticateToken, async (req, res) => {
     const result = await pool.query(
       `SELECT COUNT(*) as count 
        FROM notifications 
-       WHERE user_id = $1 AND company_id = $2 AND read = FALSE`,
-      [userId, companyId]
+       WHERE user_id = $1 AND company_id::text = $2 AND read = FALSE`,
+      [userId, String(companyId)]
     );
 
     res.json({ count: parseInt(result.rows[0].count) });
@@ -110,10 +110,16 @@ router.get('/sse', authenticateToken, (req, res) => {
         console.warn('SSE Redis subscriber error (non-fatal):', err.message);
       });
 
+      // Swallow unhandled promise rejections from ioredis internal operations
+      subscriber.on('end', () => {
+        // Connection ended — cleanup already handled by req.on('close')
+      });
+
       req.on('close', () => {
         console.log(`📡 SSE connection closed for user ${userId}`);
         clearInterval(heartbeatInterval);
-        try { subscriber.unsubscribe(channel); subscriber.disconnect(); } catch {}
+        try { subscriber.unsubscribe(channel); } catch {}
+        try { subscriber.disconnect(); } catch {}
       });
 
       return; // Keep connection open — cleanup handled by req.on('close')
@@ -139,9 +145,9 @@ router.patch('/mark-all-read', authenticateToken, async (req, res) => {
     const result = await pool.query(
       `UPDATE notifications 
        SET read = TRUE 
-       WHERE user_id = $1 AND company_id = $2 AND read = FALSE 
+       WHERE user_id = $1 AND company_id::text = $2 AND read = FALSE 
        RETURNING id`,
-      [userId, companyId]
+      [userId, String(companyId)]
     );
 
     console.log(`✅ Marked ${result.rows.length} notifications as read`);

@@ -31,6 +31,8 @@ async function mapRowToEmployee(row) {
     department: row.department || null,
     is_active: row.is_active !== false,
     role: row.role || 'employee',
+    rating: row.rating ? parseFloat(row.rating) : null,
+    review_count: row.review_count ? parseInt(row.review_count) : 0,
   };
 }
 
@@ -42,10 +44,17 @@ router.get('/', DEV ? (req, res, next) => next() : authenticateToken, async (req
       return res.status(400).json({ message: 'No company associated with your account' });
     }
     const result = await pool.query(
-      `SELECT u.id, u.name, u.email, u.role, u.created_at, p.phone, p.position, p.department, p.hire_date, p.is_active, p.created_at AS profile_created_at
+      `SELECT u.id, u.name, u.email, u.role, u.created_at,
+              p.phone, p.position, p.department, p.hire_date, p.is_active,
+              p.created_at AS profile_created_at,
+              ROUND(AVG(r.rating)::numeric, 1) AS rating,
+              COUNT(r.id)::int AS review_count
        FROM users u
        LEFT JOIN employee_profiles p ON u.id = p.user_id
+       LEFT JOIN job_reviews r ON r.employee_id = u.id
        WHERE u.company_id = $1 AND u.role != 'owner' AND u.role != 'admin'
+       GROUP BY u.id, u.name, u.email, u.role, u.created_at,
+                p.phone, p.position, p.department, p.hire_date, p.is_active, p.created_at
        ORDER BY u.created_at DESC NULLS LAST`,
       [companyId]
     );

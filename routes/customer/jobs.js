@@ -30,10 +30,10 @@ const redisClient = require('../../utils/redis');
 const {
   createNotificationForOwners,
 } = require('../../utils/notificationHelpers');
-const { dispatchJob }          = require('../../services/smartDispatch');
+const { dispatchJob } = require('../../services/smartDispatch');
 const { getSuggestedPriority } = require('../../services/autoPriorityService');
-const auditService  = require('../../services/auditService');
-const errorLogger   = require('../../utils/errorLogger');
+const auditService = require('../../services/auditService');
+const errorLogger = require('../../utils/errorLogger');
 
 // ─── Section 8: Standardized response helpers ─────────────────────────────────
 function ok(res, data, statusCode = 200) {
@@ -61,10 +61,10 @@ function auditLog(req, customerId, action, details, companyId) {
 // ─── GET / — list own jobs ────────────────────────────────────────────────────
 router.get('/', async (req, res) => {
   const customerId = req.customer.id;
-  const companyId  = req.customer.companyId;
+  const companyId = req.customer.companyId;
 
-  const page   = Math.max(1, parseInt(req.query.page)  || 1);
-  const limit  = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
+  const page = Math.max(1, parseInt(req.query.page) || 1);
+  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
   const offset = (page - 1) * limit;
 
   try {
@@ -73,7 +73,7 @@ router.get('/', async (req, res) => {
         `SELECT
            j.id, j.title, j.description,
            j.status,
-           COALESCE(j.approval_status, 'approved') AS approval_status,
+           j.approval_status,
            j.employee_status,
            j.priority, j.ai_suggested_priority,
            j.progress, j.assigned_to,
@@ -97,7 +97,7 @@ router.get('/', async (req, res) => {
     ]);
 
     return ok(res, {
-      jobs:  listResult.rows,
+      jobs: listResult.rows,
       total: parseInt(countResult.rows[0].count),
       page,
       limit,
@@ -262,7 +262,7 @@ router.post('/', [
 // NOTE: must be registered BEFORE GET /:id to prevent 'notifications' matching as a UUID param
 router.get('/notifications', async (req, res) => {
   const customerId = req.customer.id;
-  const companyId  = req.customer.companyId;
+  const companyId = req.customer.companyId;
   const limit = Math.min(50, parseInt(req.query.limit) || 20);
 
   try {
@@ -287,8 +287,8 @@ router.get('/notifications', async (req, res) => {
 // ─── GET /:id — single job detail ─────────────────────────────────────────────
 router.get('/:id', async (req, res) => {
   const customerId = req.customer.id;
-  const companyId  = req.customer.companyId;
-  const { id }     = req.params;
+  const companyId = req.customer.companyId;
+  const { id } = req.params;
 
   try {
     const result = await pool.query(
@@ -374,7 +374,7 @@ router.get('/:id/tracking', async (req, res) => {
     return ok(res, {
       available: true,
       employeeName: loc.name,
-      latitude:  loc.latitude  ? parseFloat(loc.latitude)  : null,
+      latitude: loc.latitude ? parseFloat(loc.latitude) : null,
       longitude: loc.longitude ? parseFloat(loc.longitude) : null,
       location_updated_at: loc.location_updated_at || null,
       is_online: loc.location_updated_at
@@ -390,8 +390,8 @@ router.get('/:id/tracking', async (req, res) => {
 // ─── GET /:id/invoice — invoice for completed job ─────────────────────────────
 router.get('/:id/invoice', async (req, res) => {
   const customerId = req.customer.id;
-  const companyId  = req.customer.companyId;
-  const { id }     = req.params;
+  const companyId = req.customer.companyId;
+  const { id } = req.params;
 
   try {
     // Ownership check first
@@ -426,8 +426,8 @@ router.get('/:id/invoice', async (req, res) => {
 // ─── GET /:id/materials — materials used on a job ─────────────────────────────
 router.get('/:id/materials', async (req, res) => {
   const customerId = req.customer.id;
-  const companyId  = req.customer.companyId;
-  const { id }     = req.params;
+  const companyId = req.customer.companyId;
+  const { id } = req.params;
 
   try {
     // Ownership check

@@ -161,10 +161,7 @@ router.get('/', authenticateToken, async (req, res) => {
         [String(req.user.companyId), req.user.id]
       );
       result = await pool.query(
-        `SELECT j.*,
-                j.approval_status,
-                j.employee_status,
-                j.review_status
+        `SELECT j.*
          FROM jobs j
          WHERE j.company_id::text = $1
            AND (

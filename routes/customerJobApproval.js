@@ -21,16 +21,16 @@
 'use strict';
 
 const express = require('express');
-const router  = express.Router();
-const crypto  = require('crypto');
+const router = express.Router();
+const crypto = require('crypto');
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
-const { dispatchJob }       = require('../services/smartDispatch');
+const { dispatchJob } = require('../services/smartDispatch');
 const { createNotificationForOwners } = require('../utils/notificationHelpers');
-const auditService  = require('../services/auditService');
-const slaService    = require('../services/slaService');
-const errorLogger   = require('../utils/errorLogger');
-const redisClient   = require('../utils/redis');
+const auditService = require('../services/auditService');
+const slaService = require('../services/slaService');
+const errorLogger = require('../utils/errorLogger');
+const redisClient = require('../utils/redis');
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -66,7 +66,7 @@ function notifyCustomer(customerId, companyId, opts) {
       JSON.stringify({ customer_id: customerId, title, message, job_id: jobId }),
       companyId,
     ]
-  ).catch(function(e) { console.error('notifyCustomer error:', e.message); });
+  ).catch(function (e) { console.error('notifyCustomer error:', e.message); });
 }
 
 /** Publish SSE event to customer portal (non-blocking, post-commit) */
@@ -74,7 +74,7 @@ function publishSSE(jobId, payload) {
   if (!redisClient || redisClient.status !== 'ready') return;
   var event = Object.assign({}, payload, { event_id: sseEventId(), timestamp: new Date().toISOString() });
   redisClient.publish('customer_job_events:' + jobId, JSON.stringify(event))
-    .catch(function(e) { console.error('SSE publish error:', e.message); });
+    .catch(function (e) { console.error('SSE publish error:', e.message); });
 }
 
 function upsertSetting(companyId, key, value, userId) {
@@ -93,15 +93,15 @@ function upsertSetting(companyId, key, value, userId) {
 router.get('/', authenticateToken, requireOwnerOrHr, async (req, res) => {
   const companyId = req.user.companyId;
   const approval_status = req.query.approval_status;
-  const priority        = req.query.priority;
-  const date_from       = req.query.date_from;
-  const date_to         = req.query.date_to;
-  const page  = req.query.page  || 1;
+  const priority = req.query.priority;
+  const date_from = req.query.date_from;
+  const date_to = req.query.date_to;
+  const page = req.query.page || 1;
   const limit = req.query.limit || 50;
 
-  const pageNum  = Math.max(1, parseInt(page)  || 1);
+  const pageNum = Math.max(1, parseInt(page) || 1);
   const limitNum = Math.min(100, Math.max(1, parseInt(limit) || 50));
-  const offset   = (pageNum - 1) * limitNum;
+  const offset = (pageNum - 1) * limitNum;
 
   try {
     // Build WHERE clause with correct $N placeholders
@@ -112,7 +112,7 @@ router.get('/', authenticateToken, requireOwnerOrHr, async (req, res) => {
     if (approval_status) {
       // Section 7: NULL treated as 'approved'
       if (approval_status === 'approved') {
-        conditions.push('(j.approval_status = $' + idx + ' OR j.approval_status IS NULL)');
+        conditions.push('j.approval_status = $' + idx);
       } else {
         conditions.push('j.approval_status = $' + idx);
       }
@@ -136,13 +136,12 @@ router.get('/', authenticateToken, requireOwnerOrHr, async (req, res) => {
     }
 
     const where = conditions.join(' AND ');
-    const limitIdx  = idx;
+    const limitIdx = idx;
     const offsetIdx = idx + 1;
 
     const listSql =
-      'SELECT' +
       '  j.id, j.title, j.description, j.priority,' +
-      "  COALESCE(j.approval_status, 'approved') AS approval_status," +
+      '  j.approval_status,' +
       '  j.status, j.employee_status,' +
       '  j.created_at, j.approved_at, j.rejected_at, j.assigned_at,' +
       '  j.started_at, j.completed_at,' +
@@ -158,7 +157,7 @@ router.get('/', authenticateToken, requireOwnerOrHr, async (req, res) => {
       ' LEFT JOIN users u        ON u.id    = j.assigned_to' +
       ' WHERE ' + where +
       ' ORDER BY' +
-      "   CASE COALESCE(j.approval_status, 'approved')" +
+      '   CASE j.approval_status' +
       "     WHEN 'pending_approval' THEN 0" +
       "     WHEN 'approved'         THEN 1" +
       '     ELSE 2' +
@@ -169,14 +168,14 @@ router.get('/', authenticateToken, requireOwnerOrHr, async (req, res) => {
     const listParams = params.concat([limitNum, offset]);
 
     const countResult = await pool.query('SELECT COUNT(*) FROM jobs j WHERE ' + where, params);
-    const listResult  = await pool.query(listSql, listParams);
+    const listResult = await pool.query(listSql, listParams);
 
     console.log('[customerJobApproval.GET /] fetched', listResult.rows.length, 'jobs for company', companyId);
 
     return ok(res, {
-      jobs:  listResult.rows,
+      jobs: listResult.rows,
       total: parseInt(countResult.rows[0].count),
-      page:  pageNum,
+      page: pageNum,
       limit: limitNum,
     });
   } catch (err) {
@@ -190,7 +189,7 @@ router.get('/', authenticateToken, requireOwnerOrHr, async (req, res) => {
 // Section 2: Dispatch triggered ONLY after COMMIT
 router.post('/:id/approve', authenticateToken, requireOwnerOrHr, async (req, res) => {
   const companyId = req.user.companyId;
-  const id        = req.params.id;
+  const id = req.params.id;
 
   const client = await pool.connect();
   var updatedJob = null;
@@ -209,22 +208,15 @@ router.post('/:id/approve', authenticateToken, requireOwnerOrHr, async (req, res
       ' WHERE id = $1' +
       '   AND company_id::text = $2' +
       "   AND source = 'customer'" +
-      "   AND COALESCE(approval_status, 'pending_approval') = 'pending_approval'" +
+      "   AND approval_status = 'pending_approval'" +
       ' RETURNING id, title, customer_id, priority, approval_status',
       [id, String(companyId)]
     );
 
     if (result.rowCount === 0) {
       await client.query('ROLLBACK');
-      const check = await pool.query(
-        "SELECT COALESCE(approval_status, 'pending_approval') AS approval_status" +
-        ' FROM jobs WHERE id = $1 AND company_id::text = $2',
-        [id, String(companyId)]
-      );
-      if (check.rows.length === 0) return fail(res, 'Job not found', 404);
-      const cur = check.rows[0].approval_status;
-      if (cur === 'approved')  return fail(res, 'Job was already approved', 409);
-      if (cur === 'rejected')  return fail(res, 'Cannot approve a rejected job', 400);
+      if (cur === 'approved') return fail(res, 'Job was already approved', 409);
+      if (cur === 'rejected') return fail(res, 'Cannot approve a rejected job', 400);
       return fail(res, 'Job could not be approved in its current state', 409);
     }
 
@@ -236,7 +228,7 @@ router.post('/:id/approve', authenticateToken, requireOwnerOrHr, async (req, res
     console.log('[customerJobApproval.approve] Job', id, 'approved. approval_status =', updatedJob.approval_status);
 
   } catch (err) {
-    await client.query('ROLLBACK').catch(function() {});
+    await client.query('ROLLBACK').catch(function () { });
     errorLogger.logFromRequest(req, err, { context: 'customerJobApproval.approve', extra: { jobId: id } });
     return fail(res, 'Server error');
   } finally {
@@ -250,7 +242,7 @@ router.post('/:id/approve', authenticateToken, requireOwnerOrHr, async (req, res
     actionType: 'job_approved', entityType: 'job', entityId: id,
     oldValue: { approval_status: 'pending_approval' },
     newValue: { approval_status: 'approved', approved_by: req.user.id },
-  }).catch(function() {});
+  }).catch(function () { });
 
   if (updatedJob.customer_id) {
     notifyCustomer(updatedJob.customer_id, companyId, {
@@ -262,8 +254,8 @@ router.post('/:id/approve', authenticateToken, requireOwnerOrHr, async (req, res
     publishSSE(id, { type: 'job_approved', jobId: id, approvedAt: new Date().toISOString() });
   }
 
-  setImmediate(function() {
-    dispatchJob(id, companyId).then(function(dispatchResult) {
+  setImmediate(function () {
+    dispatchJob(id, companyId).then(function (dispatchResult) {
       if (!dispatchResult.assigned) {
         // Dispatch found no employee — notify ALL employees so they can self-assign
         const { createNotificationForCompany } = require('../utils/notificationHelpers');
@@ -274,7 +266,7 @@ router.post('/:id/approve', authenticateToken, requireOwnerOrHr, async (req, res
           message: 'A customer job is available to accept: "' + updatedJob.title + '"',
           priority: updatedJob.priority || 'medium',
           data: { job_id: id, source: 'customer', url: '/employee/jobs' },
-        }).catch(function() {});
+        }).catch(function () { });
 
         createNotificationForOwners({
           company_id: companyId,
@@ -283,12 +275,12 @@ router.post('/:id/approve', authenticateToken, requireOwnerOrHr, async (req, res
           message: 'Job "' + updatedJob.title + '" approved but no employee could be auto-assigned. Please assign manually.',
           priority: updatedJob.priority || 'medium',
           data: { job_id: id, reason: dispatchResult.reason },
-        }).catch(function() {});
+        }).catch(function () { });
       } else {
         // Dispatch succeeded — notify the assigned employee specifically
         // (smartDispatch already sends a notification, but we ensure it's correct)
       }
-    }).catch(function(e) {
+    }).catch(function (e) {
       // Dispatch failed entirely — still notify employees so they can pick it up
       const { createNotificationForCompany } = require('../utils/notificationHelpers');
       createNotificationForCompany({
@@ -298,7 +290,7 @@ router.post('/:id/approve', authenticateToken, requireOwnerOrHr, async (req, res
         message: 'A customer job is available to accept: "' + updatedJob.title + '"',
         priority: updatedJob.priority || 'medium',
         data: { job_id: id, source: 'customer', url: '/employee/jobs' },
-      }).catch(function() {});
+      }).catch(function () { });
       errorLogger.log(e, { context: 'smartDispatch.post-approve', extra: { jobId: id } });
     });
   });
@@ -309,8 +301,8 @@ router.post('/:id/approve', authenticateToken, requireOwnerOrHr, async (req, res
 // ─── POST /:id/reject ─────────────────────────────────────────────────────────
 router.post('/:id/reject', authenticateToken, requireOwnerOrHr, async (req, res) => {
   const companyId = req.user.companyId;
-  const id        = req.params.id;
-  const reason    = req.body.reason;
+  const id = req.params.id;
+  const reason = req.body.reason;
 
   const client = await pool.connect();
   var updatedJob = null;
@@ -326,7 +318,7 @@ router.post('/:id/reject', authenticateToken, requireOwnerOrHr, async (req, res)
       ' WHERE id = $1' +
       '   AND company_id::text = $2' +
       "   AND source = 'customer'" +
-      "   AND COALESCE(approval_status, 'pending_approval') = 'pending_approval'" +
+      "   AND approval_status = 'pending_approval'" +
       ' RETURNING id, title, customer_id',
       [id, String(companyId)]
     );
@@ -334,7 +326,7 @@ router.post('/:id/reject', authenticateToken, requireOwnerOrHr, async (req, res)
     if (result.rowCount === 0) {
       await client.query('ROLLBACK');
       const check = await pool.query(
-        "SELECT COALESCE(approval_status, 'pending_approval') AS approval_status" +
+        "SELECT approval_status" +
         ' FROM jobs WHERE id = $1 AND company_id::text = $2',
         [id, String(companyId)]
       );
@@ -349,7 +341,7 @@ router.post('/:id/reject', authenticateToken, requireOwnerOrHr, async (req, res)
     await client.query('COMMIT');
 
   } catch (err) {
-    await client.query('ROLLBACK').catch(function() {});
+    await client.query('ROLLBACK').catch(function () { });
     errorLogger.logFromRequest(req, err, { context: 'customerJobApproval.reject', extra: { jobId: id } });
     return fail(res, 'Server error');
   } finally {
@@ -361,7 +353,7 @@ router.post('/:id/reject', authenticateToken, requireOwnerOrHr, async (req, res)
     actionType: 'job_rejected', entityType: 'job', entityId: id,
     oldValue: { approval_status: 'pending_approval' },
     newValue: { approval_status: 'rejected', rejected_by: req.user.id, reason: reason || null },
-  }).catch(function() {});
+  }).catch(function () { });
 
   if (updatedJob.customer_id) {
     notifyCustomer(updatedJob.customer_id, companyId, {
@@ -390,7 +382,7 @@ router.get('/settings', authenticateToken, requireOwnerOrHr, async (req, res) =>
   // Safe defaults — returned whenever the DB query fails or returns no rows
   const DEFAULT_SETTINGS = {
     auto_approve_customer_jobs: false,
-    hourly_rate:    50,
+    hourly_rate: 50,
     service_charge: 0,
     sla: { max_accept_time: 15, max_completion_time: 240 },
   };
@@ -404,7 +396,7 @@ router.get('/settings', authenticateToken, requireOwnerOrHr, async (req, res) =>
       "   AND setting_key IN ('auto_approve_customer_jobs', 'hourly_rate', 'service_charge')",
       [companyId]
     );
-    settingsResult.rows.forEach(function(r) { settingsMap[r.setting_key] = r.setting_value; });
+    settingsResult.rows.forEach(function (r) { settingsMap[r.setting_key] = r.setting_value; });
     console.log('[customerJobApproval.GET /settings] fetched settings for company', companyId, settingsMap);
   } catch (settingsErr) {
     // Non-UUID company_id or missing table — use defaults, don't crash
@@ -421,7 +413,7 @@ router.get('/settings', authenticateToken, requireOwnerOrHr, async (req, res) =>
 
   return ok(res, {
     auto_approve_customer_jobs: settingsMap.auto_approve_customer_jobs === 'true',
-    hourly_rate:    parseFloat(settingsMap.hourly_rate)    || DEFAULT_SETTINGS.hourly_rate,
+    hourly_rate: parseFloat(settingsMap.hourly_rate) || DEFAULT_SETTINGS.hourly_rate,
     service_charge: parseFloat(settingsMap.service_charge) || DEFAULT_SETTINGS.service_charge,
     sla: slaConfig,
   });
@@ -434,10 +426,10 @@ router.put('/settings', authenticateToken, async (req, res) => {
   }
   const companyId = req.user.companyId;
   const auto_approve_customer_jobs = req.body.auto_approve_customer_jobs;
-  const hourly_rate                = req.body.hourly_rate;
-  const service_charge             = req.body.service_charge;
-  const sla_max_accept_time        = req.body.sla_max_accept_time;
-  const sla_max_completion_time    = req.body.sla_max_completion_time;
+  const hourly_rate = req.body.hourly_rate;
+  const service_charge = req.body.service_charge;
+  const sla_max_accept_time = req.body.sla_max_accept_time;
+  const sla_max_completion_time = req.body.sla_max_completion_time;
 
   try {
     const updates = [];
@@ -469,7 +461,7 @@ router.put('/settings', authenticateToken, async (req, res) => {
       companyId, userId: req.user.id, actorType: 'user',
       actionType: 'company_settings_updated', entityType: 'company', entityId: companyId,
       newValue: req.body,
-    }).catch(function() {});
+    }).catch(function () { });
 
     return ok(res, { updated: true });
   } catch (err) {
@@ -482,11 +474,11 @@ router.put('/settings', authenticateToken, async (req, res) => {
 router.get('/sla-metrics', authenticateToken, requireOwnerOrHr, async (req, res) => {
   const companyId = req.user.companyId;
   const start_date = req.query.start_date;
-  const end_date   = req.query.end_date;
+  const end_date = req.query.end_date;
   try {
     const metrics = await slaService.getSlaMetrics(companyId, {
       startDate: start_date ? new Date(start_date) : undefined,
-      endDate:   end_date   ? new Date(end_date)   : undefined,
+      endDate: end_date ? new Date(end_date) : undefined,
     });
     return ok(res, metrics);
   } catch (err) {

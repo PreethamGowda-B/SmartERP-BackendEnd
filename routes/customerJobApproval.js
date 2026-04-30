@@ -118,7 +118,7 @@ router.get('/', authenticateToken, requireOwnerOrHr, async (req, res) => {
 
   try {
     // Build WHERE clause with correct $N placeholders
-    const conditions = ["j.company_id::text = $1", "j.source = 'customer'"];
+    const conditions = ["(j.company_id::text = $1 OR j.company_id IN (SELECT id FROM companies WHERE id::text = $1))", "j.source = 'customer'"];
     const params = [String(companyId)];
     var idx = 2;
 
@@ -213,6 +213,7 @@ router.post('/:id/approve', authenticateToken, requireOwnerOrHr, async (req, res
 
     // Conditional update — atomic race condition prevention
     // Use company_id::text comparison to handle both INTEGER and UUID company_id types
+    // Also try matching via companies table in case owner JWT has integer ID but jobs store UUID
     const result = await client.query(
       'UPDATE jobs' +
       "  SET approval_status  = 'approved'," +
@@ -222,7 +223,7 @@ router.post('/:id/approve', authenticateToken, requireOwnerOrHr, async (req, res
       '      assigned_to      = NULL,' +
       '      visible_to_all   = TRUE' +
       ' WHERE id = $1' +
-      '   AND company_id::text = $2' +
+      '   AND (company_id::text = $2 OR company_id IN (SELECT id FROM companies WHERE id::text = $2))' +
       "   AND source = 'customer'" +
       "   AND approval_status = 'pending_approval'" +
       ' RETURNING id, title, customer_id, priority, approval_status',
@@ -233,7 +234,7 @@ router.post('/:id/approve', authenticateToken, requireOwnerOrHr, async (req, res
       await client.query('ROLLBACK');
       // Check current state to give a meaningful error
       const check = await pool.query(
-        "SELECT approval_status FROM jobs WHERE id = $1 AND company_id::text = $2",
+        "SELECT approval_status FROM jobs WHERE id = $1 AND (company_id::text = $2 OR company_id IN (SELECT id FROM companies WHERE id::text = $2))",
         [id, String(companyId)]
       );
       if (check.rows.length === 0) return fail(res, 'Job not found', 404);
@@ -313,7 +314,7 @@ router.post('/:id/reject', authenticateToken, requireOwnerOrHr, async (req, res)
       '      rejected_at     = NOW(),' +
       "      status          = 'cancelled'" +
       ' WHERE id = $1' +
-      '   AND company_id::text = $2' +
+      '   AND (company_id::text = $2 OR company_id IN (SELECT id FROM companies WHERE id::text = $2))' +
       "   AND source = 'customer'" +
       "   AND approval_status = 'pending_approval'" +
       ' RETURNING id, title, customer_id',
@@ -324,7 +325,7 @@ router.post('/:id/reject', authenticateToken, requireOwnerOrHr, async (req, res)
       await client.query('ROLLBACK');
       const check = await pool.query(
         "SELECT approval_status" +
-        ' FROM jobs WHERE id = $1 AND company_id::text = $2',
+        ' FROM jobs WHERE id = $1 AND (company_id::text = $2 OR company_id IN (SELECT id FROM companies WHERE id::text = $2))',
         [id, String(companyId)]
       );
       if (check.rows.length === 0) return fail(res, 'Job not found', 404);

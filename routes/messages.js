@@ -285,61 +285,6 @@ router.get('/owner', async (req, res) => {
   }
 });
 
-// ─── GET /api/messages/job-conversations ─────────────────────────────────────
-// Get all customer job chats where this employee is the assigned technician
-// Used by the employee Messages tab to show customer conversations
-router.get('/job-conversations', async (req, res) => {
-  try {
-    const employeeId = req.user.userId || req.user.id;
-    const companyId = req.user.companyId;
-
-    // Find all jobs assigned to this employee that have at least one message
-    const result = await pool.query(
-      `SELECT
-         j.id          AS job_id,
-         j.title       AS job_title,
-         j.status      AS job_status,
-         j.customer_id,
-         c.name        AS customer_name,
-         c.email       AS customer_email,
-         (
-           SELECT jm.message
-           FROM job_messages jm
-           WHERE jm.job_id = j.id
-           ORDER BY jm.created_at DESC
-           LIMIT 1
-         ) AS last_message,
-         (
-           SELECT jm.created_at
-           FROM job_messages jm
-           WHERE jm.job_id = j.id
-           ORDER BY jm.created_at DESC
-           LIMIT 1
-         ) AS last_message_time,
-         (
-           SELECT COUNT(*)
-           FROM job_messages jm
-           WHERE jm.job_id = j.id
-             AND jm.sender_type = 'customer'
-         ) AS total_messages
-       FROM jobs j
-       LEFT JOIN customers c ON c.id = j.customer_id
-       WHERE j.assigned_to::text = $1
-         AND j.company_id::text = $2
-         AND j.customer_id IS NOT NULL
-         AND EXISTS (
-           SELECT 1 FROM job_messages jm WHERE jm.job_id = j.id
-         )
-       ORDER BY last_message_time DESC NULLS LAST`,
-      [String(employeeId), String(companyId)]
-    );
-
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Error fetching job conversations:', err);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
 
 // ─── GET /api/messages/job/:jobId ─────────────────────────────────────────────
 // Get full message history for a specific job (employee side)
@@ -359,13 +304,20 @@ router.get('/job/:jobId', async (req, res) => {
     }
 
     const result = await pool.query(
-      `SELECT id, sender_type, sender_id, sender_name, message, created_at
+      `SELECT id, sender_type, sender_id, sender_name, message, read_by_employee, read_by_customer, created_at
        FROM job_messages
        WHERE job_id = $1
        ORDER BY created_at ASC
        LIMIT 200`,
       [jobId]
     );
+
+    // Mark customer messages as read by employee
+    pool.query(
+      `UPDATE job_messages SET read_by_employee = TRUE
+       WHERE job_id = $1 AND sender_type = 'customer' AND read_by_employee = FALSE`,
+      [jobId]
+    ).catch(() => {});
 
     res.json(result.rows);
   } catch (err) {
@@ -404,9 +356,9 @@ router.post('/job/:jobId', async (req, res) => {
 
     // Insert message
     const result = await pool.query(
-      `INSERT INTO job_messages (job_id, sender_type, sender_id, sender_name, message, company_id)
-       VALUES ($1, 'employee', $2, $3, $4, $5)
-       RETURNING id, sender_type, sender_id, sender_name, message, created_at`,
+      `INSERT INTO job_messages (job_id, sender_type, sender_id, sender_name, message, company_id, read_by_employee, read_by_customer)
+       VALUES ($1, 'employee', $2, $3, $4, $5, TRUE, FALSE)
+       RETURNING id, sender_type, sender_id, sender_name, message, read_by_employee, read_by_customer, created_at`,
       [jobId, String(employeeId), senderName, message.trim(), String(companyId)]
     );
 
@@ -469,18 +421,18 @@ router.get('/job-conversations', async (req, res) => {
           (SELECT message FROM job_messages jm2
             WHERE jm2.job_id = j.id
             ORDER BY jm2.created_at DESC LIMIT 1) AS last_message,
-          COUNT(jm.id)      AS total_messages,
+          COUNT(DISTINCT jm.id)      AS total_messages,
           -- Unread count: messages from customer that this employee hasn't read
-          COUNT(jm_unread.id) AS unread_count
+          COUNT(DISTINCT jm_unread.id) AS unread_count
        FROM jobs j
-       JOIN users c ON c.id = j.customer_id
+       LEFT JOIN customers c ON c.id = j.customer_id
        LEFT JOIN job_messages jm ON jm.job_id = j.id
        LEFT JOIN job_messages jm_unread ON (
              jm_unread.job_id = j.id
          AND jm_unread.sender_type = 'customer'
          AND jm_unread.read_by_employee = false
        )
-       WHERE j.assigned_to = $1
+       WHERE j.assigned_to::text = $1
          AND j.company_id::text = $2
          AND j.customer_id IS NOT NULL
        GROUP BY j.id, j.title, j.status, j.employee_status, j.customer_id,

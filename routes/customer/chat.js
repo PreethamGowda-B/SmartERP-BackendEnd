@@ -16,6 +16,7 @@ const express = require('express');
 const router  = express.Router({ mergeParams: true });
 const { pool } = require('../../db');
 const redisClient = require('../../utils/redis');
+const { createNotification } = require('../../utils/notificationHelpers');
 
 function ok(res, data, statusCode = 200) {
   return res.status(statusCode).json({ success: true, data, error: null });
@@ -28,17 +29,23 @@ function fail(res, message, statusCode = 400) {
 async function ensureTable() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS job_messages (
-      id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      job_id      UUID NOT NULL,
-      sender_type VARCHAR(20) NOT NULL,  -- 'customer' | 'employee'
-      sender_id   UUID NOT NULL,
-      sender_name VARCHAR(255),
-      message     TEXT NOT NULL,
-      company_id  TEXT,
-      created_at  TIMESTAMP NOT NULL DEFAULT NOW()
+      id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      job_id          UUID NOT NULL,
+      sender_type     VARCHAR(20) NOT NULL,  -- 'customer' | 'employee'
+      sender_id       UUID NOT NULL,
+      sender_name     VARCHAR(255),
+      message         TEXT NOT NULL,
+      company_id      TEXT,
+      read_by_customer  BOOLEAN NOT NULL DEFAULT FALSE,
+      read_by_employee  BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at      TIMESTAMP NOT NULL DEFAULT NOW()
     );
     CREATE INDEX IF NOT EXISTS idx_job_messages_job_id ON job_messages(job_id);
     CREATE INDEX IF NOT EXISTS idx_job_messages_created_at ON job_messages(job_id, created_at);
+
+    -- Add unread columns to existing tables (safe to run multiple times)
+    ALTER TABLE job_messages ADD COLUMN IF NOT EXISTS read_by_customer BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE job_messages ADD COLUMN IF NOT EXISTS read_by_employee BOOLEAN NOT NULL DEFAULT FALSE;
   `).catch(() => {}); // Silently ignore if already exists
 }
 
@@ -70,13 +77,21 @@ router.get('/', async (req, res) => {
     }
 
     const messages = await pool.query(
-      `SELECT id, sender_type, sender_id, sender_name, message, created_at
+      `SELECT id, sender_type, sender_id, sender_name, message,
+              read_by_customer, read_by_employee, created_at
        FROM job_messages
        WHERE job_id = $1
        ORDER BY created_at ASC
        LIMIT 200`,
       [jobId]
     );
+
+    // Mark employee messages as read by customer (non-blocking)
+    pool.query(
+      `UPDATE job_messages SET read_by_customer = TRUE
+       WHERE job_id = $1 AND sender_type = 'employee' AND read_by_customer = FALSE`,
+      [jobId]
+    ).catch(() => {});
 
     return ok(res, messages.rows);
   } catch (err) {
@@ -123,11 +138,11 @@ router.post('/', async (req, res) => {
 
     const senderName = job.customer_name || 'Customer';
 
-    // Insert message
+    // Insert message — unread for employee by default
     const result = await pool.query(
-      `INSERT INTO job_messages (job_id, sender_type, sender_id, sender_name, message, company_id)
-       VALUES ($1, 'customer', $2, $3, $4, $5)
-       RETURNING id, sender_type, sender_id, sender_name, message, created_at`,
+      `INSERT INTO job_messages (job_id, sender_type, sender_id, sender_name, message, company_id, read_by_customer, read_by_employee)
+       VALUES ($1, 'customer', $2, $3, $4, $5, TRUE, FALSE)
+       RETURNING id, sender_type, sender_id, sender_name, message, read_by_customer, read_by_employee, created_at`,
       [jobId, customerId, senderName, message.trim(), String(companyId)]
     );
 
@@ -144,11 +159,29 @@ router.post('/', async (req, res) => {
       // Customer SSE channel (for real-time update in customer portal)
       redisClient.publish(`customer_job_events:${jobId}`, JSON.stringify(event))
         .catch(() => {});
-      // Employee notification channel (notify assigned employee)
+      // Employee notification channel (notify assigned employee via SSE)
       if (job.assigned_to) {
         redisClient.publish(`employee_events:${job.assigned_to}`, JSON.stringify(event))
           .catch(() => {});
       }
+    }
+
+    // FIX 1: Create in-app notification for the assigned employee
+    if (job.assigned_to) {
+      const preview = message.trim().substring(0, 50) + (message.trim().length > 50 ? '...' : '');
+      createNotification({
+        user_id: job.assigned_to,
+        company_id: companyId,
+        type: 'chat_message',
+        title: `New message from ${senderName}`,
+        message: preview,
+        priority: 'high',
+        data: {
+          job_id: jobId,
+          sender_name: senderName,
+          url: `/employee/jobs`,
+        },
+      }).catch(e => console.error('Chat notification error:', e.message));
     }
 
     return ok(res, newMessage, 201);

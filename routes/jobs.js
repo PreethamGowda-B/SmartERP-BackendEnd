@@ -134,25 +134,24 @@ router.get('/', authenticateToken, async (req, res) => {
     let queryParams = [req.user.companyId];
 
     if (req.user.role === 'owner') {
-      countResult = await pool.query(`SELECT COUNT(*) FROM jobs WHERE company_id::text = $1`, [String(req.user.companyId)]);
+      // Match by both integer and UUID company_id (legacy accounts have integer companyId in JWT)
+      const ownerCompanyWhere = `(company_id::text = $1 OR company_id::text IN (SELECT id::text FROM companies WHERE id::text = $1 OR company_id::text = $1))`;
+      countResult = await pool.query(`SELECT COUNT(*) FROM jobs WHERE ${ownerCompanyWhere}`, [String(req.user.companyId)]);
       result = await pool.query(
         `SELECT j.*, u.email as employee_email, u.name as employee_name
          FROM jobs j
          LEFT JOIN users u ON j.assigned_to = u.id
-         WHERE j.company_id::text = $1
+         WHERE ${ownerCompanyWhere}
          ORDER BY j.created_at DESC
          LIMIT $2 OFFSET $3`,
         [String(req.user.companyId), limit, offset]
       );
     } else if (req.user.role === 'employee') {
-      // Employees see a job if ANY of these are true:
-      //   1. visible_to_all = true (broadcast job, anyone can pick it up)
-      //   2. assigned_to = this employee (directly assigned OR already accepted/working)
-      //   3. employee_status = 'assigned' with no specific assignee (open pool job)
-      // Exclude cancelled jobs ONLY if they are not assigned to this employee.
-      // (Jobs can have status='cancelled' but still be assigned — show those too)
+      // Match jobs by company_id — handles both integer (legacy JWT) and UUID company IDs.
+      // Customer-submitted jobs store the UUID from companies.id, while legacy jobs use integer.
+      // We match both: direct text match OR UUID lookup via companies table.
       const empWhere = `
-        company_id::text = $1
+        (company_id::text = $1 OR company_id::text IN (SELECT id::text FROM companies WHERE id::text = $1 OR company_id::text = $1))
         AND (
           visible_to_all = true
           OR assigned_to = $2

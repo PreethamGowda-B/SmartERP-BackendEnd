@@ -400,9 +400,11 @@ router.post('/:id/progress', authenticateToken, async (req, res) => {
     // Check if job is assigned to this employee and accepted
     console.log(`🔍 Checking job access: JobID=${id}, UserID=${req.user.id}`);
 
-    // HARDENED: scope existence check to own company too
+    // HARDENED: scope existence check to own company too (handles both integer and UUID company_id)
     const jobExists = await pool.query(
-      'SELECT id, assigned_to, employee_status FROM jobs WHERE id = $1 AND company_id::text = $2',
+      `SELECT id, assigned_to, employee_status FROM jobs j
+       WHERE j.id = $1
+         AND (j.company_id::text = $2 OR j.company_id::text IN (SELECT c.id::text FROM companies c WHERE c.id::text = $2 OR c.company_id::text = $2))`,
       [id, String(req.user.companyId)]
     );
     if (jobExists.rows.length === 0) {
@@ -438,7 +440,7 @@ router.post('/:id/progress', authenticateToken, async (req, res) => {
            completed_at  = $3,
            employee_status = CASE WHEN $1 = 100 THEN 'completed' ELSE employee_status END
        WHERE id = $4
-         AND company_id::text = $5
+         AND (company_id::text = $5 OR company_id::text IN (SELECT c.id::text FROM companies c WHERE c.id::text = $5 OR c.company_id::text = $5))
          AND assigned_to = $6
        RETURNING *`,
       [progress, status, completed_at, id, String(req.user.companyId), req.user.id]

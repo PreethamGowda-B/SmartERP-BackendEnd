@@ -232,11 +232,17 @@ router.post('/', [
       data: { job_id: createdJob.id, job_title: title, source: 'customer', approval_status: approvalStatus },
     }).catch(e => console.error('Owner notification error:', e.message));
 
-    // If auto-approved, trigger Smart Dispatch immediately (non-blocking)
+    // If auto-approved, notify ALL employees immediately so they can self-assign
     if (autoApprove) {
-      dispatchJob(createdJob.id, companyId).catch(e =>
-        console.error('Auto-approve dispatch error:', e.message)
-      );
+      const { createNotificationForCompany } = require('../../utils/notificationHelpers');
+      createNotificationForCompany({
+        company_id: companyId,
+        type: 'job_available',
+        title: 'New Job Available',
+        message: 'A customer job is available to accept: "' + createdJob.title + '"',
+        priority: finalPriority,
+        data: { job_id: createdJob.id, source: 'customer', url: '/employee/jobs' },
+      }).catch(e => console.error('Auto-approve notification error:', e.message));
     }
 
     auditLog(req, customerId, 'customer_job_created', {

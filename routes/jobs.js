@@ -152,13 +152,14 @@ router.get('/', authenticateToken, async (req, res) => {
       const empWhere = `
         (j.company_id::text = $1 OR j.company_id::text IN (SELECT c.id::text FROM companies c WHERE c.id::text = $1 OR c.company_id::text = $1))
         AND (
-          j.visible_to_all = true
-          OR j.assigned_to = $2
-          OR (j.employee_status IN ('assigned', 'pending') AND j.assigned_to IS NULL)
-          OR (j.source = 'customer' AND COALESCE(j.approval_status, 'approved') = 'approved')
+          j.assigned_to = $2
+          OR (
+            j.assigned_to IS NULL 
+            AND (j.visible_to_all = true OR j.employee_status IN ('assigned', 'pending'))
+          )
         )
         AND (j.source IS NULL OR j.source != 'customer' OR COALESCE(j.approval_status, 'approved') = 'approved')
-        AND (j.status NOT IN ('cancelled') OR j.assigned_to = $2)
+        AND (j.status NOT IN ('cancelled', 'completed', 'closed') OR j.assigned_to = $2)
       `;
       countResult = await pool.query(
         `SELECT COUNT(*) FROM jobs j WHERE ${empWhere}`,

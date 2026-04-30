@@ -176,7 +176,15 @@ router.post('/:id/run', async (req, res) => {
     }).catch(() => {});
 
     if (autoApprove) {
-      dispatchJob(createdJob.id, companyId).catch(() => {});
+      const { createNotificationForCompany } = require('../../utils/notificationHelpers');
+      createNotificationForCompany({
+        company_id: companyId,
+        type: 'job_available',
+        title: 'New Job Available',
+        message: 'A recurring job is available: "' + createdJob.title + '"',
+        priority: t.priority,
+        data: { job_id: createdJob.id, source: 'customer', url: '/employee/jobs' },
+      }).catch(() => {});
     }
 
     return ok(res, { job: createdJob }, 201);

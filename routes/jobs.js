@@ -134,29 +134,34 @@ router.get('/', authenticateToken, async (req, res) => {
     let queryParams = [req.user.companyId];
 
     if (req.user.role === 'owner') {
-      // Match by both integer and UUID company_id (legacy accounts have integer companyId in JWT)
-      const ownerCompanyWhere = `(j.company_id::text = $1 OR j.company_id::text IN (SELECT c.id::text FROM companies c WHERE c.id::text = $1 OR c.company_id::text = $1))`;
-      countResult = await pool.query(`SELECT COUNT(*) FROM jobs j WHERE ${ownerCompanyWhere}`, [String(req.user.companyId)]);
+      // Simple direct match — jobs.company_id stores the same value as JWT companyId
+      countResult = await pool.query(`SELECT COUNT(*) FROM jobs j WHERE j.company_id::text = $1`, [String(req.user.companyId)]);
       result = await pool.query(
         `SELECT j.*, u.email as employee_email, u.name as employee_name
          FROM jobs j
          LEFT JOIN users u ON j.assigned_to = u.id
-         WHERE ${ownerCompanyWhere}
+         WHERE j.company_id::text = $1
          ORDER BY j.created_at DESC
          LIMIT $2 OFFSET $3`,
         [String(req.user.companyId), limit, offset]
       );
     } else if (req.user.role === 'employee') {
-      // Match jobs by company_id — handles both integer (legacy JWT) and UUID company IDs.
-      // Customer-submitted jobs store the UUID from companies.id, while legacy jobs use integer.
+      // Employees see jobs where:
+      //   1. visible_to_all = true (broadcast to all employees)
+      //   2. assigned_to = this employee (directly assigned, accepted, working, completed)
+      //   3. employee_status = 'assigned'/'pending' with no specific assignee (open pool)
+      //   4. approved customer jobs (visible_to_all=true after approval)
+      // Exclude cancelled jobs unless assigned to this employee.
       const empWhere = `
-        (j.company_id::text = $1 OR j.company_id::text IN (SELECT c.id::text FROM companies c WHERE c.id::text = $1 OR c.company_id::text = $1))
+        j.company_id::text = $1
         AND (
-          j.assigned_to = $2
-          OR (j.assigned_to IS NULL AND j.employee_status = 'assigned')
+          j.visible_to_all = true
+          OR j.assigned_to = $2
+          OR (j.employee_status IN ('assigned', 'pending') AND j.assigned_to IS NULL)
+          OR (j.source = 'customer' AND COALESCE(j.approval_status, 'approved') = 'approved')
         )
-        AND (j.source != 'customer' OR j.approval_status = 'approved')
-        AND (j.status NOT IN ('cancelled', 'completed', 'closed') OR j.assigned_to = $2)
+        AND (j.source IS NULL OR j.source != 'customer' OR COALESCE(j.approval_status, 'approved') = 'approved')
+        AND (j.status NOT IN ('cancelled') OR j.assigned_to = $2)
       `;
       countResult = await pool.query(
         `SELECT COUNT(*) FROM jobs j WHERE ${empWhere}`,

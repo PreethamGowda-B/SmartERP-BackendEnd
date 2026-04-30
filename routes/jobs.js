@@ -145,32 +145,28 @@ router.get('/', authenticateToken, async (req, res) => {
         [String(req.user.companyId), limit, offset]
       );
     } else if (req.user.role === 'employee') {
-      // HARDENED: Employees see jobs where:
-      //   - employee_status = 'assigned' (available to pick up, visible to all), OR
-      //   - assigned_to = this employee (accepted/working/completed — regardless of visible_to_all)
-      // Never show customer jobs still pending_approval.
-      // Never show cancelled jobs.
+      // Employees see a job if ANY of these are true:
+      //   1. visible_to_all = true (broadcast job, anyone can pick it up)
+      //   2. assigned_to = this employee (directly assigned OR already accepted/working)
+      //   3. employee_status = 'assigned' with no specific assignee (open pool job)
+      // Always exclude: customer jobs pending approval, cancelled jobs.
+      const empWhere = `
+        company_id::text = $1
+        AND (
+          visible_to_all = true
+          OR assigned_to = $2
+          OR (employee_status = 'assigned' AND assigned_to IS NULL)
+        )
+        AND (source != 'customer' OR COALESCE(approval_status, 'approved') = 'approved')
+        AND status NOT IN ('cancelled')
+      `;
       countResult = await pool.query(
-        `SELECT COUNT(*) FROM jobs
-         WHERE company_id::text = $1
-           AND (
-             (employee_status = 'assigned' AND (visible_to_all = true OR assigned_to IS NULL))
-             OR assigned_to = $2
-           )
-           AND (source != 'customer' OR COALESCE(approval_status, 'approved') = 'approved')
-           AND status NOT IN ('cancelled')`,
+        `SELECT COUNT(*) FROM jobs WHERE ${empWhere}`,
         [String(req.user.companyId), req.user.id]
       );
       result = await pool.query(
-        `SELECT j.*
-         FROM jobs j
-         WHERE j.company_id::text = $1
-           AND (
-             (j.employee_status = 'assigned' AND (j.visible_to_all = true OR j.assigned_to IS NULL))
-             OR j.assigned_to = $2
-           )
-           AND (j.source != 'customer' OR COALESCE(j.approval_status, 'approved') = 'approved')
-           AND j.status NOT IN ('cancelled')
+        `SELECT j.* FROM jobs j
+         WHERE ${empWhere}
          ORDER BY j.created_at DESC
          LIMIT $3 OFFSET $4`,
         [String(req.user.companyId), req.user.id, limit, offset]

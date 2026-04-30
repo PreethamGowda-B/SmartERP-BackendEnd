@@ -45,8 +45,9 @@ router.post('/', authenticateToken, [
     job.assignedTo ||
     null;
 
-  const visibleToAll =
-    job.visible_to_all === false ? false : true;
+  const visibleToAll = job.visible_to_all !== undefined
+    ? job.visible_to_all === true || job.visible_to_all === 'true'
+    : (assignedTo ? false : true);
 
   try {
     const result = await pool.query(

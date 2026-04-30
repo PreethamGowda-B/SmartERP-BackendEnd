@@ -55,9 +55,10 @@ function requireOwnerOrHr(req, res, next) {
   next();
 }
 
-/** Notify customer via in-app activity record (non-blocking, post-commit) */
+/** Notify customer via in-app activity record and notifications table (non-blocking, post-commit) */
 function notifyCustomer(customerId, companyId, opts) {
   const { type, title, message, jobId } = opts;
+  // 1. Activity log (legacy)
   pool.query(
     'INSERT INTO activities (user_id, action, activity_type, details, company_id, created_at)' +
     ' VALUES ($1, $2, $3, $4, $5, NOW())',
@@ -66,7 +67,19 @@ function notifyCustomer(customerId, companyId, opts) {
       JSON.stringify({ customer_id: customerId, title, message, job_id: jobId }),
       companyId,
     ]
-  ).catch(function (e) { console.error('notifyCustomer error:', e.message); });
+  ).catch(function (e) { console.error('notifyCustomer activity error:', e.message); });
+
+  // 2. Low FIX: Notifications table (visible in Customer Portal UI)
+  const { createNotification } = require('../utils/notificationHelpers');
+  createNotification({
+    user_id: customerId,
+    company_id: companyId,
+    type: type,
+    title: title,
+    message: message,
+    priority: 'high',
+    data: { job_id: jobId, url: `/customer/job/${jobId}` },
+  }).catch(function (e) { console.error('notifyCustomer notification error:', e.message); });
 }
 
 /** Publish SSE event to customer portal (non-blocking, post-commit) */

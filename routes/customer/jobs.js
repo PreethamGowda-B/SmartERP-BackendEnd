@@ -301,7 +301,7 @@ router.get('/:id', async (req, res) => {
       `SELECT
          j.id, j.title, j.description,
          j.status,
-         COALESCE(j.approval_status, 'approved') AS approval_status,
+         j.approval_status,
          j.priority, j.ai_suggested_priority,
          j.employee_status, j.progress, j.assigned_to,
          j.created_at, j.approved_at, j.assigned_at,

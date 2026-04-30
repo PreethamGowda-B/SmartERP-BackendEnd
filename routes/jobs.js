@@ -153,12 +153,9 @@ router.get('/', authenticateToken, async (req, res) => {
         (j.company_id::text = $1 OR j.company_id::text IN (SELECT c.id::text FROM companies c WHERE c.id::text = $1 OR c.company_id::text = $1))
         AND (
           j.assigned_to = $2
-          OR (
-            j.assigned_to IS NULL 
-            AND (j.visible_to_all = true OR j.employee_status IN ('assigned', 'pending'))
-          )
+          OR (j.assigned_to IS NULL AND j.employee_status = 'assigned')
         )
-        AND (j.source IS NULL OR j.source != 'customer' OR COALESCE(j.approval_status, 'approved') = 'approved')
+        AND (j.source != 'customer' OR j.approval_status = 'approved')
         AND (j.status NOT IN ('cancelled', 'completed', 'closed') OR j.assigned_to = $2)
       `;
       countResult = await pool.query(
@@ -251,16 +248,17 @@ router.post('/:id/accept', authenticateToken, async (req, res) => {
     // The atomic UPDATE returns 0 rows if another employee already accepted
     const result = await client.query(
       `UPDATE jobs
-       SET employee_status = 'accepted',
-           accepted_at     = NOW(),
-           started_at      = NOW(),
-           status          = 'in_progress',
-           assigned_to     = $2,
-           visible_to_all  = false
-       WHERE id = $1
-         AND company_id::text = $3
-         AND (employee_status IN ('assigned', 'pending') OR employee_status IS NULL)
-       RETURNING *`,
+        SET employee_status = 'accepted',
+            accepted_at     = NOW(),
+            started_at      = NOW(),
+            status          = 'in_progress',
+            assigned_to     = $2,
+            visible_to_all  = false
+        WHERE id = $1
+          AND company_id::text = $3
+          AND assigned_to IS NULL
+          AND employee_status = 'assigned'
+        RETURNING *`,
       [id, req.user.id, String(req.user.companyId)]
     );
 

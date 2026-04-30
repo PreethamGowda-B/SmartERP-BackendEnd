@@ -4,7 +4,7 @@ const { createNotificationForOwners } = require('../utils/notificationHelpers');
 
 /**
  * Daily Attendance Processing Job
- * Runs every day at 7:30 PM (19:30)
+ * Runs every day at 7:05 PM IST (13:35 UTC)
  * 
  * Tasks:
  * 1. Auto clock-out employees who didn't clock out
@@ -13,9 +13,12 @@ const { createNotificationForOwners } = require('../utils/notificationHelpers');
  */
 
 function startDailyAttendanceProcessor() {
-    // Run daily at 7:30 PM IST (19:30)
-    cron.schedule('30 19 * * *', async () => {
-        const targetDate = new Date().toISOString().split('T')[0];
+    // Run daily at 7:05 PM IST = 13:35 UTC (5-min grace after 7 PM cutoff)
+    // Using UTC directly to avoid node-cron timezone reliability issues on hosted servers
+    cron.schedule('35 13 * * *', async () => {
+        // Double-check we're running at the right IST time
+        const nowIST = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+        const targetDate = nowIST.toISOString().split('T')[0];
 
         console.log(`\n${'='.repeat(60)}`);
         console.log(`🕐 DAILY ATTENDANCE PROCESSING - ${targetDate}`);
@@ -107,10 +110,10 @@ function startDailyAttendanceProcessor() {
             });
         }
     }, {
-        timezone: "Asia/Kolkata" // IST timezone
+        scheduled: true
     });
 
-    console.log('✅ Daily attendance processor scheduled (7:30 PM IST)');
+    console.log('✅ Daily attendance processor scheduled (7:05 PM IST / 13:35 UTC)');
 }
 
 module.exports = { startDailyAttendanceProcessor };

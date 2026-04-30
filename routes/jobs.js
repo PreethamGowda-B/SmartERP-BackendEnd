@@ -180,12 +180,15 @@ router.get('/', authenticateToken, async (req, res) => {
     }
 
     const total = parseInt(countResult.rows[0].count);
+    console.log(`🧩 Jobs query returned ${result.rows.length} rows (total: ${total}) for role: ${req.user.role}, company: ${req.user.companyId}`);
 
     const rows = result.rows.map((r) => {
       const job = r.data && typeof r.data === 'object' ? r.data : {};
       return {
-        ...job,  // Spread job data first
-        // Then override with database values (these take precedence)
+        // Spread legacy data blob for any extra fields (e.g. custom fields)
+        ...job,
+        // Always override with authoritative DB column values — never let the
+        // stale data blob overwrite these critical fields
         id: r.id,
         title: r.title,
         description: r.description,
@@ -201,6 +204,12 @@ router.get('/', authenticateToken, async (req, res) => {
         declined_at: r.declined_at,
         completed_at: r.completed_at,
         employee_email: r.employee_email,
+        // These fields must also come from DB, not the blob
+        source: r.source || null,
+        approval_status: r.approval_status || null,
+        customer_id: r.customer_id || null,
+        company_id: r.company_id || null,
+        started_at: r.started_at || null,
       };
     });
 

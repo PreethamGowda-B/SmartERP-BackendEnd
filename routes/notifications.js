@@ -51,34 +51,77 @@ router.get('/unread-count', authenticateToken, async (req, res) => {
 });
 
 // ─── GET /api/notifications/sse ──────────────────────────────────────────────
-// Server-Sent Events endpoint for real-time notifications
+// C4 FIX: Each SSE connection now subscribes to its own Redis channel
+// (`employee_notifications:{userId}`) so events work across cluster workers.
+// Falls back to in-process Map when Redis is unavailable (dev/single-worker).
 router.get('/sse', authenticateToken, (req, res) => {
-  const userId = req.user.userId || req.user.id;
+  const userId = String(req.user.userId || req.user.id);
+  const redisUrl = process.env.REDIS_URL;
 
   console.log(`📡 SSE connection established for user ${userId}`);
 
-  // Set headers for SSE
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no'); // Disable buffering for nginx
+  res.setHeader('X-Accel-Buffering', 'no');
 
-  // Send initial connection message
   res.write(`data: ${JSON.stringify({ type: 'connected', message: 'SSE connection established' })}\n\n`);
 
-  // Register this connection
-  registerSSEConnection(userId, res);
-
-  // Send heartbeat every 15 seconds to keep connection alive
   const heartbeatInterval = setInterval(() => {
-    try {
-      res.write(`:heartbeat\n\n`);
-    } catch (err) {
-      clearInterval(heartbeatInterval);
-    }
+    try { res.write(`:heartbeat\n\n`); }
+    catch { clearInterval(heartbeatInterval); }
   }, 15000);
 
-  // Handle client disconnect
+  // ── Redis path (cluster-safe) ─────────────────────────────────────────────
+  if (redisUrl) {
+    const Redis = require('ioredis');
+    let subscriber;
+    try {
+      subscriber = new Redis(redisUrl, {
+        maxRetriesPerRequest: 1,
+        retryStrategy(times) { return times > 3 ? null : Math.min(times * 200, 1000); },
+        lazyConnect: false,
+      });
+    } catch (redisErr) {
+      console.warn('SSE: Redis subscriber creation failed, using in-process fallback:', redisErr.message);
+      subscriber = null;
+    }
+
+    if (subscriber) {
+      const channel = `employee_notifications:${userId}`;
+
+      subscriber.subscribe(channel, (err) => {
+        if (err) {
+          console.error('SSE Redis subscribe error:', err.message);
+          subscriber.disconnect();
+          // Fall through to in-process fallback below
+          registerSSEConnection(userId, res);
+        }
+      });
+
+      subscriber.on('message', (ch, rawMessage) => {
+        if (ch === channel) {
+          try { res.write(`data: ${rawMessage}\n\n`); }
+          catch (writeErr) { console.error('SSE write error:', writeErr.message); }
+        }
+      });
+
+      subscriber.on('error', (err) => {
+        console.warn('SSE Redis subscriber error (non-fatal):', err.message);
+      });
+
+      req.on('close', () => {
+        console.log(`📡 SSE connection closed for user ${userId}`);
+        clearInterval(heartbeatInterval);
+        try { subscriber.unsubscribe(channel); subscriber.disconnect(); } catch {}
+      });
+
+      return; // Keep connection open — cleanup handled by req.on('close')
+    }
+  }
+
+  // ── In-process fallback (dev / no Redis) ─────────────────────────────────
+  registerSSEConnection(userId, res);
   req.on('close', () => {
     console.log(`📡 SSE connection closed for user ${userId}`);
     clearInterval(heartbeatInterval);

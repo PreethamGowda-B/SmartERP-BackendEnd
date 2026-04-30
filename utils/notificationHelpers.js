@@ -1,4 +1,5 @@
 const { pool } = require('../db');
+const redisPublisher = require('./redis');
 const { sendPushNotification } = require('../services/firebaseService');
 
 // Store active SSE connections: { userId: [response1, response2, ...] }
@@ -98,19 +99,36 @@ async function createNotification(notificationData) {
 }
 
 /**
- * Broadcast a message to a specific user via SSE
+ * Broadcast a message to a specific user via SSE.
+ * C4 FIX: Uses Redis pub/sub so broadcast works in cluster mode (multi-worker).
+ * Falls back to in-process Map only when Redis is unavailable.
  */
 function broadcastToUser(userId, message) {
+    const uid = String(userId);
+    // Primary: Redis pub/sub (cluster-safe)
+    if (redisPublisher && redisPublisher.status === 'ready') {
+        redisPublisher.publish(`employee_notifications:${uid}`, JSON.stringify(message))
+            .catch(e => {
+                console.error(`❌ Redis broadcast error for user ${uid}:`, e.message);
+                // Fallback to in-process on Redis failure
+                _broadcastInProcess(uid, message);
+            });
+        return;
+    }
+    // Fallback: in-process Map (single-worker only)
+    _broadcastInProcess(uid, message);
+}
+
+function _broadcastInProcess(userId, message) {
     const connections = sseConnections.get(userId);
     if (connections && connections.length > 0) {
         const messageStr = `data: ${JSON.stringify(message)}\n\n`;
         connections.forEach((res, index) => {
             try {
                 res.write(messageStr);
-                console.log(`📡 Broadcast to user ${userId} connection #${index + 1}`);
+                console.log(`📡 In-process broadcast to user ${userId} connection #${index + 1}`);
             } catch (err) {
                 console.error(`❌ Failed to broadcast to connection #${index + 1}:`, err.message);
-                // Remove dead connection
                 connections.splice(index, 1);
             }
         });
@@ -148,29 +166,26 @@ function unregisterSSEConnection(userId, response) {
 }
 
 /**
- * Create notifications for all employees in a company
+ * Create notifications for all employees in a company.
+ * Medium FIX: Uses a single bulk INSERT instead of N+1 parallel INSERTs.
+ * Then broadcasts to each user via Redis pub/sub for real-time delivery.
  */
 async function createNotificationForCompany({ company_id, type, title, message, priority = 'medium', data = null, exclude_user_id = null }) {
     try {
-        // 1. Fetch all employees for the company
-        // Use ::text casting to be type-agnostic (handles both Integer and UUID company_ids)
+        // 1. Fetch all target employee IDs
         let query = "SELECT id FROM users WHERE role = 'employee'";
         let params = [];
 
         if (company_id) {
             const cid = String(company_id);
             const isDefault = cid === '1' || cid === '0' || cid === '00000000-0000-0000-0000-000000000000';
-
             if (!isDefault) {
-                // Multi-tenant: ONLY notify employees of this specific company
                 query += " AND company_id::text = $1";
                 params.push(cid);
             } else {
-                // Global/Default: Notify employees in the system default or unassigned company
                 query += " AND (company_id::text = '1' OR company_id::text = '0' OR company_id IS NULL)";
             }
         }
-
         if (exclude_user_id) {
             query += ` AND id::text != $${params.length + 1}::text`;
             params.push(String(exclude_user_id));
@@ -178,23 +193,36 @@ async function createNotificationForCompany({ company_id, type, title, message, 
 
         const employeesResult = await pool.query(query, params);
         const employees = employeesResult.rows;
+        if (employees.length === 0) return { success: true, count: 0 };
 
-        console.log(`📣 Broadcasting notification to ${employees.length} employees for company ${company_id || 'Global'}`);
+        console.log(`📣 Bulk-notifying ${employees.length} employees for company ${company_id || 'Global'}`);
 
-        // 2. Create notifications for each (Parallel)
-        const notificationPromises = employees.map(emp =>
-            createNotification({
-                user_id: emp.id,
-                company_id,
-                type,
-                title,
-                message,
-                priority,
-                data: { url: '/employee/notifications', ...data }
-            }).catch(err => console.error(`❌ Failed to notify employee ${emp.id}:`, err.message))
+        // 2. Bulk INSERT — single query instead of N individual INSERTs
+        const mergedData = JSON.stringify({ url: '/employee/notifications', ...data });
+        const valuePlaceholders = employees.map((_, i) => `($${i * 5 + 1}, $${i * 5 + 2}, $${i * 5 + 3}, $${i * 5 + 4}, $${i * 5 + 5}, NOW())`).join(', ');
+        const bulkParams = employees.flatMap(emp => [emp.id, company_id, type, title, message]);
+        // We use a per-row subselect to embed priority and data since flatMap would bloat params
+        // Instead use a simpler approach: build rows individually in a VALUES list
+        const rowValues = [];
+        const bulkValues = [];
+        employees.forEach((emp, i) => {
+            const base = i * 7;
+            rowValues.push(`($${base+1}, $${base+2}, $${base+3}, $${base+4}, $${base+5}, $${base+6}, $${base+7}, NOW())`);
+            bulkValues.push(emp.id, company_id, type, title, message, priority, mergedData);
+        });
+
+        const insertResult = await pool.query(
+            `INSERT INTO notifications (user_id, company_id, type, title, message, priority, data, created_at)
+             VALUES ${rowValues.join(', ')}
+             RETURNING id, user_id, type, title, message, priority, data, created_at`,
+            bulkValues
         );
 
-        await Promise.all(notificationPromises);
+        // 3. Broadcast each inserted notification via Redis SSE (non-blocking)
+        insertResult.rows.forEach(notification => {
+            broadcastToUser(notification.user_id, { type: 'notification', data: notification });
+        });
+
         return { success: true, count: employees.length };
     } catch (err) {
         console.error('❌ Error in createNotificationForCompany:', err);
@@ -203,29 +231,25 @@ async function createNotificationForCompany({ company_id, type, title, message, 
 }
 
 /**
- * Create notifications for all owners/admins in a company
+ * Create notifications for all owners/admins in a company.
+ * Medium FIX: Uses a single bulk INSERT instead of N+1 parallel INSERTs.
  */
 async function createNotificationForOwners({ company_id, type, title, message, priority = 'medium', data = null, exclude_user_id = null }) {
     try {
-        // 1. Fetch all owners and admins for the company
-        // Use ::text casting to be type-agnostic (handles both Integer and UUID company_ids)
+        // 1. Fetch all target owner/admin IDs
         let query = "SELECT id FROM users WHERE role IN ('owner', 'admin')";
         let params = [];
 
         if (company_id) {
             const cid = String(company_id);
             const isDefault = cid === '1' || cid === '0' || cid === '00000000-0000-0000-0000-000000000000';
-
             if (!isDefault) {
-                // Multi-tenant: ONLY notify owners/admins of this specific company
                 query += " AND company_id::text = $1";
                 params.push(cid);
             } else {
-                // Global/Default: Notify owners/admins in the system default or unassigned company
                 query += " AND (company_id::text = '1' OR company_id::text = '0' OR company_id IS NULL)";
             }
         }
-
         if (exclude_user_id) {
             query += ` AND id::text != $${params.length + 1}::text`;
             params.push(String(exclude_user_id));
@@ -233,23 +257,32 @@ async function createNotificationForOwners({ company_id, type, title, message, p
 
         const ownersResult = await pool.query(query, params);
         const owners = ownersResult.rows;
+        if (owners.length === 0) return { success: true, count: 0 };
 
-        console.log(`📣 Broadcasting notification to ${owners.length} owners/admins for company ${company_id || 'Global'}`);
+        console.log(`📣 Bulk-notifying ${owners.length} owners/admins for company ${company_id || 'Global'}`);
 
-        // 2. Create notifications for each (Parallel)
-        const notificationPromises = owners.map(owner =>
-            createNotification({
-                user_id: owner.id,
-                company_id,
-                type,
-                title,
-                message,
-                priority,
-                data: { url: '/owner/notifications', ...data }
-            }).catch(err => console.error(`❌ Failed to notify owner ${owner.id}:`, err.message))
+        // 2. Bulk INSERT
+        const mergedData = JSON.stringify({ url: '/owner/notifications', ...data });
+        const rowValues = [];
+        const bulkValues = [];
+        owners.forEach((owner, i) => {
+            const base = i * 7;
+            rowValues.push(`($${base+1}, $${base+2}, $${base+3}, $${base+4}, $${base+5}, $${base+6}, $${base+7}, NOW())`);
+            bulkValues.push(owner.id, company_id, type, title, message, priority, mergedData);
+        });
+
+        const insertResult = await pool.query(
+            `INSERT INTO notifications (user_id, company_id, type, title, message, priority, data, created_at)
+             VALUES ${rowValues.join(', ')}
+             RETURNING id, user_id, type, title, message, priority, data, created_at`,
+            bulkValues
         );
 
-        await Promise.all(notificationPromises);
+        // 3. Broadcast each notification via Redis SSE (non-blocking)
+        insertResult.rows.forEach(notification => {
+            broadcastToUser(notification.user_id, { type: 'notification', data: notification });
+        });
+
         return { success: true, count: owners.length };
     } catch (err) {
         console.error('❌ Error in createNotificationForOwners:', err);

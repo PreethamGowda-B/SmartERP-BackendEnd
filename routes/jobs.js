@@ -158,9 +158,9 @@ router.get('/', authenticateToken, async (req, res) => {
           j.visible_to_all = true
           OR j.assigned_to = $2
           OR (j.employee_status IN ('assigned', 'pending') AND j.assigned_to IS NULL)
-          OR (j.source = 'customer' AND COALESCE(j.approval_status, 'approved') = 'approved')
+          OR (j.source = 'customer' AND j.approval_status = 'approved' AND j.assigned_to IS NULL)
         )
-        AND (j.source IS NULL OR j.source != 'customer' OR COALESCE(j.approval_status, 'approved') = 'approved')
+        AND (j.source IS NULL OR j.source != 'customer' OR j.approval_status = 'approved')
         AND (j.status NOT IN ('cancelled') OR j.assigned_to = $2)
       `;
       countResult = await pool.query(
@@ -209,14 +209,15 @@ router.get('/', authenticateToken, async (req, res) => {
         declined_at: r.declined_at,
         completed_at: r.completed_at,
         employee_email: r.employee_email,
-        employee_name: r.employee_name || null,
+        employee_name: r.employee_name ?? null,
         // These fields must also come from DB, not the blob
-        source: r.source || null,
-        approval_status: r.approval_status || null,
-        customer_id: r.customer_id || null,
-        company_id: r.company_id || null,
-        started_at: r.started_at || null,
-        assigned_employee_name: r.assigned_employee_name || null,
+        // Low FIX: use ?? (nullish coalescing) — || would coerce '' or 0 to null
+        source: r.source ?? null,
+        approval_status: r.approval_status ?? null,
+        customer_id: r.customer_id ?? null,
+        company_id: r.company_id ?? null,
+        started_at: r.started_at ?? null,
+        assigned_employee_name: r.assigned_employee_name ?? null,
       };
     });
 
@@ -594,123 +595,9 @@ router.delete('/:id', authenticateToken, async (req, res) => {
 });
 
 /**
- * GET /jobs/:id/messages — Employee fetches chat history for a job
- * Marks customer messages as read when employee opens chat
- */
-router.get('/:id/messages', authenticateToken, async (req, res) => {
-  const { id } = req.params;
-  const employeeId = req.user.id;
-
-  try {
-    // Verify employee is assigned to this job
-    const jobCheck = await pool.query(
-      `SELECT id, customer_id, assigned_to FROM jobs
-       WHERE id = $1 AND assigned_to = $2`,
-      [id, employeeId]
-    );
-    if (jobCheck.rows.length === 0) {
-      return res.status(403).json({ message: 'Access denied' });
-    }
-
-    const messages = await pool.query(
-      `SELECT id, sender_type, sender_id, sender_name, message,
-              read_by_customer, read_by_employee, created_at
-       FROM job_messages
-       WHERE job_id = $1
-       ORDER BY created_at ASC
-       LIMIT 200`,
-      [id]
-    );
-
-    // Mark customer messages as read by employee (non-blocking)
-    pool.query(
-      `UPDATE job_messages SET read_by_employee = TRUE
-       WHERE job_id = $1 AND sender_type = 'customer' AND read_by_employee = FALSE`,
-      [id]
-    ).catch(() => {});
-
-    res.json({ success: true, data: messages.rows });
-  } catch (err) {
-    console.error('jobs GET messages error:', err.message);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-/**
- * POST /jobs/:id/messages — Employee sends a message to customer
- */
-router.post('/:id/messages', authenticateToken, async (req, res) => {
-  const { id } = req.params;
-  const { message } = req.body;
-  const employeeId = req.user.id;
-
-  if (!message || !message.trim()) {
-    return res.status(400).json({ message: 'Message cannot be empty' });
-  }
-
-  try {
-    // Verify employee is assigned to this job
-    const jobCheck = await pool.query(
-      `SELECT j.id, j.customer_id, j.assigned_to, j.company_id, j.title,
-              u.name AS employee_name
-       FROM jobs j
-       LEFT JOIN users u ON u.id = j.assigned_to
-       WHERE j.id = $1 AND j.assigned_to = $2`,
-      [id, employeeId]
-    );
-    if (jobCheck.rows.length === 0) {
-      return res.status(403).json({ message: 'Access denied' });
-    }
-
-    const job = jobCheck.rows[0];
-    const senderName = job.employee_name || 'Technician';
-
-    // Insert message — unread for customer by default
-    const result = await pool.query(
-      `INSERT INTO job_messages (job_id, sender_type, sender_id, sender_name, message, company_id, read_by_customer, read_by_employee)
-       VALUES ($1, 'employee', $2, $3, $4, $5, FALSE, TRUE)
-       RETURNING id, sender_type, sender_id, sender_name, message, read_by_customer, read_by_employee, created_at`,
-      [id, employeeId, senderName, message.trim(), String(job.company_id)]
-    );
-
-    const newMessage = result.rows[0];
-
-    // Publish SSE event to customer portal (real-time update)
-    if (redisClient && redisClient.status === 'ready') {
-      const event = { type: 'chat_message', jobId: id, message: newMessage };
-      redisClient.publish(`customer_job_events:${id}`, JSON.stringify(event)).catch(() => {});
-    }
-
-    // Notify customer via activity log (customer portal notification)
-    if (job.customer_id) {
-      const preview = message.trim().substring(0, 50) + (message.trim().length > 50 ? '...' : '');
-      pool.query(
-        `INSERT INTO activities (user_id, action, activity_type, details, company_id, created_at)
-         VALUES ($1, $2, $3, $4, $5, NOW())`,
-        [
-          null,
-          'chat_message',
-          'customer_notification',
-          JSON.stringify({
-            customer_id: job.customer_id,
-            title: `New message from ${senderName}`,
-            message: preview,
-            job_id: id,
-          }),
-          String(job.company_id),
-        ]
-      ).catch(() => {});
-    }
-
-    res.json({ success: true, data: newMessage });
-  } catch (err) {
-    console.error('jobs POST messages error:', err.message);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-/**
  * GET /jobs/chat-unread-count — Employee gets total unread messages across all jobs
+ * NOTE: GET/POST /:id/messages were removed (duplicates of /api/messages/job/:jobId).
+ * The canonical chat routes live in routes/messages.js.
  */
 router.get('/chat-unread-count', authenticateToken, async (req, res) => {
   const employeeId = req.user.id;
@@ -732,3 +619,4 @@ router.get('/chat-unread-count', authenticateToken, async (req, res) => {
 });
 
 module.exports = router;
+

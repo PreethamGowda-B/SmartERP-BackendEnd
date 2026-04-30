@@ -167,6 +167,7 @@ router.post('/', async (req, res) => {
     }
 
     // FIX 1: Create in-app notification for the assigned employee
+    // Medium FIX: idempotency_key prevents duplicate notifications on retry
     if (job.assigned_to) {
       const preview = message.trim().substring(0, 50) + (message.trim().length > 50 ? '...' : '');
       createNotification({
@@ -176,6 +177,8 @@ router.post('/', async (req, res) => {
         title: `New message from ${senderName}`,
         message: preview,
         priority: 'high',
+        actor_id: null,
+        idempotency_key: `chat_cust_${newMessage.id}`,
         data: {
           job_id: jobId,
           sender_name: senderName,

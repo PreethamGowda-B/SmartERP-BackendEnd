@@ -135,12 +135,13 @@ router.get('/conversation/:userId', async (req, res) => {
 });
 
 // ─── GET /api/messages/conversations ─────────────────────────────────────────
-// Get list of all conversations (for owner)
+// Get list of all conversations (for owner) — company-scoped
 router.get('/conversations', async (req, res) => {
   try {
     const currentUserId = req.user.userId || req.user.id;
+    const companyId = req.user.companyId;
 
-    // Get all users who have messages with current user
+    // Medium FIX: Added company_id filter to prevent cross-tenant data exposure
     const result = await pool.query(
       `SELECT DISTINCT
         u.id as user_id,
@@ -165,8 +166,8 @@ router.get('/conversations', async (req, res) => {
         (
           SELECT COUNT(*)
           FROM messages m2
-          WHERE m2.sender_id = u.id 
-            AND m2.receiver_id = $1 
+          WHERE m2.sender_id = u.id
+            AND m2.receiver_id = $1
             AND m2.read = false
         ) as unread_count,
         (
@@ -178,13 +179,14 @@ router.get('/conversations', async (req, res) => {
           LIMIT 1
         ) as is_last_message_mine
        FROM users u
-       WHERE EXISTS (
-         SELECT 1 FROM messages m
-         WHERE (m.sender_id = u.id AND m.receiver_id = $1)
-            OR (m.sender_id = $1 AND m.receiver_id = u.id)
-       )
+       WHERE u.company_id::text = $2
+         AND EXISTS (
+           SELECT 1 FROM messages m
+           WHERE (m.sender_id = u.id AND m.receiver_id = $1)
+              OR (m.sender_id = $1 AND m.receiver_id = u.id)
+         )
        ORDER BY last_message_time DESC`,
-      [currentUserId]
+      [currentUserId, String(companyId)]
     );
 
     res.json(result.rows);
@@ -195,31 +197,30 @@ router.get('/conversations', async (req, res) => {
 });
 
 // ─── PATCH /api/messages/conversation/:userId/read ───────────────────────────
-// Mark all messages in a conversation as read
+// Mark all messages in a conversation as read — company-scoped
 router.patch('/conversation/:userId/read', async (req, res) => {
   try {
     const currentUserId = req.user.userId || req.user.id;
+    const companyId = req.user.companyId;
     const otherUserId = req.params.userId;
 
     if (!otherUserId) {
       return res.status(400).json({ message: 'Invalid user ID' });
     }
 
-    // Mark all messages from other user as read
+    // Medium FIX: scope the update to the current company
     const result = await pool.query(
-      `UPDATE messages 
+      `UPDATE messages
        SET read = true, updated_at = NOW()
-       WHERE sender_id = $1 
-         AND receiver_id = $2 
+       WHERE sender_id = $1
+         AND receiver_id = $2
          AND read = false
+         AND company_id::text = $3
        RETURNING id`,
-      [otherUserId, currentUserId]
+      [otherUserId, currentUserId, String(companyId)]
     );
 
-    res.json({
-      success: true,
-      marked_count: result.rows.length
-    });
+    res.json({ success: true, marked_count: result.rows.length });
   } catch (err) {
     console.error('Error marking messages as read:', err);
     res.status(500).json({ message: 'Server error marking messages as read' });
@@ -227,21 +228,23 @@ router.patch('/conversation/:userId/read', async (req, res) => {
 });
 
 // ─── GET /api/messages/unread-count ──────────────────────────────────────────
-// Get total unread message count
+// Get total unread message count — company-scoped
 router.get('/unread-count', async (req, res) => {
   try {
     const currentUserId = req.user.userId || req.user.id;
+    const companyId = req.user.companyId;
 
+    // Medium FIX: scope to company
     const result = await pool.query(
       `SELECT COUNT(*) as count
        FROM messages
-       WHERE receiver_id = $1 AND read = false`,
-      [currentUserId]
+       WHERE receiver_id = $1
+         AND read = false
+         AND company_id::text = $2`,
+      [currentUserId, String(companyId)]
     );
 
-    res.json({
-      count: parseInt(result.rows[0].count, 10)
-    });
+    res.json({ count: parseInt(result.rows[0].count, 10) });
   } catch (err) {
     console.error('Error fetching unread count:', err);
     res.status(500).json({ message: 'Server error fetching unread count' });

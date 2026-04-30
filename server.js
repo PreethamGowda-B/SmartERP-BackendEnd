@@ -229,20 +229,68 @@ async function fixDatabaseConstraints() {
       WHERE approval_status IS NULL AND source = 'customer';
 
       UPDATE jobs SET approval_status = 'approved'
-      WHERE approval_status IS NULL AND source != 'customer';
+      WHERE approval_status IS NULL AND (source IS NULL OR source != 'customer');
 
       UPDATE jobs SET employee_status = 'assigned'
       WHERE employee_status IS NULL AND status NOT IN ('completed', 'cancelled');
     `).catch(e => console.warn('⚠️ NULL backfill skipped:', e.message));
 
-    // Step 2: Drop old constraint
-    await pool.query(`ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_status_check`);
-
-    // Step 3: Add new flexible constraint
+    // C1 FIX: Enforce NOT NULL + DEFAULT on critical state columns
     await pool.query(`
-      ALTER TABLE jobs ADD CONSTRAINT jobs_status_check 
-      CHECK (status IN ('open', 'pending', 'in_progress', 'active', 'completed', 'closed', 'cancelled'))
-    `);
+      ALTER TABLE jobs ALTER COLUMN approval_status SET DEFAULT 'pending_approval';
+      ALTER TABLE jobs ALTER COLUMN employee_status SET DEFAULT 'assigned';
+    `).catch(e => console.warn('⚠️ DEFAULT constraint update skipped:', e.message));
+
+    await pool.query(`ALTER TABLE jobs ALTER COLUMN approval_status SET NOT NULL`)
+      .catch(e => console.warn('⚠️ approval_status NOT NULL skipped (NULLs may still exist):', e.message));
+    await pool.query(`ALTER TABLE jobs ALTER COLUMN employee_status SET NOT NULL`)
+      .catch(e => console.warn('⚠️ employee_status NOT NULL skipped (NULLs may still exist):', e.message));
+
+    // C3 FIX: Ensure notifications.company_id is UUID (fix INTEGER type from legacy migration)
+    await pool.query(`
+      DO $$
+      BEGIN
+        IF EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'notifications'
+            AND column_name = 'company_id'
+            AND data_type = 'integer'
+        ) THEN
+          ALTER TABLE notifications ALTER COLUMN company_id TYPE UUID USING company_id::text::uuid;
+        END IF;
+      END $$;
+    `).catch(e => console.warn('⚠️ notifications.company_id type fix skipped:', e.message));
+
+    // Medium FIX: Add composite index for unread message queries
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_job_messages_unread
+      ON job_messages(job_id, sender_type, read_by_employee);
+    `).catch(e => console.warn('⚠️ job_messages index skipped:', e.message));
+
+    // C2 FIX: Migrate job_messages.company_id from TEXT to UUID
+    // Step 1: Ensure the column exists (additive — safe)
+    await pool.query(`
+      ALTER TABLE job_messages ADD COLUMN IF NOT EXISTS company_id TEXT;
+    `).catch(() => {});
+    // Step 2: Convert TEXT → UUID if still TEXT type
+    await pool.query(`
+      DO $$
+      BEGIN
+        IF EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'job_messages'
+            AND column_name = 'company_id'
+            AND data_type = 'text'
+        ) THEN
+          -- Null out any non-UUID values to avoid cast failures
+          UPDATE job_messages SET company_id = NULL
+            WHERE company_id IS NOT NULL
+              AND company_id !~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$';
+          ALTER TABLE job_messages
+            ALTER COLUMN company_id TYPE UUID USING company_id::uuid;
+        END IF;
+      END $$;
+    `).catch(e => console.warn('⚠️ job_messages.company_id type migration skipped:', e.message));
 
     console.log('✅ Database constraints fixed');
 
@@ -364,7 +412,8 @@ async function runDatabaseInitialization() {
       CREATE INDEX IF NOT EXISTS idx_feedback_user_id ON feedback(user_id);
 
       -- Expand notifications table for global broadcasts and metadata
-      ALTER TABLE notifications ADD COLUMN IF NOT EXISTS company_id INTEGER;
+      -- C3 FIX: company_id must be UUID (not INTEGER) — consistent with schema.sql
+      ALTER TABLE notifications ADD COLUMN IF NOT EXISTS company_id UUID;
       ALTER TABLE notifications ADD COLUMN IF NOT EXISTS type VARCHAR(100) DEFAULT 'system';
       ALTER TABLE notifications ADD COLUMN IF NOT EXISTS priority VARCHAR(50) DEFAULT 'normal';
       CREATE INDEX IF NOT EXISTS idx_notifications_company_id ON notifications(company_id);

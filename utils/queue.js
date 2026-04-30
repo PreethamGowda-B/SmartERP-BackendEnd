@@ -37,9 +37,9 @@ async function enqueueNotification(data) {
  */
 async function enqueueAudit(data) {
   if (!auditQueue) {
-    console.warn('⚠️ Redis not connected. Processing audit immediately.');
-    const { logActivity } = require('./authMiddleware'); // assuming logActivity is exported from there or similar
-    return; // handle as needed
+    // Redis not available — silently skip audit (non-critical path)
+    console.warn('⚠️ Redis not connected. Skipping background audit log.');
+    return;
   }
   return await auditQueue.add('log', data, { removeOnComplete: true });
 }

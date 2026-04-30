@@ -145,18 +145,19 @@ router.get('/', authenticateToken, async (req, res) => {
         [String(req.user.companyId), limit, offset]
       );
     } else if (req.user.role === 'employee') {
-      // HARDENED: Employees ONLY see jobs where:
-      //   - employee_status = 'assigned' (available to pick up), OR
-      //   - assigned_to = this employee (already accepted/working)
-      // Never show jobs still pending_approval from customers.
+      // HARDENED: Employees see jobs where:
+      //   - employee_status = 'assigned' (available to pick up, visible to all), OR
+      //   - assigned_to = this employee (accepted/working/completed — regardless of visible_to_all)
+      // Never show customer jobs still pending_approval.
+      // Never show cancelled jobs.
       countResult = await pool.query(
         `SELECT COUNT(*) FROM jobs
          WHERE company_id::text = $1
            AND (
-             ((employee_status = 'assigned' OR employee_status IS NULL) AND (visible_to_all = true OR assigned_to IS NULL))
+             (employee_status = 'assigned' AND (visible_to_all = true OR assigned_to IS NULL))
              OR assigned_to = $2
            )
-           AND (source != 'customer' OR approval_status = 'approved')
+           AND (source != 'customer' OR COALESCE(approval_status, 'approved') = 'approved')
            AND status NOT IN ('cancelled')`,
         [String(req.user.companyId), req.user.id]
       );
@@ -165,10 +166,10 @@ router.get('/', authenticateToken, async (req, res) => {
          FROM jobs j
          WHERE j.company_id::text = $1
            AND (
-             ((j.employee_status = 'assigned' OR j.employee_status IS NULL) AND (j.visible_to_all = true OR j.assigned_to IS NULL))
+             (j.employee_status = 'assigned' AND (j.visible_to_all = true OR j.assigned_to IS NULL))
              OR j.assigned_to = $2
            )
-           AND (j.source != 'customer' OR j.approval_status = 'approved')
+           AND (j.source != 'customer' OR COALESCE(j.approval_status, 'approved') = 'approved')
            AND j.status NOT IN ('cancelled')
          ORDER BY j.created_at DESC
          LIMIT $3 OFFSET $4`,

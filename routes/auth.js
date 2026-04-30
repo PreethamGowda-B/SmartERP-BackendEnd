@@ -781,8 +781,12 @@ router.get("/me", authenticateToken, async (req, res) => {
 // ---------------------------------------------
 router.post("/logout", async (req, res) => {
   try {
-    // Accept refresh token from cookie OR request body (for cross-domain auth)
-    const token = req.cookies?.refresh_token || req.body?.refreshToken;
+    // Accept refresh token from role-specific cookies OR generic fallback OR body
+    const token =
+      req.cookies?.[COOKIE_REFRESH_ADMIN] ||
+      req.cookies?.[COOKIE_REFRESH_USER] ||
+      req.cookies?.refresh_token ||
+      req.body?.refreshToken;
 
     if (token) {
       const rt = await pool.query("SELECT * FROM refresh_tokens WHERE token = $1", [token]);
@@ -793,9 +797,14 @@ router.post("/logout", async (req, res) => {
       await pool.query("DELETE FROM refresh_tokens WHERE token = $1", [token]);
     }
 
-    // ✅ Clear cookies properly for cross-site setup
-    res.clearCookie("access_token", { sameSite: "none", secure: true });
-    res.clearCookie("refresh_token", { sameSite: "none", secure: true });
+    // ✅ Clear ALL possible cookie names (role-specific + legacy generic)
+    const cookieOpts = { sameSite: "none", secure: true, path: "/" };
+    res.clearCookie(COOKIE_ACCESS_USER, cookieOpts);
+    res.clearCookie(COOKIE_REFRESH_USER, cookieOpts);
+    res.clearCookie(COOKIE_ACCESS_ADMIN, cookieOpts);
+    res.clearCookie(COOKIE_REFRESH_ADMIN, cookieOpts);
+    res.clearCookie("access_token", cookieOpts);
+    res.clearCookie("refresh_token", cookieOpts);
 
     res.json({ ok: true });
   } catch (err) {

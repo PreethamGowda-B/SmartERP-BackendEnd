@@ -216,6 +216,13 @@ router.post('/:id/approve', authenticateToken, requireOwnerOrHr, async (req, res
 
     if (result.rowCount === 0) {
       await client.query('ROLLBACK');
+      // Check current state to give a meaningful error
+      const check = await pool.query(
+        "SELECT approval_status FROM jobs WHERE id = $1 AND company_id::text = $2",
+        [id, String(companyId)]
+      );
+      if (check.rows.length === 0) return fail(res, 'Job not found', 404);
+      const cur = check.rows[0].approval_status;
       if (cur === 'approved') return fail(res, 'Job was already approved', 409);
       if (cur === 'rejected') return fail(res, 'Cannot approve a rejected job', 400);
       return fail(res, 'Job could not be approved in its current state', 409);

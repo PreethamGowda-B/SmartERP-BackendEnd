@@ -1,6 +1,10 @@
 /**
  * middleware/tenantContext.js
  * Ensures Row-Level Security (RLS) is active for the current request.
+ *
+ * IMPORTANT: This middleware must run AFTER authenticateToken so that
+ * req.user is already populated. It is called from within authenticateToken
+ * (see authMiddleware.js) rather than as a standalone router-level middleware.
  */
 const { storage } = require('./als');
 
@@ -9,7 +13,6 @@ function setTenantContext(req, res, next) {
 
   if (!companyId) {
     // If req.user exists but has no companyId, log a warning (authenticated orphan user)
-    // If req.user doesn't exist yet, this is normal — authenticateToken runs per-route after this
     if (req.user && req.user.role !== 'super_admin') {
       console.warn(`⚠️ setTenantContext: Authenticated user ${req.user?.id || 'unknown'} has no companyId on ${req.method} ${req.path}`);
     }

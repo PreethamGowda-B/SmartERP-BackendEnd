@@ -1,6 +1,7 @@
 const jwt = require("jsonwebtoken");
 
 const redisClient = require("../utils/redis");
+const { setTenantContext } = require("./tenantContext");
 
 const SUSPENSION_CACHE_TTL = 60; // seconds
 
@@ -90,7 +91,10 @@ function authenticateToken(req, res, next) {
     }
 
     req.user = payload;
-    next();
+    // ✅ Activate RLS tenant context immediately after auth so all downstream
+    // DB queries run inside the correct company scope. This ensures
+    // setTenantContext always runs AFTER req.user is populated.
+    setTenantContext(req, res, next);
   });
 }
 

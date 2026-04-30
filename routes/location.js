@@ -40,7 +40,7 @@ router.post('/update', authenticateToken, loadPlan, requireFeature('location_tra
             const rateLimitKey = `loc_rate:${userId}`;
             const existing = await redisClient.get(rateLimitKey);
             if (existing) {
-                return res.status(429).json({ success: false, error: 'Location updated too recently. Wait 8 seconds.' });
+                return res.status(200).json({ success: true, message: 'Location update rate-limited (ignored safely)', data: null });
             }
             await redisClient.setex(rateLimitKey, 8, '1');
         }

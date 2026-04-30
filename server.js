@@ -422,9 +422,9 @@ async function runDatabaseInitialization() {
 
 // ✅ API Versioning (v1)
 const v1Router = express.Router();
-const { setTenantContext } = require("./middleware/tenantContext");
-
-v1Router.use(setTenantContext); // Enforce RLS for all v1 routes
+// NOTE: setTenantContext (RLS) is now applied inside authenticateToken
+// so it always runs AFTER req.user is populated. No need for a global
+// router-level middleware here.
 
 v1Router.use("/auth", require("./routes/auth"));
 v1Router.use("/users", require("./routes/users"));

@@ -149,7 +149,8 @@ router.get('/', authenticateToken, async (req, res) => {
       //   1. visible_to_all = true (broadcast job, anyone can pick it up)
       //   2. assigned_to = this employee (directly assigned OR already accepted/working)
       //   3. employee_status = 'assigned' with no specific assignee (open pool job)
-      // Always exclude: customer jobs pending approval, cancelled jobs.
+      // Exclude cancelled jobs ONLY if they are not assigned to this employee.
+      // (Jobs can have status='cancelled' but still be assigned — show those too)
       const empWhere = `
         company_id::text = $1
         AND (
@@ -158,7 +159,7 @@ router.get('/', authenticateToken, async (req, res) => {
           OR (employee_status = 'assigned' AND assigned_to IS NULL)
         )
         AND (source != 'customer' OR COALESCE(approval_status, 'approved') = 'approved')
-        AND status NOT IN ('cancelled')
+        AND (status NOT IN ('cancelled') OR assigned_to = $2)
       `;
       countResult = await pool.query(
         `SELECT COUNT(*) FROM jobs WHERE ${empWhere}`,

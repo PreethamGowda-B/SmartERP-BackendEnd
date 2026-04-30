@@ -156,7 +156,7 @@ router.get('/', authenticateToken, async (req, res) => {
         AND (
           visible_to_all = true
           OR assigned_to = $2
-          OR (employee_status = 'assigned' AND assigned_to IS NULL)
+          OR (employee_status IN ('assigned', 'pending') AND assigned_to IS NULL)
           OR (source = 'customer' AND COALESCE(approval_status, 'approved') = 'approved')
         )
         AND (source IS NULL OR source != 'customer' OR COALESCE(approval_status, 'approved') = 'approved')
@@ -245,7 +245,7 @@ router.post('/:id/accept', authenticateToken, async (req, res) => {
       return res.status(403).json({ message: 'Job not assigned to you' });
     }
 
-    // Race condition guard: only accept if employee_status is still 'assigned' (not yet accepted by anyone)
+    // Race condition guard: only accept if employee_status is still available (not yet accepted by anyone)
     // The atomic UPDATE returns 0 rows if another employee already accepted
     const result = await client.query(
       `UPDATE jobs
@@ -257,7 +257,7 @@ router.post('/:id/accept', authenticateToken, async (req, res) => {
            visible_to_all  = false
        WHERE id = $1
          AND company_id::text = $3
-         AND employee_status = 'assigned'
+         AND (employee_status IN ('assigned', 'pending') OR employee_status IS NULL)
        RETURNING *`,
       [id, req.user.id, String(req.user.companyId)]
     );
@@ -347,7 +347,7 @@ router.post('/:id/decline', authenticateToken, async (req, res) => {
            declined_at     = NOW()
        WHERE id = $1
          AND company_id::text = $2
-         AND employee_status = 'assigned'
+         AND (employee_status IN ('assigned', 'pending') OR employee_status IS NULL)
        RETURNING *`,
       [id, String(req.user.companyId)]
     );

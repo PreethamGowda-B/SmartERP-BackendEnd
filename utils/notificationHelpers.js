@@ -11,18 +11,37 @@ const sseConnections = new Map();
  * Enhanced createNotification - Supporting Background Queues
  */
 async function createNotification(notificationData) {
-  const { user_id, company_id, type, title, message, priority = 'low', data = {} } = notificationData;
-  
-  // If this handles background logic, it will be called by the worker.
-  // If called by logic that wants to queue it, it should use enqueueNotification.
-  
-  try {
-    const result = await pool.query(
-      `INSERT INTO notifications (user_id, company_id, type, title, message, priority, data, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-       RETURNING *`,
-      [user_id, company_id, type, title, message, priority, JSON.stringify(data)]
-    );
+    const { user_id, company_id, type, title, message, priority = 'low', data = {}, idempotency_key = null, actor_id = null } = notificationData;
+
+    // STRICT RULE: Never notify the same user who performed the action
+    if (actor_id && String(actor_id) === String(user_id)) {
+        console.log(`🔕 Skipping self-notification for user ${user_id} (actor === receiver)`);
+        return null;
+    }
+
+    try {
+        // If idempotency_key provided, use ON CONFLICT DO NOTHING to deduplicate
+        let result;
+        if (idempotency_key) {
+            result = await pool.query(
+                `INSERT INTO notifications (user_id, company_id, type, title, message, priority, data, idempotency_key, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+         ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
+         RETURNING *`,
+                [user_id, company_id, type, title, message, priority, JSON.stringify(data), idempotency_key]
+            );
+            if (result.rows.length === 0) {
+                console.log(`🔁 Duplicate notification suppressed: key=${idempotency_key}`);
+                return null; // Already created — deduplicated
+            }
+        } else {
+            result = await pool.query(
+                `INSERT INTO notifications (user_id, company_id, type, title, message, priority, data, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+         RETURNING *`,
+                [user_id, company_id, type, title, message, priority, JSON.stringify(data)]
+            );
+        }
 
         const notification = result.rows[0];
 
@@ -36,7 +55,7 @@ async function createNotification(notificationData) {
         try {
             // Fetch all active devices for this user
             const deviceResult = await pool.query(
-                'SELECT fcm_token FROM user_devices WHERE user_id = $1', 
+                'SELECT fcm_token FROM user_devices WHERE user_id = $1',
                 [user_id]
             );
             const tokens = deviceResult.rows.map(r => r.fcm_token);
@@ -52,7 +71,7 @@ async function createNotification(notificationData) {
                     else if (type.startsWith('payroll')) finalUrl = '/payroll';
                     else finalUrl = '/notifications';
                 }
-                
+
                 const pushData = {
                     type,
                     notificationId: notification.id.toString(),
@@ -141,7 +160,7 @@ async function createNotificationForCompany({ company_id, type, title, message, 
         if (company_id) {
             const cid = String(company_id);
             const isDefault = cid === '1' || cid === '0' || cid === '00000000-0000-0000-0000-000000000000';
-            
+
             if (!isDefault) {
                 // Multi-tenant: ONLY notify employees of this specific company
                 query += " AND company_id::text = $1";
@@ -196,7 +215,7 @@ async function createNotificationForOwners({ company_id, type, title, message, p
         if (company_id) {
             const cid = String(company_id);
             const isDefault = cid === '1' || cid === '0' || cid === '00000000-0000-0000-0000-000000000000';
-            
+
             if (!isDefault) {
                 // Multi-tenant: ONLY notify owners/admins of this specific company
                 query += " AND company_id::text = $1";

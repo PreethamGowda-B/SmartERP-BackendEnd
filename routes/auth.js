@@ -265,7 +265,7 @@ router.post("/send-otp", async (req, res) => {
         const ttl = await redisClient.ttl(otpLimitKey);
         const minutesLeft = Math.ceil(ttl / 60);
         console.warn(`🛡️  OTP Blocked for ${email}. Too many requests.`);
-        return res.status(429).json({ 
+        return res.status(429).json({
           message: `You have reached the OTP request limit. Please try again after ${minutesLeft} minutes.`,
           retryAfter: ttl
         });
@@ -308,7 +308,7 @@ router.post("/send-otp", async (req, res) => {
 
     // Send email via Resend with a 10s timeout safety
     const resend = new Resend(process.env.RESEND_API_KEY);
-    
+
     // We race the email send with a timeout to avoid hanging the UI
     const sendPromise = resend.emails.send({
       from: "SmartERP <noreply@prozync.in>",
@@ -333,7 +333,7 @@ router.post("/send-otp", async (req, res) => {
     });
 
     const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Email service timeout')), 12000));
-    
+
     const sendResult = await Promise.race([sendPromise, timeoutPromise]);
 
 
@@ -403,16 +403,11 @@ router.post("/signup", [
   try {
     await client.query("BEGIN");
 
-    // 1. Transactional OTP Verification (Stress Test Bypass for @test.com)
-    const isTestEmail = email.endsWith('@test.com');
-    let otpCheck = { rows: [ { id: 'dummy' } ] };
-    
-    if (!isTestEmail) {
-      otpCheck = await client.query(
-        "SELECT id FROM email_otps WHERE email = $1 AND used = TRUE AND created_at > NOW() - INTERVAL '15 minutes' ORDER BY created_at DESC LIMIT 1",
-        [email]
-      );
-    }
+    // 1. Transactional OTP Verification
+    const otpCheck = await client.query(
+      "SELECT id FROM email_otps WHERE email = $1 AND used = TRUE AND created_at > NOW() - INTERVAL '15 minutes' ORDER BY created_at DESC LIMIT 1",
+      [email]
+    );
 
     if (otpCheck.rows.length === 0) {
       await client.query("ROLLBACK");
@@ -455,7 +450,7 @@ router.post("/signup", [
          VALUES ($1, 'trial_started', 3, $2, NOW())`,
         [companyId, JSON.stringify({ source: 'email_signup', email })]
       );
-    } 
+    }
 
     // ─── EMPLOYEE FLOW ──────────────────────────────────────────────────────
     else if (role.toLowerCase() === 'employee') {
@@ -510,7 +505,7 @@ router.post("/signup", [
 
     // ─── POST-TRANSACTION (Offloaded to Redis Queues) ──────────────────
     const { enqueueNotification, enqueueAudit } = require('../utils/queue');
-    
+
     // Fire and forget enqueuing
     enqueueAudit({ userId: user.id, action: 'signup', reqInfo: { ip: req.ip, agent: req.get('user-agent') } })
       .catch(e => console.error('Queue Audit Error:', e.message));
@@ -567,8 +562,8 @@ router.post("/login", [
       const companyRes = await pool.query("SELECT status FROM companies WHERE id = $1", [user.company_id]);
       if (companyRes.rows.length > 0 && companyRes.rows[0].status === 'suspended') {
         console.warn(`🛑 Login blocked for suspended company user: ${email}`);
-        return res.status(403).json({ 
-          message: "Account Suspended/Disabled", 
+        return res.status(403).json({
+          message: "Account Suspended/Disabled",
           error: "company_suspended",
           details: "Your account is suspended/disabled because of some unusual activities found in your account. Please contact our customer care to reactivate account. Customer care email: prozyncinnovations@gmail.com"
         });
@@ -644,10 +639,10 @@ router.post("/login", [
 // ---------------------------------------------
 router.post("/refresh", async (req, res) => {
   // Try dual-context cookies first, then generic fallback, then body
-  const token = req.cookies?.[COOKIE_REFRESH_ADMIN] || 
-                req.cookies?.[COOKIE_REFRESH_USER] || 
-                req.cookies?.refresh_token || 
-                req.body?.refreshToken;
+  const token = req.cookies?.[COOKIE_REFRESH_ADMIN] ||
+    req.cookies?.[COOKIE_REFRESH_USER] ||
+    req.cookies?.refresh_token ||
+    req.body?.refreshToken;
 
   if (!token) {
     console.warn("⚠️ Refresh attempt failed: No refresh token provided");
@@ -657,7 +652,7 @@ router.post("/refresh", async (req, res) => {
   try {
     // 1. Check DB for the token
     const tokenResult = await pool.query("SELECT * FROM refresh_tokens WHERE token = $1", [token]);
-    
+
     if (tokenResult.rows.length === 0) {
       console.warn("⚠️ Refresh attempt failed: Token not found in database.");
       return res.status(401).json({ message: "Invalid refresh token" });
@@ -694,8 +689,8 @@ router.post("/refresh", async (req, res) => {
         if (user.role !== 'super_admin' && user.company_id) {
           const compRes = await pool.query("SELECT status FROM companies WHERE id = $1", [user.company_id]);
           if (compRes.rows.length > 0 && compRes.rows[0].status === 'suspended') {
-            return res.status(403).json({ 
-              message: "Account Suspended/Disabled", 
+            return res.status(403).json({
+              message: "Account Suspended/Disabled",
               error: "company_suspended",
               details: "Your account is suspended/disabled. Please contact prozyncinnovations@gmail.com"
             });
@@ -752,10 +747,7 @@ router.post("/refresh", async (req, res) => {
     console.error("❌ Refresh route error:", err.message);
     res.status(500).json({
       message: "Server error during refresh",
-      error: err.message,
-      code: err.code,
-      stack: err.stack,
-      detail: err.detail || null
+      error: "Internal Server Error"
     });
   }
 });
@@ -768,7 +760,7 @@ router.get("/me", authenticateToken, async (req, res) => {
     const userId = req.user.userId || req.user.id;
     const result = await pool.query(
       `SELECT id, name, email, role, company_id, company_code 
-       FROM users WHERE id = $1`, 
+       FROM users WHERE id = $1`,
       [userId]
     );
 
@@ -963,7 +955,7 @@ async function updatePushToken(req, res) {
 
     console.log(`\n📲 --- APK PUSH TOKEN RECEIVED ---`);
     console.log(`👤 User ID: ${userId}`);
-    console.log(`🔑 pushToken: ${pushToken ? pushToken.substring(0,20) + '...' : 'undefined'}`);
+    console.log(`🔑 pushToken: ${pushToken ? pushToken.substring(0, 20) + '...' : 'undefined'}`);
     console.log(`----------------------------------\n`);
 
     if (!pushToken) {

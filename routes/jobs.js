@@ -145,22 +145,37 @@ router.get('/', authenticateToken, async (req, res) => {
         [String(req.user.companyId), limit, offset]
       );
     } else if (req.user.role === 'employee') {
-      // Employees ONLY see approved customer jobs — never pending_approval or rejected
+      // HARDENED: Employees ONLY see jobs where:
+      //   - employee_status = 'assigned' (available to pick up), OR
+      //   - assigned_to = this employee (already accepted/working)
+      // Never show jobs still pending_approval from customers.
       countResult = await pool.query(
         `SELECT COUNT(*) FROM jobs
-         WHERE (visible_to_all = true OR assigned_to = $1)
-           AND company_id::text = $2
-           AND (source != 'customer' OR COALESCE(approval_status, 'approved') = 'approved')`,
-        [req.user.id, String(req.user.companyId)]
+         WHERE company_id::text = $1
+           AND (
+             (employee_status = 'assigned' AND (visible_to_all = true OR assigned_to IS NULL))
+             OR assigned_to = $2
+           )
+           AND (source != 'customer' OR approval_status = 'approved')
+           AND status NOT IN ('cancelled')`,
+        [String(req.user.companyId), req.user.id]
       );
       result = await pool.query(
-        `SELECT * FROM jobs
-         WHERE (visible_to_all = true OR assigned_to = $1)
-           AND company_id::text = $2
-           AND (source != 'customer' OR COALESCE(approval_status, 'approved') = 'approved')
-         ORDER BY created_at DESC
+        `SELECT j.*,
+                j.approval_status,
+                j.employee_status,
+                j.review_status
+         FROM jobs j
+         WHERE j.company_id::text = $1
+           AND (
+             (j.employee_status = 'assigned' AND (j.visible_to_all = true OR j.assigned_to IS NULL))
+             OR j.assigned_to = $2
+           )
+           AND (j.source != 'customer' OR j.approval_status = 'approved')
+           AND j.status NOT IN ('cancelled')
+         ORDER BY j.created_at DESC
          LIMIT $3 OFFSET $4`,
-        [req.user.id, String(req.user.companyId), limit, offset]
+        [String(req.user.companyId), req.user.id, limit, offset]
       );
     } else {
       countResult = await pool.query(`SELECT COUNT(*) FROM jobs WHERE visible_to_all = true AND company_id::text = $1`, [String(req.user.companyId)]);
@@ -231,12 +246,14 @@ router.post('/:id/accept', authenticateToken, async (req, res) => {
        SET employee_status = 'accepted',
            accepted_at     = NOW(),
            started_at      = NOW(),
-           status          = 'active',
-           assigned_to     = $2
+           status          = 'in_progress',
+           assigned_to     = $2,
+           visible_to_all  = false
        WHERE id = $1
-         AND (employee_status = 'assigned' OR employee_status IS NULL OR employee_status = 'pending')
+         AND company_id::text = $3
+         AND employee_status = 'assigned'
        RETURNING *`,
-      [id, req.user.id]
+      [id, req.user.id, String(req.user.companyId)]
     );
 
     if (result.rowCount === 0) {
@@ -291,7 +308,7 @@ router.post('/:id/accept', authenticateToken, async (req, res) => {
 
     res.json(acceptedJob);
   } catch (err) {
-    await client.query('ROLLBACK').catch(() => {});
+    await client.query('ROLLBACK').catch(() => { });
     console.error('jobs ACCEPT error', err);
     res.status(500).json({ message: 'Server error' });
   } finally {
@@ -316,14 +333,22 @@ router.post('/:id/decline', authenticateToken, async (req, res) => {
       return res.status(403).json({ message: 'Job not assigned to you' });
     }
 
+    // HARDENED: company_id in UPDATE prevents cross-tenant write
+    // Atomic guard: only decline if still in 'assigned' state
     const result = await pool.query(
-      `UPDATE jobs 
-       SET employee_status = 'declined', 
-           declined_at = NOW()
+      `UPDATE jobs
+       SET employee_status = 'declined',
+           declined_at     = NOW()
        WHERE id = $1
+         AND company_id::text = $2
+         AND employee_status = 'assigned'
        RETURNING *`,
-      [id]
+      [id, String(req.user.companyId)]
     );
+
+    if (result.rowCount === 0) {
+      return res.status(409).json({ message: 'Job not available for decline (already accepted or wrong company)' });
+    }
 
     const declinedJob = result.rows[0];
 
@@ -369,13 +394,14 @@ router.post('/:id/progress', authenticateToken, async (req, res) => {
     // Check if job is assigned to this employee and accepted
     console.log(`🔍 Checking job access: JobID=${id}, UserID=${req.user.id}`);
 
-    // First, check if job exists at all to differentiate 404 vs 403
-    const jobExists = await pool.query('SELECT * FROM jobs WHERE id = $1', [id]);
+    // HARDENED: scope existence check to own company too
+    const jobExists = await pool.query(
+      'SELECT id, assigned_to, employee_status FROM jobs WHERE id = $1 AND company_id::text = $2',
+      [id, String(req.user.companyId)]
+    );
     if (jobExists.rows.length === 0) {
-      console.log(`❌ Job not found: ${id}`);
       return res.status(404).json({ message: 'Job not found' });
     }
-    console.log(`   Job found. Assigned To: ${jobExists.rows[0].assigned_to}, Employee Status: ${jobExists.rows[0].employee_status}`);
 
     const checkJob = await pool.query(
       'SELECT * FROM jobs WHERE id = $1 AND assigned_to = $2 AND employee_status = $3',
@@ -389,7 +415,8 @@ router.post('/:id/progress', authenticateToken, async (req, res) => {
       });
     }
 
-    let status = 'active';
+    // Use 'in_progress' (not 'active') as the canonical in-flight status
+    let status = 'in_progress';
     let completed_at = null;
 
     if (progress === 100) {
@@ -397,16 +424,23 @@ router.post('/:id/progress', authenticateToken, async (req, res) => {
       completed_at = new Date();
     }
 
+    // HARDENED: company_id in UPDATE, only allow if assigned_to = me
     const result = await pool.query(
-      `UPDATE jobs 
-       SET progress = $1, 
-           status = $2,
-           completed_at = $3,
+      `UPDATE jobs
+       SET progress      = $1,
+           status        = $2,
+           completed_at  = $3,
            employee_status = CASE WHEN $1 = 100 THEN 'completed' ELSE employee_status END
        WHERE id = $4
+         AND company_id::text = $5
+         AND assigned_to = $6
        RETURNING *`,
-      [progress, status, completed_at, id]
+      [progress, status, completed_at, id, String(req.user.companyId), req.user.id]
     );
+
+    if (result.rowCount === 0) {
+      return res.status(403).json({ message: 'Cannot update job — access denied or already completed' });
+    }
 
     const updatedJob = result.rows[0];
 

@@ -157,6 +157,7 @@ router.get('/', authenticateToken, async (req, res) => {
           visible_to_all = true
           OR assigned_to = $2
           OR (employee_status = 'assigned' AND assigned_to IS NULL)
+          OR (source = 'customer' AND COALESCE(approval_status, 'approved') = 'approved')
         )
         AND (source IS NULL OR source != 'customer' OR COALESCE(approval_status, 'approved') = 'approved')
         AND (status NOT IN ('cancelled') OR assigned_to = $2)

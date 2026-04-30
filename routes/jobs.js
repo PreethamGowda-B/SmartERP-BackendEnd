@@ -135,8 +135,8 @@ router.get('/', authenticateToken, async (req, res) => {
 
     if (req.user.role === 'owner') {
       // Match by both integer and UUID company_id (legacy accounts have integer companyId in JWT)
-      const ownerCompanyWhere = `(company_id::text = $1 OR company_id::text IN (SELECT id::text FROM companies WHERE id::text = $1 OR company_id::text = $1))`;
-      countResult = await pool.query(`SELECT COUNT(*) FROM jobs WHERE ${ownerCompanyWhere}`, [String(req.user.companyId)]);
+      const ownerCompanyWhere = `(j.company_id::text = $1 OR j.company_id::text IN (SELECT c.id::text FROM companies c WHERE c.id::text = $1 OR c.company_id::text = $1))`;
+      countResult = await pool.query(`SELECT COUNT(*) FROM jobs j WHERE ${ownerCompanyWhere}`, [String(req.user.companyId)]);
       result = await pool.query(
         `SELECT j.*, u.email as employee_email, u.name as employee_name
          FROM jobs j
@@ -149,20 +149,19 @@ router.get('/', authenticateToken, async (req, res) => {
     } else if (req.user.role === 'employee') {
       // Match jobs by company_id — handles both integer (legacy JWT) and UUID company IDs.
       // Customer-submitted jobs store the UUID from companies.id, while legacy jobs use integer.
-      // We match both: direct text match OR UUID lookup via companies table.
       const empWhere = `
-        (company_id::text = $1 OR company_id::text IN (SELECT id::text FROM companies WHERE id::text = $1 OR company_id::text = $1))
+        (j.company_id::text = $1 OR j.company_id::text IN (SELECT c.id::text FROM companies c WHERE c.id::text = $1 OR c.company_id::text = $1))
         AND (
-          visible_to_all = true
-          OR assigned_to = $2
-          OR (employee_status IN ('assigned', 'pending') AND assigned_to IS NULL)
-          OR (source = 'customer' AND COALESCE(approval_status, 'approved') = 'approved')
+          j.visible_to_all = true
+          OR j.assigned_to = $2
+          OR (j.employee_status IN ('assigned', 'pending') AND j.assigned_to IS NULL)
+          OR (j.source = 'customer' AND COALESCE(j.approval_status, 'approved') = 'approved')
         )
-        AND (source IS NULL OR source != 'customer' OR COALESCE(approval_status, 'approved') = 'approved')
-        AND (status NOT IN ('cancelled') OR assigned_to = $2)
+        AND (j.source IS NULL OR j.source != 'customer' OR COALESCE(j.approval_status, 'approved') = 'approved')
+        AND (j.status NOT IN ('cancelled') OR j.assigned_to = $2)
       `;
       countResult = await pool.query(
-        `SELECT COUNT(*) FROM jobs WHERE ${empWhere}`,
+        `SELECT COUNT(*) FROM jobs j WHERE ${empWhere}`,
         [String(req.user.companyId), req.user.id]
       );
       result = await pool.query(
@@ -175,9 +174,9 @@ router.get('/', authenticateToken, async (req, res) => {
         [String(req.user.companyId), req.user.id, limit, offset]
       );
     } else {
-      countResult = await pool.query(`SELECT COUNT(*) FROM jobs WHERE visible_to_all = true AND company_id::text = $1`, [String(req.user.companyId)]);
+      countResult = await pool.query(`SELECT COUNT(*) FROM jobs WHERE visible_to_all = true AND jobs.company_id::text = $1`, [String(req.user.companyId)]);
       result = await pool.query(
-        `SELECT * FROM jobs WHERE visible_to_all = true AND company_id::text = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
+        `SELECT * FROM jobs WHERE visible_to_all = true AND jobs.company_id::text = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
         [String(req.user.companyId), limit, offset]
       );
     }

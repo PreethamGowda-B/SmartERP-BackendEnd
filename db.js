@@ -25,7 +25,7 @@ pool.query = async function(text, params) {
   // Validate companyId is a proper UUID before using it in SQL.
   // This prevents any injection even though the value comes from a JWT.
   if (!UUID_REGEX.test(companyId)) {
-    console.warn(`⚠️ setTenantContext: Invalid companyId format "${companyId}" — skipping RLS context`);
+    console.warn(`⚠️ pool.query: Invalid companyId format "${companyId}" — skipping RLS context`);
     return originalQuery(text, params);
   }
 

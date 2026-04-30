@@ -17,7 +17,7 @@ ALTER TABLE inventory_items ENABLE ROW LEVEL SECURITY;
 -- Allow full access when company context matches
 CREATE POLICY inventory_company_isolation ON inventory_items
   USING (
-    company_id::text = current_setting('app.current_company_id', true)
+    inventory_items.company_id::text = current_setting('app.current_company_id', true)
     OR current_setting('app.current_company_id', true) IS NULL
     OR current_setting('app.current_company_id', true) = ''
   );
@@ -27,7 +27,7 @@ ALTER TABLE payroll ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY payroll_company_isolation ON payroll
   USING (
-    company_id::text = current_setting('app.current_company_id', true)
+    payroll.company_id::text = current_setting('app.current_company_id', true)
     OR current_setting('app.current_company_id', true) IS NULL
     OR current_setting('app.current_company_id', true) = ''
   );
@@ -39,7 +39,7 @@ ALTER TABLE users ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY users_company_isolation ON users
   USING (
-    company_id::text = current_setting('app.current_company_id', true)
+    users.company_id::text = current_setting('app.current_company_id', true)
     OR current_setting('app.current_company_id', true) IS NULL
     OR current_setting('app.current_company_id', true) = ''
   );
@@ -49,7 +49,7 @@ ALTER TABLE notifications ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY notifications_company_isolation ON notifications
   USING (
-    company_id::text = current_setting('app.current_company_id', true)
+    notifications.company_id::text = current_setting('app.current_company_id', true)
     OR current_setting('app.current_company_id', true) IS NULL
     OR current_setting('app.current_company_id', true) = ''
   );
@@ -59,7 +59,7 @@ ALTER TABLE material_requests ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY material_requests_company_isolation ON material_requests
   USING (
-    company_id::text = current_setting('app.current_company_id', true)
+    material_requests.company_id::text = current_setting('app.current_company_id', true)
     OR current_setting('app.current_company_id', true) IS NULL
     OR current_setting('app.current_company_id', true) = ''
   );

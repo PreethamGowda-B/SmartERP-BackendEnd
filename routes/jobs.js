@@ -136,7 +136,7 @@ router.get('/', authenticateToken, async (req, res) => {
     if (req.user.role === 'owner') {
       countResult = await pool.query(`SELECT COUNT(*) FROM jobs WHERE company_id::text = $1`, [String(req.user.companyId)]);
       result = await pool.query(
-        `SELECT j.*, u.email as employee_email 
+        `SELECT j.*, u.email as employee_email, u.name as employee_name
          FROM jobs j
          LEFT JOIN users u ON j.assigned_to = u.id
          WHERE j.company_id::text = $1
@@ -206,6 +206,7 @@ router.get('/', authenticateToken, async (req, res) => {
         declined_at: r.declined_at,
         completed_at: r.completed_at,
         employee_email: r.employee_email,
+        employee_name: r.employee_name || null,
         // These fields must also come from DB, not the blob
         source: r.source || null,
         approval_status: r.approval_status || null,

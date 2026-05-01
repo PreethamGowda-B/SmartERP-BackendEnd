@@ -497,6 +497,24 @@ async function runDatabaseInitialization() {
     } catch (fixErr) {
       console.warn('⚠️  Customer job approval_status fix failed (non-fatal):', fixErr.message);
     }
+
+    // 8. One-time data fix: jobs with progress=100 that are still marked in_progress
+    try {
+      const progressFixResult = await pool.query(`
+        UPDATE jobs
+        SET status          = 'completed',
+            employee_status = 'completed',
+            completed_at    = COALESCE(completed_at, NOW())
+        WHERE progress = 100
+          AND status NOT IN ('completed', 'cancelled')
+        RETURNING id, title
+      `);
+      if (progressFixResult.rowCount > 0) {
+        console.log(`✅ Fixed ${progressFixResult.rowCount} job(s) with 100% progress stuck in non-completed status`);
+      }
+    } catch (fixErr) {
+      console.warn('⚠️  Progress=100 status fix failed (non-fatal):', fixErr.message);
+    }
   } catch (err) {
     console.error('❌ Database Initialization failed:', err.message);
   }

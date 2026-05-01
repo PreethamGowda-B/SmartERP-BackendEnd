@@ -4,9 +4,9 @@ const { storage } = require("./middleware/als");
 // Store the original query function
 const originalQuery = pool.query.bind(pool);
 
-// UUID validation regex — companyId comes from JWT payload but we validate
-// before interpolating into SQL to prevent any injection risk.
-const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// ID validation — supports both standard UUIDs and legacy Integer IDs (numeric strings).
+// This ensures RLS is activated regardless of the underlying company_id type.
+const ID_REGEX = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|\d+)$/i;
 
 /**
  * Global query wrapper that enforces Row-Level Security (RLS)
@@ -22,10 +22,13 @@ pool.query = async function(text, params) {
     return originalQuery(text, params);
   }
 
-  // Validate companyId is a proper UUID before using it in SQL.
-  // This prevents any injection even though the value comes from a JWT.
-  if (!UUID_REGEX.test(companyId)) {
-    console.warn(`⚠️ pool.query: Invalid companyId format "${companyId}" — skipping RLS context`);
+  // Normalize to string for regex test
+  const companyIdStr = String(companyId).trim();
+
+  // Validate companyId format before using it in SQL.
+  // We allow both UUIDs and Integers to support mixed schema states.
+  if (!ID_REGEX.test(companyIdStr)) {
+    console.warn(`⚠️ pool.query: Invalid companyId format "${companyIdStr}" — skipping RLS context`);
     return originalQuery(text, params);
   }
 
@@ -34,7 +37,7 @@ pool.query = async function(text, params) {
     // Use parameterized SET to avoid any string interpolation risk
     await client.query('SELECT set_config($1, $2, true)', [
       'app.current_company_id',
-      companyId,
+      companyIdStr,
     ]);
     return await client.query(text, params);
   } finally {

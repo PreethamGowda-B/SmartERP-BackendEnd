@@ -132,3 +132,16 @@ CREATE INDEX IF NOT EXISTS idx_user_devices_user_id ON user_devices(user_id);
 CREATE INDEX IF NOT EXISTS idx_email_otps_email ON email_otps(email);
 CREATE INDEX IF NOT EXISTS idx_feedback_status ON feedback(status);
 CREATE INDEX IF NOT EXISTS idx_feedback_user_id ON feedback(user_id);
+
+-- ── Fix stuck customer jobs: completed/accepted jobs still showing pending_approval ──
+-- Jobs that were accepted by an employee (approval_status still pending_approval)
+-- should be marked as approved since the employee clearly worked on them.
+UPDATE jobs
+SET approval_status = 'approved',
+    approved_at     = COALESCE(accepted_at, started_at, NOW())
+WHERE source = 'customer'
+  AND approval_status = 'pending_approval'
+  AND (
+    status IN ('completed', 'in_progress', 'active')
+    OR employee_status IN ('accepted', 'completed', 'arrived')
+  );

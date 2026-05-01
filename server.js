@@ -476,6 +476,27 @@ async function runDatabaseInitialization() {
     }
 
     console.log('✅ Database Initialization & Optimization complete');
+
+    // 7. One-time data fix: customer jobs that were accepted/completed but still show pending_approval
+    try {
+      const fixResult = await pool.query(`
+        UPDATE jobs
+        SET approval_status = 'approved',
+            approved_at     = COALESCE(accepted_at, started_at, NOW())
+        WHERE source = 'customer'
+          AND approval_status = 'pending_approval'
+          AND (
+            status IN ('completed', 'in_progress', 'active')
+            OR employee_status IN ('accepted', 'completed', 'arrived')
+          )
+        RETURNING id
+      `);
+      if (fixResult.rowCount > 0) {
+        console.log(`✅ Fixed ${fixResult.rowCount} stuck customer job(s) — approval_status updated to approved`);
+      }
+    } catch (fixErr) {
+      console.warn('⚠️  Customer job approval_status fix failed (non-fatal):', fixErr.message);
+    }
   } catch (err) {
     console.error('❌ Database Initialization failed:', err.message);
   }

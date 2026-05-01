@@ -260,7 +260,17 @@ router.post('/:id/accept', authenticateToken, async (req, res) => {
             started_at      = NOW(),
             status          = 'in_progress',
             assigned_to     = $2,
-            visible_to_all  = false
+            visible_to_all  = false,
+            approval_status = CASE
+              WHEN source = 'customer' AND approval_status = 'pending_approval'
+              THEN 'approved'
+              ELSE approval_status
+            END,
+            approved_at = CASE
+              WHEN source = 'customer' AND approval_status = 'pending_approval'
+              THEN NOW()
+              ELSE approved_at
+            END
         WHERE id = $1
           AND company_id::text = $3
           AND assigned_to IS NULL
@@ -440,12 +450,23 @@ router.post('/:id/progress', authenticateToken, async (req, res) => {
     }
 
     // HARDENED: company_id in UPDATE, only allow if assigned_to = me
+    // When a customer job reaches 100%, also mark it as approved (it was clearly accepted and worked on)
     const result = await pool.query(
       `UPDATE jobs
        SET progress      = $1,
            status        = $2,
            completed_at  = $3,
-           employee_status = CASE WHEN $1 = 100 THEN 'completed' ELSE employee_status END
+           employee_status = CASE WHEN $1 = 100 THEN 'completed' ELSE employee_status END,
+           approval_status = CASE
+             WHEN $1 = 100 AND source = 'customer' AND approval_status = 'pending_approval'
+             THEN 'approved'
+             ELSE approval_status
+           END,
+           approved_at = CASE
+             WHEN $1 = 100 AND source = 'customer' AND approval_status = 'pending_approval'
+             THEN NOW()
+             ELSE approved_at
+           END
        WHERE id = $4
          AND (company_id::text = $5 OR company_id::text IN (SELECT c.id::text FROM companies c WHERE c.id::text = $5 OR c.company_id::text = $5))
          AND assigned_to = $6

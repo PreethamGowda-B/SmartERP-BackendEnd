@@ -32,7 +32,11 @@ function authenticateSSE(req, res, next) {
 
   // 1. Primary: HttpOnly cookies (check both customer and user/employee)
   if (req.cookies) {
-    token = req.cookies.customer_access_token || req.cookies.access_token || req.cookies.business_access_token;
+    token = req.cookies.customer_access_token || 
+            req.cookies.user_access_token || 
+            req.cookies.access_token || 
+            req.cookies.business_access_token ||
+            req.cookies.superadmin_access_token;
   }
 
   // 2. Fallback: ?token= query param (if cookie absent OR cookie fails later, though we only take one here)
@@ -54,7 +58,7 @@ function authenticateSSE(req, res, next) {
     if (err) {
       return res.status(401).json({ message: 'Invalid or expired token' });
     }
-    if (payload.role !== 'customer' && payload.role !== 'employee' && payload.role !== 'owner' && payload.role !== 'admin') {
+    if (payload.role !== 'customer' && payload.role !== 'employee' && payload.role !== 'owner' && payload.role !== 'admin' && payload.role !== 'super_admin') {
       return res.status(403).json({ message: 'Access denied' });
     }
     req.user = payload;

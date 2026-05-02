@@ -271,6 +271,12 @@ router.get('/:id', async (req, res) => {
   const companyId = req.customer.companyId;
   const { id } = req.params;
 
+  // Basic UUID validation to prevent 500 errors on non-UUID strings (like "notifications")
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (!uuidRegex.test(id)) {
+    return fail(res, 'Invalid job ID format', 400);
+  }
+
   try {
     const result = await pool.query(
       `SELECT

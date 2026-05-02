@@ -12,17 +12,17 @@ const { authenticateCustomer } = require('../../middleware/customerAuthMiddlewar
 // ── Public auth routes (no JWT required — handles its own auth internally) ────
 router.use('/auth', require('./auth'));
 
+// ── SSE route — authenticateCustomer is applied inside sse.js
+// (SSE uses ?token= query param which requires auth inside the handler)
+// MUST BE MOUNTED BEFORE '/jobs' to avoid authenticateCustomer interception
+router.use('/', require('./sse'));
+
 // ── Protected routes — require valid customer JWT ─────────────────────────────
 router.use('/jobs', authenticateCustomer, require('./jobs'));
 router.use('/jobs/:id/messages', authenticateCustomer, require('./chat'));
 router.use('/jobs/:id/review', authenticateCustomer, require('./reviews'));
 router.use('/profile', authenticateCustomer, require('./profile'));
 router.use('/recurring', authenticateCustomer, require('./recurring'));
-
-// ── SSE route — authenticateCustomer is applied inside sse.js
-// (SSE uses ?token= query param which requires auth inside the handler)
-router.use('/', require('./sse'));
-
 router.use('/notifications', authenticateCustomer, require('./notifications'));
 
 

@@ -240,8 +240,9 @@ router.get(
         )}`
       );
     } catch (err) {
-      console.error("Google Auth Error:", err);
-      res.redirect("/login?error=auth_failed");
+      console.error("Google Auth Error:", err.message);
+      const frontendUrl = process.env.FRONTEND_ORIGIN || "https://www.prozync.in";
+      res.redirect(`${frontendUrl}/auth/login?error=oauth_failed`);
     }
   }
 );
@@ -645,7 +646,9 @@ router.post("/refresh", async (req, res) => {
     req.body?.refreshToken;
 
   if (!token) {
-    console.warn("⚠️ Refresh attempt failed: No refresh token provided");
+    // This is expected when a user logs out or has a stale background session.
+    // We log it as info to keep the production logs clean.
+    console.info(`ℹ️ Refresh skipped: No token found for ${req.ip}`);
     return res.status(401).json({ message: "No refresh token provided" });
   }
 

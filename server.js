@@ -655,6 +655,13 @@ process.on("uncaughtException", (err) => {
 });
 
 process.on("unhandledRejection", (reason, promise) => {
+  const message = reason instanceof Error ? reason.message : String(reason);
+  
+  // Filter out Redis connection noise from crashing the logs
+  if (message.includes("Connection is closed")) {
+    return;
+  }
+
   logger.error("🔥 UNHANDLED REJECTION Detected", reason instanceof Error ? reason : new Error(String(reason)), { promiseType: String(promise) });
 });
 

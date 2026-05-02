@@ -6,28 +6,31 @@ try {
   if (process.env.REDIS_URL) {
     redisClient = new Redis(process.env.REDIS_URL, {
       maxRetriesPerRequest: 1,
+      lazyConnect: true, // Don't crash if Redis is down on startup
       retryStrategy(times) {
-        if (times > 3) return null; // stop retrying after 3 attempts
-        return Math.min(times * 200, 1000);
+        const delay = Math.min(times * 50, 2000);
+        return delay;
       },
       // Prevent ioredis from throwing unhandled rejections on connection close
       enableOfflineQueue: false,
+      reconnectOnError(err) {
+        const targetError = "READONLY";
+        if (err.message.includes(targetError)) {
+          return true; // Reconnect on READONLY errors
+        }
+        return false;
+      },
     });
 
     redisClient.on("error", (err) => {
-      console.warn("⚠️ Redis client error:", err.message);
+      // Suppress "Connection is closed" noise in logs since we handle it in middleware
+      if (err.message !== "Connection is closed.") {
+        console.warn("⚠️ Redis client error:", err.message);
+      }
     });
 
     redisClient.on("connect", () => {
       console.log("🚀 Redis connected successfully");
-    });
-
-    redisClient.on("close", () => {
-      console.warn("⚠️ Redis connection closed");
-    });
-
-    redisClient.on("end", () => {
-      console.warn("⚠️ Redis connection ended");
     });
   }
 } catch (e) {

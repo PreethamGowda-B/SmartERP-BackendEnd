@@ -13,8 +13,8 @@ function authenticateSuperAdmin(req, res, next) {
   const superAdminEmail = process.env.SUPER_ADMIN_EMAIL;
   
   // Requirement 1: Role must be exactly 'super_admin'
-  // Requirement 2: Email must match the verified developer email from environment variables
-  if (user.role === 'super_admin' && user.email === superAdminEmail) {
+  // Requirement 2: Email must match the verified developer email from environment variables (if set)
+  if (user.role === 'super_admin' && (!superAdminEmail || user.email === superAdminEmail)) {
     console.log(`🛡️ Superadmin access granted to: ${user.email}`);
     return next();
   }

@@ -538,7 +538,7 @@ router.post('/login', [
     }
 
     // Issue tokens
-    await issueTokens(res, req, customer);
+    const { accessToken } = await issueTokens(res, req, customer);
 
     // Non-blocking audit log
     auditLog(req, customer.id, 'customer_login_success', { email }, customer.company_id);
@@ -551,6 +551,7 @@ router.post('/login', [
         email: customer.email,
         company_id: customer.company_id,
       },
+      token: accessToken,
     });
   } catch (err) {
     console.error('login error:', err.message);

@@ -122,7 +122,8 @@ router.post('/', async (req, res) => {
               c.name AS customer_name
        FROM jobs j
        LEFT JOIN customers c ON c.id = j.customer_id
-       WHERE j.id = $1 AND j.customer_id = $2 AND j.company_id::text = $3`,
+       WHERE j.id = $1 AND j.customer_id = $2
+         AND (j.company_id::text = $3 OR j.company_id IN (SELECT id FROM companies WHERE id::text = $3))`,
       [jobId, customerId, String(companyId)]
     );
 
@@ -138,12 +139,15 @@ router.post('/', async (req, res) => {
 
     const senderName = job.customer_name || 'Customer';
 
+    const isUUID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/i.test(String(companyId));
+    const safeCompanyId = isUUID ? String(companyId) : null;
+
     // Insert message — unread for employee by default
     const result = await pool.query(
       `INSERT INTO job_messages (job_id, sender_type, sender_id, sender_name, message, company_id, read_by_customer, read_by_employee)
        VALUES ($1, 'customer', $2, $3, $4, $5, TRUE, FALSE)
        RETURNING id, sender_type, sender_id, sender_name, message, read_by_customer, read_by_employee, created_at`,
-      [jobId, customerId, senderName, message.trim(), String(companyId)]
+      [jobId, customerId, senderName, message.trim(), safeCompanyId]
     );
 
     const newMessage = result.rows[0];

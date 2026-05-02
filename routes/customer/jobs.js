@@ -264,31 +264,6 @@ router.post('/', [
   }
 });
 
-// ─── GET /notifications — customer job notifications ──────────────────────────
-// NOTE: must be registered BEFORE GET /:id to prevent 'notifications' matching as a UUID param
-router.get('/notifications', async (req, res) => {
-  const customerId = req.customer.id;
-  const companyId = req.customer.companyId;
-  const limit = Math.min(50, parseInt(req.query.limit) || 20);
-
-  try {
-    const result = await pool.query(
-      `SELECT id, action AS type, details, created_at
-       FROM activities
-       WHERE activity_type = 'customer_notification'
-         AND company_id = $1
-         AND details::jsonb->>'customer_id' = $2
-       ORDER BY created_at DESC
-       LIMIT $3`,
-      [companyId, customerId, limit]
-    );
-
-    return ok(res, result.rows);
-  } catch (err) {
-    errorLogger.logFromRequest(req, err, { context: 'customer/jobs.GET /notifications' });
-    return fail(res, 'Server error');
-  }
-});
 
 // ─── GET /:id — single job detail ─────────────────────────────────────────────
 router.get('/:id', async (req, res) => {

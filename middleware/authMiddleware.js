@@ -50,21 +50,19 @@ function authenticateToken(req, res, next) {
   // Try query parameter (for SSE connections)
   if (!token && req.query && req.query.token) {
     token = req.query.token;
-    console.log("🔗 Query token found for SSE connection");
   }
 
   // Fallback to cookies
   if (!token && req.cookies) {
     token = req.cookies.superadmin_access_token || req.cookies.user_access_token || req.cookies.access_token;
-    if (token) {
-      const source = req.cookies.superadmin_access_token ? "superadmin" : "user";
-      console.log(`🍪 ${source} cookie token found`);
-    }
   }
 
   if (!token) {
-    const hasCookies = req.cookies && Object.keys(req.cookies).length > 0;
-    console.log(`ℹ️ No token found for ${req.method} ${req.originalUrl} (Origin: ${req.headers.origin || req.headers.host}${hasCookies ? ' | Has Cookies' : ''})`);
+    // Only log in debug mode — these are normal during token refresh cycles
+    if (process.env.LOG_AUTH_FAILURES === 'true') {
+      const hasCookies = req.cookies && Object.keys(req.cookies).length > 0;
+      console.log(`ℹ️ No token found for ${req.method} ${req.originalUrl} (Origin: ${req.headers.origin || req.headers.host}${hasCookies ? ' | Has Cookies' : ''})`);
+    }
     return res.status(401).json({ message: "Not authenticated" });
   }
 

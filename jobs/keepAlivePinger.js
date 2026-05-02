@@ -24,6 +24,8 @@ function startKeepAlivePinger() {
     const client = url.startsWith('https') ? https : http;
 
     const req = client.get(url, (res) => {
+      // Drain the response body so the socket closes cleanly
+      res.resume();
       console.log(`🏓 Keep-alive ping → ${res.statusCode} (${new Date().toISOString()})`);
     });
 
@@ -31,9 +33,14 @@ function startKeepAlivePinger() {
       console.warn(`⚠️ Keep-alive ping failed: ${err.message}`);
     });
 
+    // Only warn on timeout if we haven't already received a response
+    let responded = false;
+    req.on('response', () => { responded = true; });
     req.setTimeout(10000, () => {
-      console.warn('⚠️ Keep-alive ping timed out');
-      req.destroy();
+      if (!responded) {
+        console.warn('⚠️ Keep-alive ping timed out');
+        req.destroy();
+      }
     });
   });
 }

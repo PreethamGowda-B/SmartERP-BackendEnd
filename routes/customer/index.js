@@ -23,6 +23,9 @@ router.use('/recurring', authenticateCustomer, require('./recurring'));
 // (SSE uses ?token= query param which requires auth inside the handler)
 router.use('/', require('./sse'));
 
+router.use('/notifications', authenticateCustomer, require('./notifications'));
+
+
 // ── Validate company — public convenience endpoint (also on auth router) ──────
 // Mounted here so /api/customer/validate-company works without /auth prefix
 router.get('/validate-company', async (req, res) => {

@@ -11,9 +11,10 @@ const pool = new Pool({
     : process.env.DATABASE_URL?.includes('ssl') || process.env.DATABASE_URL?.includes('postgres')
     ? { rejectUnauthorized: false }
     : false,
-  max: 10,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 10000,
+  max: parseInt(process.env.DB_POOL_MAX || "50", 10),
+  idleTimeoutMillis: 10000,
+  connectionTimeoutMillis: 5000,
+  maxUses: 10000,
 });
 
 pool.on('error', (err) => {

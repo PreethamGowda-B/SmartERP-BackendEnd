@@ -295,6 +295,14 @@ router.post('/:id/accept', authenticateToken, async (req, res) => {
 
     const acceptedJob = result.rows[0];
 
+    // Increment active_job_count since they just accepted a job
+    await client.query(
+      `UPDATE employee_profiles
+       SET active_job_count = COALESCE(active_job_count, 0) + 1
+       WHERE user_id = $1`,
+      [req.user.id]
+    );
+
     await client.query('COMMIT');
 
     // ── Post-commit side effects (non-blocking) ───────────────────────────────
@@ -413,27 +421,32 @@ router.post('/:id/progress', authenticateToken, async (req, res) => {
     return res.status(400).json({ message: 'Progress must be between 0 and 100' });
   }
 
+  const client = await pool.connect();
   try {
+    await client.query('BEGIN');
+
     // Check if job is assigned to this employee and accepted
     console.log(`🔍 Checking job access: JobID=${id}, UserID=${req.user.id}`);
 
-    // HARDENED: scope existence check to own company too (handles both integer and UUID company_id)
-    const jobExists = await pool.query(
+    // HARDENED: scope existence check to own company too
+    const jobExists = await client.query(
       `SELECT id, assigned_to, employee_status FROM jobs j
        WHERE j.id = $1
          AND (j.company_id::text = $2 OR j.company_id::text IN (SELECT c.id::text FROM companies c WHERE c.id::text = $2 OR c.company_id::text = $2))`,
       [id, String(req.user.companyId)]
     );
     if (jobExists.rows.length === 0) {
+      await client.query('ROLLBACK');
       return res.status(404).json({ message: 'Job not found' });
     }
 
-    const checkJob = await pool.query(
+    const checkJob = await client.query(
       'SELECT * FROM jobs WHERE id = $1 AND assigned_to = $2 AND employee_status = $3',
       [id, req.user.id, 'accepted']
     );
 
     if (checkJob.rows.length === 0) {
+      await client.query('ROLLBACK');
       console.warn(`⛔ Access denied for Job ${id} by User ${req.user.id}`);
       return res.status(403).json({
         message: 'Job not assigned to you or not accepted'
@@ -449,9 +462,7 @@ router.post('/:id/progress', authenticateToken, async (req, res) => {
       completed_at = new Date();
     }
 
-    // HARDENED: company_id in UPDATE, only allow if assigned_to = me
-    // When a customer job reaches 100%, also mark it as approved (it was clearly accepted and worked on)
-    const result = await pool.query(
+    const result = await client.query(
       `UPDATE jobs
        SET progress      = $1,
            status        = $2,
@@ -475,21 +486,26 @@ router.post('/:id/progress', authenticateToken, async (req, res) => {
     );
 
     if (result.rowCount === 0) {
+      await client.query('ROLLBACK');
       return res.status(403).json({ message: 'Cannot update job — access denied or already completed' });
     }
 
     const updatedJob = result.rows[0];
 
-    // Decrement active_job_count when job is completed
+    // Decrement active_job_count atomically inside transaction
     if (progress === 100) {
-      pool.query(
+      await client.query(
         `UPDATE employee_profiles
          SET active_job_count = GREATEST(0, COALESCE(active_job_count, 0) - 1)
          WHERE user_id = $1`,
         [req.user.id]
-      ).catch(e => console.error('active_job_count decrement error:', e.message));
+      );
+    }
 
-      // Generate invoice (non-blocking) — only for non-cancelled jobs
+    await client.query('COMMIT');
+
+    // Non-blocking side effects
+    if (progress === 100) {
       const { generateInvoice } = require('../services/billingService');
       generateInvoice(updatedJob.id, updatedJob.company_id || req.user.companyId)
         .catch(e => console.error('Invoice generation error:', e.message));
@@ -543,8 +559,11 @@ router.post('/:id/progress', authenticateToken, async (req, res) => {
 
     res.json(updatedJob);
   } catch (err) {
+    if (client) await client.query('ROLLBACK').catch(() => {});
     console.error('jobs PROGRESS error', err);
     res.status(500).json({ message: 'Server error' });
+  } finally {
+    if (client) client.release();
   }
 });
 

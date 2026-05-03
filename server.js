@@ -126,8 +126,13 @@ const generalApiLimiter = rateLimit({
   legacyHeaders: false,
   message: { message: "Too many requests, please try again later." },
   skip: (req) => {
-    // Skip for already-limited auth routes
-    return req.path.startsWith('/api/auth/') || req.path.startsWith('/api/v1/auth/');
+    // Skip for already-limited auth routes (both legacy and customer portal)
+    return (
+      req.path.startsWith('/api/auth/') ||
+      req.path.startsWith('/api/v1/auth/') ||
+      req.path.startsWith('/api/customer/auth/') ||
+      req.path.startsWith('/api/v1/customer/auth/')
+    );
   }
 });
 app.use("/api", generalApiLimiter);

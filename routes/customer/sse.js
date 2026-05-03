@@ -24,6 +24,75 @@ const jwt = require('jsonwebtoken');
 
 const { pool } = require('../../db');
 
+// ─── Shared Redis subscriber (one connection for all SSE clients) ─────────────
+// Creating one ioredis connection per SSE client exhausts Redis connection limits
+// at scale. Instead we use a single shared subscriber and a local listener map.
+let sharedSubscriber = null;
+// Map<channel, Set<(message: string) => void>>
+const channelListeners = new Map();
+
+function getSharedSubscriber() {
+  const redisUrl = process.env.REDIS_URL;
+  if (!redisUrl) return null;
+
+  if (sharedSubscriber && sharedSubscriber.status === 'ready') {
+    return sharedSubscriber;
+  }
+
+  try {
+    sharedSubscriber = new Redis(redisUrl, {
+      maxRetriesPerRequest: 1,
+      retryStrategy(times) {
+        if (times > 5) return null;
+        return Math.min(times * 300, 3000);
+      },
+      lazyConnect: false,
+    });
+
+    sharedSubscriber.on('message', (channel, message) => {
+      const listeners = channelListeners.get(channel);
+      if (listeners) {
+        listeners.forEach(fn => {
+          try { fn(message); } catch {}
+        });
+      }
+    });
+
+    sharedSubscriber.on('error', (err) => {
+      console.warn('SSE shared subscriber error:', err.message);
+    });
+  } catch (err) {
+    console.warn('SSE: Failed to create shared Redis subscriber:', err.message);
+    sharedSubscriber = null;
+  }
+
+  return sharedSubscriber;
+}
+
+function addChannelListener(channel, fn) {
+  if (!channelListeners.has(channel)) {
+    channelListeners.set(channel, new Set());
+    // Subscribe only when first listener is added
+    const sub = getSharedSubscriber();
+    if (sub) sub.subscribe(channel).catch(e => console.warn('SSE subscribe error:', e.message));
+  }
+  channelListeners.get(channel).add(fn);
+}
+
+function removeChannelListener(channel, fn) {
+  const listeners = channelListeners.get(channel);
+  if (!listeners) return;
+  listeners.delete(fn);
+  if (listeners.size === 0) {
+    channelListeners.delete(channel);
+    // Unsubscribe when no more listeners
+    const sub = sharedSubscriber;
+    if (sub && sub.status === 'ready') {
+      sub.unsubscribe(channel).catch(e => console.warn('SSE unsubscribe error:', e.message));
+    }
+  }
+}
+
 // ─── Inline SSE auth — cookie-first, query token only as fallback ─────────────
 // We do NOT use the shared middleware here because SSE connections
 // may arrive before the cookie is set in some browser environments.
@@ -44,9 +113,8 @@ function authenticateSSE(req, res, next) {
     token = req.query.token;
   }
 
-  // If we have a query token, we can prefer it if it's explicitly passed, but let's just stick to token.
-  // Actually, to prevent stale cookie 401s overriding valid query tokens, let's prefer query token if present:
-  if (req.query && req.query.token) {
+  // Query token is a true fallback only — do NOT override a valid cookie token
+  if (!token && req.query && req.query.token) {
     token = req.query.token;
   }
 
@@ -122,66 +190,29 @@ router.get('/jobs/:id/events', authenticateSSE, async (req, res) => {
   }, 25_000);
 
   // ── Redis pub/sub path ──────────────────────────────────────────────────────
-  const redisUrl = process.env.REDIS_URL;
+  const subscriber = getSharedSubscriber();
 
-  if (redisUrl) {
-    // Create a dedicated subscriber client for this connection
-    // (ioredis subscribers cannot be used for other commands)
-    let subscriber;
-    try {
-      subscriber = new Redis(redisUrl, {
-        maxRetriesPerRequest: 1,
-        retryStrategy(times) {
-          if (times > 3) return null;
-          return Math.min(times * 200, 1000);
-        },
-        lazyConnect: false,
-      });
-    } catch (redisErr) {
-      console.warn('SSE: Failed to create Redis subscriber, using fallback:', redisErr.message);
-      subscriber = null;
-    }
+  if (subscriber) {
+    const channel = `customer_job_events:${jobId}`;
 
-    if (subscriber) {
-      const channel = `customer_job_events:${jobId}`;
+    const messageHandler = (message) => {
+      try {
+        res.write(`data: ${message}\n\n`);
+      } catch (writeErr) {
+        console.error('SSE write error:', writeErr.message);
+      }
+    };
 
-      subscriber.subscribe(channel, (err) => {
-        if (err) {
-          console.error('SSE Redis subscribe error:', err.message);
-          // Fall through to fallback
-          subscriber.disconnect();
-          startFallbackTimeout();
-        }
-      });
+    addChannelListener(channel, messageHandler);
 
-      subscriber.on('message', (ch, message) => {
-        if (ch === channel) {
-          try {
-            res.write(`data: ${message}\n\n`);
-          } catch (writeErr) {
-            console.error('SSE write error:', writeErr.message);
-          }
-        }
-      });
+    // Cleanup on client disconnect (Requirement 11.8)
+    req.on('close', () => {
+      clearInterval(keepAliveInterval);
+      removeChannelListener(channel, messageHandler);
+      console.log(`SSE connection closed for job ${jobId}, user ${userId}`);
+    });
 
-      subscriber.on('error', (err) => {
-        console.warn('SSE Redis subscriber error:', err.message);
-      });
-
-      subscriber.on('end', () => {
-        // Connection ended gracefully — cleanup handled by req.on('close')
-      });
-
-      // Cleanup on client disconnect (Requirement 11.8)
-      req.on('close', () => {
-        clearInterval(keepAliveInterval);
-        try { subscriber.unsubscribe(channel); } catch {}
-        try { subscriber.disconnect(); } catch {}
-        console.log(`SSE connection closed for job ${jobId}, user ${userId}`);
-      });
-
-      return; // Keep connection open — cleanup handled by req.on('close')
-    }
+    return; // Keep connection open — cleanup handled by req.on('close')
   }
 
   // ── Fallback: no Redis — close after 30s, client will reconnect ────────────

@@ -114,9 +114,6 @@ function authenticateSSE(req, res, next) {
   }
 
   // Query token is a true fallback only — do NOT override a valid cookie token
-  if (!token && req.query && req.query.token) {
-    token = req.query.token;
-  }
 
   if (!token) {
     return res.status(401).json({ message: 'Not authenticated' });

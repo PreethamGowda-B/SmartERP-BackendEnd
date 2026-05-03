@@ -219,7 +219,7 @@ router.post('/:id/approve', authenticateToken, requireOwnerOrHr, async (req, res
       "  SET approval_status  = 'approved'," +
       '      approved_at      = NOW(),' +
       "      status           = 'open'," +
-      "      employee_status  = 'assigned'," +
+      "      employee_status  = 'pending'," +
       '      assigned_to      = NULL,' +
       '      visible_to_all   = TRUE' +
       ' WHERE id = $1' +

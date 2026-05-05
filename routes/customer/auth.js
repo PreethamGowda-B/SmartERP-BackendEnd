@@ -672,16 +672,6 @@ if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
           return done(new Error('No email from Google'), null);
         }
 
-        // Email conflict check — block if email exists in users table (owner/employee)
-        const userConflict = await pool.query(
-          'SELECT id FROM users WHERE email = $1 LIMIT 1',
-          [email]
-        );
-        if (userConflict.rows.length > 0) {
-          // Signal the callback to redirect with EMAIL_ALREADY_USED error
-          return done(null, { _emailConflict: true, email });
-        }
-
         // Check if customer exists by google_id first, then by email
         const byGoogleId = await pool.query(
           'SELECT * FROM customers WHERE google_id = $1 LIMIT 1',
@@ -763,12 +753,6 @@ router.get('/google/callback', (req, res, next) => {
     }
 
     try {
-      // Email already used in users table (owner/employee) — block
-      if (customer._emailConflict) {
-        auditLog(req, null, 'email_conflict_blocked', { email: customer.email, source: 'google_signup' }, null);
-        return res.redirect(`${CUSTOMER_PORTAL_ORIGIN}/login?error=EMAIL_ALREADY_USED`);
-      }
-
       // New customer — redirect to onboarding
       if (customer._isNew) {
         const tempToken = jwt.sign(

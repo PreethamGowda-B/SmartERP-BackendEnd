@@ -659,7 +659,8 @@ if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
     {
       clientID: process.env.GOOGLE_CLIENT_ID,
       clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-      callbackURL: "/api/customer/auth/google/callback",
+      // Must be absolute — relative URLs break on Render/proxied deployments
+      callbackURL: `${process.env.BACKEND_URL || 'http://localhost:4000'}/api/customer/auth/google/callback`,
       passReqToCallback: true,
     },
     async (req, accessToken, refreshToken, profile, done) => {
@@ -670,6 +671,15 @@ if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
 
         if (!email) {
           return done(new Error('No email from Google'), null);
+        }
+
+        // Block if email already exists in users table (owner/employee)
+        const userConflict = await pool.query(
+          'SELECT id FROM users WHERE email = $1 LIMIT 1',
+          [email]
+        );
+        if (userConflict.rows.length > 0) {
+          return done(null, { _emailConflict: true, email });
         }
 
         // Check if customer exists by google_id first, then by email
@@ -690,7 +700,7 @@ if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
         );
 
         if (byEmail.rows.length === 0) {
-          // Brand new customer — create with no company_id
+          // Brand new customer — create with no company_id, flag as new
           const newCustomer = await pool.query(
             `INSERT INTO customers (name, email, google_id, auth_provider, is_verified, company_id)
              VALUES ($1, $2, $3, 'google', TRUE, NULL)
@@ -702,8 +712,7 @@ if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
 
         const customer = byEmail.rows[0];
 
-        // Email exists with manual auth — LINK Google to existing account
-        // This is the fix: instead of blocking, we link the Google identity
+        // Email exists with manual auth — link Google identity to existing account
         if (customer.auth_provider === 'manual') {
           const linked = await pool.query(
             `UPDATE customers
@@ -712,10 +721,12 @@ if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
              RETURNING *`,
             [googleId, customer.id]
           );
-          return done(null, linked.rows[0]);
+          // If no company_id yet, treat as needing onboarding
+          const updated = linked.rows[0];
+          return done(null, updated.company_id ? updated : { ...updated, _isNew: true });
         }
 
-        // Existing Google customer (matched by email, google_id was null/different) — update google_id
+        // Existing Google customer matched by email — update google_id if changed
         const updated = await pool.query(
           `UPDATE customers SET google_id = $1 WHERE id = $2 RETURNING *`,
           [googleId, customer.id]
@@ -746,40 +757,36 @@ router.get('/google/callback', (req, res, next) => {
     return res.redirect(`${CUSTOMER_PORTAL_ORIGIN}/login?error=oauth_not_configured`);
   }
 
-  passport.authenticate('customer-google', { session: false, failureRedirect: `${CUSTOMER_PORTAL_ORIGIN}/login?error=oauth_failed` }, async (err, customer) => {
+  passport.authenticate('customer-google', { session: false, failureRedirect: `${CUSTOMER_PORTAL_ORIGIN}/customer/login?error=oauth_failed` }, async (err, customer) => {
     if (err || !customer) {
       console.error('Google callback error:', err && err.message);
-      return res.redirect(`${CUSTOMER_PORTAL_ORIGIN}/login?error=oauth_failed`);
+      return res.redirect(`${CUSTOMER_PORTAL_ORIGIN}/customer/login?error=oauth_failed`);
     }
 
     try {
-      // New customer — redirect to onboarding
-      if (customer._isNew) {
-        const tempToken = jwt.sign(
-          { id: customer.id, purpose: 'onboarding', email: customer.email },
-          JWT_SECRET,
-          { expiresIn: '15m' }
-        );
-        return res.redirect(`${CUSTOMER_PORTAL_ORIGIN}/onboarding?token=${tempToken}`);
+      // Email already used in users table (owner/employee) — block
+      if (customer._emailConflict) {
+        auditLog(req, null, 'email_conflict_blocked', { email: customer.email, source: 'google_signup' }, null);
+        return res.redirect(`${CUSTOMER_PORTAL_ORIGIN}/customer/login?error=EMAIL_ALREADY_USED`);
       }
 
-      // Customer without company_id (Google-linked manual account or new Google account) — onboarding
-      if (!customer.company_id) {
+      // New customer or existing customer without company_id — redirect to onboarding
+      if (customer._isNew || !customer.company_id) {
         const tempToken = jwt.sign(
           { id: customer.id, purpose: 'onboarding', email: customer.email },
           JWT_SECRET,
           { expiresIn: '15m' }
         );
-        return res.redirect(`${CUSTOMER_PORTAL_ORIGIN}/onboarding?token=${tempToken}`);
+        return res.redirect(`${CUSTOMER_PORTAL_ORIGIN}/customer/onboarding?token=${tempToken}`);
       }
 
       // Existing customer with company_id — issue full JWT and redirect to dashboard
       await issueTokens(res, req, customer);
       auditLog(req, customer.id, 'customer_login_success', { email: customer.email, provider: 'google' }, customer.company_id);
-      return res.redirect(`${CUSTOMER_PORTAL_ORIGIN}/dashboard`);
+      return res.redirect(`${CUSTOMER_PORTAL_ORIGIN}/customer/dashboard`);
     } catch (callbackErr) {
       console.error('Google callback processing error:', callbackErr.message);
-      return res.redirect(`${CUSTOMER_PORTAL_ORIGIN}/login?error=server_error`);
+      return res.redirect(`${CUSTOMER_PORTAL_ORIGIN}/customer/login?error=server_error`);
     }
   })(req, res, next);
 });

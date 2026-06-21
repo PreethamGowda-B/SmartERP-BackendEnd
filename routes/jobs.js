@@ -251,8 +251,12 @@ router.post('/:id/accept', authenticateToken, async (req, res) => {
       return res.status(403).json({ message: 'Job not assigned to you' });
     }
 
-    // Race condition guard: only accept if employee_status is still available (not yet accepted by anyone)
-    // The atomic UPDATE returns 0 rows if another employee already accepted
+    // Race condition guard: only accept if employee_status is still available (not yet accepted by anyone).
+    // The atomic UPDATE returns 0 rows if another employee already accepted.
+    // WHERE clause is intentionally permissive for "available" states:
+    //   - employee_status IN ('assigned','pending') → normal cases
+    //   - employee_status IS NULL                  → old rows where backfill hasn't run yet
+    // approval_status uses COALESCE to guarantee it never becomes NULL (prevents NOT NULL constraint violations).
     const result = await client.query(
       `UPDATE jobs
         SET employee_status = 'accepted',
@@ -262,46 +266,50 @@ router.post('/:id/accept', authenticateToken, async (req, res) => {
             assigned_to     = $2,
             visible_to_all  = false,
             approval_status = CASE
-              WHEN source = 'customer' AND approval_status = 'pending_approval'
+              WHEN source = 'customer' AND COALESCE(approval_status, 'pending_approval') = 'pending_approval'
               THEN 'approved'
-              ELSE approval_status
+              ELSE COALESCE(approval_status, 'approved')
             END,
             approved_at = CASE
-              WHEN source = 'customer' AND approval_status = 'pending_approval'
+              WHEN source = 'customer' AND COALESCE(approval_status, 'pending_approval') = 'pending_approval'
               THEN NOW()
               ELSE approved_at
             END
         WHERE id = $1
           AND company_id::text = $3
-          AND assigned_to IS NULL
-          AND employee_status = 'assigned'
+          AND (assigned_to IS NULL OR assigned_to = $2)
+          AND (employee_status IN ('assigned', 'pending') OR employee_status IS NULL)
         RETURNING *`,
       [id, req.user.id, String(req.user.companyId)]
     );
 
     if (result.rowCount === 0) {
       await client.query('ROLLBACK');
-      // Check current state to give a meaningful error
-      const current = await pool.query('SELECT employee_status, assigned_to FROM jobs WHERE id = $1', [id]);
+      // Fetch full row to determine why the UPDATE matched 0 rows
+      const current = await pool.query('SELECT * FROM jobs WHERE id = $1', [id]);
       const cur = current.rows[0];
-      if (cur && cur.employee_status === 'accepted' && cur.assigned_to !== req.user.id) {
+
+      // Log the actual state so it's easy to diagnose in server logs
+      console.warn(`[jobs/accept] UPDATE returned 0 rows for job ${id}. ` +
+        `employee_status=${cur?.employee_status}, assigned_to=${cur?.assigned_to}, ` +
+        `status=${cur?.status}, company_id=${cur?.company_id}, requester=${req.user.id}`);
+
+      // Idempotent: this employee already accepted — return current job as success
+      if (cur && cur.employee_status === 'accepted' && String(cur.assigned_to) === String(req.user.id)) {
+        return res.status(200).json(cur);
+      }
+      // Taken by a different employee
+      if (cur && cur.employee_status === 'accepted' && cur.assigned_to && String(cur.assigned_to) !== String(req.user.id)) {
         return res.status(409).json({ message: 'Job already accepted by another employee' });
       }
-      if (cur && cur.employee_status === 'accepted' && cur.assigned_to === req.user.id) {
-        return res.status(409).json({ message: 'You have already accepted this job' });
+      // Job was completed or cancelled
+      if (cur && ['completed', 'cancelled'].includes(cur.status)) {
+        return res.status(409).json({ message: `Job is already ${cur.status}` });
       }
       return res.status(409).json({ message: 'Job is no longer available for acceptance' });
     }
 
     const acceptedJob = result.rows[0];
-
-    // Increment active_job_count since they just accepted a job
-    await client.query(
-      `UPDATE employee_profiles
-       SET active_job_count = COALESCE(active_job_count, 0) + 1
-       WHERE user_id = $1`,
-      [req.user.id]
-    );
 
     await client.query('COMMIT');
 
@@ -421,32 +429,27 @@ router.post('/:id/progress', authenticateToken, async (req, res) => {
     return res.status(400).json({ message: 'Progress must be between 0 and 100' });
   }
 
-  const client = await pool.connect();
   try {
-    await client.query('BEGIN');
-
     // Check if job is assigned to this employee and accepted
     console.log(`🔍 Checking job access: JobID=${id}, UserID=${req.user.id}`);
 
-    // HARDENED: scope existence check to own company too
-    const jobExists = await client.query(
+    // HARDENED: scope existence check to own company too (handles both integer and UUID company_id)
+    const jobExists = await pool.query(
       `SELECT id, assigned_to, employee_status FROM jobs j
        WHERE j.id = $1
          AND (j.company_id::text = $2 OR j.company_id::text IN (SELECT c.id::text FROM companies c WHERE c.id::text = $2 OR c.company_id::text = $2))`,
       [id, String(req.user.companyId)]
     );
     if (jobExists.rows.length === 0) {
-      await client.query('ROLLBACK');
       return res.status(404).json({ message: 'Job not found' });
     }
 
-    const checkJob = await client.query(
+    const checkJob = await pool.query(
       'SELECT * FROM jobs WHERE id = $1 AND assigned_to = $2 AND employee_status = $3',
       [id, req.user.id, 'accepted']
     );
 
     if (checkJob.rows.length === 0) {
-      await client.query('ROLLBACK');
       console.warn(`⛔ Access denied for Job ${id} by User ${req.user.id}`);
       return res.status(403).json({
         message: 'Job not assigned to you or not accepted'
@@ -462,7 +465,9 @@ router.post('/:id/progress', authenticateToken, async (req, res) => {
       completed_at = new Date();
     }
 
-    const result = await client.query(
+    // HARDENED: company_id in UPDATE, only allow if assigned_to = me
+    // When a customer job reaches 100%, also mark it as approved (it was clearly accepted and worked on)
+    const result = await pool.query(
       `UPDATE jobs
        SET progress      = $1,
            status        = $2,
@@ -486,26 +491,21 @@ router.post('/:id/progress', authenticateToken, async (req, res) => {
     );
 
     if (result.rowCount === 0) {
-      await client.query('ROLLBACK');
       return res.status(403).json({ message: 'Cannot update job — access denied or already completed' });
     }
 
     const updatedJob = result.rows[0];
 
-    // Decrement active_job_count atomically inside transaction
+    // Decrement active_job_count when job is completed
     if (progress === 100) {
-      await client.query(
+      pool.query(
         `UPDATE employee_profiles
          SET active_job_count = GREATEST(0, COALESCE(active_job_count, 0) - 1)
          WHERE user_id = $1`,
         [req.user.id]
-      );
-    }
+      ).catch(e => console.error('active_job_count decrement error:', e.message));
 
-    await client.query('COMMIT');
-
-    // Non-blocking side effects
-    if (progress === 100) {
+      // Generate invoice (non-blocking) — only for non-cancelled jobs
       const { generateInvoice } = require('../services/billingService');
       generateInvoice(updatedJob.id, updatedJob.company_id || req.user.companyId)
         .catch(e => console.error('Invoice generation error:', e.message));
@@ -559,11 +559,8 @@ router.post('/:id/progress', authenticateToken, async (req, res) => {
 
     res.json(updatedJob);
   } catch (err) {
-    if (client) await client.query('ROLLBACK').catch(() => {});
     console.error('jobs PROGRESS error', err);
     res.status(500).json({ message: 'Server error' });
-  } finally {
-    if (client) client.release();
   }
 });
 

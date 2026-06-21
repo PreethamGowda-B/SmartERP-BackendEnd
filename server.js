@@ -126,13 +126,8 @@ const generalApiLimiter = rateLimit({
   legacyHeaders: false,
   message: { message: "Too many requests, please try again later." },
   skip: (req) => {
-    // Skip for already-limited auth routes (both legacy and customer portal)
-    return (
-      req.path.startsWith('/api/auth/') ||
-      req.path.startsWith('/api/v1/auth/') ||
-      req.path.startsWith('/api/customer/auth/') ||
-      req.path.startsWith('/api/v1/customer/auth/')
-    );
+    // Skip for already-limited auth routes
+    return req.path.startsWith('/api/auth/') || req.path.startsWith('/api/v1/auth/');
   }
 });
 app.use("/api", generalApiLimiter);
@@ -660,13 +655,6 @@ process.on("uncaughtException", (err) => {
 });
 
 process.on("unhandledRejection", (reason, promise) => {
-  const message = reason instanceof Error ? reason.message : String(reason);
-  
-  // Filter out Redis connection noise from crashing the logs
-  if (message.includes("Connection is closed")) {
-    return;
-  }
-
   logger.error("🔥 UNHANDLED REJECTION Detected", reason instanceof Error ? reason : new Error(String(reason)), { promiseType: String(promise) });
 });
 

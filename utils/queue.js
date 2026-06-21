@@ -6,14 +6,6 @@ const redisConnection = process.env.REDIS_URL
   ? new IORedis(process.env.REDIS_URL, { maxRetriesPerRequest: null })
   : null;
 
-if (redisConnection) {
-  redisConnection.on('error', (err) => {
-    if (err.message !== 'Connection is closed.') {
-      console.warn('⚠️ BullMQ Redis Connection Error:', err.message);
-    }
-  });
-}
-
 /**
  * High-Scale Background Queues
  */

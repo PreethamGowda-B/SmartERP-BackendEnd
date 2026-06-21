@@ -11,10 +11,7 @@ router.get('/', authenticateToken, async (req, res) => {
     const userId = req.user.userId || req.user.id;
     const companyId = req.user.companyId;
 
-    // Only log in debug mode to prevent log flooding on poll
-    if (process.env.LOG_LEVEL === 'debug') {
-      console.log('🔍 Fetching notifications for user:', userId);
-    }
+    console.log('🔍 Fetching notifications for user:', userId);
 
     const result = await pool.query(
       `SELECT * FROM notifications 
@@ -24,9 +21,7 @@ router.get('/', authenticateToken, async (req, res) => {
       [userId, String(companyId)]
     );
 
-    if (process.env.LOG_LEVEL === 'debug') {
-      console.log(`✅ Found ${result.rows.length} notifications`);
-    }
+    console.log(`✅ Found ${result.rows.length} notifications`);
     res.json(result.rows);
   } catch (err) {
     console.error('❌ Error fetching notifications:', err);

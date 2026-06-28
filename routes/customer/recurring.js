@@ -152,9 +152,9 @@ router.post('/:id/run', async (req, res) => {
          (title, description, priority, status, approval_status, approved_at,
           customer_id, company_id, source, visible_to_all, created_by, employee_status)
        VALUES ($1, $2, $3, 'open', $4, $5,
-               $6, $7, 'customer', TRUE, NULL, 'assigned')
+               $6, $7, 'customer', $8, NULL, 'assigned')
        RETURNING *`,
-      [t.title, t.description, t.priority, approvalStatus, approvedAt, customerId, companyId]
+      [t.title, t.description, t.priority, approvalStatus, approvedAt, customerId, companyId, autoApprove]
     );
     const createdJob = jobResult.rows[0];
 

@@ -135,13 +135,17 @@ router.get('/', authenticateToken, async (req, res) => {
     let queryParams = [req.user.companyId];
 
     if (req.user.role === 'owner') {
-      // Simple direct match — jobs.company_id stores the same value as JWT companyId
-      countResult = await pool.query(`SELECT COUNT(*) FROM jobs j WHERE j.company_id::text = $1`, [String(req.user.companyId)]);
+      // Exclude pending_approval / rejected customer jobs from the owner's tasks list
+      const ownerWhere = `
+        j.company_id::text = $1
+        AND (j.source IS NULL OR j.source != 'customer' OR j.approval_status = 'approved')
+      `;
+      countResult = await pool.query(`SELECT COUNT(*) FROM jobs j WHERE ${ownerWhere}`, [String(req.user.companyId)]);
       result = await pool.query(
         `SELECT j.*, u.email as employee_email, u.name as employee_name
          FROM jobs j
          LEFT JOIN users u ON j.assigned_to = u.id
-         WHERE j.company_id::text = $1
+         WHERE ${ownerWhere}
          ORDER BY j.created_at DESC
          LIMIT $2 OFFSET $3`,
         [String(req.user.companyId), limit, offset]
@@ -178,9 +182,20 @@ router.get('/', authenticateToken, async (req, res) => {
         [String(req.user.companyId), req.user.id, limit, offset]
       );
     } else {
-      countResult = await pool.query(`SELECT COUNT(*) FROM jobs WHERE visible_to_all = true AND jobs.company_id::text = $1`, [String(req.user.companyId)]);
+      // HR/other roles: only see jobs visible to all that are approved (if from customer)
+      const hrWhere = `
+        j.visible_to_all = true 
+        AND j.company_id::text = $1
+        AND (j.source IS NULL OR j.source != 'customer' OR j.approval_status = 'approved')
+      `;
+      countResult = await pool.query(`SELECT COUNT(*) FROM jobs j WHERE ${hrWhere}`, [String(req.user.companyId)]);
       result = await pool.query(
-        `SELECT * FROM jobs WHERE visible_to_all = true AND jobs.company_id::text = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
+        `SELECT j.*, u.email as employee_email, u.name as employee_name
+         FROM jobs j 
+         LEFT JOIN users u ON j.assigned_to = u.id
+         WHERE ${hrWhere} 
+         ORDER BY j.created_at DESC 
+         LIMIT $2 OFFSET $3`,
         [String(req.user.companyId), limit, offset]
       );
     }

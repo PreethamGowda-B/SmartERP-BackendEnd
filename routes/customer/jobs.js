@@ -203,8 +203,8 @@ router.post('/', [
           scheduled_at)
        VALUES ($1, $2, $3, $4, $5,
                'open', $6, $7,
-               $8, $9, 'customer', TRUE, NULL, 'assigned',
-               $10)
+               $8, $9, 'customer', $10, NULL, 'assigned',
+               $11)
        RETURNING *`,
       [
         title,
@@ -216,9 +216,14 @@ router.post('/', [
         approvedAt,
         customerId,
         companyId,
+        // visible_to_all: TRUE only when auto-approved so the job is immediately
+        // visible to employees. When pending_approval, keep it FALSE until the
+        // owner explicitly approves it — this prevents it from appearing in Tasks.
+        autoApprove,
         scheduled_at || null,
       ]
     );
+
 
     const createdJob = result.rows[0];
 

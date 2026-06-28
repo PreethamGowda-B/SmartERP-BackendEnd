@@ -357,12 +357,15 @@ router.post('/job/:jobId', async (req, res) => {
     const job = jobCheck.rows[0];
     const senderName = job.employee_name || 'Technician';
 
+    const isUUID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/i.test(String(companyId));
+    const safeCompanyId = isUUID ? String(companyId) : null;
+
     // Insert message
     const result = await pool.query(
       `INSERT INTO job_messages (job_id, sender_type, sender_id, sender_name, message, company_id, read_by_employee, read_by_customer)
        VALUES ($1, 'employee', $2, $3, $4, $5, TRUE, FALSE)
        RETURNING id, sender_type, sender_id, sender_name, message, read_by_employee, read_by_customer, created_at`,
-      [jobId, String(employeeId), senderName, message.trim(), String(companyId)]
+      [jobId, String(employeeId), senderName, message.trim(), safeCompanyId]
     );
 
     const newMessage = result.rows[0];

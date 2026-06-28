@@ -81,10 +81,6 @@ router.get('/sse', authenticateToken, (req, res) => {
         maxRetriesPerRequest: 1,
         retryStrategy(times) { return times > 3 ? null : Math.min(times * 200, 1000); },
         lazyConnect: false,
-        // CRITICAL: Disable offline queue so commands aren't queued after disconnect.
-        // This prevents "Connection is closed." rejections from in-flight commands.
-        enableOfflineQueue: false,
-        enableReadyCheck: false,
       });
 
       // Attach error handler IMMEDIATELY to prevent unhandled error events

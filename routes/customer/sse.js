@@ -144,12 +144,19 @@ router.get('/jobs/:id/events', authenticateSSE, async (req, res) => {
 
     if (subscriber) {
       const channel = `customer_job_events:${jobId}`;
+      let isClosing = false;
 
-      subscriber.subscribe(channel, (err) => {
-        if (err) {
+      // Attach error handler IMMEDIATELY to prevent unhandled error events
+      subscriber.on('error', (err) => {
+        if (err.message !== 'Connection is closed.' && !err.message.includes('connect ECONNREFUSED')) {
+          console.warn('SSE Redis subscriber error (non-fatal):', err.message);
+        }
+      });
+
+      // Subscribe with .catch() to swallow connection-closed errors on early disconnect
+      subscriber.subscribe(channel).catch((err) => {
+        if (!isClosing) {
           console.error('SSE Redis subscribe error:', err.message);
-          // Fall through to fallback
-          subscriber.disconnect();
           startFallbackTimeout();
         }
       });
@@ -164,19 +171,20 @@ router.get('/jobs/:id/events', authenticateSSE, async (req, res) => {
         }
       });
 
-      subscriber.on('error', (err) => {
-        console.warn('SSE Redis subscriber error:', err.message);
-      });
-
       subscriber.on('end', () => {
         // Connection ended gracefully — cleanup handled by req.on('close')
       });
 
       // Cleanup on client disconnect (Requirement 11.8)
       req.on('close', () => {
+        isClosing = true;
         clearInterval(keepAliveInterval);
-        try { subscriber.unsubscribe(channel); } catch {}
-        try { subscriber.disconnect(); } catch {}
+        try {
+          subscriber.unsubscribe(channel).catch(() => {});
+          subscriber.quit().catch(() => {});
+        } catch {
+          try { subscriber.disconnect(); } catch {}
+        }
         console.log(`SSE connection closed for job ${jobId}, user ${userId}`);
       });
 

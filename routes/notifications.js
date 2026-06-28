@@ -81,7 +81,19 @@ router.get('/sse', authenticateToken, (req, res) => {
         maxRetriesPerRequest: 1,
         retryStrategy(times) { return times > 3 ? null : Math.min(times * 200, 1000); },
         lazyConnect: false,
+        // CRITICAL: Disable offline queue so commands aren't queued after disconnect.
+        // This prevents "Connection is closed." rejections from in-flight commands.
+        enableOfflineQueue: false,
+        enableReadyCheck: false,
       });
+
+      // Attach error handler IMMEDIATELY to prevent unhandled error events
+      subscriber.on('error', (err) => {
+        if (err.message !== 'Connection is closed.' && !err.message.includes('connect ECONNREFUSED')) {
+          console.warn('SSE Redis subscriber error (non-fatal):', err.message);
+        }
+      });
+
     } catch (redisErr) {
       console.warn('SSE: Redis subscriber creation failed, using in-process fallback:', redisErr.message);
       subscriber = null;
@@ -89,13 +101,12 @@ router.get('/sse', authenticateToken, (req, res) => {
 
     if (subscriber) {
       const channel = `employee_notifications:${userId}`;
+      let isClosing = false; // Guard to prevent double-cleanup
 
-      subscriber.subscribe(channel, (err) => {
-        if (err) {
+      // Subscribe with .catch() to swallow "Connection is closed." on early disconnect
+      subscriber.subscribe(channel).catch((err) => {
+        if (!isClosing) {
           console.error('SSE Redis subscribe error:', err.message);
-          subscriber.disconnect();
-          // Fall through to in-process fallback below
-          registerSSEConnection(userId, res);
         }
       });
 
@@ -106,20 +117,22 @@ router.get('/sse', authenticateToken, (req, res) => {
         }
       });
 
-      subscriber.on('error', (err) => {
-        console.warn('SSE Redis subscriber error (non-fatal):', err.message);
-      });
-
-      // Swallow unhandled promise rejections from ioredis internal operations
-      subscriber.on('end', () => {
-        // Connection ended — cleanup already handled by req.on('close')
-      });
+      // Swallow connection-end events gracefully
+      subscriber.on('end', () => { /* cleanup handled by req.on('close') */ });
+      subscriber.on('close', () => { /* no-op — cleanup handled by req.on('close') */ });
 
       req.on('close', () => {
         console.log(`📡 SSE connection closed for user ${userId}`);
+        isClosing = true;
         clearInterval(heartbeatInterval);
-        try { subscriber.unsubscribe(channel); } catch {}
-        try { subscriber.disconnect(); } catch {}
+        // Use quit() instead of disconnect() — gracefully resolves in-flight commands
+        // then closes, preventing "Connection is closed." unhandled rejections
+        try {
+          subscriber.unsubscribe(channel).catch(() => {});
+          subscriber.quit().catch(() => {});
+        } catch {
+          try { subscriber.disconnect(); } catch {}
+        }
       });
 
       return; // Keep connection open — cleanup handled by req.on('close')

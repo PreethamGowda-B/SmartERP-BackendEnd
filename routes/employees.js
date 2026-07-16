@@ -79,12 +79,10 @@ router.post('/', authenticateToken, [
     return res.status(400).json({ message: "Validation failed", errors: errors.array() });
   }
 
-  // Role guard (skip in DEV mode)
-  if (!DEV) {
-    const role = req.user?.role;
-    if (role !== 'owner' && role !== 'admin' && role !== 'hr') {
-      return res.status(403).json({ message: 'Only owners or HR can create employees' });
-    }
+  // Role guard — only owners, admins, and HR can create employees
+  const role = req.user?.role;
+  if (role !== 'owner' && role !== 'admin' && role !== 'hr') {
+    return res.status(403).json({ message: 'Only owners or HR can create employees' });
   }
 
   const { email, password, position, phone, name } = req.body;

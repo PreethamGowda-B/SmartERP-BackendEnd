@@ -696,6 +696,13 @@ router.post("/login", [
       { expiresIn: REFRESH_EXPIRY }
     );
 
+    // Revoke all previous refresh tokens for this user on new login
+    // Prevents stolen old tokens from remaining valid for 30 days
+    await pool.query(
+      `UPDATE refresh_tokens SET revoked = TRUE WHERE user_id = $1::uuid AND revoked = FALSE`,
+      [user.id]
+    );
+
     // Save Refresh Token to DB
     const tokenFamily = crypto.randomUUID();
     await pool.query(

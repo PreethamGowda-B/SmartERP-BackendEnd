@@ -5,3 +5,10 @@ services/firebase-service-account.json
 load-tests/users.csv
 load-tests/*.log
 load-tests/*.json
+
+# Security: always ignore secrets and local files
+.env.local
+.env.production
+.env.*.local
+uploads/
+scratch/

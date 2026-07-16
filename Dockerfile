@@ -29,5 +29,9 @@ COPY . .
 # Expose backend port
 EXPOSE 4000
 
+# ✅ Security: Run as non-root user (prevents container escape privilege escalation)
+RUN chown -R node:node /usr/src/app
+USER node
+
 # Start the application inside the container
 CMD ["node", "server.js"]

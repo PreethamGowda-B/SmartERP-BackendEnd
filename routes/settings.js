@@ -55,7 +55,7 @@ router.get('/profile', authenticateToken, async (req, res) => {
         res.json(result.rows[0]);
     } catch (err) {
         console.error('GET /settings/profile error:', err.message);
-        res.status(500).json({ message: err.message });
+        res.status(500).json({ message: "An internal server error occurred. Please try again." });
     }
 });
 
@@ -77,7 +77,7 @@ router.put('/profile', authenticateToken, async (req, res) => {
         res.json({ message: 'Profile updated successfully', user: result.rows[0] });
     } catch (err) {
         console.error('PUT /settings/profile error:', err.message);
-        res.status(500).json({ message: err.message });
+        res.status(500).json({ message: "An internal server error occurred. Please try again." });
     }
 });
 
@@ -110,7 +110,7 @@ router.put('/change-password', authenticateToken, async (req, res) => {
         res.json({ message: 'Password changed successfully' });
     } catch (err) {
         console.error('PUT /settings/change-password error:', err.message);
-        res.status(500).json({ message: err.message });
+        res.status(500).json({ message: "An internal server error occurred. Please try again." });
     }
 });
 
@@ -127,7 +127,7 @@ router.put('/notification-prefs', authenticateToken, async (req, res) => {
         res.json({ message: 'Preferences saved' });
     } catch (err) {
         console.error('PUT /settings/notification-prefs error:', err.message);
-        res.status(500).json({ message: err.message });
+        res.status(500).json({ message: "An internal server error occurred. Please try again." });
     }
 });
 
@@ -142,7 +142,7 @@ router.get('/company', authenticateToken, async (req, res) => {
         res.json(company);
     } catch (err) {
         console.error('GET /settings/company error:', err.message);
-        res.status(500).json({ message: err.message });
+        res.status(500).json({ message: "An internal server error occurred. Please try again." });
     }
 });
 
@@ -155,7 +155,7 @@ router.get('/company-info', authenticateToken, async (req, res) => {
         res.json(company);
     } catch (err) {
         console.error('GET /settings/company-info error:', err.message);
-        res.status(500).json({ message: err.message });
+        res.status(500).json({ message: "An internal server error occurred. Please try again." });
     }
 });
 
@@ -214,7 +214,7 @@ router.put('/company', authenticateToken, async (req, res) => {
         res.json({ message: 'Company settings updated', company: result.rows[0] });
     } catch (err) {
         console.error('PUT /settings/company error:', err.message);
-        res.status(500).json({ message: err.message });
+        res.status(500).json({ message: "An internal server error occurred. Please try again." });
     }
 });
 

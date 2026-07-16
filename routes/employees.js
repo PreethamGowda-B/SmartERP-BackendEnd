@@ -5,8 +5,6 @@ const { pool } = require('../db');
 
 const { authenticateToken } = require('../middleware/authMiddleware');
 
-const DEV = process.env.DEV_ALLOW_UNAUTH_USERS === 'true';
-
 async function mapRowToEmployee(row) {
   // Use actual name from database if available, otherwise derive from email
   let name = row.name;
@@ -37,7 +35,7 @@ async function mapRowToEmployee(row) {
 }
 
 // ─── GET /api/employees ─────────────────────────────────────────────────────
-router.get('/', DEV ? (req, res, next) => next() : authenticateToken, async (req, res) => {
+router.get('/', authenticateToken, async (req, res) => {
   try {
     const companyId = req.user?.companyId;
     if (!companyId) {
@@ -69,7 +67,7 @@ router.get('/', DEV ? (req, res, next) => next() : authenticateToken, async (req
 const { body, validationResult } = require('express-validator');
 
 // ─── POST /api/employees ────────────────────────────────────────────────────
-router.post('/', DEV ? (req, res, next) => next() : authenticateToken, [
+router.post('/', authenticateToken, [
   body('email').isEmail().withMessage('Valid email is required').normalizeEmail(),
   body('name').trim().notEmpty().withMessage('Name is required').escape(),
   body('password').optional({ checkFalsy: true }).isString(),

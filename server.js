@@ -72,13 +72,25 @@ app.use(helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
-      scriptSrc: ["'self'", "'unsafe-inline'", "https://www.prozync.in", "https://prozync.in"],
-      connectSrc: ["'self'", "https://smarterp-backendend.onrender.com", "https://www.prozync.in", "https://prozync.in", "https://*.firebaseio.com", "https://*.googleapis.com"],
-      imgSrc: ["'self'", "data:", "https:", "http:"],
+      scriptSrc: ["'self'", "https://www.prozync.in", "https://prozync.in"],
+      connectSrc: [
+        "'self'",
+        "https://smarterp-backendend.onrender.com",
+        "https://www.prozync.in",
+        "https://prozync.in",
+        "https://*.firebaseio.com",
+        "https://*.googleapis.com",
+      ],
+      imgSrc: ["'self'", "data:", "https:", "https://res.cloudinary.com"],
       styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
       fontSrc: ["'self'", "https://fonts.gstatic.com"],
       upgradeInsecureRequests: [],
     },
+  },
+  hsts: {
+    maxAge: 31536000,
+    includeSubDomains: true,
+    preload: true,
   },
   crossOriginResourcePolicy: { policy: "cross-origin" },
   dnsPrefetchControl: { allow: true },
@@ -205,8 +217,8 @@ if (process.env.NODE_ENV === "production") {
   });
 }
 
-// ✅ Serve uploaded files statically
-app.use('/uploads', express.static('uploads'));
+// NOTE: /uploads is NOT served statically. All file access goes through
+// authenticated routes in routes/documents.js
 
 // Fix database constraints on startup
 async function fixDatabaseConstraints() {
@@ -582,42 +594,18 @@ app.get("/api/health", async (req, res) => {
     res.status(500).json({
       status: "error",
       database: "disconnected",
-      message: err.message,
     });
   }
 });
 
 // ✅ Info route
 app.get("/api", (req, res) => {
-  res.json({
-    message: "🚀 SmartERP Backend API is running successfully!",
-    database: "connected",
-    base: "/api",
-    frontend: process.env.FRONTEND_ORIGIN,
-  });
+  res.json({ status: "ok", version: process.env.npm_package_version || "1" });
 });
 
 // ✅ Root (for Render homepage)
-app.get("/", async (req, res) => {
-  try {
-    await pool.query("SELECT NOW()");
-    res.send(`
-      <h1>SmartERP Backend</h1>
-      <p>Status: <strong>OK ✅</strong></p>
-      <p>Database: <strong>Connected to Neon</strong></p>
-      <p>API Base: <code>/api</code></p>
-      <p>Server running on port ${process.env.PORT || 4000}</p>
-      <p>CORS: <strong>Configured for all Vercel deployments ✅</strong></p>
-    `);
-  } catch (err) {
-    console.error("❌ DB Connection Error:", err.message);
-    res.status(500).send(`
-      <h1>SmartERP Backend</h1>
-      <p>Status: <strong>ERROR</strong></p>
-      <p>Database: <strong>Disconnected</strong></p>
-      <p>Error: ${err.message}</p>
-    `);
-  }
+app.get("/", (req, res) => {
+  res.status(200).json({ status: "ok" });
 });
 
 // ✅ Global Error Handler (MUST BE LAST)
@@ -763,3 +751,38 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
 }
 
 module.exports = app;
+
+// ✅ Authenticated document access — replaces the removed express.static('/uploads')
+// Files are served only after verifying the requester's company ownership
+const path = require("path");
+const { authenticateToken: _authDoc } = require("./middleware/authMiddleware");
+app.get("/uploads/documents/:filename", _authDoc, async (req, res) => {
+  try {
+    const filename = path.basename(req.params.filename); // prevent path traversal
+    const companyId = req.user.companyId;
+
+    // Verify this file belongs to the requesting user's company
+    const { pool: _pool } = require("./db");
+    const check = await _pool.query(
+      `SELECT id FROM employee_documents
+       WHERE file_url LIKE $1 AND company_id::text = $2
+       LIMIT 1`,
+      [`%${filename}`, String(companyId)]
+    );
+
+    if (!check.rows.length) {
+      return res.status(403).json({ message: "Access denied" });
+    }
+
+    const filePath = path.join(__dirname, "uploads", "documents", filename);
+    res.sendFile(filePath, (err) => {
+      if (err) {
+        console.error("File serve error:", err.message);
+        res.status(404).json({ message: "File not found" });
+      }
+    });
+  } catch (err) {
+    console.error("Document serve error:", err.message);
+    res.status(500).json({ message: "Could not retrieve file" });
+  }
+});

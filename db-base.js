@@ -1,16 +1,22 @@
 const { Pool } = require('pg');
 require('dotenv').config();
 
-// Suppress pg-connection-string SSL deprecation warning by explicitly setting ssl option.
-// The warning fires when DATABASE_URL contains 'sslmode=require' (or prefer/verify-ca).
-// We override with rejectUnauthorized: false which matches the previous 'require' behavior.
+// SSL configuration driven by explicit env vars rather than URL string matching.
+// DB_SSL=true  → verify certificate (production, recommended)
+// DB_SSL=no-verify → encrypted but skip cert check (some managed DBs)
+// DB_SSL=false or unset → no SSL (local dev)
+// When DATABASE_URL contains 'sslmode=disable' we always honour that and skip SSL.
+function resolveSsl() {
+  if (process.env.DATABASE_URL?.includes('sslmode=disable')) return false;
+  const flag = (process.env.DB_SSL || '').toLowerCase();
+  if (flag === 'true') return { rejectUnauthorized: true };
+  if (flag === 'no-verify') return { rejectUnauthorized: false };
+  return false;
+}
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL?.includes('sslmode=disable')
-    ? false
-    : process.env.DATABASE_URL?.includes('ssl') || process.env.DATABASE_URL?.includes('postgres')
-    ? { rejectUnauthorized: false }
-    : false,
+  ssl: resolveSsl(),
   max: 10,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 10000,

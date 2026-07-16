@@ -43,7 +43,9 @@ const permissions = {
     'hr:read',
     'hr:write',
     'messages:read',
-    'messages:write'
+    'messages:write',
+    'jobs:read',
+    'inventory:read'
   ]
 };
 

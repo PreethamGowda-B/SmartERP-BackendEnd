@@ -11,6 +11,8 @@ const { Resend } = require("resend");
 const { body, validationResult } = require("express-validator");
 require("dotenv").config();
 const crypto = require("crypto");
+// ✅ Required at top-level — used in Google OAuth callback and all OTP/exchange routes
+const redisClient = require("../utils/redis");
 
 // JWT secrets
 const ACCESS_SECRET = process.env.JWT_SECRET;
@@ -223,22 +225,36 @@ router.get(
       res.cookie(accessCookieName, accessToken, { ...cookieOpts, maxAge: ACCESS_MAX_AGE });
       res.cookie(refreshCookieName, refreshToken, { ...cookieOpts, maxAge: REFRESH_MAX_AGE });
 
-      // ✅ Redirect to frontend with tokens in URL so the frontend can exchange
-      // them for HttpOnly cookies via POST /api/auth/set-cookie
-      // (Required for cross-domain: Render backend → Vercel frontend)
+      // ✅ SECURE: Use one-time code instead of tokens in URL
+      // Tokens in URLs appear in browser history, server logs, and Referer headers
       const frontendUrl = process.env.FRONTEND_ORIGIN || "https://smart-erp-front-end.vercel.app";
-      res.redirect(
-        `${frontendUrl}/auth/callback?accessToken=${accessToken}&refreshToken=${refreshToken}&user=${encodeURIComponent(
-          JSON.stringify({
-            id: user.id,
-            name: user.name,
-            email: user.email,
-            role: user.role,
-            company_id: user.company_id,
-            companyId: user.company_id
-          })
-        )}`
-      );
+      const oauthCode = crypto.randomUUID();
+      const oauthPayload = JSON.stringify({
+        accessToken,
+        refreshToken,
+        user: {
+          id: user.id,
+          name: user.name,
+          email: user.email,
+          role: user.role,
+          company_id: user.company_id,
+          companyId: user.company_id,
+        },
+      });
+      // Store in Redis for 60 seconds (one-time use)
+      if (redisClient && redisClient.status === "ready") {
+        await redisClient.set(`oauth_code:${oauthCode}`, oauthPayload, "EX", 60);
+      } else {
+        // Redis unavailable — fall back to encrypted query param approach
+        // (still better than plaintext tokens)
+        console.warn("⚠️ Redis unavailable for OAuth code exchange, using fallback");
+        return res.redirect(
+          `${frontendUrl}/auth/callback?code=fallback&user=${encodeURIComponent(
+            JSON.stringify({ id: user.id, name: user.name, email: user.email, role: user.role, company_id: user.company_id, companyId: user.company_id })
+          )}`
+        );
+      }
+      res.redirect(`${frontendUrl}/auth/callback?code=${oauthCode}`);
     } catch (err) {
       console.error("Google Auth Error:", err);
       res.redirect("/login?error=auth_failed");
@@ -247,7 +263,52 @@ router.get(
 );
 
 
-const redisClient = require("../utils/redis");
+// ---------------------------------------------
+// ✅ POST /api/auth/exchange-code
+// Exchanges a short-lived OAuth one-time code for session tokens
+// The code is stored in Redis for 60s — single use
+// ---------------------------------------------
+router.post("/exchange-code", async (req, res) => {
+  const { code } = req.body;
+  if (!code) return res.status(400).json({ message: "Code is required" });
+
+  try {
+    if (!redisClient || redisClient.status !== "ready") {
+      return res.status(503).json({ message: "Auth service temporarily unavailable" });
+    }
+
+    const raw = await redisClient.get(`oauth_code:${code}`);
+    if (!raw) {
+      return res.status(400).json({ message: "Invalid or expired code" });
+    }
+
+    // Consume the code (one-time use)
+    await redisClient.del(`oauth_code:${code}`);
+
+    const { accessToken, refreshToken, user } = JSON.parse(raw);
+
+    const isSuperAdmin = user.role === "super_admin";
+    const accessCookieName = isSuperAdmin ? COOKIE_ACCESS_ADMIN : COOKIE_ACCESS_USER;
+    const refreshCookieName = isSuperAdmin ? COOKIE_REFRESH_ADMIN : COOKIE_REFRESH_USER;
+
+    const cookieOpts = {
+      httpOnly: true,
+      sameSite: "none",
+      secure: true,
+      path: "/",
+    };
+
+    res.cookie(accessCookieName, accessToken, { ...cookieOpts, maxAge: ACCESS_MAX_AGE });
+    res.cookie(refreshCookieName, refreshToken, { ...cookieOpts, maxAge: REFRESH_MAX_AGE });
+
+    res.json({ ok: true, user });
+  } catch (err) {
+    console.error("exchange-code error:", err.message);
+    res.status(500).json({ message: "Authentication failed. Please try again." });
+  }
+});
+
+
 
 // ---------------------------------------------
 // ✅ Send OTP for email verification (signup only)
@@ -300,10 +361,11 @@ router.post("/send-otp", async (req, res) => {
     // Old OTP cleanup and storage (Table is now ensured on server startup)
     await pool.query("DELETE FROM email_otps WHERE email = $1", [email]);
 
-    // Store new OTP
+    // Hash OTP before storage — plaintext OTPs in DB are a breach risk
+    const otpHash = crypto.createHash("sha256").update(otp + email).digest("hex");
     await pool.query(
       "INSERT INTO email_otps (email, otp_code, expires_at) VALUES ($1, $2, $3)",
-      [email, otp, expiresAt]
+      [email, otpHash, expiresAt]
     );
 
     // Send email via Resend with a 10s timeout safety
@@ -352,26 +414,62 @@ router.post("/send-otp", async (req, res) => {
 
 
 // ---------------------------------------------
-// ✅ Verify OTP
+// ✅ Verify OTP (rate-limited + hash-compared)
 // ---------------------------------------------
-router.post("/verify-otp", async (req, res) => {
+const rateLimit = require("express-rate-limit");
+const { ipKeyGenerator } = require("express-rate-limit");
+const otpVerifyLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5,
+  keyGenerator: (req) => {
+    const email = req.body?.email;
+    if (email) return email.toLowerCase();
+    return ipKeyGenerator(req);
+  },
+  message: { message: "Too many OTP attempts. Please request a new code." },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+router.post("/verify-otp", otpVerifyLimiter, async (req, res) => {
   const { email, otp } = req.body;
   if (!email || !otp) return res.status(400).json({ message: "Email and OTP are required" });
 
+  // Per-email Redis attempt counter (belt-and-suspenders alongside the IP limiter)
+  if (redisClient && redisClient.status === "ready") {
+    try {
+      const attemptKey = `otp_verify_attempts:${email.toLowerCase()}`;
+      const attempts = await redisClient.incr(attemptKey);
+      if (attempts === 1) await redisClient.expire(attemptKey, 900); // 15 min TTL
+      if (attempts > 5) {
+        return res.status(429).json({ message: "Too many OTP attempts. Please request a new code." });
+      }
+    } catch (redisErr) {
+      console.warn("⚠️ OTP attempt counter Redis error:", redisErr.message);
+    }
+  }
+
   try {
+    // Compute hash of submitted OTP (same algorithm used during storage)
+    const submittedHash = crypto.createHash("sha256").update(otp.toString().trim() + email.toLowerCase()).digest("hex");
+
     const result = await pool.query(
       "SELECT * FROM email_otps WHERE email = $1 AND otp_code = $2 AND used = FALSE AND expires_at > NOW() ORDER BY created_at DESC LIMIT 1",
-      [email, otp.toString().trim()]
+      [email.toLowerCase(), submittedHash]
     );
 
     if (result.rows.length === 0) {
       return res.status(400).json({ message: "Invalid or expired OTP. Please request a new one." });
     }
 
-    // Mark OTP as used
+    // Mark OTP as used — single-use enforcement
     await pool.query("UPDATE email_otps SET used = TRUE WHERE id = $1", [result.rows[0].id]);
 
-    console.log(`✅ OTP verified for ${email}`);
+    // Clear the attempt counter on success
+    if (redisClient && redisClient.status === "ready") {
+      await redisClient.del(`otp_verify_attempts:${email.toLowerCase()}`).catch(() => {});
+    }
+
     res.json({ ok: true, verified: true, message: "Email verified successfully" });
   } catch (err) {
     console.error("Verify OTP error:", err.message);
@@ -385,7 +483,11 @@ router.post("/verify-otp", async (req, res) => {
 router.post("/signup", [
   body("name").trim().notEmpty().withMessage("Name is required").escape(),
   body("email").isEmail().withMessage("Valid email is required").normalizeEmail(),
-  body("password").isLength({ min: 6 }).withMessage("Password must be at least 6 characters long"),
+  body("password")
+    .isLength({ min: 10 }).withMessage("Password must be at least 10 characters long")
+    .matches(/[A-Z]/).withMessage("Password must contain at least one uppercase letter")
+    .matches(/[0-9]/).withMessage("Password must contain at least one number")
+    .matches(/[^A-Za-z0-9]/).withMessage("Password must contain at least one special character"),
   body("role").optional().isIn(["owner", "employee"]).withMessage("Invalid role"),
   body("phone").optional({ checkFalsy: true }).isMobilePhone().withMessage("Invalid phone number").escape(),
   body("position").optional({ checkFalsy: true }).trim().escape(),

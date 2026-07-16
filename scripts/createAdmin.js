@@ -3,8 +3,19 @@ const bcrypt = require('bcrypt');
 require('dotenv').config();
 
 async function createAdmin() {
-  const email = process.env.ADMIN_EMAIL || 'admin@example.com';
-  const password = process.env.ADMIN_PASSWORD || 'admin123';
+  const email = process.env.ADMIN_EMAIL;
+  const password = process.env.ADMIN_PASSWORD;
+
+  if (!email || !password) {
+    console.error('❌ ADMIN_EMAIL and ADMIN_PASSWORD must be set. Refusing to create admin with defaults.');
+    process.exit(1);
+  }
+
+  if (password.length < 12) {
+    console.error('❌ ADMIN_PASSWORD must be at least 12 characters.');
+    process.exit(1);
+  }
+
   const role = 'owner';
 
   const hash = await bcrypt.hash(password, 10);

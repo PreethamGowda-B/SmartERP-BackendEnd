@@ -3,9 +3,12 @@ const { pool } = require('../db-base');
 const fetch = require('node-fetch');
 
 async function testApkLoginFlow() {
-  const email = 'thepreethu01@gmail.com';
-  const password = 'password123'; // Guessing common dev password, won't log it
-  
+  const email = process.env.TEST_EMAIL;
+  if (!email) {
+    console.error('❌ TEST_EMAIL env var must be set to run this script.');
+    process.exit(1);
+  }
+
   console.log(`\n🧪 Testing APK Auth Flow...`);
   
   try {

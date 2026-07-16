@@ -6,4 +6,9 @@ Dockerfile
 .git
 .gitignore
 .vscode
-.idea           
+.idea
+scratch/
+scripts/
+tests/
+load-tests/
+*.md

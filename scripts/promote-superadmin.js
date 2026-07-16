@@ -2,7 +2,13 @@ const { pool } = require('../db');
 require('dotenv').config();
 
 async function promoteToSuperAdmin() {
-  const email = process.env.SUPER_ADMIN_EMAIL || 'prozyncinnovations@gmail.com';
+  const email = process.env.SUPER_ADMIN_EMAIL;
+
+  if (!email) {
+    console.error('❌ SUPER_ADMIN_EMAIL must be set. Refusing to run without an explicit target.');
+    process.exit(1);
+  }
+
   console.log(`Promoting user: ${email} to super_admin`);
   
   const res = await pool.query(

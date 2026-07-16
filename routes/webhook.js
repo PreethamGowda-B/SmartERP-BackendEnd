@@ -21,13 +21,18 @@ router.post('/razorpay', async (req, res) => {
       return res.status(500).send('Webhook secret not configured');
     }
 
-    // Verify webhook signature
+    // Verify webhook signature (constant-time to prevent timing side-channel attacks)
     const expectedSignature = crypto
       .createHmac('sha256', secret)
       .update(req.rawBody)
       .digest('hex');
 
-    if (expectedSignature !== signature) {
+    const sigBufExpected = Buffer.from(expectedSignature, 'utf8');
+    const sigBufActual = Buffer.from(signature, 'utf8');
+    const signaturesMatch = sigBufExpected.length === sigBufActual.length &&
+      crypto.timingSafeEqual(sigBufExpected, sigBufActual);
+
+    if (!signaturesMatch) {
       console.error('❌ Razorpay Webhook: Invalid signature match');
       return res.status(400).send('Invalid signature');
     }

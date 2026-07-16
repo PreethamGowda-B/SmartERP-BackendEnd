@@ -600,7 +600,7 @@ app.get("/api/health", async (req, res) => {
 
 // ✅ Info route
 app.get("/api", (req, res) => {
-  res.json({ status: "ok", version: process.env.npm_package_version || "1" });
+  res.json({ status: "ok" });
 });
 
 // ✅ Root (for Render homepage)
@@ -614,10 +614,19 @@ if (process.env.SENTRY_DSN) {
 }
 
 app.use((err, req, res, next) => {
-  // Ensure CORS headers are present even on error responses
+  // Ensure CORS headers are present even on error responses.
+  // Use the SAME allowedPatterns as the CSRF middleware — one canonical list.
   const origin = req.headers.origin;
   const allowedOrigins = ['https://www.prozync.in', 'https://prozync.in', 'http://localhost:3000', 'https://client.prozync.in', 'http://localhost:3001'];
-  if (origin && (allowedOrigins.includes(origin) || origin.match(/\.vercel\.app$/))) {
+  const allowedPatterns = [
+    /^https:\/\/smart-erp-front(-[a-z0-9]+)?(-[a-z0-9-]+)?\.vercel\.app$/,
+    /^https:\/\/smart-erp-front-[a-z0-9]+-thepreethu01-9119s-projects\.vercel\.app$/,
+  ];
+  const isAllowedOrigin = origin && (
+    allowedOrigins.includes(origin) ||
+    allowedPatterns.some(p => p.test(origin))
+  );
+  if (isAllowedOrigin) {
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Access-Control-Allow-Credentials', 'true');
   }
@@ -629,8 +638,11 @@ app.use((err, req, res, next) => {
 
   logger.error("Global API Route Error", err, { path: req.path, method: req.method });
 
+  // Only echo err.message for deliberate errors (those with a .status set by route handlers).
+  // For unexpected/unhandled errors, always return a generic message to avoid
+  // leaking DB table names, column names, or query fragments to the client.
   res.status(err.status || 500).json({
-    message: err.message || "An internal server error occurred.",
+    message: err.status ? (err.message || "An error occurred.") : "An internal server error occurred.",
     error: process.env.NODE_ENV === "development" ? err.stack : undefined,
   });
 });

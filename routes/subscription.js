@@ -227,14 +227,19 @@ router.post('/verify-payment', requireOwner, async (req, res) => {
 
     const planId = parseInt(planIdInput, 10);
 
-    // Verify signature
+    // Verify signature (constant-time comparison to prevent timing side-channel attacks)
     const body = razorpay_order_id + "|" + razorpay_payment_id;
     const expectedSignature = crypto
       .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
       .update(body.toString())
       .digest("hex");
 
-    if (expectedSignature !== razorpay_signature) {
+    const sigBufExpected = Buffer.from(expectedSignature, 'utf8');
+    const sigBufActual = Buffer.from(razorpay_signature, 'utf8');
+    const signaturesMatch = sigBufExpected.length === sigBufActual.length &&
+      crypto.timingSafeEqual(sigBufExpected, sigBufActual);
+
+    if (!signaturesMatch) {
       return res.status(400).json({ message: 'Invalid payment signature' });
     }
 

@@ -301,7 +301,9 @@ router.post("/exchange-code", async (req, res) => {
     res.cookie(accessCookieName, accessToken, { ...cookieOpts, maxAge: ACCESS_MAX_AGE });
     res.cookie(refreshCookieName, refreshToken, { ...cookieOpts, maxAge: REFRESH_MAX_AGE });
 
-    res.json({ ok: true, user });
+    // Also return tokens in body so the frontend can store them in sessionStorage
+    // (cookies alone fail cross-origin in modern browsers blocking 3rd-party cookies)
+    res.json({ ok: true, user, accessToken, refreshToken });
   } catch (err) {
     console.error("exchange-code error:", err.message);
     res.status(500).json({ message: "Authentication failed. Please try again." });

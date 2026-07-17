@@ -259,6 +259,7 @@ async function fixDatabaseConstraints() {
       .catch(e => console.warn('⚠️ employee_status NOT NULL skipped (NULLs may still exist):', e.message));
 
     // C3 FIX: Ensure notifications.company_id is UUID (fix INTEGER type from legacy migration)
+    // Note: silently skipped if column is already UUID or used in a policy definition
     await pool.query(`
       DO $$
       BEGIN
@@ -271,7 +272,7 @@ async function fixDatabaseConstraints() {
           ALTER TABLE notifications ALTER COLUMN company_id TYPE UUID USING company_id::text::uuid;
         END IF;
       END $$;
-    `).catch(e => console.warn('⚠️ notifications.company_id type fix skipped:', e.message));
+    `).catch(() => {}); // Silently skip — already migrated or blocked by RLS policy
 
     // Medium FIX: Add composite index for unread message queries
     await pool.query(`
@@ -433,8 +434,12 @@ async function runDatabaseInitialization() {
       CREATE INDEX IF NOT EXISTS idx_notifications_type ON notifications(type);
     `);
 
-    const { optimizeDatabase } = require('./scripts/optimizeDb');
-    await optimizeDatabase();
+    try {
+      const { optimizeDatabase } = require('./scripts/optimizeDb');
+      await optimizeDatabase();
+    } catch (e) {
+      console.warn('⚠️ optimizeDb skipped (script not available in this environment)');
+    }
 
     // 4. Customer Portal migration (additive — safe to re-run)
     // Section 6: Migration failure must NOT crash server

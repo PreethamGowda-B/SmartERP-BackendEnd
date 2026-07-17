@@ -379,14 +379,15 @@ async function runDatabaseInitialization() {
       CREATE TABLE IF NOT EXISTS email_otps (
         id SERIAL PRIMARY KEY,
         email VARCHAR(255) NOT NULL,
-        otp_code VARCHAR(6) NOT NULL,
+        otp_code VARCHAR(64) NOT NULL,
         expires_at TIMESTAMP NOT NULL,
         used BOOLEAN DEFAULT FALSE,
         created_at TIMESTAMP DEFAULT NOW()
       );
       CREATE INDEX IF NOT EXISTS idx_email_otps_email ON email_otps(email);
 
-      -- Update activities table for modern logging
+      -- Migrate existing column if it's still VARCHAR(6)
+      ALTER TABLE email_otps ALTER COLUMN otp_code TYPE VARCHAR(64);
       ALTER TABLE activities ADD COLUMN IF NOT EXISTS activity_type TEXT;
       ALTER TABLE activities ADD COLUMN IF NOT EXISTS details JSONB;
       ALTER TABLE activities ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();

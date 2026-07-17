@@ -640,6 +640,20 @@ router.post("/signup", [
 });
 
 // ---------------------------------------------
+// ✅ Check if email is already registered (used before OTP send to give early feedback)
+// ---------------------------------------------
+router.post("/check-email", async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ message: "Email is required" });
+  try {
+    const result = await pool.query("SELECT id FROM users WHERE email = $1", [email.toLowerCase()]);
+    res.json({ exists: result.rows.length > 0 });
+  } catch (err) {
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+// ---------------------------------------------
 // ✅ Login Route
 // ---------------------------------------------
 router.post("/login", [

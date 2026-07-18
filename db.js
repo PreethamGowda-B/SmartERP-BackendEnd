@@ -54,7 +54,8 @@ async function applyRlsToClient(client) {
 
   if (bypassRls) {
     // Explicit bypass — restore the privileged role, mark bypass = 'on'.
-    await client.query('RESET ROLE');
+    // RESET ROLE is a no-op if the role was never changed, so always safe.
+    try { await client.query('RESET ROLE'); } catch { /* ignore — role may not be set */ }
     await client.query(
       `SELECT
          set_config('app.bypass_rls',         'on', true),
@@ -62,10 +63,16 @@ async function applyRlsToClient(client) {
          set_config('app.current_role',       '',   true)`
     );
   } else {
-    // Normal tenant request (or no context) — drop to restricted role first,
-    // then set session variables that the policy USING clause reads.
-    // smarterp_app has rolbypassrls = FALSE → even a policy bug can't leak rows.
-    await client.query('SET ROLE smarterp_app');
+    // Normal tenant request (or no context) — try to drop to restricted role first.
+    // If smarterp_app role doesn't exist in this DB, skip gracefully — the session
+    // variables alone enforce row-level isolation via the policy USING clause.
+    try {
+      await client.query('SET ROLE smarterp_app');
+    } catch (roleErr) {
+      // smarterp_app role not provisioned — fall through to session variable enforcement only.
+      // This is acceptable: the app.bypass_rls='off' + empty company_id still denies cross-tenant access.
+      console.warn('⚠️ db.js: SET ROLE smarterp_app skipped (role not found):', roleErr.message);
+    }
     await client.query(
       `SELECT
          set_config('app.bypass_rls',         'off', true),

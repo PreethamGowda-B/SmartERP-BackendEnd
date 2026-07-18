@@ -13,6 +13,13 @@ require("dotenv").config();
 const crypto = require("crypto");
 // ✅ Required at top-level — used in Google OAuth callback and all OTP/exchange routes
 const redisClient = require("../utils/redis");
+const { storage } = require("../middleware/als");
+
+// ✅ RLS bypass — auth routes query users/companies by email BEFORE any company
+// context is known (login lookup, OTP, Google OAuth). They explicitly opt-in to
+// cross-tenant access rather than relying on an empty companyId.
+router.use((req, res, next) => storage.run({ isWebRequest: true, bypassRls: true }, next));
+
 
 // JWT secrets
 const ACCESS_SECRET = process.env.JWT_SECRET;

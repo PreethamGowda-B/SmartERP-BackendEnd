@@ -1,44 +1,105 @@
 const { pool } = require("./db-base");
 const { storage } = require("./middleware/als");
 
-// Store the original query function
-const originalQuery = pool.query.bind(pool);
-
 // ID validation — supports both standard UUIDs and legacy Integer IDs (numeric strings).
-// This ensures RLS is activated regardless of the underlying company_id type.
 const ID_REGEX = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|\d+)$/i;
 
 /**
- * Global query wrapper that enforces Row-Level Security (RLS)
- * by pulling the companyId from AsyncLocalStorage.
- * We monkey-patch pool.query so existing code works perfectly.
+ * Determines RLS configuration from the current ALS context.
+ *
+ * TWO-LAYER DESIGN:
+ *
+ *   Layer 1 — PostgreSQL Role (structural enforcement)
+ *     • bypassRls: true  → RESET ROLE   (reverts to neondb_owner which has BYPASSRLS)
+ *     • Otherwise        → SET ROLE smarterp_app  (role has NO BYPASSRLS — can't sidestep policies)
+ *
+ *   Layer 2 — Session variables (policy filter)
+ *     • app.bypass_rls         = 'on'|'off'
+ *     • app.current_company_id = validated UUID/int or ''
+ *     • app.current_role       = role string or ''
+ *
+ * FAIL-CLOSED:
+ *   No ALS context → companyId='', bypass='off', role='', role=smarterp_app
+ *   → policy USING clause matches nothing → 0 rows returned (never a data leak).
+ *
+ * BYPASS (explicit opt-in only):
+ *   storage.run({ bypassRls: true }, fn) in auth routes, migrations, background jobs.
+ *   → RESET ROLE (neondb_owner) + app.bypass_rls='on' → all rows visible.
  */
-pool.query = async function(text, params) {
+function buildRlsConfig() {
   const context = storage.getStore();
-  const companyId = context?.companyId;
 
-  // Use standard query if no companyId (e.g. public routes, startup)
-  if (!companyId) {
-    return originalQuery(text, params);
+  const bypassRls  = context?.bypassRls === true;
+  const role       = (context?.role && typeof context.role === 'string') ? context.role.trim() : '';
+
+  let companyId = '';
+  if (context?.companyId) {
+    const raw = String(context.companyId).trim();
+    if (ID_REGEX.test(raw)) {
+      companyId = raw;
+    } else {
+      console.warn(`⚠️ db.js: Invalid companyId format "${raw}" — omitting from RLS context`);
+    }
   }
 
-  // Normalize to string for regex test
-  const companyIdStr = String(companyId).trim();
+  return { bypassRls, role, companyId };
+}
 
-  // Validate companyId format before using it in SQL.
-  // We allow both UUIDs and Integers to support mixed schema states.
-  if (!ID_REGEX.test(companyIdStr)) {
-    console.warn(`⚠️ pool.query: Invalid companyId format "${companyIdStr}" — skipping RLS context`);
-    return originalQuery(text, params);
+/**
+ * Applies RLS context to a raw pg Client.
+ * Called immediately after every pool.connect() or pool.query() checkout.
+ */
+async function applyRlsToClient(client) {
+  const { bypassRls, role, companyId } = buildRlsConfig();
+
+  if (bypassRls) {
+    // Explicit bypass — restore the privileged role, mark bypass = 'on'.
+    await client.query('RESET ROLE');
+    await client.query(
+      `SELECT
+         set_config('app.bypass_rls',         'on', true),
+         set_config('app.current_company_id', '',   true),
+         set_config('app.current_role',       '',   true)`
+    );
+  } else {
+    // Normal tenant request (or no context) — drop to restricted role first,
+    // then set session variables that the policy USING clause reads.
+    // smarterp_app has rolbypassrls = FALSE → even a policy bug can't leak rows.
+    await client.query('SET ROLE smarterp_app');
+    await client.query(
+      `SELECT
+         set_config('app.bypass_rls',         'off', true),
+         set_config('app.current_company_id', $1,    true),
+         set_config('app.current_role',       $2,    true)`,
+      [companyId, role]
+    );
   }
+}
 
-  const client = await pool.connect();
+// ─── Patch pool.connect ───────────────────────────────────────────────────────
+// Any code that grabs a raw client (transactions, LISTEN/NOTIFY) also
+// inherits the correct RLS context before the caller runs any query.
+const originalConnect = pool.connect.bind(pool);
+
+pool.connect = async function () {
+  const client = await originalConnect();
   try {
-    // Use parameterized SET to avoid any string interpolation risk
-    await client.query('SELECT set_config($1, $2, true)', [
-      'app.current_company_id',
-      companyIdStr,
-    ]);
+    await applyRlsToClient(client);
+  } catch (err) {
+    // Release so it doesn't leak, then re-throw.
+    client.release();
+    throw err;
+  }
+  return client;
+};
+
+// ─── Patch pool.query ─────────────────────────────────────────────────────────
+// Convenience wrapper — acquires an RLS-configured client, runs the query,
+// then releases it. Callers that need BEGIN/COMMIT should use pool.connect()
+// directly (also patched above — transactions are covered).
+pool.query = async function (text, params) {
+  const client = await pool.connect(); // uses the patched version above
+  try {
     return await client.query(text, params);
   } finally {
     client.release();

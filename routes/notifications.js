@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
-const { registerSSEConnection, unregisterSSEConnection } = require('../utils/notificationHelpers');
+const { registerSSEConnection, unregisterSSEConnection, broadcastToUser } = require('../utils/notificationHelpers');
 
 // ─── GET /api/notifications ──────────────────────────────────────────────────
 // Get all notifications for authenticated user
@@ -54,7 +54,7 @@ router.get('/unread-count', authenticateToken, async (req, res) => {
 // C4 FIX: Each SSE connection now subscribes to its own Redis channel
 // (`employee_notifications:{userId}`) so events work across cluster workers.
 // Falls back to in-process Map when Redis is unavailable (dev/single-worker).
-router.get('/sse', authenticateToken, (req, res) => {
+router.get('/sse', authenticateToken, async (req, res) => {
   const userId = String(req.user.userId || req.user.id);
   const redisUrl = process.env.REDIS_URL;
 
@@ -66,6 +66,35 @@ router.get('/sse', authenticateToken, (req, res) => {
   res.setHeader('X-Accel-Buffering', 'no');
 
   res.write(`data: ${JSON.stringify({ type: 'connected', message: 'SSE connection established' })}\n\n`);
+
+  // Mark user as online in Redis
+  const companyId = String(req.user.companyId || '');
+  if (redisUrl && companyId) {
+    try {
+      const Redis = require('ioredis');
+      const onlineRedis = new Redis(redisUrl, { maxRetriesPerRequest: 1, lazyConnect: false });
+      onlineRedis.on('error', () => {});
+      await onlineRedis.hset(`online_users:${companyId}`, userId, '1');
+      await onlineRedis.expire(`online_users:${companyId}`, 300); // 5 min TTL
+      onlineRedis.quit().catch(() => {});
+    } catch (e) {
+      console.warn('⚠️ Could not set online status:', e.message);
+    }
+
+    // Broadcast status_change (online) to all other users in the same company
+    try {
+      const peers = await pool.query(
+        `SELECT id FROM users WHERE company_id::text = $1 AND id::text != $2`,
+        [companyId, userId]
+      );
+      const payload = { type: 'status_change', data: { user_id: userId, online: true } };
+      for (const peer of peers.rows) {
+        broadcastToUser(String(peer.id), payload);
+      }
+    } catch (e) {
+      console.warn('⚠️ Could not broadcast status_change (online):', e.message);
+    }
+  }
 
   const heartbeatInterval = setInterval(() => {
     try { res.write(`:heartbeat\n\n`); }
@@ -117,10 +146,38 @@ router.get('/sse', authenticateToken, (req, res) => {
       subscriber.on('end', () => { /* cleanup handled by req.on('close') */ });
       subscriber.on('close', () => { /* no-op — cleanup handled by req.on('close') */ });
 
-      req.on('close', () => {
+      req.on('close', async () => {
         console.log(`📡 SSE connection closed for user ${userId}`);
         isClosing = true;
         clearInterval(heartbeatInterval);
+        // Mark user as offline in Redis
+        const companyId = String(req.user.companyId || '');
+        if (redisUrl && companyId) {
+          try {
+            const Redis = require('ioredis');
+            const offlineRedis = new Redis(redisUrl, { maxRetriesPerRequest: 1, lazyConnect: false });
+            offlineRedis.on('error', () => {});
+            await offlineRedis.hdel(`online_users:${companyId}`, userId);
+            offlineRedis.quit().catch(() => {});
+          } catch (e) {
+            console.warn('⚠️ Could not clear online status:', e.message);
+          }
+        }
+
+        // Broadcast status_change (offline) to all other users in the same company
+        try {
+          const peers = await pool.query(
+            `SELECT id FROM users WHERE company_id::text = $1 AND id::text != $2`,
+            [companyId, userId]
+          );
+          const payload = { type: 'status_change', data: { user_id: userId, online: false } };
+          for (const peer of peers.rows) {
+            broadcastToUser(String(peer.id), payload);
+          }
+        } catch (e) {
+          console.warn('⚠️ Could not broadcast status_change (offline):', e.message);
+        }
+
         // Use quit() instead of disconnect() — gracefully resolves in-flight commands
         // then closes, preventing "Connection is closed." unhandled rejections
         try {

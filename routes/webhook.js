@@ -5,6 +5,13 @@ const { pool } = require('../db');
 const Sentry = require("@sentry/node");
 const { notifyPlanUpgrade } = require('../services/smartNotificationService');
 const { invalidatePlanCache } = require('../middleware/planMiddleware');
+const { storage } = require('../middleware/als');
+
+// ✅ RLS bypass — Razorpay webhooks arrive with no user/tenant session.
+// Explicitly opt-in so payment/subscription updates can write cross-tenant.
+router.use((req, res, next) => storage.run({ isWebRequest: true, bypassRls: true }, next));
+
+
 
 router.post('/razorpay', async (req, res) => {
   try {

@@ -23,10 +23,19 @@ const rateLimit = require("express-rate-limit");
 const cookieParser = require("cookie-parser");
 const { pool } = require("./db"); // ✅ Make sure db.js exports { pool }
 const logger = require("./utils/logger");
+const { storage } = require("./middleware/als"); // ✅ ALS — needed for global RLS initializer
 
 const app = express();
 
-// ✅ Sentry Request Handling is now automatic in SDK v8+ 
+// ✅ Global ALS initializer — MUST be the very first middleware.
+// Ensures every HTTP request enters the ALS context so pool.query() never
+// receives an undefined store (which would be treated as no-context = fail-closed).
+// Auth routes opt-in to bypassRls: true via their own router-level middleware.
+app.use((req, res, next) => {
+  storage.run({ isWebRequest: true, bypassRls: false }, next);
+});
+
+// ✅ Sentry Request Handling is now automatic in SDK v8+
 // Just ensure Sentry.init() is called before any other code (done on line 7)
 
 // ✅ CORS configuration — MUST be before rate limiters and other security headers
@@ -675,10 +684,16 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
   console.log(`📡 Master process ${process.pid} is running`);
   console.log(`🧵 Spawning ${WORKER_COUNT} workers for cluster mode...`);
 
-  // Run DB initialization ONCE in the master process before forking
+  // Run DB initialization ONCE in the master process before forking.
+  // Wrap in bypassRls: true so schema mutations aren't blocked by RLS policies.
   (async () => {
     try {
-      await runDatabaseInitialization();
+      await new Promise((resolve, reject) =>
+        storage.run({ bypassRls: true }, async () => {
+          try { await runDatabaseInitialization(); resolve(); }
+          catch (err) { reject(err); }
+        })
+      );
     } catch (err) {
       console.error('❌ Master DB Init Error:', err.message);
     }

@@ -1,4 +1,6 @@
 const { pool } = require('../db');
+const fs = require('fs');
+const path = require('path');
 
 /**
  * Auto-migration: Fix material_requests table schema
@@ -188,4 +190,29 @@ async function setupDocumentsTable() {
     }
 }
 
-module.exports = { fixMaterialRequestsSchema, setupDocumentsTable };
+/**
+ * Numbered SQL migrations — run in order on server startup.
+ * Each file uses IF NOT EXISTS guards so it is safe to re-run.
+ */
+const NUMBERED_MIGRATIONS = [
+    '001_hardening_indexes_and_migration.sql',
+    '002_fix_approval_nulls.sql',
+    '003_otp_hashing.sql',
+    '004_internal_messaging.sql',
+];
+
+async function runNumberedMigrations() {
+    for (const filename of NUMBERED_MIGRATIONS) {
+        const filePath = path.join(__dirname, filename);
+        try {
+            const sql = fs.readFileSync(filePath, 'utf8');
+            await pool.query(sql);
+            console.log(`✅ Migration applied: ${filename}`);
+        } catch (err) {
+            // Log but don't crash the server — each migration is independently guarded
+            console.error(`⚠️  Migration failed (${filename}):`, err.message);
+        }
+    }
+}
+
+module.exports = { fixMaterialRequestsSchema, setupDocumentsTable, runNumberedMigrations };

@@ -25,16 +25,22 @@ CREATE INDEX IF NOT EXISTS idx_jobs_emp_visibility
 -- messages / job_messages indexes
 CREATE INDEX IF NOT EXISTS idx_messages_sender_id      ON messages(sender_id);
 CREATE INDEX IF NOT EXISTS idx_messages_receiver_id    ON messages(receiver_id);
-CREATE INDEX IF NOT EXISTS idx_messages_company_id     ON messages(company_id) WHERE company_id IS NOT NULL;
 
-CREATE INDEX IF NOT EXISTS idx_job_messages_job_id     ON job_messages(job_id);
-CREATE INDEX IF NOT EXISTS idx_job_messages_company_id ON job_messages(company_id);
-CREATE INDEX IF NOT EXISTS idx_job_messages_created_at ON job_messages(created_at DESC);
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.tables WHERE table_name = 'job_messages'
+  ) THEN
+    EXECUTE 'CREATE INDEX IF NOT EXISTS idx_job_messages_job_id     ON job_messages(job_id)';
+    EXECUTE 'CREATE INDEX IF NOT EXISTS idx_job_messages_company_id ON job_messages(company_id)';
+    EXECUTE 'CREATE INDEX IF NOT EXISTS idx_job_messages_created_at ON job_messages(created_at DESC)';
+  END IF;
+END $$;
 
 -- notifications indexes
 CREATE INDEX IF NOT EXISTS idx_notifications_user_id   ON notifications(user_id);
 CREATE INDEX IF NOT EXISTS idx_notifications_company   ON notifications(company_id);
-CREATE INDEX IF NOT EXISTS idx_notifications_read      ON notifications(user_id, is_read);
+CREATE INDEX IF NOT EXISTS idx_notifications_read      ON notifications(user_id, read);
 
 -- attendance indexes
 CREATE INDEX IF NOT EXISTS idx_attendance_user_id      ON attendance(user_id);
@@ -102,6 +108,8 @@ BEGIN
     ALTER TABLE messages ADD COLUMN company_id TEXT;
   END IF;
 END $$;
+
+CREATE INDEX IF NOT EXISTS idx_messages_company_id ON messages(company_id) WHERE company_id IS NOT NULL;
 
 -- ────────────────────────────────────────────────────────────────────────────
 -- SECTION 5: Data Migration — Normalize Legacy broken states

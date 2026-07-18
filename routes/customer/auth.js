@@ -28,6 +28,12 @@ const { Resend } = require('resend');
 const { pool } = require('../../db');
 const redisClient = require('../../utils/redis');
 const { validateCompanyCode } = require('../../utils/companyIdGenerator');
+const { storage } = require('../../middleware/als');
+
+// ✅ RLS bypass — customer auth routes look up customers/companies by email before
+// any company context is known. Explicitly opt-in to cross-tenant access.
+router.use((req, res, next) => storage.run({ isWebRequest: true, bypassRls: true }, next));
+
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const CUSTOMER_PORTAL_ORIGIN = process.env.CUSTOMER_PORTAL_ORIGIN || 'http://localhost:3001';

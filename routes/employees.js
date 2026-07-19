@@ -38,13 +38,25 @@ async function mapRowToEmployee(row) {
 router.get('/debug', authenticateToken, async (req, res) => {
   const companyId = req.user?.companyId;
   try {
+    // Test 1: normal query
     const r1 = await pool.query(`SELECT id, name, role, company_id FROM users WHERE company_id::text = $1`, [String(companyId)]);
-    const r2 = await pool.query(`SELECT id, name, role, company_id FROM users WHERE company_id = $1`, [companyId]);
+    
+    // Test 2: check RLS status on users table
+    const r3 = await pool.query(`SELECT relname, relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = 'users'`);
+    
+    // Test 3: check current session role and RLS settings
+    const r4 = await pool.query(`SELECT current_user, current_setting('app.bypass_rls', true) as bypass_rls, current_setting('app.current_company_id', true) as company_id_setting`);
+    
+    // Test 4: count without any filter
+    const r5 = await pool.query(`SELECT COUNT(*) as total FROM users`);
+    
     res.json({
       jwtCompanyId: companyId,
       jwtCompanyIdType: typeof companyId,
       queryWithTextCast: r1.rows,
-      queryWithoutCast: r2.rows,
+      usersTableRlsStatus: r3.rows[0],
+      sessionInfo: r4.rows[0],
+      totalUsersVisible: r5.rows[0].total,
     });
   } catch (err) {
     res.status(500).json({ error: err.message, companyId });

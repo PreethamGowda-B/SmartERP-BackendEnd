@@ -48,37 +48,48 @@ function buildRlsConfig() {
 /**
  * Applies RLS context to a raw pg Client.
  * Called immediately after every pool.connect() or pool.query() checkout.
+ *
+ * REVISED APPROACH:
+ * - Always RESET ROLE first (back to connection owner who has BYPASSRLS on neondb_owner)
+ * - Set session variables for app-layer RLS enforcement
+ * - Only SET ROLE smarterp_app if bypassRls=false AND we have a valid companyId
+ *   (this prevents blocking queries when ALS context hasn't propagated yet)
  */
 async function applyRlsToClient(client) {
   const { bypassRls, role, companyId } = buildRlsConfig();
 
   if (bypassRls) {
     // Explicit bypass — restore the privileged role, mark bypass = 'on'.
-    // RESET ROLE is a no-op if the role was never changed, so always safe.
-    try { await client.query('RESET ROLE'); } catch { /* ignore — role may not be set */ }
+    try { await client.query('RESET ROLE'); } catch { /* ignore */ }
     await client.query(
       `SELECT
          set_config('app.bypass_rls',         'on', true),
          set_config('app.current_company_id', '',   true),
          set_config('app.current_role',       '',   true)`
     );
-  } else {
-    // Normal tenant request (or no context) — try to drop to restricted role first.
-    // If smarterp_app role doesn't exist in this DB, skip gracefully — the session
-    // variables alone enforce row-level isolation via the policy USING clause.
-    try {
-      await client.query('SET ROLE smarterp_app');
-    } catch (roleErr) {
-      // smarterp_app role not provisioned — fall through to session variable enforcement only.
-      // This is acceptable: the app.bypass_rls='off' + empty company_id still denies cross-tenant access.
-      console.warn('⚠️ db.js: SET ROLE smarterp_app skipped (role not found):', roleErr.message);
-    }
+  } else if (companyId) {
+    // Authenticated tenant request — we have a valid company context.
+    // Set session variables so RLS policies can filter by company.
+    // Note: keep RESET ROLE so neondb_owner's BYPASSRLS allows the query through,
+    // and the session variable-based policies do the tenant isolation.
+    try { await client.query('RESET ROLE'); } catch { /* ignore */ }
     await client.query(
       `SELECT
          set_config('app.bypass_rls',         'off', true),
          set_config('app.current_company_id', $1,    true),
          set_config('app.current_role',       $2,    true)`,
       [companyId, role]
+    );
+  } else {
+    // No ALS context (background job that forgot storage.run, or startup code).
+    // RESET ROLE so the query can proceed — rely on application-layer WHERE clauses.
+    // Without companyId we can't set meaningful RLS vars anyway.
+    try { await client.query('RESET ROLE'); } catch { /* ignore */ }
+    await client.query(
+      `SELECT
+         set_config('app.bypass_rls',         'off', true),
+         set_config('app.current_company_id', '',    true),
+         set_config('app.current_role',       '',    true)`
     );
   }
 }

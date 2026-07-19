@@ -176,11 +176,11 @@ router.post('/', async (req, res) => {
 
     const trimmedContent = String(msgContent).trim();
 
-    // Insert message — receiver_id is the other participant (NOT NULL constraint in production DB)
+    // Insert message — production messages table has both 'message' (old, NOT NULL) and 'content' (new) columns
     const result = await pool.query(
-      `INSERT INTO messages (conversation_id, sender_id, receiver_id, content, message_type, created_at)
-       VALUES ($1, $2::UUID, $3::UUID, $4, COALESCE($5, 'text'), NOW())
-       RETURNING id, conversation_id, sender_id, content, message_type, created_at`,
+      `INSERT INTO messages (conversation_id, sender_id, receiver_id, message, content, message_type, created_at)
+       VALUES ($1, $2::UUID, $3::UUID, $4, $4, COALESCE($5, 'text'), NOW())
+       RETURNING id, conversation_id, sender_id, content, message, message_type, created_at`,
       [conversation_id, String(senderId), String(recipientId), trimmedContent, 'text']
     );
 

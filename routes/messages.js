@@ -106,8 +106,8 @@ router.post('/conversations/start', async (req, res) => {
       await client.query('BEGIN');
 
       const convResult = await client.query(
-        `INSERT INTO conversations (company_id) VALUES ($1) RETURNING id`,
-        [companyId]
+        `INSERT INTO conversations (company_id) VALUES ($1::integer) RETURNING id`,
+        [parseInt(companyId, 10)]
       );
       const newConversationId = convResult.rows[0].id;
 

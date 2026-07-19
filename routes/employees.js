@@ -34,6 +34,23 @@ async function mapRowToEmployee(row) {
   };
 }
 
+// ─── GET /api/employees/debug — raw user count for this company ──────────────
+router.get('/debug', authenticateToken, async (req, res) => {
+  const companyId = req.user?.companyId;
+  try {
+    const r1 = await pool.query(`SELECT id, name, role, company_id FROM users WHERE company_id::text = $1`, [String(companyId)]);
+    const r2 = await pool.query(`SELECT id, name, role, company_id FROM users WHERE company_id = $1`, [companyId]);
+    res.json({
+      jwtCompanyId: companyId,
+      jwtCompanyIdType: typeof companyId,
+      queryWithTextCast: r1.rows,
+      queryWithoutCast: r2.rows,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message, companyId });
+  }
+});
+
 // ─── GET /api/employees ─────────────────────────────────────────────────────
 router.get('/', authenticateToken, async (req, res) => {
   try {

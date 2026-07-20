@@ -1,10 +1,25 @@
 const express = require('express');
 const router = express.Router();
+const multer = require('multer');
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 const { createNotification, broadcastToUser } = require('../utils/notificationHelpers');
 const { loadPlan } = require('../middleware/planMiddleware');
 const redisClient = require('../utils/redis');
+const { cloudinary, hasCloudinaryConfig } = require('../config/cloudinary');
+
+// Multer setup for message attachments (in-memory, then we upload manually)
+const uploadMiddleware = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB
+  fileFilter: (_req, file, cb) => {
+    const allowed = ['image/jpeg', 'image/png', 'image/gif', 'image/webp',
+                     'application/pdf', 'application/msword',
+                     'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                     'text/plain'];
+    cb(null, allowed.includes(file.mimetype));
+  }
+});
 
 // Global protection: authentication + plan loading required for all message routes.
 // Note: messages is available on all plans — no requireFeature gate here.
@@ -264,7 +279,8 @@ router.post('/', async (req, res) => {
       content: sentMessage.content,
       message_type: sentMessage.message_type,
       created_at: sentMessage.created_at,
-      is_mine: true
+      is_mine: true,
+      receipt: 'sent'
     });
   } catch (err) {
     console.error('Error sending message:', err);
@@ -412,6 +428,54 @@ router.patch('/conversation/:conversationId/read', async (req, res) => {
       `UPDATE conversation_participants SET last_read_at = NOW() WHERE conversation_id = $1 AND user_id::text = $2`,
       [conversationId, String(currentUserId)]
     );
+
+    // Upsert read receipts for all unread messages in this conversation sent by the other participant
+    const unreadMessages = await pool.query(
+      `SELECT id FROM messages
+       WHERE conversation_id = $1
+         AND sender_id::text != $2
+         AND created_at >= COALESCE(
+           (SELECT last_read_at FROM conversation_participants
+            WHERE conversation_id = $1 AND user_id::text = $2),
+           '1970-01-01'
+         )`,
+      [conversationId, String(currentUserId)]
+    );
+
+    if (unreadMessages.rows.length > 0) {
+      const messageIds = unreadMessages.rows.map(r => r.id);
+
+      // Bulk upsert read receipts
+      for (const msgId of messageIds) {
+        await pool.query(
+          `INSERT INTO message_read_receipts (message_id, user_id, status, created_at)
+           VALUES ($1, $2::UUID, 'read', NOW())
+           ON CONFLICT (message_id, user_id, status) DO NOTHING`,
+          [msgId, String(currentUserId)]
+        );
+      }
+
+      // Find the sender of these messages (the other participant) to broadcast receipt_update
+      const senderResult = await pool.query(
+        `SELECT DISTINCT sender_id FROM messages WHERE id = ANY($1::UUID[])`,
+        [messageIds]
+      );
+
+      for (const { sender_id } of senderResult.rows) {
+        if (String(sender_id) !== String(currentUserId)) {
+          try {
+            broadcastToUser(sender_id, {
+              type: 'receipt_update',
+              data: {
+                conversation_id: conversationId,
+                message_ids: messageIds,
+                status: 'read'
+              }
+            });
+          } catch { /* non-critical */ }
+        }
+      }
+    }
 
     res.json({ success: true });
   } catch (err) {
@@ -700,6 +764,106 @@ router.get('/job-conversations', async (req, res) => {
   } catch (err) {
     console.error('GET /messages/job-conversations error:', err.message);
     res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ─── POST /api/messages/typing ───────────────────────────────────────────────
+// Broadcast a typing_indicator SSE event to the other participant — NOT persisted
+router.post('/typing', async (req, res) => {
+  try {
+    const senderId = req.user.userId || req.user.id;
+    const { conversation_id, typing } = req.body;
+
+    if (!conversation_id) {
+      return res.status(400).json({ message: 'conversation_id is required' });
+    }
+
+    // Verify sender is a participant
+    const participantCheck = await pool.query(
+      `SELECT id FROM conversation_participants WHERE conversation_id = $1 AND user_id::text = $2`,
+      [conversation_id, String(senderId)]
+    );
+    if (participantCheck.rows.length === 0) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    // Get other participant
+    const otherResult = await pool.query(
+      `SELECT user_id FROM conversation_participants WHERE conversation_id = $1 AND user_id::text != $2`,
+      [conversation_id, String(senderId)]
+    );
+    const recipientId = otherResult.rows[0]?.user_id ?? null;
+
+    // Get sender name
+    const senderInfo = await pool.query(
+      `SELECT name FROM users WHERE id::text = $1`,
+      [String(senderId)]
+    );
+    const senderName = senderInfo.rows[0]?.name ?? 'Someone';
+
+    if (recipientId) {
+      try {
+        broadcastToUser(recipientId, {
+          type: 'typing_indicator',
+          data: {
+            conversation_id,
+            user_id: senderId,
+            user_name: senderName,
+            typing: !!typing
+          }
+        });
+      } catch { /* non-critical */ }
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Error broadcasting typing indicator:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ─── POST /api/messages/upload ────────────────────────────────────────────────
+// Upload a file attachment for a message. Returns file metadata.
+router.post('/upload', uploadMiddleware.single('attachment'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ message: 'No file provided' });
+    }
+
+    if (!hasCloudinaryConfig) {
+      return res.status(503).json({ message: 'File upload is not configured' });
+    }
+
+    const { originalname, mimetype, size, buffer } = req.file;
+    const isImage = mimetype.startsWith('image/');
+    const folder = 'smarterp/messages';
+
+    // Upload buffer to Cloudinary
+    const uploadResult = await new Promise((resolve, reject) => {
+      const stream = cloudinary.uploader.upload_stream(
+        {
+          folder,
+          resource_type: isImage ? 'image' : 'raw',
+          public_id: `msg_${Date.now()}`,
+          ...(isImage && { transformation: [{ width: 1200, crop: 'limit' }] })
+        },
+        (error, result) => {
+          if (error) reject(error);
+          else resolve(result);
+        }
+      );
+      stream.end(buffer);
+    });
+
+    res.json({
+      file_url: uploadResult.secure_url,
+      file_name: originalname,
+      file_type: mimetype,
+      file_size: size
+    });
+  } catch (err) {
+    console.error('Error uploading message attachment:', err);
+    res.status(500).json({ message: 'File upload failed' });
   }
 });
 

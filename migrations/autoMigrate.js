@@ -199,6 +199,7 @@ const NUMBERED_MIGRATIONS = [
     '002_fix_approval_nulls.sql',
     '003_otp_hashing.sql',
     '004_internal_messaging.sql',
+    '005_messaging_phase2.sql',
 ];
 
 async function runNumberedMigrations() {

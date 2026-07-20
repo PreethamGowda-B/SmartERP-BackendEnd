@@ -580,12 +580,17 @@ router.post('/:id/progress', authenticateToken, async (req, res) => {
 });
 
 /**
- * Update job (Owner/Admin)
+ * Update job (Owner/Admin only)
  */
 router.put('/:id', authenticateToken, async (req, res) => {
   const { id } = req.params;
   const updates = req.body || {};
   const companyId = req.user.companyId;
+
+  // Only owners and admins can update jobs
+  if (req.user.role !== 'owner' && req.user.role !== 'admin') {
+    return res.status(403).json({ message: 'Only owners can update jobs' });
+  }
 
   try {
     const result = await pool.query(
@@ -626,11 +631,16 @@ router.put('/:id', authenticateToken, async (req, res) => {
 });
 
 /**
- * Delete job
+ * Delete job (Owner/Admin only)
  */
 router.delete('/:id', authenticateToken, async (req, res) => {
   const { id } = req.params;
   const companyId = req.user.companyId;
+
+  // Only owners and admins can delete jobs
+  if (req.user.role !== 'owner' && req.user.role !== 'admin') {
+    return res.status(403).json({ message: 'Only owners can delete jobs' });
+  }
 
   try {
     const result = await pool.query(

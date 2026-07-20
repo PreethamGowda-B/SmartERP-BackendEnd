@@ -227,6 +227,29 @@ router.post('/verify-payment', requireOwner, async (req, res) => {
 
     const planId = parseInt(planIdInput, 10);
 
+    // Validate planId is a known paid plan (never trust client for financial data)
+    if (![2, 3].includes(planId)) {
+      return res.status(400).json({ message: 'Invalid plan selected.' });
+    }
+
+    // Verify the Razorpay order actually exists and belongs to this company/plan
+    // This prevents a user from paying for Basic but claiming Pro by sending planId=3
+    let verifiedPlanId = planId;
+    try {
+      const Razorpay = require('razorpay');
+      const rz = new Razorpay({ key_id: process.env.RAZORPAY_KEY_ID, key_secret: process.env.RAZORPAY_KEY_SECRET });
+      const order = await rz.orders.fetch(razorpay_order_id);
+      const orderPlanId = parseInt(order.notes?.planId, 10);
+      const orderCompanyId = parseInt(order.notes?.companyId, 10);
+      if ([2, 3].includes(orderPlanId)) verifiedPlanId = orderPlanId;
+      if (orderCompanyId && orderCompanyId !== parseInt(companyId, 10)) {
+        return res.status(403).json({ message: 'Order does not belong to your account.' });
+      }
+    } catch (fetchErr) {
+      console.warn('Could not fetch Razorpay order for extra validation:', fetchErr.message);
+      // Fall through — signature check below is the primary security gate
+    }
+
     // Verify signature (constant-time comparison to prevent timing side-channel attacks)
     const body = razorpay_order_id + "|" + razorpay_payment_id;
     const expectedSignature = crypto
@@ -271,14 +294,14 @@ router.post('/verify-payment', requireOwner, async (req, res) => {
            subscription_expires_at = COALESCE(GREATEST(subscription_expires_at, NOW()), NOW()) + INTERVAL $2,
            updated_at = NOW()
        WHERE id = $3`,
-      [planId, expiryInterval, companyId]
+      [verifiedPlanId, expiryInterval, companyId]
     );
 
     // Log event
     await pool.query(
       `INSERT INTO subscription_events (company_id, event_type, new_plan_id, metadata, created_at)
        VALUES ($1, 'upgrade', $2, $3, NOW())`,
-      [companyId, planId, JSON.stringify({ 
+      [companyId, verifiedPlanId, JSON.stringify({ 
         razorpay_payment_id, 
         razorpay_order_id, 
         billingCycle
@@ -297,7 +320,7 @@ router.post('/verify-payment', requireOwner, async (req, res) => {
       2: 'Basic',
       3: 'Pro'
     };
-    const planName = planNameMap[planId] || 'Unknown';
+    const planName = planNameMap[verifiedPlanId] || 'Unknown';
     
     if (process.env.NODE_ENV === 'development') {
       console.log(`[SUBSCRIPTION URL] Plan ${planName} assigned to company ${companyId}`);

@@ -35,31 +35,21 @@ async function mapRowToEmployee(row) {
 }
 
 // ─── GET /api/employees/debug — raw user count for this company ──────────────
+// Owner-only: basic employee count check (no internal DB/RLS details exposed)
 router.get('/debug', authenticateToken, async (req, res) => {
   const companyId = req.user?.companyId;
+  const role = req.user?.role;
+  if (role !== 'owner' && role !== 'admin') {
+    return res.status(403).json({ message: 'Access denied' });
+  }
   try {
-    // Test 1: normal query
-    const r1 = await pool.query(`SELECT id, name, role, company_id FROM users WHERE company_id::text = $1`, [String(companyId)]);
-    
-    // Test 2: check RLS status on users table
-    const r3 = await pool.query(`SELECT relname, relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = 'users'`);
-    
-    // Test 3: check current session role and RLS settings
-    const r4 = await pool.query(`SELECT current_user, current_setting('app.bypass_rls', true) as bypass_rls, current_setting('app.current_company_id', true) as company_id_setting`);
-    
-    // Test 4: count without any filter
-    const r5 = await pool.query(`SELECT COUNT(*) as total FROM users`);
-    
-    res.json({
-      jwtCompanyId: companyId,
-      jwtCompanyIdType: typeof companyId,
-      queryWithTextCast: r1.rows,
-      usersTableRlsStatus: r3.rows[0],
-      sessionInfo: r4.rows[0],
-      totalUsersVisible: r5.rows[0].total,
-    });
+    const r1 = await pool.query(
+      `SELECT COUNT(*) as total, array_agg(role) as roles FROM users WHERE company_id::text = $1`,
+      [String(companyId)]
+    );
+    res.json({ companyId, userCount: r1.rows[0]?.total, roles: r1.rows[0]?.roles });
   } catch (err) {
-    res.status(500).json({ error: err.message, companyId });
+    res.status(500).json({ error: 'Server error' });
   }
 });
 

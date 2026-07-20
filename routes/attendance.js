@@ -736,7 +736,10 @@ router.patch('/:id', authenticateToken, async (req, res) => {
     const { check_in_time, check_out_time, status, notes } = req.body;
     const editedBy = req.user.userId || req.user.id;
 
-    const companyId = req.user.companyId || 1;
+    const companyId = req.user.companyId;
+    if (!companyId) {
+      return res.status(403).json({ message: 'Missing company affiliation' });
+    }
 
     // Check if record is processed (locked) and verify company_id
     const existing = await pool.query('SELECT is_processed, company_id FROM attendance WHERE id = $1 AND company_id = $2', [id, companyId]);
@@ -976,7 +979,7 @@ router.post('/biometric/webhook', async (req, res) => {
       return res.status(404).json({ message: 'Device not registered or inactive' });
     }
 
-    // Verify employee exists
+    // Verify employee exists and belongs to the same company as the device
     const employee = await pool.query(
       'SELECT id, company_id FROM users WHERE id = $1',
       [employee_id]
@@ -984,6 +987,11 @@ router.post('/biometric/webhook', async (req, res) => {
 
     if (employee.rows.length === 0) {
       return res.status(404).json({ message: 'Employee not found' });
+    }
+
+    // Ensure the employee belongs to the same company as the biometric device
+    if (String(employee.rows[0].company_id) !== String(device.rows[0].company_id)) {
+      return res.status(403).json({ message: 'Device and employee company mismatch' });
     }
 
     const today = new Date(timestamp || Date.now()).toISOString().split('T')[0];

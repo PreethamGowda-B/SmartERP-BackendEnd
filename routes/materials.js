@@ -6,11 +6,17 @@ const { loadPlan } = require('../middleware/planMiddleware');
 
 // Create inventory item
 router.post('/items', authenticateToken, async (req, res) => {
+  const companyId = req.user.companyId;
+  if (!companyId) return res.status(400).json({ message: 'No company associated with your account' });
+  if (req.user.role !== 'owner' && req.user.role !== 'admin') {
+    return res.status(403).json({ message: 'Only owners can manage inventory' });
+  }
   const { sku, name, description, quantity, unit, location, reorder_threshold, image_url } = req.body;
+  if (!name || !name.trim()) return res.status(400).json({ message: 'Item name is required' });
   try {
     const result = await pool.query(
-      'INSERT INTO inventory_items (sku, name, description, quantity, unit, location, reorder_threshold, image_url) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *',
-      [sku, name, description, quantity || 0, unit || null, location || null, reorder_threshold || 0, image_url || null]
+      'INSERT INTO inventory_items (sku, name, description, quantity, unit, location, reorder_threshold, image_url, company_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *',
+      [sku, name.trim(), description, quantity || 0, unit || null, location || null, reorder_threshold || 0, image_url || null, companyId]
     );
     res.json(result.rows[0]);
   } catch (err) {
@@ -21,8 +27,10 @@ router.post('/items', authenticateToken, async (req, res) => {
 
 // List inventory
 router.get('/items', authenticateToken, async (req, res) => {
+  const companyId = req.user.companyId;
+  if (!companyId) return res.status(400).json({ message: 'No company associated with your account' });
   try {
-    const result = await pool.query('SELECT * FROM inventory_items ORDER BY name');
+    const result = await pool.query('SELECT * FROM inventory_items WHERE company_id = $1 ORDER BY name', [companyId]);
     res.json(result.rows);
   } catch (err) {
     console.error('Error fetching inventory items:', err);
@@ -129,15 +137,25 @@ router.post('/requests', authenticateToken, loadPlan, async (req, res) => {
 
 // List requests
 // - employees see only their requests
-// - owners/admins see all requests
+// - owners/admins see all requests (scoped to their company)
 router.get('/requests', authenticateToken, async (req, res) => {
   try {
+    const companyId = req.user.companyId;
+    if (!companyId) return res.status(400).json({ message: 'No company associated with your account' });
+
     if (req.user.role === 'employee' || req.user.role === 'user') {
-      const result = await pool.query('SELECT * FROM material_requests WHERE requested_by = $1 ORDER BY created_at DESC', [req.user.userId]);
+      const result = await pool.query(
+        'SELECT * FROM material_requests WHERE requested_by = $1 AND company_id = $2 ORDER BY created_at DESC',
+        [req.user.userId, companyId]
+      );
       return res.json(result.rows);
     }
 
-    const result = await pool.query('SELECT * FROM material_requests ORDER BY created_at DESC');
+    // Owners/admins: scoped to their company only
+    const result = await pool.query(
+      'SELECT * FROM material_requests WHERE company_id = $1 ORDER BY created_at DESC',
+      [companyId]
+    );
     res.json(result.rows);
   } catch (err) {
     console.error('Error listing material requests', err);

@@ -20,7 +20,7 @@ const { createNotification } = require('../utils/notificationHelpers');
 const auditService = require('./auditService');
 
 const GEOFENCE_RADIUS_M = 100;   // 100 metres
-const POLL_INTERVAL_MS  = 12_000; // 12 seconds
+const POLL_INTERVAL_MS  = 60_000; // 60 seconds — reduced from 12s to conserve DB compute
 
 let _timer = null;
 let _running = false;

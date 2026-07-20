@@ -84,10 +84,14 @@ router.post('/', authenticateToken, upload.single('file'), async (req, res) => {
 });
 
 // ─── GET /api/documents ──────────────────────────────────────────────────────
-// List employees with document counts (Owner/Admin)
+// List employees with document counts (Owner/Admin only)
 router.get('/', authenticateToken, async (req, res) => {
     try {
-        const { companyId } = req.user;
+        const { role, companyId } = req.user;
+
+        if (role !== 'owner' && role !== 'admin') {
+            return res.status(403).json({ message: 'Only owners and admins can view document lists' });
+        }
 
         // Optimized query to get all active employees and their document counts
         const result = await pool.query(
@@ -151,7 +155,13 @@ router.delete('/:id', authenticateToken, async (req, res) => {
         }
 
         const doc = docResult.rows[0];
-        const filePath = path.join(process.cwd(), doc.file_url);
+
+        // Prevent path traversal: resolve and ensure it's within the uploads directory
+        const uploadsRoot = path.resolve(process.cwd(), 'uploads');
+        const filePath = path.resolve(process.cwd(), doc.file_url.replace(/^\//, ''));
+        if (!filePath.startsWith(uploadsRoot)) {
+          return res.status(400).json({ message: 'Invalid file path' });
+        }
 
         // Delete from DB first
         await pool.query('DELETE FROM employee_documents WHERE id = $1', [id]);

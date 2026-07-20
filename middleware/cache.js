@@ -12,7 +12,7 @@ function cacheMiddleware(duration = 60) {
       return next();
     }
 
-    const key = `cache:${req.user?.companyId || 'global'}:${req.originalUrl}`;
+    const key = `cache:${req.user?.companyId || 'global'}:${req.user?.role || 'anon'}:${req.originalUrl}`;
 
     try {
       const cachedResponse = await redisClient.get(key);

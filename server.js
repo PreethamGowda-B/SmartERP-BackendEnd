@@ -785,6 +785,51 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
 
 module.exports = app;
 
+// ✅ Graceful shutdown — drain in-flight requests before closing DB pool
+// This prevents connection errors on Render deploys and SIGTERM events.
+let httpServer = null;
+
+function registerGracefulShutdown(server) {
+  httpServer = server;
+  const shutdown = (signal) => async () => {
+    console.log(`\n📴 ${signal} received — starting graceful shutdown...`);
+    if (httpServer) {
+      httpServer.close(async () => {
+        console.log('✅ HTTP server closed — no new connections accepted');
+        try {
+          const { pool: shutdownPool } = require('./db');
+          await shutdownPool.end();
+          console.log('✅ DB pool closed cleanly');
+        } catch (err) {
+          console.error('❌ Error closing DB pool:', err.message);
+        }
+        console.log('👋 Graceful shutdown complete');
+        process.exit(0);
+      });
+      // Force exit after 15s if graceful close hangs
+      setTimeout(() => {
+        console.error('❌ Forced shutdown after 15s timeout');
+        process.exit(1);
+      }, 15000);
+    } else {
+      process.exit(0);
+    }
+  };
+  process.on('SIGTERM', shutdown('SIGTERM'));
+  process.on('SIGINT',  shutdown('SIGINT'));
+}
+
+// Wire graceful shutdown when this is the worker that starts the server
+if (process.env.IS_PRIMARY_WORKER === 'true' || process.env.NODE_ENV !== 'production') {
+  // app.listen returns the server — we capture it below
+  const origListen = app.listen.bind(app);
+  app.listen = (...args) => {
+    const server = origListen(...args);
+    registerGracefulShutdown(server);
+    return server;
+  };
+}
+
 // ✅ Authenticated document access — replaces the removed express.static('/uploads')
 // Files are served only after verifying the requester's company ownership
 const path = require("path");

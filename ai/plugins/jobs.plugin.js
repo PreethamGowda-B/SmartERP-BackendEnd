@@ -1,5 +1,5 @@
 const BasePlugin = require("./base.plugin");
-const { pool } = require("../../db");
+const JobService = require("../../services/jobService");
 
 class JobsPlugin extends BasePlugin {
   constructor() {
@@ -19,34 +19,11 @@ class JobsPlugin extends BasePlugin {
         },
       },
       execute: async (params, context) => {
-        const companyId = context.user.companyId;
-        const limit = params.limit || 20;
-        let query = `
-          SELECT id, title, description, status, priority, created_at, updated_at
-          FROM jobs
-          WHERE company_id::text = $1
-        `;
-        const values = [String(companyId)];
-
-        if (params.status) {
-          query += ` AND LOWER(status) = LOWER($2)`;
-          values.push(params.status);
-        }
-
-        query += ` ORDER BY created_at DESC LIMIT ${limit}`;
-
-        const res = await pool.query(query, values);
-        return {
-          totalReturned: res.rows.length,
-          jobs: res.rows.map((j) => ({
-            id: j.id,
-            title: j.title,
-            description: j.description || "",
-            status: j.status || "open",
-            priority: j.priority || "medium",
-            createdAt: j.created_at,
-          })),
-        };
+        return await JobService.getJobs({
+          companyId: context.user.companyId,
+          status: params.status,
+          limit: params.limit,
+        });
       },
     };
 
@@ -61,21 +38,9 @@ class JobsPlugin extends BasePlugin {
         properties: {},
       },
       execute: async (params, context) => {
-        const companyId = context.user.companyId;
-        const query = `
-          SELECT id, title, status, priority, created_at
-          FROM jobs
-          WHERE company_id::text = $1
-            AND status NOT IN ('completed', 'closed', 'cancelled')
-            AND created_at < NOW() - INTERVAL '7 days'
-          ORDER BY created_at ASC
-        `;
-        const res = await pool.query(query, [String(companyId)]);
-
-        return {
-          delayedCount: res.rows.length,
-          delayedJobs: res.rows,
-        };
+        return await JobService.getDelayedJobs({
+          companyId: context.user.companyId,
+        });
       },
     };
 
@@ -95,41 +60,12 @@ class JobsPlugin extends BasePlugin {
         required: ["title"],
       },
       execute: async (params, context) => {
-        const companyId = context.user.companyId;
-        const res = await pool.query(
-          `INSERT INTO jobs (title, description, priority, status, company_id, created_at, updated_at)
-           VALUES ($1, $2, $3, 'open', $4, NOW(), NOW())
-           RETURNING id, title, priority, status`,
-          [params.title, params.description || "", params.priority || "medium", companyId]
-        );
-
-        return {
-          success: true,
-          message: `Job '${params.title}' created successfully.`,
-          job: res.rows[0],
-        };
-      },
-    };
-
-    // Skill: detect_job_bottlenecks
-    this.skills["detect_job_bottlenecks"] = {
-      name: "detect_job_bottlenecks",
-      description: "Analyzes open job volume and flags operational bottlenecks.",
-      allowedRoles: ["owner", "hr", "admin"],
-      execute: async (params, context) => {
-        const companyId = context.user.companyId;
-        const res = await pool.query(
-          `SELECT status, COUNT(*) as count
-           FROM jobs
-           WHERE company_id::text = $1
-           GROUP BY status`,
-          [String(companyId)]
-        );
-
-        return {
-          summary: "Job status breakdown analysis.",
-          breakdown: res.rows,
-        };
+        return await JobService.createJob({
+          companyId: context.user.companyId,
+          title: params.title,
+          description: params.description,
+          priority: params.priority,
+        });
       },
     };
   }

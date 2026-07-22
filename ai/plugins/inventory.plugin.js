@@ -1,5 +1,5 @@
 const BasePlugin = require("./base.plugin");
-const { pool } = require("../../db");
+const InventoryService = require("../../services/inventoryService");
 
 class InventoryPlugin extends BasePlugin {
   constructor() {
@@ -16,19 +16,9 @@ class InventoryPlugin extends BasePlugin {
         properties: {},
       },
       execute: async (params, context) => {
-        const companyId = context.user.companyId;
-        const res = await pool.query(
-          `SELECT id, name, category, quantity, min_quantity, unit
-           FROM inventory
-           WHERE company_id::text = $1 AND (quantity <= min_quantity OR quantity < 10)
-           ORDER BY quantity ASC`,
-          [String(companyId)]
-        );
-
-        return {
-          lowStockCount: res.rows.length,
-          items: res.rows,
-        };
+        return await InventoryService.getLowStockItems({
+          companyId: context.user.companyId,
+        });
       },
     };
 
@@ -45,26 +35,10 @@ class InventoryPlugin extends BasePlugin {
         },
       },
       execute: async (params, context) => {
-        const companyId = context.user.companyId;
-        let query = `
-          SELECT id, material_name, quantity, status, requested_by, created_at
-          FROM material_requests
-          WHERE company_id::text = $1
-        `;
-        const values = [String(companyId)];
-
-        if (params.status) {
-          query += ` AND LOWER(status) = LOWER($2)`;
-          values.push(params.status);
-        }
-
-        query += ` ORDER BY created_at DESC LIMIT 20`;
-        const res = await pool.query(query, values);
-
-        return {
-          requestCount: res.rows.length,
-          requests: res.rows,
-        };
+        return await InventoryService.getMaterialRequests({
+          companyId: context.user.companyId,
+          status: params.status,
+        });
       },
     };
   }

@@ -4,6 +4,7 @@ const AttendancePlugin = require("./attendance.plugin");
 const PayrollPlugin = require("./payroll.plugin");
 const InventoryPlugin = require("./inventory.plugin");
 const FinancialPlugin = require("./financial.plugin");
+const CustomerPlugin = require("./customer.plugin");
 const NavigationPlugin = require("./navigation.plugin");
 
 class PluginRegistry {
@@ -15,6 +16,7 @@ class PluginRegistry {
       new PayrollPlugin(),
       new InventoryPlugin(),
       new FinancialPlugin(),
+      new CustomerPlugin(),
       new NavigationPlugin(),
     ];
   }

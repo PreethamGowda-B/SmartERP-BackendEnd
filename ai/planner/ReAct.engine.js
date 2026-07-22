@@ -1,6 +1,7 @@
 const ProviderFactory = require("../providers/provider.factory");
 const ContextEngine = require("../context/context.engine");
 const pluginRegistry = require("../plugins");
+const MetricsService = require("../telemetry/metrics.service");
 
 class ReActEngine {
   /**
@@ -60,7 +61,6 @@ class ReActEngine {
         const responseText = parsedPayload?.text || content || "Operation processed.";
         const widget = parsedPayload?.widget || null;
 
-        // Auto-detect widget if returning tabular / list data and no widget was built
         let finalWidget = widget;
         if (!finalWidget && modulesUsed.has("AttendancePlugin")) {
           finalWidget = {
@@ -104,6 +104,14 @@ class ReActEngine {
         try {
           const toolResult = await pluginRegistry.execute(functionName, args, context);
 
+          // Audit Log Entry
+          await MetricsService.logAIAuditEvent({
+            userContext: context,
+            toolName: functionName,
+            params: args,
+            status: "SUCCESS",
+          });
+
           // Track module source
           if (toolResult && toolResult.action === "NAVIGATE") {
             navigationCommand = { path: toolResult.path, label: toolResult.label };
@@ -121,6 +129,14 @@ class ReActEngine {
             content: JSON.stringify(toolResult),
           });
         } catch (toolErr) {
+          await MetricsService.logAIAuditEvent({
+            userContext: context,
+            toolName: functionName,
+            params: args,
+            status: "FAILED",
+            error: toolErr.message,
+          });
+
           messages.push({
             role: "tool",
             tool_call_id: toolCall.id,

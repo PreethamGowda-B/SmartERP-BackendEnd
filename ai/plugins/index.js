@@ -6,6 +6,7 @@ const InventoryPlugin = require("./inventory.plugin");
 const FinancialPlugin = require("./financial.plugin");
 const CustomerPlugin = require("./customer.plugin");
 const NavigationPlugin = require("./navigation.plugin");
+const OCRPlugin = require("./ocr.plugin");
 
 class PluginRegistry {
   constructor() {
@@ -18,6 +19,7 @@ class PluginRegistry {
       new FinancialPlugin(),
       new CustomerPlugin(),
       new NavigationPlugin(),
+      new OCRPlugin(),
     ];
   }
 

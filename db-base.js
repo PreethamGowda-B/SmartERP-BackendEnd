@@ -2,10 +2,6 @@ const { Pool } = require('pg');
 require('dotenv').config();
 
 // SSL configuration driven by explicit env vars rather than URL string matching.
-// DB_SSL=true  → verify certificate (production, recommended)
-// DB_SSL=no-verify → encrypted but skip cert check (some managed DBs)
-// DB_SSL=false or unset → no SSL (local dev)
-// When DATABASE_URL contains 'sslmode=disable' we always honour that and skip SSL.
 function resolveSsl() {
   if (process.env.DATABASE_URL?.includes('sslmode=disable')) return false;
   const flag = (process.env.DB_SSL || '').toLowerCase();
@@ -17,9 +13,10 @@ function resolveSsl() {
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: resolveSsl(),
-  max: 10,
+  max: parseInt(process.env.DB_POOL_MAX || '25'),
   idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 10000,
+  connectionTimeoutMillis: 5000, // Faster timeout to fail fast under overload
+  statement_timeout: 10000,       // 10s query safety limit to prevent deadlocks
 });
 
 pool.on('error', (err) => {

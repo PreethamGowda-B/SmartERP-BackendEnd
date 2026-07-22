@@ -1,6 +1,6 @@
 /**
  * SmartERP Security Shield
- * Defends against prompt injection attempts, system prompt overrides,
+ * Defends against prompt injection attempts, cross-company data access,
  * and malicious input vectors before reaching the AI Orchestrator.
  */
 
@@ -10,15 +10,31 @@ class SecurityShield {
       return "";
     }
 
-    // Trim excessive whitespace
     let clean = input.trim();
 
-    // Check input length
     if (clean.length > 2000) {
       throw new Error("Input payload exceeds maximum character limit of 2000.");
     }
 
-    // Detect prompt injection patterns (system overrides, ignore previous instructions)
+    // Detect cross-company query attempts
+    const crossCompanyPatterns = [
+      /show me company [a-z0-9_\-\s]+'s/i,
+      /compare my company with another company/i,
+      /show all customers across every company/i,
+      /show all employees across all companies/i,
+      /access other company data/i,
+      /list all companies database/i,
+    ];
+
+    for (const pattern of crossCompanyPatterns) {
+      if (pattern.test(clean)) {
+        throw new Error(
+          "I can't access or disclose information belonging to another company. Your account can only access data that your organization is authorized to view."
+        );
+      }
+    }
+
+    // Detect prompt injection / system override patterns
     const injectionPatterns = [
       /ignore previous instructions/i,
       /ignore all previous system prompts/i,

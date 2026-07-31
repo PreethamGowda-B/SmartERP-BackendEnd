@@ -48,6 +48,10 @@ const corsOptions = {
       "https://smart-erp-front-end.vercel.app",
       "https://www.prozync.in",
       "https://prozync.in",
+      "https://smarterp.prozync.in",
+      "https://customer.prozync.in",
+      "https://superadmin.prozync.in",
+      "https://api.prozync.in",
       "http://localhost:3001",
       "https://client.prozync.in",
     ];
@@ -211,6 +215,10 @@ if (process.env.NODE_ENV === "production") {
       /^https:\/\/smart-erp-front-[a-z0-9]+-thepreethu01-9119s-projects\.vercel\.app$/,
       /^https:\/\/www\.prozync\.in$/,
       /^https:\/\/prozync\.in$/,
+      /^https:\/\/smarterp\.prozync\.in$/,
+      /^https:\/\/customer\.prozync\.in$/,
+      /^https:\/\/superadmin\.prozync\.in$/,
+      /^https:\/\/api\.prozync\.in$/,
       /^https:\/\/client\.prozync\.in$/,
     ];
 
@@ -637,7 +645,17 @@ app.use((err, req, res, next) => {
   // Ensure CORS headers are present even on error responses.
   // Use the SAME allowedPatterns as the CSRF middleware — one canonical list.
   const origin = req.headers.origin;
-  const allowedOrigins = ['https://www.prozync.in', 'https://prozync.in', 'http://localhost:3000', 'https://client.prozync.in', 'http://localhost:3001'];
+  const allowedOrigins = [
+    'https://www.prozync.in',
+    'https://prozync.in',
+    'https://smarterp.prozync.in',
+    'https://customer.prozync.in',
+    'https://superadmin.prozync.in',
+    'https://api.prozync.in',
+    'http://localhost:3000',
+    'https://client.prozync.in',
+    'http://localhost:3001'
+  ];
   const allowedPatterns = [
     /^https:\/\/smart-erp-front(-[a-z0-9]+)?(-[a-z0-9-]+)?\.vercel\.app$/,
     /^https:\/\/smart-erp-front-[a-z0-9]+-thepreethu01-9119s-projects\.vercel\.app$/,

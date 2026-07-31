@@ -1,5 +1,6 @@
 const BaseAIProvider = require("./provider.interface");
 const Groq = require("groq-sdk");
+const { groqConcurrencyLimiter } = require("../../utils/asyncLimiter");
 
 class GroqProvider extends BaseAIProvider {
   constructor() {
@@ -11,27 +12,30 @@ class GroqProvider extends BaseAIProvider {
   }
 
   async generateCompletion({ messages, tools = [], temperature = 0.2 }) {
-    const payload = {
-      model: this.defaultModel,
-      messages,
-      temperature,
-    };
+    // Concurrency-capped queue execution
+    return groqConcurrencyLimiter.run(async () => {
+      const payload = {
+        model: this.defaultModel,
+        messages,
+        temperature,
+      };
 
-    if (tools && tools.length > 0) {
-      payload.tools = tools;
-      payload.tool_choice = "auto";
-    }
+      if (tools && tools.length > 0) {
+        payload.tools = tools;
+        payload.tool_choice = "auto";
+      }
 
-    const response = await this.client.chat.completions.create(payload);
-    const choice = response.choices[0];
-    const message = choice.message;
+      const response = await this.client.chat.completions.create(payload);
+      const choice = response.choices[0];
+      const message = choice.message;
 
-    return {
-      content: message.content || "",
-      toolCalls: message.tool_calls || [],
-      usage: response.usage || {},
-      model: response.model,
-    };
+      return {
+        content: message.content || "",
+        toolCalls: message.tool_calls || [],
+        usage: response.usage || {},
+        model: response.model,
+      };
+    });
   }
 }
 

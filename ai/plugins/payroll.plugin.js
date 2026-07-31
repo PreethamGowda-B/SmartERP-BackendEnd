@@ -1,9 +1,10 @@
 const BasePlugin = require("./base.plugin");
 const PayrollService = require("../../services/payrollService");
+const PayrollValidationService = require("../../services/payrollValidationService");
 
 class PayrollPlugin extends BasePlugin {
   constructor() {
-    super("PayrollPlugin", "Payroll");
+    super("PayrollPlugin", "Provides tools for payroll processing, expense summaries, and pre-run anomaly detection.");
 
     // Tool: get_payroll_summary
     this.tools["get_payroll_summary"] = {
@@ -47,6 +48,32 @@ class PayrollPlugin extends BasePlugin {
           month: params.month,
           year: params.year,
         });
+      },
+    };
+
+    // Tool: validate_payroll_pre_run
+    this.tools["validate_payroll_pre_run"] = {
+      name: "validate_payroll_pre_run",
+      description: "Executes 7-point pre-run validation audit (ghost employees, duplicate bank accounts, salary spikes, statutory errors) before payroll disbursal.",
+      allowedRoles: ["owner", "hr", "admin"],
+      isDestructive: false,
+      parameters: {
+        type: "object",
+        properties: {
+          month: { type: "integer", description: "Month number 1-12" },
+          year: { type: "integer", description: "Year e.g. 2026" },
+        },
+        required: ["month", "year"],
+      },
+      execute: async (params, context) => {
+        const valRes = await PayrollValidationService.runPreRunValidation({
+          companyId: context.user.companyId,
+          userId: context.user.userId,
+          month: params.month,
+          year: params.year,
+          proposedPayroll: [],
+        });
+        return { success: true, validation: valRes };
       },
     };
   }

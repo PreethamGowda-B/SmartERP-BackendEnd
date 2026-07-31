@@ -578,6 +578,11 @@ v1Router.use("/admin", require("./routes/admin"));
 v1Router.use("/documents", require("./routes/documents"));
 v1Router.use("/webhook", require("./routes/webhook"));
 v1Router.use("/feedback", require("./routes/feedback"));
+v1Router.use("/gst-reconciliation", require("./routes/gstReconciliation"));
+v1Router.use("/inventory-forecast", require("./routes/inventoryForecast"));
+v1Router.use("/ar-collections", require("./routes/arCollections"));
+v1Router.use("/payroll-validation", require("./routes/payrollValidation"));
+v1Router.use("/crm-sales", require("./routes/crmSales"));
 
 
 // Mount v1 router

@@ -15,9 +15,9 @@ class EmployeeService {
     let query = `
       SELECT id, name, email, phone, position, department, is_active, role, rating, created_at
       FROM users
-      WHERE company_id::text = $1
+      WHERE company_id = $1
     `;
-    const values = [String(companyId)];
+    const values = [companyId];
     let paramIdx = 2;
 
     if (department) {
@@ -94,9 +94,9 @@ class EmployeeService {
     const res = await pool.query(
       `SELECT id, name, email, position, department, rating, review_count
        FROM users
-       WHERE company_id::text = $1 AND is_active = true
+       WHERE company_id = $1 AND is_active = true
        ORDER BY rating DESC NULLS LAST LIMIT $2`,
-      [String(companyId), limit]
+      [companyId, limit]
     );
 
     return {

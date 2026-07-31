@@ -1,9 +1,10 @@
 const BasePlugin = require("./base.plugin");
 const InventoryService = require("../../services/inventoryService");
+const InventoryForecastService = require("../../services/inventoryForecastService");
 
 class InventoryPlugin extends BasePlugin {
   constructor() {
-    super("InventoryPlugin", "Inventory");
+    super("InventoryPlugin", "Provides tools for inventory management, ROP forecasts, and low stock tracking.");
 
     // Tool: get_low_stock_items
     this.tools["get_low_stock_items"] = {
@@ -39,6 +40,22 @@ class InventoryPlugin extends BasePlugin {
           companyId: context.user.companyId,
           status: params.status,
         });
+      },
+    };
+
+    // Tool: get_demand_forecasts
+    this.tools["get_demand_forecasts"] = {
+      name: "get_demand_forecasts",
+      description: "Retrieves AI demand forecasts, dynamic Reorder Points (ROP), and EOQ estimates for company items.",
+      allowedRoles: ["owner", "admin", "hr"],
+      isDestructive: false,
+      parameters: {
+        type: "object",
+        properties: {},
+      },
+      execute: async (params, context) => {
+        const forecasts = await InventoryForecastService.recalculateCompanyForecasts(context.user.companyId);
+        return { success: true, count: forecasts.length, forecasts };
       },
     };
   }

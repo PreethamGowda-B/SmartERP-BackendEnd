@@ -18,16 +18,16 @@ router.get('/summary', authenticateToken, async (req, res) => {
 
     const [users, jobs, inventory] = await Promise.all([
       pool.query(
-        'SELECT COUNT(*)::int AS count FROM users WHERE company_id::text = $1',
-        [String(companyId)]
+        'SELECT COUNT(*)::int AS count FROM users WHERE company_id = $1',
+        [companyId]
       ),
       pool.query(
-        'SELECT COUNT(*)::int AS count FROM jobs WHERE company_id::text = $1',
-        [String(companyId)]
+        'SELECT COUNT(*)::int AS count FROM jobs WHERE company_id = $1',
+        [companyId]
       ),
       pool.query(
-        'SELECT COUNT(*)::int AS count FROM inventory_items WHERE company_id::text = $1',
-        [String(companyId)]
+        'SELECT COUNT(*)::int AS count FROM inventory_items WHERE company_id = $1',
+        [companyId]
       ),
     ]);
 

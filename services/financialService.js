@@ -12,8 +12,8 @@ class FinancialService {
          COUNT(id) as total_transactions,
          COALESCE(SUM(amount), 0) as total_revenue
        FROM payments
-       WHERE company_id::text = $1 AND status = 'success'`,
-      [String(companyId)]
+       WHERE company_id = $1 AND status = 'success'`,
+      [companyId]
     );
 
     const revenue = parseFloat(res.rows[0]?.total_revenue || 125000);
@@ -35,9 +35,9 @@ class FinancialService {
     const res = await pool.query(
       `SELECT id, customer_name, amount, due_date, status
        FROM invoices
-       WHERE company_id::text = $1 AND status IN ('pending', 'overdue')
+       WHERE company_id = $1 AND status IN ('pending', 'overdue')
        ORDER BY due_date ASC`,
-      [String(companyId)]
+      [companyId]
     );
 
     return {

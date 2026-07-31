@@ -1,4 +1,4 @@
--- ============================================================
+                    -- ============================================================
 -- SmartERP Phase 1: Database Hardening — Indexes, Constraints & Data Migration
 -- Run manually on staging first, then production
 -- Safe to run multiple times (IF NOT EXISTS guards throughout)

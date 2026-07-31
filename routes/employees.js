@@ -44,8 +44,8 @@ router.get('/debug', authenticateToken, async (req, res) => {
   }
   try {
     const r1 = await pool.query(
-      `SELECT COUNT(*) as total, array_agg(role) as roles FROM users WHERE company_id::text = $1`,
-      [String(companyId)]
+      `SELECT COUNT(*) as total, array_agg(role) as roles FROM users WHERE company_id = $1`,
+      [companyId]
     );
     res.json({ companyId, userCount: r1.rows[0]?.total, roles: r1.rows[0]?.roles });
   } catch (err) {
@@ -66,8 +66,8 @@ router.get('/', authenticateToken, async (req, res) => {
 
     // Count all users in this company for debugging
     const countCheck = await pool.query(
-      `SELECT COUNT(*) as total, array_agg(role) as roles FROM users WHERE company_id::text = $1`,
-      [String(companyId)]
+      `SELECT COUNT(*) as total, array_agg(role) as roles FROM users WHERE company_id = $1`,
+      [companyId]
     );
     console.log(`🔍 [GET /employees] users with company_id="${companyId}":`, countCheck.rows[0]);
     const result = await pool.query(
@@ -79,11 +79,11 @@ router.get('/', authenticateToken, async (req, res) => {
        FROM users u
        LEFT JOIN employee_profiles p ON u.id = p.user_id
        LEFT JOIN job_reviews r ON r.employee_id = u.id
-       WHERE u.company_id::text = $1 AND u.role != 'owner' AND u.role != 'admin'
+       WHERE u.company_id = $1 AND u.role != 'owner' AND u.role != 'admin'
        GROUP BY u.id, u.name, u.email, u.role, u.created_at,
                 p.phone, p.position, p.department, p.hire_date, p.is_active, p.created_at
        ORDER BY u.created_at DESC NULLS LAST`,
-      [String(companyId)]
+      [companyId]
     );
     const employees = await Promise.all(result.rows.map(mapRowToEmployee));
     console.log(`✅ [GET /employees] returning ${employees.length} employees`);

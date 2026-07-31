@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
-const authenticateToken = require('../middleware/authMiddleware');
-const checkPermission = require('../middleware/rbac');
+const { authenticateToken } = require('../middleware/authMiddleware');
+const { checkPermission } = require('../middleware/rbac');
 const CrmSalesService = require('../services/crmSalesService');
 
 router.use(authenticateToken);

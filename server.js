@@ -550,6 +550,14 @@ async function runDatabaseInitialization() {
     } catch (fixErr) {
       console.warn('⚠️  Progress=100 status fix failed (non-fatal):', fixErr.message);
     }
+
+    // 9. Seed platform Super Admin account (admin@prozync.in)
+    try {
+      const { seedSuperAdmin } = require('./scripts/seedSuperAdmin');
+      await seedSuperAdmin();
+    } catch (saErr) {
+      console.warn('⚠️  Super Admin seed failed (non-fatal):', saErr.message);
+    }
   } catch (err) {
     console.error('❌ Database Initialization failed:', err.message);
   }

@@ -3,6 +3,7 @@ const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 const { registerSSEConnection, unregisterSSEConnection, broadcastToUser } = require('../utils/notificationHelpers');
+const redisShared = require('../utils/redis'); // shared singleton — never create extra connections for non-pubsub ops
 
 // ─── GET /api/notifications ──────────────────────────────────────────────────
 // Get all notifications for authenticated user
@@ -67,16 +68,12 @@ router.get('/sse', authenticateToken, async (req, res) => {
 
   res.write(`data: ${JSON.stringify({ type: 'connected', message: 'SSE connection established' })}\n\n`);
 
-  // Mark user as online in Redis
+  // Mark user as online in Redis — reuse shared singleton, no new connection needed
   const companyId = String(req.user.companyId || '');
-  if (redisUrl && companyId) {
+  if (redisShared && companyId) {
     try {
-      const Redis = require('ioredis');
-      const onlineRedis = new Redis(redisUrl, { maxRetriesPerRequest: 1, lazyConnect: false });
-      onlineRedis.on('error', () => {});
-      await onlineRedis.hset(`online_users:${companyId}`, userId, '1');
-      await onlineRedis.expire(`online_users:${companyId}`, 300); // 5 min TTL
-      onlineRedis.quit().catch(() => {});
+      await redisShared.hset(`online_users:${companyId}`, userId, '1');
+      await redisShared.expire(`online_users:${companyId}`, 300); // 5 min TTL
     } catch (e) {
       console.warn('⚠️ Could not set online status:', e.message);
     }
@@ -150,15 +147,11 @@ router.get('/sse', authenticateToken, async (req, res) => {
         console.log(`📡 SSE connection closed for user ${userId}`);
         isClosing = true;
         clearInterval(heartbeatInterval);
-        // Mark user as offline in Redis
+        // Mark user as offline in Redis — reuse shared singleton, no new connection needed
         const companyId = String(req.user.companyId || '');
-        if (redisUrl && companyId) {
+        if (redisShared && companyId) {
           try {
-            const Redis = require('ioredis');
-            const offlineRedis = new Redis(redisUrl, { maxRetriesPerRequest: 1, lazyConnect: false });
-            offlineRedis.on('error', () => {});
-            await offlineRedis.hdel(`online_users:${companyId}`, userId);
-            offlineRedis.quit().catch(() => {});
+            await redisShared.hdel(`online_users:${companyId}`, userId);
           } catch (e) {
             console.warn('⚠️ Could not clear online status:', e.message);
           }

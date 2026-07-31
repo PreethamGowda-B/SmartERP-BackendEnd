@@ -13,10 +13,13 @@ function resolveSsl() {
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: resolveSsl(),
-  max: parseInt(process.env.DB_POOL_MAX || '25'),
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 5000, // Faster timeout to fail fast under overload
-  statement_timeout: 10000,       // 10s query safety limit to prevent deadlocks
+  // Default pool max is intentionally low (5) to let Neon free-tier compute scale to zero.
+  // Override with DB_POOL_MAX env var on paid plans or self-hosted Postgres.
+  max: parseInt(process.env.DB_POOL_MAX || '5'),
+  // Aggressive idle timeout so Neon compute can sleep between bursts of traffic.
+  idleTimeoutMillis: parseInt(process.env.DB_IDLE_TIMEOUT_MS || '10000'),
+  connectionTimeoutMillis: 5000, // Fail fast under overload
+  statement_timeout: 10000,      // 10s query safety limit to prevent deadlocks
 });
 
 pool.on('error', (err) => {

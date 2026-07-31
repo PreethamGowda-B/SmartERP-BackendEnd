@@ -3,24 +3,42 @@ const { pool } = require("../../db");
 
 class GSTReconciliationPlugin extends BasePlugin {
   constructor() {
-    super("GSTReconciliationPlugin", "Provides tools for GST GSTR-2B reconciliation, ITC tracking, and supplier compliance.");
+    super("GSTReconciliationPlugin", "GST");
 
-    this.registerTool("get_gst_reconciliation_summary", "Retrieves summary metrics for a GSTR-2B reconciliation period.", {
-      type: "object",
-      properties: {
-        financialPeriod: { type: "string", description: "Financial period in YYYY-MM format, e.g. 2026-07" },
+    this.tools["get_gst_reconciliation_summary"] = {
+      name: "get_gst_reconciliation_summary",
+      description: "Retrieves summary metrics for a GSTR-2B reconciliation period.",
+      allowedRoles: ["owner", "admin", "hr"],
+      isDestructive: false,
+      parameters: {
+        type: "object",
+        properties: {
+          financialPeriod: { type: "string", description: "Financial period in YYYY-MM format, e.g. 2026-07" },
+        },
+        required: ["financialPeriod"],
       },
-      required: ["financialPeriod"],
-    }, ["owner", "admin", "hr"], this.getReconciliationSummary.bind(this));
+      execute: async (params, context) => {
+        return await this.getReconciliationSummary(params, context);
+      },
+    };
 
-    this.registerTool("list_unmatched_gst_invoices", "Lists invoices missing from GSTR-2B or having tax mismatches.", {
-      type: "object",
-      properties: {
-        financialPeriod: { type: "string", description: "Financial period YYYY-MM" },
-        matchStatus: { type: "string", description: "Filter status: missing_in_gstr, tax_mismatch, fuzzy_match" },
+    this.tools["list_unmatched_gst_invoices"] = {
+      name: "list_unmatched_gst_invoices",
+      description: "Lists invoices missing from GSTR-2B or having tax mismatches.",
+      allowedRoles: ["owner", "admin"],
+      isDestructive: false,
+      parameters: {
+        type: "object",
+        properties: {
+          financialPeriod: { type: "string", description: "Financial period YYYY-MM" },
+          matchStatus: { type: "string", description: "Filter status: missing_in_gstr, tax_mismatch, fuzzy_match" },
+        },
+        required: ["financialPeriod"],
       },
-      required: ["financialPeriod"],
-    }, ["owner", "admin"], this.listUnmatchedInvoices.bind(this));
+      execute: async (params, context) => {
+        return await this.listUnmatchedInvoices(params, context);
+      },
+    };
   }
 
   async getReconciliationSummary(params, context) {

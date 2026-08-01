@@ -3,8 +3,18 @@ const IORedis = require('ioredis');
 
 // Connect to Redis (URL will be provided in env)
 const redisConnection = process.env.REDIS_URL 
-  ? new IORedis(process.env.REDIS_URL, { maxRetriesPerRequest: null })
+  ? new IORedis(process.env.REDIS_URL, { maxRetriesPerRequest: null, enableOfflineQueue: false })
   : null;
+
+if (redisConnection) {
+  redisConnection.on('error', (err) => {
+    if (err.message?.includes('max number of clients reached')) {
+      console.warn('⚠️ BullMQ Redis connection limit reached (non-fatal)');
+    } else {
+      console.warn('⚠️ BullMQ Redis connection error (non-fatal):', err.message);
+    }
+  });
+}
 
 /**
  * High-Scale Background Queues

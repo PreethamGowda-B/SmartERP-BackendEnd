@@ -122,74 +122,51 @@ router.get('/jobs/:id/events', authenticateSSE, async (req, res) => {
   }, 25_000);
 
   // ── Redis pub/sub path ──────────────────────────────────────────────────────
-  const redisUrl = process.env.REDIS_URL;
+  const { getSharedSubscriber } = require('../../utils/redis');
+  const subscriber = getSharedSubscriber();
 
-  if (redisUrl) {
-    // Create a dedicated subscriber client for this connection
-    // (ioredis subscribers cannot be used for other commands)
-    let subscriber;
-    try {
-      subscriber = new Redis(redisUrl, {
-        maxRetriesPerRequest: 1,
-        retryStrategy(times) {
-          if (times > 3) return null;
-          return Math.min(times * 200, 1000);
-        },
-        lazyConnect: false,
-      });
-    } catch (redisErr) {
-      console.warn('SSE: Failed to create Redis subscriber, using fallback:', redisErr.message);
-      subscriber = null;
+  if (subscriber) {
+    const channel = `customer_job_events:${jobId}`;
+    if (!global._customerSseListeners) global._customerSseListeners = new Map();
+    const customerSseListeners = global._customerSseListeners;
+
+    if (!customerSseListeners.has(channel)) {
+      customerSseListeners.set(channel, new Set());
     }
+    const listenerSet = customerSseListeners.get(channel);
+    listenerSet.add(res);
 
-    if (subscriber) {
-      const channel = `customer_job_events:${jobId}`;
-      let isClosing = false;
-
-      // Attach error handler IMMEDIATELY to prevent unhandled error events
-      subscriber.on('error', (err) => {
-        if (err.message !== 'Connection is closed.' && !err.message.includes('connect ECONNREFUSED')) {
-          console.warn('SSE Redis subscriber error (non-fatal):', err.message);
-        }
-      });
-
-      // Subscribe with .catch() to swallow connection-closed errors on early disconnect
-      subscriber.subscribe(channel).catch((err) => {
-        if (!isClosing) {
-          console.error('SSE Redis subscribe error:', err.message);
-          startFallbackTimeout();
-        }
-      });
-
+    if (!subscriber._customerHandlerAttached) {
+      subscriber._customerHandlerAttached = true;
       subscriber.on('message', (ch, message) => {
-        if (ch === channel) {
-          try {
-            res.write(`data: ${message}\n\n`);
-          } catch (writeErr) {
-            console.error('SSE write error:', writeErr.message);
+        const listeners = global._customerSseListeners?.get(ch);
+        if (listeners) {
+          for (const clientRes of listeners) {
+            try { clientRes.write(`data: ${message}\n\n`); }
+            catch {}
           }
         }
       });
-
-      subscriber.on('end', () => {
-        // Connection ended gracefully — cleanup handled by req.on('close')
-      });
-
-      // Cleanup on client disconnect (Requirement 11.8)
-      req.on('close', () => {
-        isClosing = true;
-        clearInterval(keepAliveInterval);
-        try {
-          subscriber.unsubscribe(channel).catch(() => {});
-          subscriber.quit().catch(() => {});
-        } catch {
-          try { subscriber.disconnect(); } catch {}
-        }
-        console.log(`SSE connection closed for job ${jobId}, user ${userId}`);
-      });
-
-      return; // Keep connection open — cleanup handled by req.on('close')
     }
+
+    if (listenerSet.size === 1) {
+      subscriber.subscribe(channel).catch((err) => {
+        console.warn('Customer SSE Redis subscribe error:', err.message);
+        startFallbackTimeout();
+      });
+    }
+
+    req.on('close', () => {
+      clearInterval(keepAliveInterval);
+      listenerSet.delete(res);
+      if (listenerSet.size === 0) {
+        customerSseListeners.delete(channel);
+        try { subscriber.unsubscribe(channel).catch(() => {}); } catch {}
+      }
+      console.log(`SSE connection closed for job ${jobId}, user ${userId}`);
+    });
+
+    return;
   }
 
   // ── Fallback: no Redis — close after 30s, client will reconnect ────────────

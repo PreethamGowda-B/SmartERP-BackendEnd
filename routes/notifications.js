@@ -99,90 +99,75 @@ router.get('/sse', authenticateToken, async (req, res) => {
   }, 15000);
 
   // ── Redis path (cluster-safe) ─────────────────────────────────────────────
-  if (redisUrl) {
-    const Redis = require('ioredis');
-    let subscriber;
-    try {
-      subscriber = new Redis(redisUrl, {
-        maxRetriesPerRequest: 1,
-        retryStrategy(times) { return times > 3 ? null : Math.min(times * 200, 1000); },
-        lazyConnect: false,
-      });
+  const { getSharedSubscriber } = require('../utils/redis');
+  const subscriber = getSharedSubscriber();
 
-      // Attach error handler IMMEDIATELY to prevent unhandled error events
-      subscriber.on('error', (err) => {
-        if (err.message !== 'Connection is closed.' && !err.message.includes('connect ECONNREFUSED')) {
-          console.warn('SSE Redis subscriber error (non-fatal):', err.message);
-        }
-      });
+  if (subscriber) {
+    const channel = `employee_notifications:${userId}`;
+    if (!global._sseListeners) global._sseListeners = new Map();
+    const sseListeners = global._sseListeners;
 
-    } catch (redisErr) {
-      console.warn('SSE: Redis subscriber creation failed, using in-process fallback:', redisErr.message);
-      subscriber = null;
+    if (!sseListeners.has(channel)) {
+      sseListeners.set(channel, new Set());
     }
+    const listenerSet = sseListeners.get(channel);
+    listenerSet.add(res);
 
-    if (subscriber) {
-      const channel = `employee_notifications:${userId}`;
-      let isClosing = false; // Guard to prevent double-cleanup
-
-      // Subscribe with .catch() to swallow "Connection is closed." on early disconnect
-      subscriber.subscribe(channel).catch((err) => {
-        if (!isClosing) {
-          console.error('SSE Redis subscribe error:', err.message);
-        }
-      });
-
+    if (!subscriber._handlerAttached) {
+      subscriber._handlerAttached = true;
       subscriber.on('message', (ch, rawMessage) => {
-        if (ch === channel) {
-          try { res.write(`data: ${rawMessage}\n\n`); }
-          catch (writeErr) { console.error('SSE write error:', writeErr.message); }
-        }
-      });
-
-      // Swallow connection-end events gracefully
-      subscriber.on('end', () => { /* cleanup handled by req.on('close') */ });
-      subscriber.on('close', () => { /* no-op — cleanup handled by req.on('close') */ });
-
-      req.on('close', async () => {
-        console.log(`📡 SSE connection closed for user ${userId}`);
-        isClosing = true;
-        clearInterval(heartbeatInterval);
-        // Mark user as offline in Redis — reuse shared singleton, no new connection needed
-        const companyId = String(req.user.companyId || '');
-        if (redisShared && companyId) {
-          try {
-            await redisShared.hdel(`online_users:${companyId}`, userId);
-          } catch (e) {
-            console.warn('⚠️ Could not clear online status:', e.message);
+        const listeners = global._sseListeners?.get(ch);
+        if (listeners) {
+          for (const clientRes of listeners) {
+            try { clientRes.write(`data: ${rawMessage}\n\n`); }
+            catch {}
           }
         }
-
-        // Broadcast status_change (offline) to all other users in the same company
-        try {
-          const peers = await pool.query(
-            `SELECT id FROM users WHERE company_id::text = $1 AND id::text != $2`,
-            [companyId, userId]
-          );
-          const payload = { type: 'status_change', data: { user_id: userId, online: false } };
-          for (const peer of peers.rows) {
-            broadcastToUser(String(peer.id), payload);
-          }
-        } catch (e) {
-          console.warn('⚠️ Could not broadcast status_change (offline):', e.message);
-        }
-
-        // Use quit() instead of disconnect() — gracefully resolves in-flight commands
-        // then closes, preventing "Connection is closed." unhandled rejections
-        try {
-          subscriber.unsubscribe(channel).catch(() => {});
-          subscriber.quit().catch(() => {});
-        } catch {
-          try { subscriber.disconnect(); } catch {}
-        }
       });
-
-      return; // Keep connection open — cleanup handled by req.on('close')
     }
+
+    if (listenerSet.size === 1) {
+      subscriber.subscribe(channel).catch((err) => {
+        console.warn('SSE Redis subscribe error:', err.message);
+      });
+    }
+
+    req.on('close', async () => {
+      console.log(`📡 SSE connection closed for user ${userId}`);
+      clearInterval(heartbeatInterval);
+
+      listenerSet.delete(res);
+      if (listenerSet.size === 0) {
+        sseListeners.delete(channel);
+        try { subscriber.unsubscribe(channel).catch(() => {}); } catch {}
+      }
+
+      // Mark user as offline in Redis — reuse shared singleton
+      const companyId = String(req.user.companyId || '');
+      if (redisShared && companyId) {
+        try {
+          await redisShared.hdel(`online_users:${companyId}`, userId);
+        } catch (e) {
+          console.warn('⚠️ Could not clear online status:', e.message);
+        }
+      }
+
+      // Broadcast status_change (offline) to all other users in the same company
+      try {
+        const peers = await pool.query(
+          `SELECT id FROM users WHERE company_id::text = $1 AND id::text != $2`,
+          [companyId, userId]
+        );
+        const payload = { type: 'status_change', data: { user_id: userId, online: false } };
+        for (const peer of peers.rows) {
+          broadcastToUser(String(peer.id), payload);
+        }
+      } catch (e) {
+        console.warn('⚠️ Could not broadcast status_change (offline):', e.message);
+      }
+    });
+
+    return; // Keep connection open — cleanup handled by req.on('close')
   }
 
   // ── In-process fallback (dev / no Redis) ─────────────────────────────────

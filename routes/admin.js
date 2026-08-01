@@ -256,4 +256,278 @@ router.post('/announcements', async (req, res) => {
     }
 });
 
+// ─── GET /api/admin/companies/:id ────────────────────────────────────────────
+// Get full detail for a specific company (for drilldown view)
+router.get('/companies/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const [companyRes, usersRes, planRes] = await Promise.all([
+      pool.query(`
+        SELECT c.*, u.name as owner_name, u.email as owner_email, u.phone as owner_phone,
+               p.name as plan_name
+        FROM companies c
+        LEFT JOIN users u ON c.owner_id = u.id
+        LEFT JOIN plans p ON c.plan_id = p.id
+        WHERE c.id = $1
+      `, [id]),
+      pool.query(`
+        SELECT id, name, email, role, created_at FROM users WHERE company_id = $1 ORDER BY created_at DESC
+      `, [id]),
+      pool.query(`SELECT * FROM plans ORDER BY id`)
+    ]);
+
+    if (companyRes.rows.length === 0) return res.status(404).json({ message: 'Company not found' });
+
+    res.json({
+      company: companyRes.rows[0],
+      users: usersRes.rows,
+      plans: planRes.rows
+    });
+  } catch (err) {
+    console.error('❌ Company detail error:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ─── GET /api/admin/revenue ──────────────────────────────────────────────────
+// Platform revenue analytics (MRR, ARR, plan breakdown)
+router.get('/revenue', async (req, res) => {
+  try {
+    // Plan pricing (define here, can be moved to DB later)
+    const PLAN_PRICING = { 1: 0, 2: 999, 3: 2499 }; // Free, Basic, Pro (monthly ₹)
+
+    const [planDist, recentUpgrades, churnData, monthlyRevenue] = await Promise.all([
+      // Active subscriptions by plan
+      pool.query(`
+        SELECT p.id as plan_id, p.name as plan_name, COUNT(c.id) as company_count
+        FROM companies c
+        JOIN plans p ON c.plan_id = p.id
+        WHERE c.status != 'suspended' OR c.status IS NULL
+        GROUP BY p.id, p.name
+        ORDER BY p.id
+      `),
+      // Recent upgrades (last 30 days)
+      pool.query(`
+        SELECT c.company_name, p.name as plan_name, c.updated_at
+        FROM companies c
+        JOIN plans p ON c.plan_id = p.id
+        WHERE c.plan_id > 1 AND c.updated_at > NOW() - INTERVAL '30 days'
+        ORDER BY c.updated_at DESC
+        LIMIT 10
+      `),
+      // Churned (expired subscriptions)
+      pool.query(`
+        SELECT COUNT(*) as churned
+        FROM companies
+        WHERE subscription_expires_at < NOW() AND plan_id > 1
+      `),
+      // Monthly revenue trend (last 6 months by company creation date as proxy)
+      pool.query(`
+        SELECT 
+          TO_CHAR(DATE_TRUNC('month', created_at), 'Mon YYYY') as month,
+          COUNT(*) FILTER (WHERE plan_id = 2) as basic_count,
+          COUNT(*) FILTER (WHERE plan_id = 3) as pro_count
+        FROM companies
+        WHERE created_at > NOW() - INTERVAL '6 months'
+        GROUP BY DATE_TRUNC('month', created_at)
+        ORDER BY DATE_TRUNC('month', created_at) ASC
+      `)
+    ]);
+
+    // Calculate MRR
+    let mrr = 0;
+    const planBreakdown = planDist.rows.map(row => {
+      const price = PLAN_PRICING[row.plan_id] || 0;
+      const revenue = price * parseInt(row.company_count);
+      mrr += revenue;
+      return {
+        plan: row.plan_name,
+        count: parseInt(row.company_count),
+        price,
+        revenue
+      };
+    });
+
+    res.json({
+      mrr,
+      arr: mrr * 12,
+      planBreakdown,
+      recentUpgrades: recentUpgrades.rows,
+      churned: parseInt(churnData.rows[0]?.churned || 0),
+      monthlyTrend: monthlyRevenue.rows.map(r => ({
+        month: r.month,
+        basicRevenue: parseInt(r.basic_count) * PLAN_PRICING[2],
+        proRevenue: parseInt(r.pro_count) * PLAN_PRICING[3],
+        total: parseInt(r.basic_count) * PLAN_PRICING[2] + parseInt(r.pro_count) * PLAN_PRICING[3]
+      }))
+    });
+  } catch (err) {
+    console.error('❌ Revenue analytics error:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ─── GET /api/admin/health ───────────────────────────────────────────────────
+// Platform health metrics for the monitoring dashboard
+router.get('/health', async (req, res) => {
+  try {
+    const start = Date.now();
+    
+    const [dbCheck, activeCompanies, activeUsers, recentErrors, suspendedCount] = await Promise.all([
+      pool.query('SELECT NOW() as db_time'),
+      pool.query("SELECT COUNT(*) as count FROM companies WHERE status != 'suspended' OR status IS NULL"),
+      pool.query("SELECT COUNT(DISTINCT user_id) as count FROM activities WHERE created_at > NOW() - INTERVAL '24 hours'"),
+      pool.query(`
+        SELECT COUNT(*) as count FROM feedback 
+        WHERE created_at > NOW() - INTERVAL '24 hours' AND type = 'bug'
+      `),
+      pool.query("SELECT COUNT(*) as count FROM companies WHERE status = 'suspended'")
+    ]);
+
+    const dbLatencyMs = Date.now() - start;
+
+    res.json({
+      status: 'operational',
+      dbLatencyMs,
+      dbTime: dbCheck.rows[0].db_time,
+      activeCompanies: parseInt(activeCompanies.rows[0].count),
+      activeUsersLast24h: parseInt(activeUsers.rows[0].count),
+      bugReportsLast24h: parseInt(recentErrors.rows[0].count),
+      suspendedCompanies: parseInt(suspendedCount.rows[0].count),
+      timestamp: new Date().toISOString()
+    });
+  } catch (err) {
+    res.status(500).json({
+      status: 'degraded',
+      error: err.message,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+// ─── GET /api/admin/users (extended with search) ─────────────────────────────
+// Enhanced platform-wide user list with search and role filter
+
+// ─── GET /api/admin/users/search ─────────────────────────────────────────────
+router.get('/users/search', async (req, res) => {
+  try {
+    const { q, role, company } = req.query;
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(100, parseInt(req.query.limit) || 50);
+    const offset = (page - 1) * limit;
+
+    let whereClause = 'WHERE 1=1';
+    const params = [];
+    let paramIdx = 1;
+
+    if (q) {
+      whereClause += ` AND (u.name ILIKE $${paramIdx} OR u.email ILIKE $${paramIdx})`;
+      params.push(`%${q}%`);
+      paramIdx++;
+    }
+    if (role && role !== 'all') {
+      whereClause += ` AND u.role = $${paramIdx}`;
+      params.push(role);
+      paramIdx++;
+    }
+    if (company) {
+      whereClause += ` AND c.company_name ILIKE $${paramIdx}`;
+      params.push(`%${company}%`);
+      paramIdx++;
+    }
+
+    const [result, countResult] = await Promise.all([
+      pool.query(
+        `SELECT u.id, u.name, u.email, u.role, u.created_at, c.company_name, c.id as company_id
+         FROM users u
+         LEFT JOIN companies c ON u.company_id = c.id
+         ${whereClause}
+         ORDER BY u.created_at DESC
+         LIMIT $${paramIdx} OFFSET $${paramIdx + 1}`,
+        [...params, limit, offset]
+      ),
+      pool.query(
+        `SELECT COUNT(*) as total FROM users u LEFT JOIN companies c ON u.company_id = c.id ${whereClause}`,
+        params
+      )
+    ]);
+
+    res.json({
+      users: result.rows,
+      pagination: {
+        page,
+        limit,
+        total: parseInt(countResult.rows[0].total),
+        pages: Math.ceil(countResult.rows[0].total / limit)
+      }
+    });
+  } catch (err) {
+    console.error('❌ User search error:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ─── GET /api/admin/audit-trail ──────────────────────────────────────────────
+// Platform-wide admin action audit trail
+router.get('/audit-trail', async (req, res) => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(100, parseInt(req.query.limit) || 30);
+    const offset = (page - 1) * limit;
+
+    const result = await pool.query(`
+      SELECT 
+        a.id, a.action, a.created_at,
+        u.name as user_name, u.email, u.role,
+        c.company_name
+      FROM activities a
+      LEFT JOIN users u ON a.user_id = u.id
+      LEFT JOIN companies c ON a.company_id = c.id
+      ORDER BY a.created_at DESC
+      LIMIT $1 OFFSET $2
+    `, [limit, offset]);
+
+    const countResult = await pool.query('SELECT COUNT(*) as total FROM activities');
+
+    res.json({
+      activities: result.rows,
+      pagination: {
+        page, limit,
+        total: parseInt(countResult.rows[0].total),
+        pages: Math.ceil(countResult.rows[0].total / limit)
+      }
+    });
+  } catch (err) {
+    console.error('❌ Audit trail error:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ─── PATCH /api/admin/companies/:id/plan ─────────────────────────────────────
+// Quick plan override (alternative to /subscriptions/:companyId, takes company.id not companyId)
+router.patch('/companies/:id/plan', async (req, res) => {
+  const { id } = req.params;
+  const { plan_id, expires_at, note } = req.body;
+
+  if (!plan_id) return res.status(400).json({ message: 'plan_id is required' });
+
+  try {
+    const result = await pool.query(
+      `UPDATE companies 
+       SET plan_id = $1, subscription_expires_at = $2, is_on_trial = FALSE, 
+           subscription_status = 'active', updated_at = NOW()
+       WHERE id = $3 RETURNING id, company_name, plan_id`,
+      [plan_id, expires_at || null, id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ message: 'Company not found' });
+    
+    console.log(`🛡️ SuperAdmin plan override: company ${id} → plan ${plan_id}${note ? ` (${note})` : ''}`);
+    res.json({ ok: true, company: result.rows[0] });
+  } catch (err) {
+    console.error('❌ Plan override error:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 module.exports = router;
+

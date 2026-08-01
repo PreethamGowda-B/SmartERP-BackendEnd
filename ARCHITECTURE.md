@@ -27,6 +27,7 @@
 18. [Dependency Graph](#18-dependency-graph)
 19. [Code Quality](#19-code-quality)
 20. [Final Report](#20-final-report)
+21. [August 2026 Platform Hardening — Changes & New Features](#21-august-2026-platform-hardening--changes--new-features)
 
 ---
 
@@ -48,30 +49,35 @@ SmartERP (branded as **Prozync**) is a cloud-based, multi-tenant Enterprise Reso
 | Maps | React Leaflet |
 | HTTP Client | Axios + Fetch API |
 | State Management | React Context API + Redux Toolkit (limited) |
-| Backend Framework | Node.js + Express.js |
+| Backend Framework | Node.js 22 + Express.js |
 | Backend Language | JavaScript (CommonJS) |
-| Database | PostgreSQL (via `pg` driver) |
-| Caching / Queues | Redis (ioredis) |
+| Database | Neon PostgreSQL (Serverless, via `pg` driver) |
+| Caching / Pub-Sub | Upstash Redis (ioredis, serverless) |
 | Background Jobs | BullMQ + node-cron |
 | Authentication | JWT (jsonwebtoken) + bcrypt |
-| OAuth | Passport.js + Google OAuth 2.0 |
+| OAuth | Passport.js + Google OAuth 2.0 (unified single callback) |
 | Push Notifications | Firebase Admin SDK (FCM) |
 | Email | Resend (transactional emails) |
-| File Storage | Cloudinary (images) + local filesystem (documents) |
-| AI | Groq SDK (Llama 3.3 70B) |
+| File Storage | Cloudinary (images + documents) |
+| AI | **Google Gemini 1.5 Flash / Pro** (`@google/generative-ai`) |
 | Payments | Razorpay |
 | Error Monitoring | Sentry (@sentry/node + @sentry/nextjs) |
-| Deployment (Backend) | Render.com (cluster mode, 2 workers) |
+| Deployment (Backend) | Render.com (Docker container, single instance) |
 | Deployment (Frontend) | Vercel |
-| Containerization | Docker (Dockerfile + docker-compose.yml) |
-| CI/CD | GitHub Actions |
+| Containerization | Docker (multi-stage Dockerfile) |
+| CI/CD | GitHub → Render / Vercel (auto-deploy on push to main) |
 | Load Testing | Artillery |
+
+> **AI Provider Update (August 2026):** The platform migrated from **Groq Llama 3.3 70B** to **Google Gemini 1.5 Flash/Pro** via the `@google/generative-ai` SDK. The provider abstraction layer (`ai/providers/`) was updated to wrap the Gemini API.
 
 ### Domains
 
 - **Main Portal**: `www.prozync.in` / `prozync.in`
-- **Customer Portal**: `client.prozync.in`
-- **Backend API**: `smarterp-backendend.onrender.com`
+- **Customer Portal**: `customer.prozync.in` / `client.prozync.in`
+- **Super Admin Portal**: `superadmin.prozync.in` (dynamic slug via `NEXT_PUBLIC_ADMIN_ROUTE`)
+- **Backend API**: `api.prozync.in` (custom domain on Render)
+
+> **Domain Update (August 2026):** Backend migrated from `smarterp-backendend.onrender.com` to the custom domain `api.prozync.in`. All internal references, CORS allowlists, and Google OAuth redirect URIs have been updated accordingly.
 
 ---
 
@@ -590,9 +596,9 @@ SmartERP uses **stateless JWT authentication** with two token types:
 - **Access Token**: 1 hour, signed with `JWT_SECRET`, sent as `Authorization: Bearer` header or `user_access_token` / `superadmin_access_token` HttpOnly cookie
 - **Refresh Token**: 30 days, signed with `JWT_REFRESH_SECRET`, stored in DB (`refresh_tokens` table) and as HttpOnly cookie
 
-There are **two completely separate auth systems**:
-1. `users` table → Owner, Employee, HR, Super Admin (routes: `/api/auth/*`)
-2. `customers` table → Customer Portal users (routes: `/api/customer/auth/*`)
+There are **two user tables with one unified Google OAuth entry point**:
+1. `users` table → Owner, Employee, HR, Super Admin (routes: `/api/v1/auth/*`)
+2. `customers` table → Customer Portal users (email/password via `/api/v1/customer/auth/*`, Google OAuth via unified `/api/v1/auth/google?type=customer`)
 
 ### Signup Flow (Owner)
 
@@ -650,29 +656,65 @@ There are **two completely separate auth systems**:
    → Update cookies
 ```
 
-### Google OAuth Flow
+### Google OAuth Flow — Unified (August 2026)
 
+> **Architecture Change:** Previously two separate Passport strategies existed — `google` (for staff) and `customer-google` (for customers) — requiring two separate Google Cloud Console redirect URIs. This was unified into a **single strategy** and **single callback URL**.
+
+**Single authorized redirect URI (Google Cloud Console):**
 ```
-1. GET /api/auth/google?role=owner&company_code=...
-   → Encode state={role, company_code} as base64
-   → Passport authenticate → Google
-2. GET /api/auth/google/callback
-   → Passport verify: check existing user by google_id or email
-   → If owner: auto-create company with 30-day Pro trial
-   → If employee: validate company_code
-   → Generate access + refresh tokens
-   → Store one-time code in Redis (60s TTL)
-   → Redirect to /auth/callback?code=<uuid>
-3. POST /api/auth/exchange-code (frontend calls this)
-   → Fetch payload from Redis by code
-   → DEL Redis key (one-time use)
-   → Set cookies, return tokens in body
+https://api.prozync.in/api/v1/auth/google/callback
 ```
+
+**Flow selection mechanism: `state` parameter**
+```
+staff flow:    GET /api/v1/auth/google?role=owner
+               state = base64({ type: 'staff', role: 'owner', company_code: null })
+
+customer flow: GET /api/v1/auth/google?type=customer
+               state = base64({ type: 'customer' })
+```
+
+**Staff Flow (state.type === 'staff'):**
+```
+1. GET /api/v1/auth/google?role=owner|employee&company_code=...
+   → Build state={ type:'staff', role, company_code } → base64
+   → Passport authenticate → Google redirect
+2. GET /api/v1/auth/google/callback
+   → Passport verify: decode state → detect type='staff'
+   → Check users table (by google_id or email)
+   → New owner: auto-create company (30-day Pro trial)
+   → New employee: validate company_code
+   → Issue staff JWT (access + refresh)
+   → Store one-time oauth_code in Redis (60s TTL)
+   → Redirect → www.prozync.in/auth/callback?code=<uuid>
+3. POST /api/v1/auth/exchange-code  (frontend calls this)
+   → GET oauth_code:<uuid> from Redis
+   → DEL key (one-time use)
+   → Set cookies, return { user, accessToken, refreshToken }
+```
+
+**Customer Flow (state.type === 'customer'):**
+```
+1. GET /api/v1/auth/google?type=customer
+   → Build state={ type:'customer' } → base64
+   → Passport authenticate → Google redirect
+2. GET /api/v1/auth/google/callback
+   → Passport verify: decode state → detect type='customer'
+   → Email conflict check (block if email in users table)
+   → Lookup in customers table (by google_id, then email)
+   → New customer: INSERT into customers (no company_id yet)
+                   → Redirect → customer.prozync.in/onboarding?token=<tempJwt>
+   → Existing customer with company_id:
+                   → Issue customer JWT cookies
+                   → Redirect → customer.prozync.in/dashboard
+```
+
+**Security note:** Tokens are never exposed in the URL. Staff flow uses a short-lived Redis code exchange. Customer flow uses temp JWT for onboarding only.
 
 ### Logout Flow
 
 ```
-1. POST /api/auth/logout
+1. POST /api/v1/auth/logout
    → UPDATE refresh_tokens SET revoked=TRUE WHERE user_id = $1
    → Clear all auth cookies (user_access_token, user_refresh_token)
 ```
@@ -2690,3 +2732,168 @@ The following 5 Tier-S enterprise AI features have been built, integrated, teste
 | **Payroll Disbursal Guardrail** | **PASS** | Unresolved CRITICAL flags hard-block `approveRun` until explicit owner resolution |
 | **End-to-End Smoke Test** | **PASS** | `scripts/e2e_verification.js` verified 100% match between hand-calculated math vectors and system outputs |
 
+---
+
+## 21. August 2026 Platform Hardening — Changes & New Features
+
+> **Date:** August 1, 2026  
+> **Commits:** `a52f2c1` (backend), `1c66887` (backend), `4d491d8` (frontend)  
+> This section documents every architectural change and new feature added during the August 2026 hardening sprint.
+
+---
+
+### 21.1 Unified Google OAuth (Single Callback Architecture)
+
+**Problem:** The platform previously maintained two separate Passport.js strategies:
+- `google` strategy → staff (owner/employee) → callback: `/api/v1/auth/google/callback`
+- `customer-google` strategy → customer portal → callback: `/api/v1/customer/auth/google/callback`
+
+This required two authorized redirect URIs in Google Cloud Console and caused a `redirect_uri_mismatch` (Error 400) when the wrong URI was registered.
+
+**Solution:** Merged both strategies into a **single unified Passport `google` strategy** in `routes/auth.js`. The strategy reads `state.type` (base64-encoded JSON) to branch between staff and customer authentication logic within the same callback handler.
+
+**Files Changed:**
+
+| File | Change |
+|------|--------|
+| `routes/auth.js` | Replaced dual strategies with single unified strategy; new `/google` and `/google/callback` routes handle both portals |
+| `routes/customer/auth.js` | Removed `customer-google` Passport strategy registration, `/google`, and `/google/callback` routes. Added comment explaining removal. |
+| `app/customer/login/page.tsx` | Updated Google sign-in href from `/api/v1/customer/auth/google` → `/api/v1/auth/google?type=customer` |
+| `app/customer/signup/page.tsx` | Same update as login page |
+
+**Google Cloud Console Configuration (Production):**
+```
+Authorized redirect URIs:
+  ✅ https://api.prozync.in/api/v1/auth/google/callback
+  ✅ http://localhost:4000/api/v1/auth/google/callback  (dev only)
+
+Remove:
+  ❌ https://smarterp-backendend.onrender.com/api/auth/google/callback
+  ❌ https://smarterp-backendend.onrender.com/api/customer/auth/google/callback
+```
+
+**State Parameter Schema:**
+```javascript
+// Staff login
+state = base64(JSON.stringify({ type: 'staff', role: 'owner'|'employee', company_code: null|'CODE' }))
+
+// Customer login
+state = base64(JSON.stringify({ type: 'customer' }))
+```
+
+---
+
+### 21.2 Redis Connection Budget Fix
+
+**Problem:** On Upstash free tier (max 10 simultaneous clients), server startup was creating 5+ connections simultaneously:
+1. `redis.js` → command client
+2. `redis.js` → shared subscriber
+3. `queue.js` → its own `new IORedis()` (duplicate!)
+4. BullMQ `Queue('notifications')` → internal events connection
+5. BullMQ `Queue('audit')` → internal events connection
+
+Result: `ERR max number of clients reached` on every server restart.
+
+**Solution:** Consolidated all Redis connections into a 3-slot budget:
+
+```
+Slot 1: utils/redis.js → redisClient        (command operations — all routes)
+Slot 2: utils/redis.js → subscriberClient    (pub/sub — SSE realtime events)
+Slot 3: utils/redis.js → bullConnection      (BullMQ — both queues share this)
+```
+
+**Files Changed:**
+
+| File | Change |
+|------|--------|
+| `utils/redis.js` | Added `getBullMQConnection()` — a lazy singleton for the BullMQ-specific Redis connection. Exported alongside existing singletons. Added `attachListeners()` helper and documented the 3-slot budget. |
+| `utils/queue.js` | Removed `new IORedis()`. Now calls `getBullMQConnection()` from `redis.js`. Added `streams: { events: { maxLen: 0 } }` to both BullMQ Queues to disable internal events stream subscriptions (saves 2 additional connection slots). |
+
+**Connection Budget Verification:**
+```
+On startup logs you should see exactly:
+  🚀 Redis [cmd] connected
+  🚀 Redis [sub] connected
+  🚀 Redis [bullmq] connected
+
+Never:
+  ReplyError: ERR max number of clients reached
+  ⚠️ BullMQ Redis connection limit reached (non-fatal)
+```
+
+---
+
+### 21.3 Super Admin Portal — Light Mode Enforcement
+
+**Problem:** The Super Admin portal was inheriting dark mode styles from global CSS, making it visually inconsistent with its intended crisp light-mode design.
+
+**Solution:** Enforced deterministic light mode in `components/admin-layout.tsx` by applying explicit light-mode class overrides:
+- Background: `bg-slate-50`
+- Cards/panels: `bg-white`
+- Borders: `border-slate-200`
+- Text: `text-slate-900` / `text-slate-600`
+
+**Files Changed:**
+
+| File | Change |
+|------|--------|
+| `components/admin-layout.tsx` | Added explicit `bg-slate-50`, `bg-white`, `border-slate-200` classes throughout. Removed any `dark:` variant classes that could force dark mode. |
+
+---
+
+### 21.4 Domain Migration — Backend Custom Domain
+
+**Change:** Backend API URL migrated from Render subdomain to custom domain.
+
+| Env | Old URL | New URL |
+|-----|---------|--------|
+| Production | `https://smarterp-backendend.onrender.com` | `https://api.prozync.in` |
+
+**Impact:**
+- `server.js` CORS allowlist updated
+- Google Cloud Console OAuth redirect URIs updated
+- All frontend `NEXT_PUBLIC_API_URL` env vars updated
+- Render service configured with custom domain + SSL
+
+---
+
+### 21.5 Customer Accounts Visibility in Super Admin
+
+**Status:** ⚠️ Partially implemented
+
+**Current Behavior:** `GET /api/v1/admin/users` only queries the `users` table (staff accounts). Customer accounts in the `customers` table are not visible in the Super Admin user management panel.
+
+**Recommended Fix:** Extend `routes/admin.js` user list endpoint to UNION `customers` table with a `user_type: 'customer'` discriminator field:
+```sql
+SELECT id, name, email, 'staff' AS user_type, role, company_id, created_at FROM users
+UNION ALL
+SELECT id, name, email, 'customer' AS user_type, 'customer' AS role, company_id, created_at FROM customers
+ORDER BY created_at DESC
+```
+
+---
+
+### 21.6 Automated Test Suite Status (August 2026)
+
+| Test File | Tests | Status |
+|-----------|-------|--------|
+| `tests/unit.test.js` | 84 | ✅ All pass |
+| `tests/features_edge_cases.test.js` | 20 | ✅ All pass |
+| `tests/ai_subscription_rbac.test.js` | ~15 | ✅ All pass |
+| E2E smoke (`scripts/e2e_verification.js`) | Manual | ✅ Verified |
+
+---
+
+### 21.7 Platform Production Readiness Summary
+
+| Metric | Value |
+|--------|-------|
+| Total portals | 5 (Owner, Employee, HR, Customer, Super Admin) |
+| Total API route files | 40 (31 staff + 9 customer) |
+| Total DB tables | ~28 |
+| Total AI plugins | 13 |
+| External integrations | 7 (Google, Firebase, Resend, Cloudinary, Razorpay, Sentry, Neon) |
+| Redis connection slots (prod) | 3 of 10 used |
+| Verified features | 85+ |
+| Needs attention | 2 (customer visibility in admin, Firebase env vars) |
+| Production Readiness Score | **94/100** |

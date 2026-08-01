@@ -1,57 +1,65 @@
-const { Queue, Worker } = require('bullmq');
-const IORedis = require('ioredis');
+/**
+ * utils/queue.js
+ *
+ * BullMQ background queues — notifications and audit logs.
+ *
+ * Uses the centralized BullMQ Redis connection from utils/redis.js
+ * (getBullMQConnection) to avoid creating a separate connection and
+ * blowing through Upstash's free-tier connection limit.
+ *
+ * BullMQ internally creates one extra "events" connection per Queue,
+ * so 2 Queues here = 1 shared base connection + 2 event listeners.
+ * We disable the events connection to save connection slots.
+ */
 
-// Connect to Redis (URL will be provided in env)
-const redisConnection = process.env.REDIS_URL 
-  ? new IORedis(process.env.REDIS_URL, { maxRetriesPerRequest: null, enableOfflineQueue: false })
+const { Queue } = require('bullmq');
+const { getBullMQConnection } = require('./redis');
+
+// Lazy: only connect if REDIS_URL is set
+const connection = getBullMQConnection();
+
+// BullMQ Queue options — disable internal event connections to save slots
+const QUEUE_OPTS = {
+  connection,
+  // Disable the events stream subscription (saves 1 connection per Queue)
+  streams: { events: { maxLen: 0 } },
+};
+
+const notificationQueue = connection
+  ? new Queue('notifications', QUEUE_OPTS)
   : null;
 
-if (redisConnection) {
-  redisConnection.on('error', (err) => {
-    if (err.message?.includes('max number of clients reached')) {
-      console.warn('⚠️ BullMQ Redis connection limit reached (non-fatal)');
-    } else {
-      console.warn('⚠️ BullMQ Redis connection error (non-fatal):', err.message);
-    }
-  });
-}
+const auditQueue = connection
+  ? new Queue('audit', QUEUE_OPTS)
+  : null;
 
 /**
- * High-Scale Background Queues
- */
-const notificationQueue = redisConnection ? new Queue('notifications', { connection: redisConnection }) : null;
-const auditQueue = redisConnection ? new Queue('audit', { connection: redisConnection }) : null;
-
-/**
- * Offload a notification task to the background
+ * Offload a notification task to the background queue.
+ * Falls back to synchronous creation if BullMQ is unavailable.
  */
 async function enqueueNotification(data) {
   if (!notificationQueue) {
-    // Fallback to in-memory/immediate if Redis not ready
     console.warn('⚠️ Redis not connected. Processing notification immediately.');
     const { createNotification } = require('./notificationHelpers');
     return createNotification(data);
   }
-  return await notificationQueue.add('send', data, { 
+  return notificationQueue.add('send', data, {
     removeOnComplete: true,
-    attempts: 3, // Retry up to 3 times
-    backoff: {
-      type: 'exponential',
-      delay: 1000, // Wait 1s, then 2s, then 4s...
-    }
+    attempts: 3,
+    backoff: { type: 'exponential', delay: 1000 },
   });
 }
 
 /**
- * Offload an audit log task to the background
+ * Offload an audit log task to the background queue.
+ * Silently skipped if BullMQ is unavailable (non-critical path).
  */
 async function enqueueAudit(data) {
   if (!auditQueue) {
-    // Redis not available — silently skip audit (non-critical path)
     console.warn('⚠️ Redis not connected. Skipping background audit log.');
     return;
   }
-  return await auditQueue.add('log', data, { removeOnComplete: true });
+  return auditQueue.add('log', data, { removeOnComplete: true });
 }
 
 module.exports = {
@@ -59,5 +67,6 @@ module.exports = {
   auditQueue,
   enqueueNotification,
   enqueueAudit,
-  redisConnection
+  // Expose so callers that previously used redisConnection can migrate
+  redisConnection: connection,
 };

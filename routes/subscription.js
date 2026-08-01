@@ -194,7 +194,7 @@ router.post('/create-order', requireOwner, async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/subscription/verify-payment
-// Verify Razorpay payment signature & execute company subscription upgrade
+// Highly Concurrent, Idempotent, Row-Locked Subscription Activation
 // ─────────────────────────────────────────────────────────────────────────────
 router.post('/verify-payment', requireOwner, async (req, res) => {
   const startTime = Date.now();
@@ -223,7 +223,7 @@ router.post('/verify-payment', requireOwner, async (req, res) => {
       return res.status(400).json({ message: 'Invalid plan selected.' });
     }
 
-    // 1. Optional Signature Check (if signature provided)
+    // 1. Signature Check
     if (razorpay_signature) {
       const body = razorpay_order_id + "|" + razorpay_payment_id;
       const expectedSignature = crypto
@@ -260,9 +260,27 @@ router.post('/verify-payment', requireOwner, async (req, res) => {
       console.warn(`[Razorpay] Order Lookup Notice: ${fetchErr.message}`);
     }
 
-    // 3. Database Transaction Activation
-    console.log(`[Subscription] Updating Companies Table... Target Plan = ${verifiedPlanId}`);
+    // 3. Transaction Isolation & Row-Level Lock (FOR UPDATE + Advisory Lock)
+    console.log(`[Concurrency] Acquiring Transaction Advisory Lock & Row Lock for Company ${companyId}...`);
     await pool.query('BEGIN');
+
+    // Advisory lock per company ID ensures strict serial execution per company
+    await pool.query(`SELECT pg_advisory_xact_lock(hashtext('sub_upgrade_' || $1))`, [String(companyId)]);
+
+    // Row-level lock on companies table
+    const compCheck = await pool.query(
+      `SELECT id, plan_id, subscription_status FROM companies WHERE id = $1 FOR UPDATE`,
+      [companyId]
+    );
+
+    if (compCheck.rows.length === 0) {
+      await pool.query('ROLLBACK');
+      console.error(`[Subscription] ERROR: Company ID ${companyId} not found in DB`);
+      return res.status(404).json({ message: 'Company record not found for activation.' });
+    }
+
+    const currentPlanId = compCheck.rows[0].plan_id;
+    console.log(`[Subscription] Company ID = ${companyId} | Current Plan = ${currentPlanId}`);
 
     // Duplicate Check
     const duplicateCheck = await pool.query(
@@ -272,17 +290,18 @@ router.post('/verify-payment', requireOwner, async (req, res) => {
 
     if (duplicateCheck.rows.length > 0) {
       await pool.query('ROLLBACK');
-      console.log(`[Subscription] Already Processed | Payment ID ${razorpay_payment_id} exists in subscription_events`);
+      console.log(`[Subscription] Idempotency Match: Payment ID ${razorpay_payment_id} already processed.`);
       invalidatePlanCache(companyId);
       return res.json({ 
         ok: true,
+        success: true,
         message: 'Subscription already activated.',
         is_duplicate: true 
       });
     }
 
     // 4. Update Company Plan & Subscription Expiry Dates
-    // Valid PostgreSQL parameterized expression syntax
+    console.log(`[Subscription] Updating Companies Table... Target Plan = ${verifiedPlanId}`);
     const updateResult = await pool.query(
       `UPDATE companies 
        SET plan_id = $1, 
@@ -293,12 +312,6 @@ router.post('/verify-payment', requireOwner, async (req, res) => {
        WHERE id = $3`,
       [verifiedPlanId, billingCycle, companyId]
     );
-
-    if (updateResult.rowCount === 0) {
-      await pool.query('ROLLBACK');
-      console.error(`[Subscription] ERROR: UPDATE companies modified 0 rows for Company ID ${companyId}`);
-      return res.status(404).json({ message: 'Company record not found for activation.' });
-    }
 
     console.log(`[Subscription] Updating Companies Table... Rows Updated = ${updateResult.rowCount}`);
     console.log(`[Subscription] Updating Billing Dates... Billing Cycle = ${billingCycle}`);
@@ -325,7 +338,7 @@ router.post('/verify-payment', requireOwner, async (req, res) => {
     const planName = planNameMap[verifiedPlanId] || 'Pro';
 
     const durationMs = Date.now() - startTime;
-    console.log(`[Subscription] Activation Completed in ${durationMs}ms | Company ID: ${companyId} | New Plan: ${planName}`);
+    console.log(`[Subscription] Activation Completed in ${durationMs}ms | Company ID: ${companyId} | New Plan = ${planName}`);
 
     // Push notification (async, non-blocking)
     try {

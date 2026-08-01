@@ -600,6 +600,7 @@ v1Router.use("/inventory-forecast", require("./routes/inventoryForecast"));
 v1Router.use("/ar-collections", require("./routes/arCollections"));
 v1Router.use("/payroll-validation", require("./routes/payrollValidation"));
 v1Router.use("/crm-sales", require("./routes/crmSales"));
+v1Router.use("/audit-logs", require("./routes/ai.routes"));
 
 
 // Mount v1 router

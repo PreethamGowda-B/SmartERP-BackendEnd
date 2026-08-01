@@ -67,6 +67,21 @@ router.post('/razorpay', async (req, res) => {
 
     await pool.query('BEGIN');
 
+    // Advisory lock per company ID ensures strict serial execution per company
+    await pool.query(`SELECT pg_advisory_xact_lock(hashtext('sub_upgrade_' || $1))`, [String(companyId)]);
+
+    // Row-level lock on companies table
+    const compCheck = await pool.query(
+      `SELECT id, plan_id FROM companies WHERE id = $1 FOR UPDATE`,
+      [companyId]
+    );
+
+    if (compCheck.rows.length === 0) {
+      await pool.query('ROLLBACK');
+      console.error(`❌ [Razorpay Webhook] Company ID ${companyId} not found in DB`);
+      return res.status(404).send('Company record not found');
+    }
+
     // Duplicate Check
     const duplicateCheck = await pool.query(
       `SELECT id FROM subscription_events WHERE metadata->>'razorpay_payment_id' = $1`,
@@ -91,12 +106,6 @@ router.post('/razorpay', async (req, res) => {
        WHERE id = $3`,
       [planId, billingCycle, companyId]
     );
-
-    if (updateResult.rowCount === 0) {
-      await pool.query('ROLLBACK');
-      console.error(`❌ [Razorpay Webhook] UPDATE companies modified 0 rows for Company ID ${companyId}`);
-      return res.status(404).send('Company record not found');
-    }
 
     // Log Event
     await pool.query(

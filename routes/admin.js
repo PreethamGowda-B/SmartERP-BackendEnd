@@ -529,5 +529,332 @@ router.patch('/companies/:id/plan', async (req, res) => {
   }
 });
 
+// ─── PATCH /api/admin/companies/:id ──────────────────────────────────────────
+// Edit company details (name, address, contact_email, phone)
+router.patch('/companies/:id', async (req, res) => {
+  const { id } = req.params;
+  const { company_name, address, contact_email, phone } = req.body;
+
+  const updates = [];
+  const values = [];
+  let idx = 1;
+
+  if (company_name) { updates.push(`company_name = $${idx++}`); values.push(company_name.trim()); }
+  if (address !== undefined) { updates.push(`address = $${idx++}`); values.push(address); }
+  if (contact_email !== undefined) { updates.push(`contact_email = $${idx++}`); values.push(contact_email); }
+  if (phone !== undefined) { updates.push(`phone = $${idx++}`); values.push(phone); }
+
+  if (updates.length === 0) return res.status(400).json({ message: 'No fields provided to update' });
+
+  updates.push(`updated_at = NOW()`);
+  values.push(id);
+
+  try {
+    const result = await pool.query(
+      `UPDATE companies SET ${updates.join(', ')} WHERE id = $${idx} RETURNING id, company_name, address, contact_email, updated_at`,
+      values
+    );
+    if (result.rows.length === 0) return res.status(404).json({ message: 'Company not found' });
+    res.json({ ok: true, company: result.rows[0] });
+  } catch (err) {
+    console.error('❌ Company edit error:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ─── DELETE /api/admin/companies/:id ─────────────────────────────────────────
+// Permanently delete a company and all associated data (irreversible)
+router.delete('/companies/:id', async (req, res) => {
+  const { id } = req.params;
+  const { confirm } = req.body;
+
+  if (confirm !== 'DELETE') {
+    return res.status(400).json({ message: 'Body must include { confirm: "DELETE" } to prevent accidental deletion' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    
+    // Get company info for logging
+    const co = await client.query('SELECT company_name, company_id FROM companies WHERE id = $1', [id]);
+    if (co.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Company not found' });
+    }
+
+    const { company_name, company_id } = co.rows[0];
+
+    // Delete in dependency order
+    await client.query('DELETE FROM notifications WHERE company_id = $1', [id]);
+    await client.query('DELETE FROM activities WHERE company_id = $1', [id]);
+    await client.query('DELETE FROM feedback WHERE company_id = $1', [id]);
+    await client.query('DELETE FROM users WHERE company_id = $1', [id]);
+    await client.query('DELETE FROM companies WHERE id = $1', [id]);
+
+    await client.query('COMMIT');
+
+    console.log(`🛡️ SuperAdmin DELETED company: ${company_name} (${company_id}), id=${id}`);
+    res.json({ ok: true, message: `Company "${company_name}" permanently deleted` });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('❌ Company delete error:', err);
+    res.status(500).json({ message: 'Server error during deletion' });
+  } finally {
+    client.release();
+  }
+});
+
+// ─── GET /api/admin/companies/:id/usage ──────────────────────────────────────
+// Per-company usage statistics
+router.get('/companies/:id/usage', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const [employees, jobs, inventory, activities7d, messages] = await Promise.all([
+      pool.query("SELECT COUNT(*) as count FROM users WHERE company_id = $1 AND role = 'employee'", [id]),
+      pool.query("SELECT COUNT(*) as count FROM jobs WHERE company_id = $1", [id]).catch(() => ({ rows: [{ count: 0 }] })),
+      pool.query("SELECT COUNT(*) as count FROM inventory WHERE company_id = $1", [id]).catch(() => ({ rows: [{ count: 0 }] })),
+      pool.query("SELECT COUNT(*) as count FROM activities WHERE company_id = $1 AND created_at > NOW() - INTERVAL '7 days'", [id]),
+      pool.query("SELECT COUNT(*) as count FROM messages WHERE company_id = $1", [id]).catch(() => ({ rows: [{ count: 0 }] })),
+    ]);
+
+    res.json({
+      employees: parseInt(employees.rows[0].count),
+      jobs: parseInt(jobs.rows[0].count),
+      inventory: parseInt(inventory.rows[0].count),
+      activities7d: parseInt(activities7d.rows[0].count),
+      messages: parseInt(messages.rows[0].count),
+    });
+  } catch (err) {
+    console.error('❌ Company usage error:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ─── GET /api/admin/users/:id ─────────────────────────────────────────────────
+// Get a specific user's details
+router.get('/users/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const r = await pool.query(
+      `SELECT u.id, u.name, u.email, u.role, u.phone, u.position, u.department,
+              u.created_at, u.is_active, c.company_name, c.id as company_id
+       FROM users u
+       LEFT JOIN companies c ON u.company_id = c.id
+       WHERE u.id = $1`,
+      [id]
+    );
+    if (r.rows.length === 0) return res.status(404).json({ message: 'User not found' });
+    res.json(r.rows[0]);
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ─── PATCH /api/admin/users/:id ──────────────────────────────────────────────
+// Edit user details (name, role, is_active)
+router.patch('/users/:id', async (req, res) => {
+  const { id } = req.params;
+  const { name, role, is_active, phone, position, department } = req.body;
+
+  const validRoles = ['owner', 'hr', 'employee', 'admin'];
+  if (role && !validRoles.includes(role)) {
+    return res.status(400).json({ message: `Invalid role. Must be one of: ${validRoles.join(', ')}` });
+  }
+
+  const updates = [];
+  const values = [];
+  let idx = 1;
+
+  if (name) { updates.push(`name = $${idx++}`); values.push(name.trim()); }
+  if (role) { updates.push(`role = $${idx++}`); values.push(role); }
+  if (is_active !== undefined) { updates.push(`is_active = $${idx++}`); values.push(Boolean(is_active)); }
+  if (phone !== undefined) { updates.push(`phone = $${idx++}`); values.push(phone); }
+  if (position !== undefined) { updates.push(`position = $${idx++}`); values.push(position); }
+  if (department !== undefined) { updates.push(`department = $${idx++}`); values.push(department); }
+
+  if (updates.length === 0) return res.status(400).json({ message: 'No fields provided to update' });
+  values.push(id);
+
+  try {
+    const result = await pool.query(
+      `UPDATE users SET ${updates.join(', ')} WHERE id = $${idx} RETURNING id, name, email, role, is_active`,
+      values
+    );
+    if (result.rows.length === 0) return res.status(404).json({ message: 'User not found' });
+    res.json({ ok: true, user: result.rows[0] });
+  } catch (err) {
+    console.error('❌ User edit error:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ─── DELETE /api/admin/users/:id ─────────────────────────────────────────────
+// Soft delete (deactivate) or hard delete a user
+router.delete('/users/:id', async (req, res) => {
+  const { id } = req.params;
+  const { hard_delete } = req.body;
+
+  try {
+    if (hard_delete === true) {
+      // Hard delete — check user is not the only owner
+      const user = await pool.query('SELECT role, company_id FROM users WHERE id = $1', [id]);
+      if (user.rows.length === 0) return res.status(404).json({ message: 'User not found' });
+
+      if (user.rows[0].role === 'owner') {
+        const ownerCount = await pool.query(
+          "SELECT COUNT(*) as c FROM users WHERE company_id = $1 AND role = 'owner'",
+          [user.rows[0].company_id]
+        );
+        if (parseInt(ownerCount.rows[0].c) <= 1) {
+          return res.status(400).json({ message: 'Cannot delete the sole owner of a company. Transfer ownership first.' });
+        }
+      }
+
+      await pool.query('DELETE FROM users WHERE id = $1', [id]);
+      res.json({ ok: true, deleted: true });
+    } else {
+      // Soft delete — just deactivate
+      const result = await pool.query(
+        'UPDATE users SET is_active = FALSE WHERE id = $1 RETURNING id, name, email, is_active',
+        [id]
+      );
+      if (result.rows.length === 0) return res.status(404).json({ message: 'User not found' });
+      res.json({ ok: true, user: result.rows[0], message: 'User deactivated (soft delete)' });
+    }
+  } catch (err) {
+    console.error('❌ User delete error:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ─── POST /api/admin/users/:id/reset-password ────────────────────────────────
+// Admin-initiated password reset for any user
+router.post('/users/:id/reset-password', async (req, res) => {
+  const { id } = req.params;
+  const { new_password } = req.body;
+
+  if (!new_password || new_password.length < 8) {
+    return res.status(400).json({ message: 'new_password must be at least 8 characters' });
+  }
+
+  try {
+    const bcrypt = require('bcrypt');
+    const hash = await bcrypt.hash(new_password, 12);
+
+    const result = await pool.query(
+      'UPDATE users SET password_hash = $1, password_set = TRUE WHERE id = $2 RETURNING id, name, email',
+      [hash, id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ message: 'User not found' });
+
+    // Revoke all refresh tokens for security
+    await pool.query('UPDATE refresh_tokens SET revoked = TRUE WHERE user_id = $1', [id]).catch(() => {});
+
+    console.log(`🛡️ SuperAdmin reset password for user: ${result.rows[0].email}`);
+    res.json({ ok: true, message: `Password reset for ${result.rows[0].name}` });
+  } catch (err) {
+    console.error('❌ Password reset error:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ─── GET /api/admin/announcements ────────────────────────────────────────────
+// List all stored announcements (uses the announcements table)
+router.get('/announcements', async (req, res) => {
+  const page = Math.max(1, parseInt(req.query.page) || 1);
+  const limit = Math.min(50, parseInt(req.query.limit) || 20);
+  const offset = (page - 1) * limit;
+
+  try {
+    const [result, count] = await Promise.all([
+      pool.query(`
+        SELECT a.*, u.name as created_by_name, u.email as created_by_email
+        FROM announcements a
+        LEFT JOIN users u ON a.created_by = u.id
+        ORDER BY a.created_at DESC
+        LIMIT $1 OFFSET $2
+      `, [limit, offset]),
+      pool.query('SELECT COUNT(*) as total FROM announcements')
+    ]);
+
+    res.json({
+      announcements: result.rows,
+      pagination: { page, limit, total: parseInt(count.rows[0].total), pages: Math.ceil(count.rows[0].total / limit) }
+    });
+  } catch (err) {
+    console.error('❌ Announcements list error:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ─── DELETE /api/admin/announcements/:id ─────────────────────────────────────
+router.delete('/announcements/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await pool.query('DELETE FROM announcements WHERE id = $1 RETURNING id, title', [id]);
+    if (result.rows.length === 0) return res.status(404).json({ message: 'Announcement not found' });
+    res.json({ ok: true, deleted: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ─── GET /api/admin/subscriptions/history ────────────────────────────────────
+// Subscription history across all companies (payment history proxy)
+router.get('/subscriptions/history', async (req, res) => {
+  const page = Math.max(1, parseInt(req.query.page) || 1);
+  const limit = Math.min(100, parseInt(req.query.limit) || 30);
+  const offset = (page - 1) * limit;
+
+  try {
+    const [result, count] = await Promise.all([
+      pool.query(`
+        SELECT s.*, c.company_name, p.name as plan_name
+        FROM subscriptions s
+        JOIN companies c ON s.company_id = c.id
+        JOIN plans p ON s.plan_id = p.id
+        ORDER BY s.created_at DESC
+        LIMIT $1 OFFSET $2
+      `, [limit, offset]),
+      pool.query('SELECT COUNT(*) as total FROM subscriptions')
+    ]);
+
+    res.json({
+      history: result.rows,
+      pagination: { page, limit, total: parseInt(count.rows[0].total), pages: Math.ceil(count.rows[0].total / limit) }
+    });
+  } catch (err) {
+    console.error('❌ Subscription history error:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ─── POST /api/admin/announcements ──────────────────────────────────────────
+// Store + broadcast announcement (OVERRIDE of above to also persist to DB)
+// NOTE: The existing POST /announcements sends notifications but doesn't persist.
+// This PATCH updates the route to also insert into announcements table.
+// The router.post above at line ~223 sends notifications only.
+// We add a SEPARATE store endpoint so the list page can show history.
+router.post('/announcements/store', async (req, res) => {
+  const { title, message: content, priority, target_role } = req.body;
+  const adminId = req.user?.id;
+
+  if (!content?.trim()) return res.status(400).json({ message: 'Content is required' });
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO announcements (created_by, title, content, priority, target_role)
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [adminId, title || 'Platform Announcement', content, priority || 'medium', target_role || null]
+    );
+    res.json({ ok: true, announcement: result.rows[0] });
+  } catch (err) {
+    console.error('❌ Announcement store error:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 module.exports = router;
+
 

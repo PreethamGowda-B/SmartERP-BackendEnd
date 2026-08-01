@@ -3,6 +3,10 @@
  *
  * Automatic seeding/verification of platform Super Admin account.
  * Runs during database initialization.
+ *
+ * IMPORTANT: Checks by EMAIL specifically, not by role.
+ * This ensures admin@prozync.in is always created even if
+ * another super_admin (e.g. Google OAuth user) already exists.
  */
 
 const { pool } = require('../db');
@@ -14,19 +18,27 @@ async function seedSuperAdmin() {
     const email = (process.env.SUPER_ADMIN_EMAIL || 'admin@prozync.in').toLowerCase().trim();
     const rawPassword = process.env.SUPER_ADMIN_PASSWORD || 'admin@preethu4959';
 
-    // Check if user already exists
+    // ✅ Check by EMAIL specifically — not by role — so we don't skip if a
+    //    different super_admin (e.g. Google OAuth account) already exists.
     const existing = await pool.query('SELECT id, role, password_hash FROM users WHERE email = $1', [email]);
 
     if (existing.rows.length > 0) {
       const user = existing.rows[0];
-      if (user.role !== 'super_admin') {
-        await pool.query("UPDATE users SET role = 'super_admin' WHERE email = $1", [email]);
-        console.log(`🛡️ Promoted existing user ${email} to super_admin`);
+      const needsRoleUpdate = user.role !== 'super_admin';
+      const needsPasswordSet = !user.password_hash;
+
+      if (needsRoleUpdate || needsPasswordSet) {
+        const hash = needsPasswordSet ? await bcrypt.hash(rawPassword, 12) : user.password_hash;
+        await pool.query(
+          "UPDATE users SET role = 'super_admin', password_hash = $1 WHERE email = $2",
+          [hash, email]
+        );
+        console.log(`🛡️ Updated Super Admin account (${email}): role=${needsRoleUpdate ? 'fixed' : 'ok'}, password=${needsPasswordSet ? 'set' : 'ok'}`);
       } else {
         console.log(`🛡️ Super Admin account (${email}) ready`);
       }
     } else {
-      const hash = await bcrypt.hash(rawPassword, 10);
+      const hash = await bcrypt.hash(rawPassword, 12);
       await pool.query(
         "INSERT INTO users (email, password_hash, role, name) VALUES ($1, $2, 'super_admin', $3)",
         [email, hash, 'Prozync Platform Administrator']

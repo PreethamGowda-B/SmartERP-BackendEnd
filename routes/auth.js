@@ -664,7 +664,7 @@ router.post("/check-email", async (req, res) => {
 // ✅ Login Route
 // ---------------------------------------------
 router.post("/login", [
-  body("email").isEmail().withMessage("Valid email is required").normalizeEmail(),
+  body("email").isEmail().withMessage("Valid email is required").normalizeEmail({ gmail_remove_dots: false, gmail_remove_subaddress: false, all_lowercase: true }),
   body("password").notEmpty().withMessage("Password is required")
 ], async (req, res) => {
   const errors = validationResult(req);

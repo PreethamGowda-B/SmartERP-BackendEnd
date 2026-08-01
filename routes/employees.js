@@ -94,10 +94,10 @@ router.get('/', authenticateToken, async (req, res) => {
   }
 });
 
-const { body, validationResult } = require('express-validator');
+const { loadPlan, checkPlanLimit } = require('../middleware/planMiddleware');
 
 // ─── POST /api/employees ────────────────────────────────────────────────────
-router.post('/', authenticateToken, [
+router.post('/', authenticateToken, loadPlan, checkPlanLimit('employee'), [
   body('email').isEmail().withMessage('Valid email is required').normalizeEmail(),
   body('name').trim().notEmpty().withMessage('Name is required').escape(),
   body('password').optional({ checkFalsy: true }).isString(),

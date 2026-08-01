@@ -22,10 +22,12 @@ function publishCustomerJobEvent(jobId, eventPayload) {
  */
 
 
+const { loadPlan, checkPlanLimit } = require('../middleware/planMiddleware');
+
 /**
  * Create a new job
  */
-router.post('/', authenticateToken, [
+router.post('/', authenticateToken, loadPlan, checkPlanLimit('job'), [
   body('title').trim().notEmpty().withMessage('Title is required').escape(),
   body('description').optional({ checkFalsy: true }).trim().escape(),
   body('priority').optional().isIn(['low', 'medium', 'high', 'urgent']).withMessage('Invalid priority value'),

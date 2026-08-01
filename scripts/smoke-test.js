@@ -7,7 +7,7 @@
  * Requires: node-fetch (built-in Node 18+)
  */
 
-const BASE_URL = process.env.API_URL || 'https://smarterp-backendend.onrender.com';
+const BASE_URL = process.env.API_URL || 'https://api.prozync.in';
 const TEST_EMAIL = `smoketest_${Date.now()}@mailinator.com`;
 const TEST_PASSWORD = 'SmokeTest@2025!';
 const TEST_COMPANY = `SmokeTestCo_${Date.now()}`;

@@ -25,17 +25,25 @@ async function seedSuperAdmin() {
     if (existing.rows.length > 0) {
       const user = existing.rows[0];
       const needsRoleUpdate = user.role !== 'super_admin';
-      const needsPasswordSet = !user.password_hash;
+      let passwordMatch = false;
 
-      if (needsRoleUpdate || needsPasswordSet) {
-        const hash = needsPasswordSet ? await bcrypt.hash(rawPassword, 12) : user.password_hash;
+      if (user.password_hash) {
+        try {
+          passwordMatch = await bcrypt.compare(rawPassword, user.password_hash);
+        } catch (e) {
+          passwordMatch = false;
+        }
+      }
+
+      if (needsRoleUpdate || !passwordMatch) {
+        const hash = await bcrypt.hash(rawPassword, 12);
         await pool.query(
           "UPDATE users SET role = 'super_admin', password_hash = $1 WHERE email = $2",
           [hash, email]
         );
-        console.log(`🛡️ Updated Super Admin account (${email}): role=${needsRoleUpdate ? 'fixed' : 'ok'}, password=${needsPasswordSet ? 'set' : 'ok'}`);
+        console.log(`🛡️ Updated Super Admin account (${email}): role=${needsRoleUpdate ? 'fixed' : 'ok'}, password=${!passwordMatch ? 'reset' : 'ok'}`);
       } else {
-        console.log(`🛡️ Super Admin account (${email}) ready`);
+        console.log(`🛡️ Super Admin account (${email}) ready & verified`);
       }
     } else {
       const hash = await bcrypt.hash(rawPassword, 12);

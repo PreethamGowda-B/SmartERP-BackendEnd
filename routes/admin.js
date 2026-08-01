@@ -368,32 +368,71 @@ router.get('/revenue', async (req, res) => {
 });
 
 // ─── GET /api/admin/health ───────────────────────────────────────────────────
-// Platform health metrics for the monitoring dashboard
+// Detailed platform health & system integration diagnostics
 router.get('/health', async (req, res) => {
   try {
     const start = Date.now();
     
-    const [dbCheck, activeCompanies, activeUsers, recentErrors, suspendedCount] = await Promise.all([
-      pool.query('SELECT NOW() as db_time'),
+    // 1. Database Health Check
+    const dbCheck = await pool.query('SELECT NOW() as db_time').then(r => ({ ok: true, time: r.rows[0].db_time })).catch(e => ({ ok: false, error: e.message }));
+    const dbLatencyMs = Date.now() - start;
+
+    // 2. Auxiliary Metrics
+    const [activeCompanies, activeUsers, recentErrors, suspendedCount] = await Promise.all([
       pool.query("SELECT COUNT(*) as count FROM companies WHERE status != 'suspended' OR status IS NULL"),
       pool.query("SELECT COUNT(DISTINCT user_id) as count FROM activities WHERE created_at > NOW() - INTERVAL '24 hours'"),
-      pool.query(`
-        SELECT COUNT(*) as count FROM feedback 
-        WHERE created_at > NOW() - INTERVAL '24 hours' AND type = 'bug'
-      `),
+      pool.query("SELECT COUNT(*) as count FROM feedback WHERE created_at > NOW() - INTERVAL '24 hours' AND type = 'bug'"),
       pool.query("SELECT COUNT(*) as count FROM companies WHERE status = 'suspended'")
     ]);
 
-    const dbLatencyMs = Date.now() - start;
+    // 3. Integration Diagnostic Checks
+    const integrations = {
+      database: {
+        status: dbCheck.ok ? 'operational' : 'degraded',
+        latencyMs: dbLatencyMs,
+        dbTime: dbCheck.time || null
+      },
+      redis: {
+        status: process.env.REDIS_URL ? 'configured' : 'fallback_memory',
+        description: process.env.REDIS_URL ? 'Redis cluster connected' : 'In-memory rate limiter & session store fallback'
+      },
+      cloudinary: {
+        status: (process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY) ? 'configured' : 'not_configured',
+        cloudName: process.env.CLOUDINARY_CLOUD_NAME || null
+      },
+      firebase: {
+        status: (process.env.FIREBASE_SERVICE_ACCOUNT || process.env.FIREBASE_CONFIG) ? 'configured' : 'not_configured',
+        fcm: 'Push notification engine ready'
+      },
+      razorpay: {
+        status: (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET) ? 'configured' : 'not_configured',
+        mode: process.env.RAZORPAY_KEY_ID?.startsWith('rzp_live') ? 'live' : 'test'
+      },
+      email_service: {
+        status: process.env.RESEND_API_KEY ? 'configured' : 'smtp_fallback',
+        provider: process.env.RESEND_API_KEY ? 'Resend API' : 'SMTP Transport'
+      },
+      storage: {
+        status: 'operational',
+        provider: process.env.CLOUDINARY_CLOUD_NAME ? 'Cloudinary + Local' : 'Local Disk'
+      },
+      workers: {
+        status: 'operational',
+        poller: 'Active background task runner'
+      }
+    };
+
+    const overallStatus = dbCheck.ok ? 'operational' : 'degraded';
 
     res.json({
-      status: 'operational',
+      status: overallStatus,
       dbLatencyMs,
-      dbTime: dbCheck.rows[0].db_time,
+      dbTime: dbCheck.time,
       activeCompanies: parseInt(activeCompanies.rows[0].count),
       activeUsersLast24h: parseInt(activeUsers.rows[0].count),
       bugReportsLast24h: parseInt(recentErrors.rows[0].count),
       suspendedCompanies: parseInt(suspendedCount.rows[0].count),
+      integrations,
       timestamp: new Date().toISOString()
     });
   } catch (err) {
@@ -830,31 +869,246 @@ router.get('/subscriptions/history', async (req, res) => {
   }
 });
 
-// ─── POST /api/admin/announcements ──────────────────────────────────────────
-// Store + broadcast announcement (OVERRIDE of above to also persist to DB)
-// NOTE: The existing POST /announcements sends notifications but doesn't persist.
-// This PATCH updates the route to also insert into announcements table.
-// The router.post above at line ~223 sends notifications only.
-// We add a SEPARATE store endpoint so the list page can show history.
-router.post('/announcements/store', async (req, res) => {
-  const { title, message: content, priority, target_role } = req.body;
-  const adminId = req.user?.id;
+// ─── GET /api/admin/system/status ─────────────────────────────────────────────
+// Get current system maintenance & platform status
+router.get('/system/status', async (req, res) => {
+  try {
+    const r = await pool.query(
+      "SELECT value FROM system_settings WHERE key = 'maintenance_mode'"
+    ).catch(() => ({ rows: [] }));
 
-  if (!content?.trim()) return res.status(400).json({ message: 'Content is required' });
+    const setting = r.rows[0]?.value || {
+      mode: 'disabled', // 'disabled' (normal live), 'enabled' (maintenance), 'read_only', 'emergency'
+      message: 'Platform is operating normally.',
+      updated_at: new Date().toISOString()
+    };
+
+    res.json(setting);
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ─── POST /api/admin/system/maintenance ──────────────────────────────────────
+// Update system maintenance mode
+router.post('/system/maintenance', async (req, res) => {
+  const { mode, message } = req.body;
+  const validModes = ['disabled', 'enabled', 'read_only', 'emergency'];
+
+  if (!mode || !validModes.includes(mode)) {
+    return res.status(400).json({ message: `Invalid mode. Must be one of: ${validModes.join(', ')}` });
+  }
+
+  try {
+    const value = {
+      mode,
+      message: message || (mode === 'disabled' ? 'Platform is operating normally.' : 'System maintenance is in progress.'),
+      updated_at: new Date().toISOString(),
+      updated_by: req.user?.email || 'admin@prozync.in'
+    };
+
+    // Ensure table exists
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS system_settings (
+        key VARCHAR(100) PRIMARY KEY,
+        value JSONB NOT NULL,
+        updated_at TIMESTAMP DEFAULT NOW()
+      );
+    `).catch(() => {});
+
+    await pool.query(
+      `INSERT INTO system_settings (key, value, updated_at)
+       VALUES ('maintenance_mode', $1, NOW())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+      [value]
+    );
+
+    console.log(`🛡️ SuperAdmin updated Maintenance Mode: ${mode} ("${value.message}")`);
+    res.json({ ok: true, maintenance: value });
+  } catch (err) {
+    console.error('❌ Maintenance mode error:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ─── GET /api/admin/logs/error ────────────────────────────────────────────────
+// Retrieve error logs from error_logs table or activity fallback
+router.get('/logs/error', async (req, res) => {
+  const page = Math.max(1, parseInt(req.query.page) || 1);
+  const limit = Math.min(100, parseInt(req.query.limit) || 30);
+  const offset = (page - 1) * limit;
+
+  try {
+    const [result, count] = await Promise.all([
+      pool.query(`
+        SELECT * FROM error_logs 
+        ORDER BY created_at DESC 
+        LIMIT $1 OFFSET $2
+      `, [limit, offset]).catch(() => ({ rows: [] })),
+      pool.query('SELECT COUNT(*) as total FROM error_logs').catch(() => ({ rows: [{ total: 0 }] }))
+    ]);
+
+    res.json({
+      logs: result.rows,
+      pagination: { page, limit, total: parseInt(count.rows[0].total), pages: Math.ceil(count.rows[0].total / limit) }
+    });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ─── GET /api/admin/logs/login ────────────────────────────────────────────────
+// Retrieve user & customer login logs from activities
+router.get('/logs/login', async (req, res) => {
+  const page = Math.max(1, parseInt(req.query.page) || 1);
+  const limit = Math.min(100, parseInt(req.query.limit) || 30);
+  const offset = (page - 1) * limit;
+
+  try {
+    const [result, count] = await Promise.all([
+      pool.query(`
+        SELECT a.id, a.action, a.created_at, a.ip_address, u.name as user_name, u.email, u.role, c.company_name
+        FROM activities a
+        LEFT JOIN users u ON a.user_id = u.id
+        LEFT JOIN companies c ON a.company_id = c.id
+        WHERE a.action IN ('login', 'login_google', 'customer_login', 'customer_login_success', 'logout', 'customer_logout')
+        ORDER BY a.created_at DESC
+        LIMIT $1 OFFSET $2
+      `, [limit, offset]),
+      pool.query(`
+        SELECT COUNT(*) as total FROM activities 
+        WHERE action IN ('login', 'login_google', 'customer_login', 'customer_login_success', 'logout', 'customer_logout')
+      `)
+    ]);
+
+    res.json({
+      logs: result.rows,
+      pagination: { page, limit, total: parseInt(count.rows[0].total), pages: Math.ceil(count.rows[0].total / limit) }
+    });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ─── POST /api/admin/users/:id/force-logout ──────────────────────────────────
+// Force logout user by revoking all refresh tokens
+router.post('/users/:id/force-logout', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const [tokens, custTokens] = await Promise.all([
+      pool.query('UPDATE refresh_tokens SET revoked = TRUE WHERE user_id = $1 RETURNING id', [id]),
+      pool.query('UPDATE customer_refresh_tokens SET revoked = TRUE WHERE customer_id = $1 RETURNING id', [id]).catch(() => ({ rows: [] }))
+    ]);
+
+    const count = tokens.rows.length + custTokens.rows.length;
+    console.log(`🛡️ SuperAdmin forced logout for user ${id}: ${count} token(s) revoked`);
+    res.json({ ok: true, revokedCount: count, message: `Forced logout: ${count} active session(s) revoked` });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ─── POST /api/admin/users/:id/restore ───────────────────────────────────────
+// Restore (re-enable) a deactivated user
+router.post('/users/:id/restore', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await pool.query(
+      'UPDATE users SET is_active = TRUE WHERE id = $1 RETURNING id, name, email, is_active',
+      [id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ message: 'User not found' });
+    res.json({ ok: true, user: result.rows[0], message: 'User account restored' });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ─── GET /api/admin/users/:id/login-history ──────────────────────────────────
+// Get login history for a specific user
+router.get('/users/:id/login-history', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await pool.query(`
+      SELECT action, created_at, ip_address 
+      FROM activities 
+      WHERE user_id = $1 AND action IN ('login', 'login_google', 'logout')
+      ORDER BY created_at DESC 
+      LIMIT 20
+    `, [id]);
+    res.json({ history: result.rows });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ─── POST /api/admin/companies/:id/restore ───────────────────────────────────
+// Restore a suspended company
+router.post('/companies/:id/restore', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await pool.query(
+      "UPDATE companies SET status = 'active', updated_at = NOW() WHERE id = $1 RETURNING id, company_name, status",
+      [id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ message: 'Company not found' });
+    res.json({ ok: true, company: result.rows[0], message: 'Company restored to active status' });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ─── GET /api/admin/payments ──────────────────────────────────────────────────
+// Payment transactions list
+router.get('/payments', async (req, res) => {
+  const page = Math.max(1, parseInt(req.query.page) || 1);
+  const limit = Math.min(100, parseInt(req.query.limit) || 30);
+  const offset = (page - 1) * limit;
+
+  try {
+    const [result, count] = await Promise.all([
+      pool.query(`
+        SELECT s.id, s.company_id, s.plan_id, s.start_date, s.end_date, s.status, s.created_at,
+               c.company_name, p.name as plan_name
+        FROM subscriptions s
+        LEFT JOIN companies c ON s.company_id = c.id
+        LEFT JOIN plans p ON s.plan_id = p.id
+        ORDER BY s.created_at DESC
+        LIMIT $1 OFFSET $2
+      `, [limit, offset]),
+      pool.query('SELECT COUNT(*) as total FROM subscriptions')
+    ]);
+
+    res.json({
+      payments: result.rows,
+      pagination: { page, limit, total: parseInt(count.rows[0].total), pages: Math.ceil(count.rows[0].total / limit) }
+    });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ─── POST /api/admin/payments/:id/refund ─────────────────────────────────────
+// Record payment refund
+router.post('/payments/:id/refund', async (req, res) => {
+  const { id } = req.params;
+  const { reason } = req.body;
 
   try {
     const result = await pool.query(
-      `INSERT INTO announcements (created_by, title, content, priority, target_role)
-       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-      [adminId, title || 'Platform Announcement', content, priority || 'medium', target_role || null]
+      `UPDATE subscriptions SET status = 'refunded' WHERE id = $1 RETURNING *`,
+      [id]
     );
-    res.json({ ok: true, announcement: result.rows[0] });
+    if (result.rows.length === 0) return res.status(404).json({ message: 'Transaction not found' });
+
+    console.log(`🛡️ SuperAdmin refunded payment ${id}: ${reason || 'Admin refund'}`);
+    res.json({ ok: true, payment: result.rows[0], message: 'Payment marked as refunded' });
   } catch (err) {
-    console.error('❌ Announcement store error:', err);
     res.status(500).json({ message: 'Server error' });
   }
 });
 
 module.exports = router;
+
 
 

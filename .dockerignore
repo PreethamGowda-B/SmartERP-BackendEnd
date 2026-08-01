@@ -8,7 +8,6 @@ Dockerfile
 .vscode
 .idea
 scratch/
-scripts/
 tests/
 load-tests/
 *.md

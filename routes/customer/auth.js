@@ -661,11 +661,14 @@ router.post('/logout', async (req, res) => {
 
 // ─── Google OAuth — register dedicated 'customer-google' strategy ─────────────
 if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
+  const custBackendDomain = process.env.NODE_ENV === 'production' ? 'https://api.prozync.in' : (process.env.BACKEND_URL || 'http://localhost:4000');
+  const custGoogleCallback = process.env.CUSTOMER_GOOGLE_CALLBACK_URL || `${custBackendDomain}/api/v1/customer/auth/google/callback`;
+
   passport.use('customer-google', new GoogleStrategy(
     {
       clientID: process.env.GOOGLE_CLIENT_ID,
       clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-      callbackURL: `${process.env.BACKEND_URL || 'http://localhost:4000'}/api/customer/auth/google/callback`,
+      callbackURL: custGoogleCallback,
       passReqToCallback: true,
     },
     async (req, accessToken, refreshToken, profile, done) => {

@@ -88,7 +88,7 @@ app.use(helmet({
       scriptSrc: ["'self'", "https://www.prozync.in", "https://prozync.in"],
       connectSrc: [
         "'self'",
-        "https://smarterp-backendend.onrender.com",
+        "https://api.prozync.in",
         "https://www.prozync.in",
         "https://prozync.in",
         "https://*.firebaseio.com",
@@ -564,11 +564,45 @@ async function runDatabaseInitialization() {
   }
 }
 
-// ✅ API Versioning (v1)
-const v1Router = express.Router();
-// NOTE: setTenantContext (RLS) is now applied inside authenticateToken
-// so it always runs AFTER req.user is populated. No need for a global
-// router-level middleware here.
+// ✅ Platform Maintenance Mode Middleware
+v1Router.use(async (req, res, next) => {
+  // Always bypass maintenance mode for Super Admin management API routes
+  if (req.path.startsWith('/admin')) {
+    return next();
+  }
+
+  try {
+    const r = await pool.query(
+      "SELECT value FROM system_settings WHERE key = 'maintenance_mode'"
+    ).catch(() => ({ rows: [] }));
+
+    const setting = r.rows[0]?.value;
+    if (!setting || setting.mode === 'disabled') {
+      return next();
+    }
+
+    if (setting.mode === 'emergency' || setting.mode === 'enabled') {
+      return res.status(503).json({
+        error: 'Service Unavailable',
+        message: setting.message || 'SmartERP platform is currently undergoing maintenance. Please try again shortly.',
+        maintenance_mode: setting.mode,
+        retry_after_seconds: 300
+      });
+    }
+
+    if (setting.mode === 'read_only' && !['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
+      return res.status(423).json({
+        error: 'Locked',
+        message: setting.message || 'Platform is currently in read-only mode during system maintenance. Writes are disabled.',
+        maintenance_mode: setting.mode
+      });
+    }
+  } catch (err) {
+    // Fail open if maintenance check fails so platform stays accessible
+  }
+
+  next();
+});
 
 v1Router.use("/auth", require("./routes/auth"));
 v1Router.use("/users", require("./routes/users"));

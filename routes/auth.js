@@ -39,12 +39,15 @@ const REFRESH_MAX_AGE = 30 * 24 * 60 * 60 * 1000; // 30 days
 // ---------------------------------------------
 // ✅ Google OAuth Strategy Configuration
 // ---------------------------------------------
+const backendDomain = process.env.NODE_ENV === 'production' ? 'https://api.prozync.in' : (process.env.BACKEND_URL || 'http://localhost:4000');
+const googleCallback = process.env.GOOGLE_CALLBACK_URL || `${backendDomain}/api/v1/auth/google/callback`;
+
 passport.use(
   new GoogleStrategy(
     {
       clientID: process.env.GOOGLE_CLIENT_ID,
       clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-      callbackURL: "/api/auth/google/callback",
+      callbackURL: googleCallback,
       passReqToCallback: true, // ✅ Allow access to req in callback
     },
     async (req, accessToken, refreshToken, profile, done) => {

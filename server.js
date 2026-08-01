@@ -553,7 +553,8 @@ async function runDatabaseInitialization() {
 
     // 9. Seed platform Super Admin account (admin@prozync.in)
     try {
-      const { seedSuperAdmin } = require('./scripts/seedSuperAdmin');
+      const seedScriptPath = path.join(__dirname, 'scripts', 'seedSuperAdmin.js');
+      const { seedSuperAdmin } = require(seedScriptPath);
       await seedSuperAdmin();
     } catch (saErr) {
       console.warn('⚠️  Super Admin seed failed (non-fatal):', saErr.message);

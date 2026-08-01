@@ -36,62 +36,101 @@ const REFRESH_EXPIRY = "30d";
 const ACCESS_MAX_AGE = 1 * 60 * 60 * 1000; // 1 hour
 const REFRESH_MAX_AGE = 30 * 24 * 60 * 60 * 1000; // 30 days
 
-// ---------------------------------------------
-// ✅ Google OAuth Strategy Configuration
-// ---------------------------------------------
-const backendDomain = process.env.NODE_ENV === 'production' ? 'https://api.prozync.in' : (process.env.BACKEND_URL || 'http://localhost:4000');
-const googleCallback = process.env.GOOGLE_CALLBACK_URL || `${backendDomain}/api/v1/auth/google/callback`;
+// ──────────────────────────────────────────────────────────────────────────────
+// ✅ UNIFIED Google OAuth — single callback URL for staff AND customer portal
+//
+// Flow is selected via state.type (base64-encoded JSON in the OAuth state param):
+//   state.type === 'customer'  → Customer Portal login/signup
+//   state.type === 'staff'     → SmartERP staff (owner / employee) — default
+//
+// Google Cloud Console only needs ONE authorized redirect URI:
+//   https://api.prozync.in/api/v1/auth/google/callback
+// ──────────────────────────────────────────────────────────────────────────────
+const backendDomain = process.env.NODE_ENV === 'production'
+  ? 'https://api.prozync.in'
+  : (process.env.BACKEND_URL || 'http://localhost:4000');
+const googleCallback = process.env.GOOGLE_CALLBACK_URL
+  || `${backendDomain}/api/v1/auth/google/callback`;
 
+// ─── Unified Passport Strategy ────────────────────────────────────────────────
 passport.use(
   new GoogleStrategy(
     {
       clientID: process.env.GOOGLE_CLIENT_ID,
       clientSecret: process.env.GOOGLE_CLIENT_SECRET,
       callbackURL: googleCallback,
-      passReqToCallback: true, // ✅ Allow access to req in callback
+      passReqToCallback: true,
     },
-    async (req, accessToken, refreshToken, profile, done) => {
+    async (req, _accessToken, _refreshToken, profile, done) => {
       try {
-        const email = profile.emails[0].value;
+        const email = profile.emails && profile.emails[0] && profile.emails[0].value;
         const googleId = profile.id;
-        const name = profile.displayName;
+        const name = profile.displayName || '';
 
-        // Extract role and company_code from state (passed from frontend)
-        let role = "owner";
-        let company_code = null;
+        if (!email) return done(new Error('No email from Google'), null);
 
-        if (req.query.state) {
-          try {
-            const stateData = JSON.parse(Buffer.from(req.query.state, 'base64').toString());
-            if (stateData.role) role = stateData.role;
-            if (stateData.company_code) company_code = stateData.company_code;
-          } catch (e) {
-            // Ignore parse error
+        // Parse state (always base64-encoded JSON)
+        let stateData = {};
+        try {
+          stateData = JSON.parse(Buffer.from(req.query.state || '', 'base64').toString());
+        } catch (_) { /* ignore */ }
+
+        // ── CUSTOMER FLOW ────────────────────────────────────────────────────
+        if (stateData.type === 'customer') {
+          // Block if email already belongs to a staff user
+          const conflict = await pool.query('SELECT id FROM users WHERE email = $1 LIMIT 1', [email]);
+          if (conflict.rows.length > 0) {
+            return done(null, { _isCustomer: true, _emailConflict: true, email });
           }
+
+          // Lookup by google_id
+          const byGid = await pool.query('SELECT * FROM customers WHERE google_id = $1 LIMIT 1', [googleId]);
+          if (byGid.rows.length > 0) {
+            return done(null, { ...byGid.rows[0], _isCustomer: true });
+          }
+
+          // Lookup by email
+          const byEmail = await pool.query('SELECT * FROM customers WHERE email = $1 LIMIT 1', [email]);
+          if (byEmail.rows.length === 0) {
+            // Brand-new customer — create without company (needs onboarding)
+            const newC = await pool.query(
+              `INSERT INTO customers (name, email, google_id, auth_provider, is_verified, company_id)
+               VALUES ($1, $2, $3, 'google', TRUE, NULL) RETURNING *`,
+              [name, email, googleId]
+            );
+            return done(null, { ...newC.rows[0], _isCustomer: true, _isNew: true });
+          }
+
+          // Link Google to existing account
+          const linked = await pool.query(
+            `UPDATE customers SET google_id = $1, auth_provider = 'google' WHERE id = $2 RETURNING *`,
+            [googleId, byEmail.rows[0].id]
+          );
+          return done(null, { ...linked.rows[0], _isCustomer: true });
         }
 
-        // Check if user exists
-        let userResult = await pool.query("SELECT * FROM users WHERE google_id = $1 OR email = $2", [
-          googleId,
-          email,
-        ]);
+        // ── STAFF FLOW (owner / employee / super_admin) ───────────────────────
+        let role = stateData.role || 'owner';
+        const company_code = stateData.company_code || null;
+
+        const userResult = await pool.query(
+          'SELECT * FROM users WHERE google_id = $1 OR email = $2',
+          [googleId, email]
+        );
 
         let user;
         let companyId = null;
         let companyCode = null;
 
         if (userResult.rows.length > 0) {
-          // Existing user - just link Google ID if needed
+          // Existing staff user — link Google ID if missing
           user = userResult.rows[0];
-
           if (!user.google_id) {
-            await pool.query("UPDATE users SET google_id = $1 WHERE id = $2", [googleId, user.id]);
+            await pool.query('UPDATE users SET google_id = $1 WHERE id = $2', [googleId, user.id]);
             user.google_id = googleId;
           }
         } else {
-          // New user - handle company creation/linking
-
-          // OWNER FLOW: Auto-create company
+          // New staff user
           if (role === 'owner') {
             const { generateCompanyId } = require('../utils/companyIdGenerator');
             companyCode = await generateCompanyId();
@@ -106,10 +145,8 @@ passport.use(
                RETURNING id, company_id`,
               [companyCode, companyName]
             );
-
             companyId = companyResult.rows[0].id;
 
-            // Log the trial start event
             pool.query(
               `INSERT INTO subscription_events (company_id, event_type, old_plan_id, new_plan_id, metadata, created_at)
                VALUES ($1, 'trial_started', NULL, 3, $2, NOW())`,
@@ -119,37 +156,27 @@ passport.use(
             console.log(`✅ Created company ${companyCode} for Google owner ${email} (30-day Pro trial)`);
           }
 
-          // EMPLOYEE FLOW: Validate and link to company
-          if (role === 'employee') {
-            if (company_code) {
-              const { validateCompanyCode } = require('../utils/companyIdGenerator');
-              const validation = await validateCompanyCode(company_code);
-
-              if (validation.valid) {
-                companyId = validation.company.id;
-                companyCode = validation.company.company_id;
-                console.log(`✅ Google employee ${email} validated for company ${companyCode}`);
-              } else {
-                return done(new Error('Invalid company code'), null);
-              }
+          if (role === 'employee' && company_code) {
+            const { validateCompanyCode } = require('../utils/companyIdGenerator');
+            const validation = await validateCompanyCode(company_code);
+            if (validation.valid) {
+              companyId = validation.company.id;
+              companyCode = validation.company.company_id;
+              console.log(`✅ Google employee ${email} validated for company ${companyCode}`);
+            } else {
+              return done(new Error('Invalid company code'), null);
             }
           }
 
-          // Create new user with company linkage
           const insertResult = await pool.query(
             `INSERT INTO users (name, email, google_id, role, company_id, company_code, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, NOW())
-             RETURNING *`,
+             VALUES ($1, $2, $3, $4, $5, $6, NOW()) RETURNING *`,
             [name, email, googleId, role, companyId, companyCode]
           );
           user = insertResult.rows[0];
 
-          // If owner, update company with owner_id
           if (role === 'owner' && companyId) {
-            await pool.query(
-              'UPDATE companies SET owner_id = $1 WHERE id = $2',
-              [user.id, companyId]
-            );
+            await pool.query('UPDATE companies SET owner_id = $1 WHERE id = $2', [user.id, companyId]);
           }
         }
 
@@ -161,116 +188,133 @@ passport.use(
   )
 );
 
-// ---------------------------------------------
-// ✅ Google OAuth Routes
-// ---------------------------------------------
+// ─── Initiate Google Login ────────────────────────────────────────────────────
+// Query params:
+//   ?type=customer               → Customer Portal
+//   ?role=owner|employee         → Staff (default: owner)
+//   ?company_code=XXX            → Employee join flow
+router.get('/google', (req, res, next) => {
+  const type = req.query.type === 'customer' ? 'customer' : 'staff';
+  const statePayload = type === 'customer'
+    ? { type: 'customer' }
+    : { type: 'staff', role: req.query.role || 'owner', company_code: req.query.company_code || null };
 
-// Initiate Google Login
-router.get(
-  "/google",
-  (req, res, next) => {
-    const role = req.query.role || "owner";
-    const company_code = req.query.company_code || null;
-    const state = Buffer.from(JSON.stringify({ role, company_code })).toString('base64');
+  const state = Buffer.from(JSON.stringify(statePayload)).toString('base64');
+  passport.authenticate('google', { scope: ['profile', 'email'], session: false, state })(req, res, next);
+});
 
-    passport.authenticate("google", {
-      scope: ["profile", "email"],
-      session: false,
-      state: state // ✅ Pass role and company_code in state
-    })(req, res, next);
-  }
-);
+// ─── Google Callback (unified) ────────────────────────────────────────────────
+router.get('/google/callback', (req, res, next) => {
+  passport.authenticate('google', { session: false }, async (err, user) => {
+    // Parse state so we know which portal to redirect failures to
+    let stateData = {};
+    try { stateData = JSON.parse(Buffer.from(req.query.state || '', 'base64').toString()); } catch (_) {}
+    const CUSTOMER_PORTAL = process.env.CUSTOMER_PORTAL_ORIGIN || 'http://localhost:3001';
+    const FRONTEND = process.env.FRONTEND_ORIGIN || 'https://www.prozync.in';
 
-// Handle Google Callback
-router.get(
-  "/google/callback",
-  passport.authenticate("google", { session: false, failureRedirect: "/login" }),
-  async (req, res) => {
+    if (err || !user) {
+      console.error('Google OAuth error:', err && err.message);
+      return res.redirect(stateData.type === 'customer'
+        ? `${CUSTOMER_PORTAL}/login?error=oauth_failed`
+        : `${FRONTEND}/login?error=oauth_failed`);
+    }
+
     try {
-      const user = req.user;
+      // ── Customer callback ──────────────────────────────────────────────────
+      if (user._isCustomer) {
+        if (user._emailConflict) {
+          return res.redirect(`${CUSTOMER_PORTAL}/login?error=EMAIL_ALREADY_USED`);
+        }
 
+        if (user._isNew || !user.company_id) {
+          const tempToken = jwt.sign(
+            { id: user.id, purpose: 'onboarding', email: user.email },
+            ACCESS_SECRET,
+            { expiresIn: '15m' }
+          );
+          return res.redirect(`${CUSTOMER_PORTAL}/onboarding?token=${tempToken}`);
+        }
+
+        // Existing customer with company — issue JWT cookies and redirect
+        const custAccess = jwt.sign(
+          { id: user.id, role: 'customer', companyId: user.company_id, email: user.email },
+          ACCESS_SECRET, { expiresIn: '1h' }
+        );
+        const custRefresh = jwt.sign({ id: user.id }, REFRESH_SECRET, { expiresIn: '30d' });
+
+        await pool.query(
+          `INSERT INTO customer_refresh_tokens
+             (customer_id, token, token_family, expires_at, user_agent, ip_address)
+           VALUES ($1, $2, $3, NOW() + INTERVAL '30 days', $4, $5)`,
+          [user.id, custRefresh, crypto.randomUUID(), req.get('user-agent') || null, req.ip || null]
+        );
+
+        const cOpts = { httpOnly: true, sameSite: 'none', secure: true, path: '/' };
+        res.cookie('customer_access_token',  custAccess,  { ...cOpts, maxAge: ACCESS_MAX_AGE });
+        res.cookie('customer_refresh_token', custRefresh, { ...cOpts, maxAge: REFRESH_MAX_AGE });
+        res.cookie('csrf_token', crypto.randomBytes(32).toString('hex'),
+          { httpOnly: false, sameSite: 'none', secure: true, path: '/', maxAge: ACCESS_MAX_AGE });
+
+        return res.redirect(`${CUSTOMER_PORTAL}/dashboard`);
+      }
+
+      // ── Staff callback ─────────────────────────────────────────────────────
       if (user.role !== 'super_admin' && user.company_id) {
-        const companyRes = await pool.query("SELECT status FROM companies WHERE id = $1", [user.company_id]);
+        const companyRes = await pool.query('SELECT status FROM companies WHERE id = $1', [user.company_id]);
         if (companyRes.rows.length > 0 && companyRes.rows[0].status === 'suspended') {
           console.warn(`🛑 Google login blocked for suspended company user: ${user.email}`);
-          const frontendUrl = process.env.FRONTEND_ORIGIN || "https://www.prozync.in";
-          return res.redirect(`${frontendUrl}/suspended`);
+          return res.redirect(`${FRONTEND}/suspended`);
         }
       }
 
-      // Log activity
-      await logActivity(user.id, "login_google", req);
+      await logActivity(user.id, 'login_google', req);
 
-      const accessToken = jwt.sign(
+      const staffAccess = jwt.sign(
         { id: user.id, userId: user.id, role: user.role, email: user.email, companyId: user.company_id },
-        ACCESS_SECRET,
-        { expiresIn: ACCESS_EXPIRY }
+        ACCESS_SECRET, { expiresIn: ACCESS_EXPIRY }
       );
-      const refreshToken = jwt.sign(
-        { id: user.id, userId: user.id },
-        REFRESH_SECRET,
-        { expiresIn: REFRESH_EXPIRY }
-      );
+      const staffRefresh = jwt.sign({ id: user.id, userId: user.id }, REFRESH_SECRET, { expiresIn: REFRESH_EXPIRY });
 
-      // Store Refresh Token in DB with family and metadata
-      const tokenFamily = require('crypto').randomUUID();
+      const tokenFamily = crypto.randomUUID();
       await pool.query(
         `INSERT INTO refresh_tokens (user_id, token, token_family, expires_at, created_at, user_agent, ip_address)
          VALUES ($1::uuid, $2, $3::uuid, NOW() + INTERVAL '30 days', NOW(), $4, $5)`,
-        [user.id, refreshToken, tokenFamily, req.headers["user-agent"], req.ip]
+        [user.id, staffRefresh, tokenFamily, req.headers['user-agent'], req.ip]
       );
 
-      // Set Cookies based on role (before redirect)
       const isSuperAdmin = user.role === 'super_admin';
-      const accessCookieName = isSuperAdmin ? COOKIE_ACCESS_ADMIN : COOKIE_ACCESS_USER;
-      const refreshCookieName = isSuperAdmin ? COOKIE_REFRESH_ADMIN : COOKIE_REFRESH_USER;
+      const sOpts = { httpOnly: true, sameSite: 'none', secure: true, path: '/' };
+      res.cookie(isSuperAdmin ? COOKIE_ACCESS_ADMIN  : COOKIE_ACCESS_USER,  staffAccess,  { ...sOpts, maxAge: ACCESS_MAX_AGE });
+      res.cookie(isSuperAdmin ? COOKIE_REFRESH_ADMIN : COOKIE_REFRESH_USER, staffRefresh, { ...sOpts, maxAge: REFRESH_MAX_AGE });
 
-      const cookieOpts = {
-        httpOnly: true,
-        sameSite: "none",
-        secure: true,
-        path: "/",
-      };
-
-      res.cookie(accessCookieName, accessToken, { ...cookieOpts, maxAge: ACCESS_MAX_AGE });
-      res.cookie(refreshCookieName, refreshToken, { ...cookieOpts, maxAge: REFRESH_MAX_AGE });
-
-      // ✅ SECURE: Use one-time code instead of tokens in URL
-      // Tokens in URLs appear in browser history, server logs, and Referer headers
-      const frontendUrl = process.env.FRONTEND_ORIGIN || "https://smart-erp-front-end.vercel.app";
+      // Secure one-time code exchange (tokens never in URL)
       const oauthCode = crypto.randomUUID();
       const oauthPayload = JSON.stringify({
-        accessToken,
-        refreshToken,
-        user: {
-          id: user.id,
-          name: user.name,
-          email: user.email,
-          role: user.role,
-          company_id: user.company_id,
-          companyId: user.company_id,
-        },
+        accessToken: staffAccess, refreshToken: staffRefresh,
+        user: { id: user.id, name: user.name, email: user.email, role: user.role,
+                company_id: user.company_id, companyId: user.company_id },
       });
-      // Store in Redis for 60 seconds (one-time use)
-      if (redisClient && redisClient.status === "ready") {
-        await redisClient.set(`oauth_code:${oauthCode}`, oauthPayload, "EX", 60);
-      } else {
-        // Redis unavailable — fall back to encrypted query param approach
-        // (still better than plaintext tokens)
-        console.warn("⚠️ Redis unavailable for OAuth code exchange, using fallback");
-        return res.redirect(
-          `${frontendUrl}/auth/callback?code=fallback&user=${encodeURIComponent(
-            JSON.stringify({ id: user.id, name: user.name, email: user.email, role: user.role, company_id: user.company_id, companyId: user.company_id })
-          )}`
-        );
+
+      if (redisClient && redisClient.status === 'ready') {
+        await redisClient.set(`oauth_code:${oauthCode}`, oauthPayload, 'EX', 60);
+        return res.redirect(`${FRONTEND}/auth/callback?code=${oauthCode}`);
       }
-      res.redirect(`${frontendUrl}/auth/callback?code=${oauthCode}`);
+
+      // Redis unavailable — fallback (no tokens in URL, just user info)
+      console.warn('⚠️ Redis unavailable for OAuth code exchange, using fallback');
+      return res.redirect(
+        `${FRONTEND}/auth/callback?code=fallback&user=${encodeURIComponent(
+          JSON.stringify({ id: user.id, name: user.name, email: user.email,
+                          role: user.role, company_id: user.company_id, companyId: user.company_id })
+        )}`
+      );
     } catch (err) {
-      console.error("Google Auth Error:", err);
-      res.redirect("/login?error=auth_failed");
+      console.error('Google Auth Error:', err);
+      return res.redirect(`${FRONTEND}/login?error=auth_failed`);
     }
-  }
-);
+  })(req, res, next);
+});
+
 
 
 // ---------------------------------------------

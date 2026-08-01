@@ -28,8 +28,34 @@ const requireOwner = (req, res, next) => {
 // ─────────────────────────────────────────────────────────────────────────────
 router.get('/status', loadPlan, async (req, res) => {
   try {
-    const companyId = req.user.companyId;
+    const companyId = req.user?.companyId;
+
+    // Super admin or users with no company — return unlimited sentinel plan
+    if (!companyId) {
+      return res.json({
+        plan: {
+          id: 0, name: 'Super Admin', is_trial: false, days_remaining: 36500,
+          trial_ends_at: null, employee_limit: null, max_inventory_items: null,
+          messages_history_days: 9999,
+          features: {
+            payroll: true, messages: true, ai_assistant: true,
+            basic_reports: true, export_reports: true, advanced_reports: true,
+            inventory_images: true, priority_support: true, location_tracking: true
+          }
+        },
+        usage: { employees: 0, inventory_items: 0 },
+        limits: { employees_remaining: null, inventory_remaining: null },
+        trial_started_at: null, subscription_expires_at: null, is_first_login: false
+      });
+    }
+
     const plan = req.plan;
+
+    // Defensive: plan middleware should always set this, but guard anyway
+    if (!plan) {
+      console.error('❌ subscription/status: req.plan is undefined after loadPlan for companyId:', companyId);
+      return res.status(503).json({ message: 'Subscription plan data unavailable. Please contact support.' });
+    }
 
     // Live usage counts
     const [empResult, invResult, companyResult] = await Promise.all([

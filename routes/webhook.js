@@ -3,15 +3,11 @@ const router = express.Router();
 const crypto = require('crypto');
 const { pool } = require('../db');
 const Sentry = require("@sentry/node");
-const { notifyPlanUpgrade } = require('../services/smartNotificationService');
 const { invalidatePlanCache } = require('../middleware/planMiddleware');
 const { storage } = require('../middleware/als');
 
 // ✅ RLS bypass — Razorpay webhooks arrive with no user/tenant session.
-// Explicitly opt-in so payment/subscription updates can write cross-tenant.
 router.use((req, res, next) => storage.run({ isWebRequest: true, bypassRls: true }, next));
-
-
 
 router.post('/razorpay', async (req, res) => {
   try {
@@ -19,16 +15,16 @@ router.post('/razorpay', async (req, res) => {
     const signature = req.headers['x-razorpay-signature'];
     
     if (!signature) {
-      console.warn('⚠️ Razorpay Webhook: Missing signature');
+      console.warn('⚠️ [Razorpay Webhook] Missing signature');
       return res.status(400).send('No signature');
     }
 
     if (!secret) {
-      console.error('❌ Razorpay Webhook: RAZORPAY_WEBHOOK_SECRET is not set');
+      console.error('❌ [Razorpay Webhook] RAZORPAY_WEBHOOK_SECRET is not set');
       return res.status(500).send('Webhook secret not configured');
     }
 
-    // Verify webhook signature (constant-time to prevent timing side-channel attacks)
+    // Verify webhook signature (constant-time)
     const expectedSignature = crypto
       .createHmac('sha256', secret)
       .update(req.rawBody)
@@ -40,7 +36,7 @@ router.post('/razorpay', async (req, res) => {
       crypto.timingSafeEqual(sigBufExpected, sigBufActual);
 
     if (!signaturesMatch) {
-      console.error('❌ Razorpay Webhook: Invalid signature match');
+      console.error('❌ [Razorpay Webhook] Invalid signature match');
       return res.status(400).send('Invalid signature');
     }
 
@@ -59,21 +55,19 @@ router.post('/razorpay', async (req, res) => {
     const companyId = parseInt(notes.companyId, 10);
     const planIdInput = parseInt(notes.planId, 10);
     const billingCycle = notes.billingCycle || 'monthly';
-    const userId = notes.userId;
 
     if (!companyId || isNaN(planIdInput)) {
-      console.error('❌ Razorpay Webhook: Missing companyId or planId in notes', notes);
+      console.error('❌ [Razorpay Webhook] Missing companyId or planId in notes', notes);
       return res.status(400).send('Missing metadata in notes');
     }
 
     const planId = planIdInput;
-    const expiryInterval = billingCycle === 'yearly' ? '1 year' : '1 month';
 
-    console.log(`📡 Razorpay Webhook: Processing capture for Company ${companyId}, Plan ${planId}`);
+    console.log(`[Razorpay Webhook] Processing capture | Company ID: ${companyId} | Plan ID: ${planId} | Payment ID: ${paymentId}`);
 
     await pool.query('BEGIN');
 
-    // ── Duplicate Check ─────────────────────────────
+    // Duplicate Check
     const duplicateCheck = await pool.query(
       `SELECT id FROM subscription_events WHERE metadata->>'razorpay_payment_id' = $1`,
       [paymentId]
@@ -81,21 +75,28 @@ router.post('/razorpay', async (req, res) => {
 
     if (duplicateCheck.rows.length > 0) {
       await pool.query('ROLLBACK');
-      console.log('ℹ️ Webhook: Already processed payment', paymentId);
+      console.log(`[Razorpay Webhook] Payment ${paymentId} already processed.`);
+      invalidatePlanCache(companyId);
       return res.json({ status: 'ok', message: 'Already processed' });
     }
 
-    // Update Company
-    await pool.query(
+    // Update Company Plan & Subscription Expiry Dates
+    const updateResult = await pool.query(
       `UPDATE companies 
        SET plan_id = $1, 
            subscription_status = 'active', 
            is_on_trial = FALSE, 
-           subscription_expires_at = COALESCE(GREATEST(subscription_expires_at, NOW()), NOW()) + INTERVAL $2,
+           subscription_expires_at = COALESCE(GREATEST(subscription_expires_at, NOW()), NOW()) + (CASE WHEN $2 = 'yearly' THEN INTERVAL '1 year' ELSE INTERVAL '1 month' END),
            updated_at = NOW()
        WHERE id = $3`,
-      [planId, expiryInterval, companyId]
+      [planId, billingCycle, companyId]
     );
+
+    if (updateResult.rowCount === 0) {
+      await pool.query('ROLLBACK');
+      console.error(`❌ [Razorpay Webhook] UPDATE companies modified 0 rows for Company ID ${companyId}`);
+      return res.status(404).send('Company record not found');
+    }
 
     // Log Event
     await pool.query(
@@ -110,21 +111,16 @@ router.post('/razorpay', async (req, res) => {
     );
 
     await pool.query('COMMIT');
+    console.log(`[Razorpay Webhook] Transaction Committed Successfully for Company ID: ${companyId}`);
 
-    // 📣 Notify & Cache Invalidation
+    // Invalidate Redis Plan Cache
     invalidatePlanCache(companyId);
-    
-    if (userId) {
-      const planNameMap = { 1: 'Free', 2: 'Basic', 3: 'Pro' };
-      const planName = planNameMap[planId] || 'Basic';
-      notifyPlanUpgrade(userId, companyId, planName).catch(e => console.error('Push Error Webhook:', e.message));
-    }
 
-    res.json({ status: 'success' });
+    res.json({ status: 'ok', message: 'Subscription activated via webhook' });
   } catch (err) {
-    console.error('❌ Razorpay Webhook Error:', err);
-    Sentry.captureException(err);
-    res.status(500).send('Internal Server Error');
+    await pool.query('ROLLBACK').catch(() => {});
+    console.error('❌ [Razorpay Webhook] Error:', err);
+    res.status(500).send('Internal server error');
   }
 });
 

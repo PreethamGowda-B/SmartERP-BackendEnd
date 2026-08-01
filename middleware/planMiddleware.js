@@ -142,9 +142,10 @@ async function loadPlan(req, res, next) {
  * @param {string|number} companyId
  */
 function invalidatePlanCache(companyId) {
-  const cacheKey = `plan:${companyId}`;
+  if (!companyId) return;
   if (redisClient && redisClient.status === 'ready') {
-    redisClient.del(cacheKey).catch(err => console.warn('⚠️ Redis plan cache delete error:', err.message));
+    const keys = [`plan:${companyId}`, `plan:${String(companyId)}`, `company_suspended:${companyId}`, `company_suspended:${String(companyId)}` ];
+    redisClient.del(keys).catch(err => console.warn('⚠️ Redis plan cache delete error:', err.message));
   }
 }
 

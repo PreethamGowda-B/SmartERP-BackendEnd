@@ -15,7 +15,7 @@ END $$;
 
 -- 2. Company AR Collection Policies Table
 CREATE TABLE IF NOT EXISTS ar_company_policies (
-  company_id UUID PRIMARY KEY REFERENCES companies(id) ON DELETE CASCADE,
+  company_id INTEGER PRIMARY KEY REFERENCES companies(id) ON DELETE CASCADE,
   is_auto_reminders_enabled BOOLEAN DEFAULT TRUE,
   auto_credit_hold_days INT DEFAULT 30,
   max_early_payment_discount_pct NUMERIC(5,2) DEFAULT 2.00,
@@ -25,8 +25,8 @@ CREATE TABLE IF NOT EXISTS ar_company_policies (
 -- 3. AR Collection Tracking Schedules Table
 CREATE TABLE IF NOT EXISTS ar_collection_schedules (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-  invoice_id INT NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  invoice_id UUID NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
   customer_id UUID REFERENCES users(id),
   customer_name VARCHAR(255) NOT NULL,
   customer_phone VARCHAR(50),
@@ -46,7 +46,7 @@ CREATE TABLE IF NOT EXISTS ar_collection_schedules (
 CREATE TABLE IF NOT EXISTS ar_collection_logs (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   schedule_id UUID NOT NULL REFERENCES ar_collection_schedules(id) ON DELETE CASCADE,
-  company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
   stage ar_stage NOT NULL,
   channel ar_channel NOT NULL,
   message_body TEXT NOT NULL,
@@ -66,10 +66,10 @@ ALTER TABLE ar_collection_schedules ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ar_collection_logs ENABLE ROW LEVEL SECURITY;
 
 DROP POLICY IF EXISTS tenant_isolation_ar_policies ON ar_company_policies;
-CREATE POLICY tenant_isolation_ar_policies ON ar_company_policies FOR ALL USING (company_id = NULLIF(current_setting('app.current_company_id', true), '')::uuid);
+CREATE POLICY tenant_isolation_ar_policies ON ar_company_policies FOR ALL USING (company_id::text = NULLIF(current_setting('app.current_company_id', true), ''));
 
 DROP POLICY IF EXISTS tenant_isolation_ar_schedules ON ar_collection_schedules;
-CREATE POLICY tenant_isolation_ar_schedules ON ar_collection_schedules FOR ALL USING (company_id = NULLIF(current_setting('app.current_company_id', true), '')::uuid);
+CREATE POLICY tenant_isolation_ar_schedules ON ar_collection_schedules FOR ALL USING (company_id::text = NULLIF(current_setting('app.current_company_id', true), ''));
 
 DROP POLICY IF EXISTS tenant_isolation_ar_logs ON ar_collection_logs;
-CREATE POLICY tenant_isolation_ar_logs ON ar_collection_logs FOR ALL USING (company_id = NULLIF(current_setting('app.current_company_id', true), '')::uuid);
+CREATE POLICY tenant_isolation_ar_logs ON ar_collection_logs FOR ALL USING (company_id::text = NULLIF(current_setting('app.current_company_id', true), ''));

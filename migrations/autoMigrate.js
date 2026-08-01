@@ -200,6 +200,12 @@ const NUMBERED_MIGRATIONS = [
     '003_otp_hashing.sql',
     '004_internal_messaging.sql',
     '005_messaging_phase2.sql',
+    '006_gst_reconciliation.sql',
+    '007_inventory_forecasting.sql',
+    '008_ar_collections.sql',
+    '009_payroll_validation.sql',
+    '010_crm_sales_agent.sql',
+    '011_standardize_uuid_and_core_rls.sql',
 ];
 
 async function runNumberedMigrations() {

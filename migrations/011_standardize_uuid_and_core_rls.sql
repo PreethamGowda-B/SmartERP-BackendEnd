@@ -1,35 +1,13 @@
 -- ====================================================================
--- SmartERP Migration 011: Standardize company_id to UUID & Core Tables RLS
+-- SmartERP Migration 011: Core Tables Row-Level Security (RLS) Engine
 -- ====================================================================
 
--- ── 1. Standardize company_id Data Type to UUID Across Core Tables ──────────────
-
-DO $$ 
-BEGIN
-  -- Helper block to safely alter column company_id to UUID on core tables
-  BEGIN ALTER TABLE users ALTER COLUMN company_id TYPE UUID USING company_id::text::uuid; EXCEPTION WHEN OTHERS THEN NULL; END;
-  BEGIN ALTER TABLE jobs ALTER COLUMN company_id TYPE UUID USING company_id::text::uuid; EXCEPTION WHEN OTHERS THEN NULL; END;
-  BEGIN ALTER TABLE attendance ALTER COLUMN company_id TYPE UUID USING company_id::text::uuid; EXCEPTION WHEN OTHERS THEN NULL; END;
-  BEGIN ALTER TABLE payroll ALTER COLUMN company_id TYPE UUID USING company_id::text::uuid; EXCEPTION WHEN OTHERS THEN NULL; END;
-  BEGIN ALTER TABLE inventory_items ALTER COLUMN company_id TYPE UUID USING company_id::text::uuid; EXCEPTION WHEN OTHERS THEN NULL; END;
-  BEGIN ALTER TABLE notifications ALTER COLUMN company_id TYPE UUID USING company_id::text::uuid; EXCEPTION WHEN OTHERS THEN NULL; END;
-  BEGIN ALTER TABLE messages ALTER COLUMN company_id TYPE UUID USING company_id::text::uuid; EXCEPTION WHEN OTHERS THEN NULL; END;
-  BEGIN ALTER TABLE employee_profiles ALTER COLUMN company_id TYPE UUID USING company_id::text::uuid; EXCEPTION WHEN OTHERS THEN NULL; END;
-  BEGIN ALTER TABLE material_requests ALTER COLUMN company_id TYPE UUID USING company_id::text::uuid; EXCEPTION WHEN OTHERS THEN NULL; END;
-  BEGIN ALTER TABLE employee_documents ALTER COLUMN company_id TYPE UUID USING company_id::text::uuid; EXCEPTION WHEN OTHERS THEN NULL; END;
-  BEGIN ALTER TABLE subscriptions ALTER COLUMN company_id TYPE UUID USING company_id::text::uuid; EXCEPTION WHEN OTHERS THEN NULL; END;
-  BEGIN ALTER TABLE subscription_events ALTER COLUMN company_id TYPE UUID USING company_id::text::uuid; EXCEPTION WHEN OTHERS THEN NULL; END;
-  BEGIN ALTER TABLE activities ALTER COLUMN company_id TYPE UUID USING company_id::text::uuid; EXCEPTION WHEN OTHERS THEN NULL; END;
-  BEGIN ALTER TABLE customers ALTER COLUMN company_id TYPE UUID USING company_id::text::uuid; EXCEPTION WHEN OTHERS THEN NULL; END;
-  BEGIN ALTER TABLE job_messages ALTER COLUMN company_id TYPE UUID USING company_id::text::uuid; EXCEPTION WHEN OTHERS THEN NULL; END;
-END $$;
-
--- ── 2. Enable & Enforce PostgreSQL RLS Policies on ALL Core Tables ──────────────
+-- ── Enable & Enforce PostgreSQL RLS Policies on ALL Core Tables ──────────────
 
 -- Macro helper applied to each core table:
 --  - Allow if app.bypass_rls = 'on' (migrations, system cron jobs)
 --  - Allow if app.current_role = 'super_admin' (platform management)
---  - Allow if company_id = NULLIF(current_setting('app.current_company_id', true), '')::uuid
+--  - Allow if company_id::text = NULLIF(current_setting('app.current_company_id', true), '')
 --  - Deny everything else (unset session context returns 0 rows)
 
 -- Table: users
@@ -39,7 +17,7 @@ CREATE POLICY rls_tenant_isolation_users ON users FOR ALL USING (
   current_setting('app.bypass_rls', true) = 'on'
   OR current_setting('app.current_role', true) = 'super_admin'
   OR current_setting('app.role', true) = 'admin_bypass'
-  OR company_id = NULLIF(current_setting('app.current_company_id', true), '')::uuid
+  OR company_id::text = NULLIF(current_setting('app.current_company_id', true), '')
 );
 
 -- Table: jobs
@@ -49,7 +27,7 @@ CREATE POLICY rls_tenant_isolation_jobs ON jobs FOR ALL USING (
   current_setting('app.bypass_rls', true) = 'on'
   OR current_setting('app.current_role', true) = 'super_admin'
   OR current_setting('app.role', true) = 'admin_bypass'
-  OR company_id = NULLIF(current_setting('app.current_company_id', true), '')::uuid
+  OR company_id::text = NULLIF(current_setting('app.current_company_id', true), '')
 );
 
 -- Table: attendance
@@ -59,7 +37,7 @@ CREATE POLICY rls_tenant_isolation_attendance ON attendance FOR ALL USING (
   current_setting('app.bypass_rls', true) = 'on'
   OR current_setting('app.current_role', true) = 'super_admin'
   OR current_setting('app.role', true) = 'admin_bypass'
-  OR company_id = NULLIF(current_setting('app.current_company_id', true), '')::uuid
+  OR company_id::text = NULLIF(current_setting('app.current_company_id', true), '')
 );
 
 -- Table: payroll
@@ -69,7 +47,7 @@ CREATE POLICY rls_tenant_isolation_payroll ON payroll FOR ALL USING (
   current_setting('app.bypass_rls', true) = 'on'
   OR current_setting('app.current_role', true) = 'super_admin'
   OR current_setting('app.role', true) = 'admin_bypass'
-  OR company_id = NULLIF(current_setting('app.current_company_id', true), '')::uuid
+  OR company_id::text = NULLIF(current_setting('app.current_company_id', true), '')
 );
 
 -- Table: inventory_items
@@ -79,7 +57,7 @@ CREATE POLICY rls_tenant_isolation_inventory_items ON inventory_items FOR ALL US
   current_setting('app.bypass_rls', true) = 'on'
   OR current_setting('app.current_role', true) = 'super_admin'
   OR current_setting('app.role', true) = 'admin_bypass'
-  OR company_id = NULLIF(current_setting('app.current_company_id', true), '')::uuid
+  OR company_id::text = NULLIF(current_setting('app.current_company_id', true), '')
 );
 
 -- Table: notifications
@@ -89,7 +67,7 @@ CREATE POLICY rls_tenant_isolation_notifications ON notifications FOR ALL USING 
   current_setting('app.bypass_rls', true) = 'on'
   OR current_setting('app.current_role', true) = 'super_admin'
   OR current_setting('app.role', true) = 'admin_bypass'
-  OR company_id = NULLIF(current_setting('app.current_company_id', true), '')::uuid
+  OR company_id::text = NULLIF(current_setting('app.current_company_id', true), '')
 );
 
 -- Table: messages
@@ -99,7 +77,7 @@ CREATE POLICY rls_tenant_isolation_messages ON messages FOR ALL USING (
   current_setting('app.bypass_rls', true) = 'on'
   OR current_setting('app.current_role', true) = 'super_admin'
   OR current_setting('app.role', true) = 'admin_bypass'
-  OR company_id = NULLIF(current_setting('app.current_company_id', true), '')::uuid
+  OR company_id::text = NULLIF(current_setting('app.current_company_id', true), '')
 );
 
 -- Table: employee_profiles
@@ -109,7 +87,7 @@ CREATE POLICY rls_tenant_isolation_employee_profiles ON employee_profiles FOR AL
   current_setting('app.bypass_rls', true) = 'on'
   OR current_setting('app.current_role', true) = 'super_admin'
   OR current_setting('app.role', true) = 'admin_bypass'
-  OR company_id = NULLIF(current_setting('app.current_company_id', true), '')::uuid
+  OR company_id::text = NULLIF(current_setting('app.current_company_id', true), '')
 );
 
 -- Table: material_requests
@@ -119,7 +97,7 @@ CREATE POLICY rls_tenant_isolation_material_requests ON material_requests FOR AL
   current_setting('app.bypass_rls', true) = 'on'
   OR current_setting('app.current_role', true) = 'super_admin'
   OR current_setting('app.role', true) = 'admin_bypass'
-  OR company_id = NULLIF(current_setting('app.current_company_id', true), '')::uuid
+  OR company_id::text = NULLIF(current_setting('app.current_company_id', true), '')
 );
 
 -- Table: employee_documents
@@ -129,7 +107,7 @@ CREATE POLICY rls_tenant_isolation_employee_documents ON employee_documents FOR 
   current_setting('app.bypass_rls', true) = 'on'
   OR current_setting('app.current_role', true) = 'super_admin'
   OR current_setting('app.role', true) = 'admin_bypass'
-  OR company_id = NULLIF(current_setting('app.current_company_id', true), '')::uuid
+  OR company_id::text = NULLIF(current_setting('app.current_company_id', true), '')
 );
 
 -- Table: subscriptions
@@ -139,7 +117,7 @@ CREATE POLICY rls_tenant_isolation_subscriptions ON subscriptions FOR ALL USING 
   current_setting('app.bypass_rls', true) = 'on'
   OR current_setting('app.current_role', true) = 'super_admin'
   OR current_setting('app.role', true) = 'admin_bypass'
-  OR company_id = NULLIF(current_setting('app.current_company_id', true), '')::uuid
+  OR company_id::text = NULLIF(current_setting('app.current_company_id', true), '')
 );
 
 -- Table: subscription_events
@@ -149,7 +127,7 @@ CREATE POLICY rls_tenant_isolation_subscription_events ON subscription_events FO
   current_setting('app.bypass_rls', true) = 'on'
   OR current_setting('app.current_role', true) = 'super_admin'
   OR current_setting('app.role', true) = 'admin_bypass'
-  OR company_id = NULLIF(current_setting('app.current_company_id', true), '')::uuid
+  OR company_id::text = NULLIF(current_setting('app.current_company_id', true), '')
 );
 
 -- Table: activities
@@ -159,7 +137,7 @@ CREATE POLICY rls_tenant_isolation_activities ON activities FOR ALL USING (
   current_setting('app.bypass_rls', true) = 'on'
   OR current_setting('app.current_role', true) = 'super_admin'
   OR current_setting('app.role', true) = 'admin_bypass'
-  OR company_id = NULLIF(current_setting('app.current_company_id', true), '')::uuid
+  OR company_id::text = NULLIF(current_setting('app.current_company_id', true), '')
 );
 
 -- Table: customers
@@ -171,7 +149,7 @@ DO $$ BEGIN
       current_setting(''app.bypass_rls'', true) = ''on''
       OR current_setting(''app.current_role'', true) = ''super_admin''
       OR current_setting(''app.role'', true) = ''admin_bypass''
-      OR company_id = NULLIF(current_setting(''app.current_company_id'', true), '''')::uuid
+      OR company_id::text = NULLIF(current_setting(''app.current_company_id'', true), '''')
     )';
   END IF;
 END $$;

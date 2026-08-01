@@ -19,7 +19,7 @@ END $$;
 -- 2. Payroll Validation Runs Table
 CREATE TABLE IF NOT EXISTS payroll_validation_runs (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
   created_by UUID NOT NULL REFERENCES users(id),
   month INT NOT NULL,
   year INT NOT NULL,
@@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS payroll_validation_runs (
 CREATE TABLE IF NOT EXISTS payroll_validation_flags (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   validation_run_id UUID NOT NULL REFERENCES payroll_validation_runs(id) ON DELETE CASCADE,
-  company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
   user_id UUID REFERENCES users(id),
   employee_name VARCHAR(255),
   flag_type payroll_flag_type NOT NULL,
@@ -62,7 +62,7 @@ ALTER TABLE payroll_validation_runs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE payroll_validation_flags ENABLE ROW LEVEL SECURITY;
 
 DROP POLICY IF EXISTS tenant_isolation_payroll_val_runs ON payroll_validation_runs;
-CREATE POLICY tenant_isolation_payroll_val_runs ON payroll_validation_runs FOR ALL USING (company_id = NULLIF(current_setting('app.current_company_id', true), '')::uuid);
+CREATE POLICY tenant_isolation_payroll_val_runs ON payroll_validation_runs FOR ALL USING (company_id::text = NULLIF(current_setting('app.current_company_id', true), ''));
 
 DROP POLICY IF EXISTS tenant_isolation_payroll_val_flags ON payroll_validation_flags;
-CREATE POLICY tenant_isolation_payroll_val_flags ON payroll_validation_flags FOR ALL USING (company_id = NULLIF(current_setting('app.current_company_id', true), '')::uuid);
+CREATE POLICY tenant_isolation_payroll_val_flags ON payroll_validation_flags FOR ALL USING (company_id::text = NULLIF(current_setting('app.current_company_id', true), ''));

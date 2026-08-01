@@ -21,7 +21,7 @@ END $$;
 
 -- 2. Company GST Settings Table
 CREATE TABLE IF NOT EXISTS gst_company_settings (
-  company_id UUID PRIMARY KEY REFERENCES companies(id) ON DELETE CASCADE,
+  company_id INTEGER PRIMARY KEY REFERENCES companies(id) ON DELETE CASCADE,
   is_auto_payment_block_enabled BOOLEAN DEFAULT FALSE,
   auto_approve_confidence_threshold NUMERIC(5,2) DEFAULT 90.00,
   canonical_tolerance_amount NUMERIC(10,2) DEFAULT 5.00,
@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS gst_company_settings (
 -- 3. Header Table: Main Reconciliation Session
 CREATE TABLE IF NOT EXISTS gst_reconciliation_runs (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
   created_by UUID NOT NULL REFERENCES users(id),
   financial_period VARCHAR(7) NOT NULL, -- YYYY-MM
   gstr_type gstr_doc_type NOT NULL DEFAULT 'GSTR_2B',
@@ -56,7 +56,7 @@ CREATE TABLE IF NOT EXISTS gst_reconciliation_runs (
 CREATE TABLE IF NOT EXISTS gst_reconciliation_items (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   reconciliation_run_id UUID NOT NULL REFERENCES gst_reconciliation_runs(id) ON DELETE CASCADE,
-  company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
   supplier_gstin VARCHAR(15) NOT NULL,
   supplier_name VARCHAR(255),
   invoice_number_books VARCHAR(100),
@@ -83,7 +83,7 @@ CREATE TABLE IF NOT EXISTS gst_reconciliation_items (
 -- 5. Vendor Compliance Rating Table
 CREATE TABLE IF NOT EXISTS gst_vendor_compliance (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
   supplier_gstin VARCHAR(15) NOT NULL,
   supplier_name VARCHAR(255) NOT NULL,
   total_invoices_received INT DEFAULT 0,
@@ -108,16 +108,16 @@ ALTER TABLE gst_vendor_compliance ENABLE ROW LEVEL SECURITY;
 
 DROP POLICY IF EXISTS tenant_isolation_gst_settings ON gst_company_settings;
 CREATE POLICY tenant_isolation_gst_settings ON gst_company_settings
-  FOR ALL USING (company_id = NULLIF(current_setting('app.current_company_id', true), '')::uuid);
+  FOR ALL USING (company_id::text = NULLIF(current_setting('app.current_company_id', true), ''));
 
 DROP POLICY IF EXISTS tenant_isolation_gst_runs ON gst_reconciliation_runs;
 CREATE POLICY tenant_isolation_gst_runs ON gst_reconciliation_runs
-  FOR ALL USING (company_id = NULLIF(current_setting('app.current_company_id', true), '')::uuid);
+  FOR ALL USING (company_id::text = NULLIF(current_setting('app.current_company_id', true), ''));
 
 DROP POLICY IF EXISTS tenant_isolation_gst_items ON gst_reconciliation_items;
 CREATE POLICY tenant_isolation_gst_items ON gst_reconciliation_items
-  FOR ALL USING (company_id = NULLIF(current_setting('app.current_company_id', true), '')::uuid);
+  FOR ALL USING (company_id::text = NULLIF(current_setting('app.current_company_id', true), ''));
 
 DROP POLICY IF EXISTS tenant_isolation_gst_compliance ON gst_vendor_compliance;
 CREATE POLICY tenant_isolation_gst_compliance ON gst_vendor_compliance
-  FOR ALL USING (company_id = NULLIF(current_setting('app.current_company_id', true), '')::uuid);
+  FOR ALL USING (company_id::text = NULLIF(current_setting('app.current_company_id', true), ''));

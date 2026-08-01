@@ -13,7 +13,7 @@ BEGIN;
 
 CREATE TABLE IF NOT EXISTS message_attachments (
   id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  message_id  UUID NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+  message_id  BIGINT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
   company_id  INTEGER NOT NULL,
   file_url    TEXT NOT NULL,
   file_name   VARCHAR(255),
@@ -32,7 +32,7 @@ CREATE INDEX IF NOT EXISTS idx_msg_attachments_message
 
 CREATE TABLE IF NOT EXISTS message_read_receipts (
   id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  message_id UUID NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+  message_id BIGINT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
   user_id    UUID NOT NULL REFERENCES users(id),
   status     VARCHAR(20) CHECK (status IN ('delivered', 'read')),
   created_at TIMESTAMP DEFAULT NOW(),

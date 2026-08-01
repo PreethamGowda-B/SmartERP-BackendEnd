@@ -16,7 +16,7 @@ END $$;
 -- 2. Enhanced CRM Leads Table
 CREATE TABLE IF NOT EXISTS crm_leads_enhanced (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
   assigned_to UUID REFERENCES users(id),
   lead_name VARCHAR(255) NOT NULL,
   company_name VARCHAR(255),
@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS crm_leads_enhanced (
 CREATE TABLE IF NOT EXISTS crm_lead_activities (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   lead_id UUID NOT NULL REFERENCES crm_leads_enhanced(id) ON DELETE CASCADE,
-  company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
   created_by UUID REFERENCES users(id),
   activity_type VARCHAR(50) NOT NULL, -- 'call', 'email', 'whatsapp', 'proposal_generated', 'stage_change'
   notes TEXT NOT NULL,
@@ -53,7 +53,7 @@ ALTER TABLE crm_leads_enhanced ENABLE ROW LEVEL SECURITY;
 ALTER TABLE crm_lead_activities ENABLE ROW LEVEL SECURITY;
 
 DROP POLICY IF EXISTS tenant_isolation_crm_leads ON crm_leads_enhanced;
-CREATE POLICY tenant_isolation_crm_leads ON crm_leads_enhanced FOR ALL USING (company_id = NULLIF(current_setting('app.current_company_id', true), '')::uuid);
+CREATE POLICY tenant_isolation_crm_leads ON crm_leads_enhanced FOR ALL USING (company_id::text = NULLIF(current_setting('app.current_company_id', true), ''));
 
 DROP POLICY IF EXISTS tenant_isolation_crm_activities ON crm_lead_activities;
-CREATE POLICY tenant_isolation_crm_activities ON crm_lead_activities FOR ALL USING (company_id = NULLIF(current_setting('app.current_company_id', true), '')::uuid);
+CREATE POLICY tenant_isolation_crm_activities ON crm_lead_activities FOR ALL USING (company_id::text = NULLIF(current_setting('app.current_company_id', true), ''));

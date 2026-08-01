@@ -192,7 +192,8 @@ if (process.env.NODE_ENV === "production") {
       '/api/auth/verify-otp', '/api/v1/auth/verify-otp',
       '/api/auth/validate-company', '/api/v1/auth/validate-company',
       '/api/auth/set-cookie', '/api/v1/auth/set-cookie',
-      '/api/webhook', '/api/v1/webhook'
+      '/api/webhook', '/api/v1/webhook',
+      '/webhooks/whatsapp', '/api/webhooks/whatsapp', '/api/v1/webhooks/whatsapp'
     ];
 
     const normalizedPath = req.path.replace(/\/$/, '') || '/';
@@ -648,6 +649,12 @@ v1Router.use("/payroll-validation", require("./routes/payrollValidation"));
 v1Router.use("/crm-sales", require("./routes/crmSales"));
 v1Router.use("/audit-logs", require("./routes/ai.routes"));
 
+
+// ✅ Meta WhatsApp Business Cloud API Webhook routes
+const whatsappRoutes = require("./routes/whatsapp");
+app.use("/webhooks/whatsapp", whatsappRoutes);
+app.use("/api/webhooks/whatsapp", whatsappRoutes);
+v1Router.use("/webhooks/whatsapp", whatsappRoutes);
 
 // Mount v1 router
 app.use("/api/v1", v1Router);

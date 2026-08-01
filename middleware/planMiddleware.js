@@ -47,8 +47,22 @@ async function loadPlan(req, res, next) {
     );
 
     if (result.rows.length === 0) {
-      return res.status(500).json({
-        message: 'Unable to verify subscription plan. Please try again later.'
+      // Graceful fallback: company has no valid plan (null plan_id or bad JOIN).
+      // Default to Free plan so users can still access the app with limited features.
+      console.warn(`⚠️ planMiddleware: No plan found for company ${companyId}. Falling back to Free plan.`);
+      try {
+        const freeResult = await pool.query(
+          `SELECT id, name, employee_limit, max_inventory_items, max_material_requests, messages_history_days, features FROM plans WHERE id = 1`
+        );
+        if (freeResult.rows.length > 0) {
+          req.plan = { ...freeResult.rows[0], is_trial: false, days_remaining: 0, trial_ends_at: null };
+          return next();
+        }
+      } catch (fallbackErr) {
+        console.error('❌ planMiddleware: Free plan fallback also failed:', fallbackErr.message);
+      }
+      return res.status(503).json({
+        message: 'Subscription plan data unavailable. Please contact support.'
       });
     }
 

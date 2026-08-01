@@ -10,12 +10,13 @@ class ReActEngine {
    * @param {string} params.userPrompt - User question or command
    * @param {Array} [params.history] - Chat history
    * @param {Object} params.context - Context object from ContextEngine
+   * @param {string} [params.systemPromptOverride] - Optional pre-built system prompt (for model-scope personas)
    * @returns {Promise<Object>} Structured AI response payload
    */
-  static async run({ userPrompt, history = [], context }) {
+  static async run({ userPrompt, history = [], context, systemPromptOverride = null }) {
     const startTime = Date.now();
     const provider = ProviderFactory.getProvider();
-    const systemPrompt = ContextEngine.generateSystemPrompt(context);
+    const systemPrompt = systemPromptOverride || ContextEngine.generateSystemPrompt(context);
     const availableTools = pluginRegistry.getAvailableTools(context);
 
     // Build message trajectory

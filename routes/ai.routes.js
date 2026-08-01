@@ -82,8 +82,18 @@ router.post(
   authenticateToken,
   loadPlan,
   async (req, res) => {
+    const startTime = Date.now();
     try {
-      const { message, history = [], clientContext = {}, currentPortal, currentModule, currentPagePath } = req.body;
+      const {
+        message,
+        history = [],
+        clientContext = {},
+        currentPortal,
+        currentModule,
+        currentPagePath,
+        modelScopes = [],    // NEW: Array of specialist scopes for multi-agent mode
+        autoMode = true,     // NEW: Whether auto model selection is enabled
+      } = req.body;
 
       if (!message) {
         return res.status(400).json({ error: "Message prompt is required." });
@@ -109,7 +119,7 @@ router.post(
           if (count > maxAllowed) {
             const ttl = await redisClient.ttl(rateLimitKey);
             return res.status(429).json({
-              error: `AI Agent rate limit reached (${maxAllowed} requests/hour for ${planTier.toUpperCase()} plan). Upgrade to increase limits.`,
+              error: `AI rate limit reached (${maxAllowed} requests/hour for ${planTier.toUpperCase()} plan). Upgrade to increase limits.`,
               retryAfter: ttl,
               planTier,
             });
@@ -129,7 +139,6 @@ router.post(
             planTier
           );
 
-          // Log Interception for false positive/negative evaluation & audit
           await MetricsService.logAIInterception({
             userContext,
             prompt: cleanMessage,
@@ -137,7 +146,6 @@ router.post(
             planTier,
           });
 
-          // Return canned response immediately BEFORE calling Groq
           return res.json({
             text: "This feature requires the Pro Plan. Upgrade to unlock AI business analysis, forecasting, company insights, and advanced automation.",
             widget: null,
@@ -146,6 +154,7 @@ router.post(
             sources: ["Subscription Guard"],
             intercepted: true,
             matchedKeyword,
+            suggestedFollowUps: ["View pricing plans", "What's included in Pro?"],
           });
         }
       }
@@ -160,14 +169,115 @@ router.post(
 
       const context = ContextEngine.buildContext(req, mergedClientContext, planTier);
 
-      // 6. Run ReAct Agent Loop
-      const result = await ReActEngine.run({
-        userPrompt: cleanMessage,
-        history,
-        context,
+      // 6. Determine Model Scope (Auto-detection or manual)
+      let resolvedScopes = [];
+      let autoSelectedModel = null;
+
+      if (modelScopes && modelScopes.length > 0) {
+        // Manual selection — use provided scopes
+        resolvedScopes = modelScopes;
+      } else if (autoMode !== false) {
+        // Auto-detection from prompt
+        const detectedScope = ContextEngine.detectModelScope(cleanMessage);
+        resolvedScopes = [detectedScope];
+        autoSelectedModel = detectedScope;
+      } else {
+        resolvedScopes = ["general"];
+      }
+
+      // 7. Execute ReAct Engine per scope (sequential multi-agent)
+      let finalResult;
+
+      if (resolvedScopes.length <= 1) {
+        // Single scope execution
+        const scope = resolvedScopes[0] || "general";
+        const systemPrompt = ContextEngine.generateSystemPrompt(context, scope);
+
+        finalResult = await ReActEngine.run({
+          userPrompt: cleanMessage,
+          history,
+          context,
+          systemPromptOverride: systemPrompt,
+        });
+
+        finalResult.autoSelectedModel = autoSelectedModel;
+        finalResult.activeModelScope = scope;
+        finalResult.suggestedFollowUps = ContextEngine.getSuggestedFollowUps(scope);
+      } else {
+        // Multi-agent: run sequentially per scope, combine responses
+        const scopeResults = [];
+        for (const scope of resolvedScopes) {
+          try {
+            const systemPrompt = ContextEngine.generateSystemPrompt(context, scope);
+            const scopeResult = await ReActEngine.run({
+              userPrompt: cleanMessage,
+              history,
+              context,
+              systemPromptOverride: systemPrompt,
+            });
+            scopeResults.push({ scope, result: scopeResult });
+          } catch (scopeErr) {
+            console.warn(`⚠️ Multi-agent scope '${scope}' failed:`, scopeErr.message);
+            scopeResults.push({
+              scope,
+              result: { text: `${scope} AI encountered an issue.`, sources: [], confidenceScore: 0 },
+            });
+          }
+        }
+
+        // Combine multi-scope responses
+        const combinedText = scopeResults
+          .map(({ scope, result }) => {
+            const label = scope.charAt(0).toUpperCase() + scope.slice(1);
+            return `**${label} AI:**\n${result.text}`;
+          })
+          .join("\n\n---\n\n");
+
+        const combinedSources = [...new Set(scopeResults.flatMap((r) => r.result.sources || []))];
+        const avgConfidence =
+          scopeResults.reduce((sum, r) => sum + (r.result.confidenceScore || 0), 0) /
+          scopeResults.length;
+        const widgets = scopeResults.filter((r) => r.result.widget).map((r) => r.result.widget);
+
+        finalResult = {
+          text: combinedText,
+          widget: widgets.length > 0 ? widgets[0] : null,
+          navigation: scopeResults.find((r) => r.result.navigation)?.result.navigation || null,
+          confidenceScore: parseFloat(avgConfidence.toFixed(4)),
+          sources: combinedSources,
+          telemetry: scopeResults[0]?.result.telemetry || { latencyMs: Date.now() - startTime },
+          autoSelectedModel: null,
+          activeModelScope: resolvedScopes.join("+"),
+          suggestedFollowUps: ContextEngine.getSuggestedFollowUps(resolvedScopes[0]),
+          multiAgent: true,
+          scopesUsed: resolvedScopes,
+        };
+      }
+
+      // 8. Extended Audit Logging
+      const latencyMs = Date.now() - startTime;
+      await MetricsService.logAIAuditEvent({
+        userContext: context,
+        toolName: `AI_REQUEST:${finalResult.activeModelScope || "general"}`,
+        params: { scope: finalResult.activeModelScope, multiAgent: resolvedScopes.length > 1 },
+        status: "SUCCESS",
+        portal: context.ui.portal,
+        module: context.ui.module,
+        planTier,
+        modelScope: finalResult.activeModelScope,
+        latencyMs,
+        confidenceScore: finalResult.confidenceScore,
+        blocked: false,
+        promptPreview: cleanMessage,
       });
 
-      res.json(result);
+      finalResult.telemetry = {
+        ...(finalResult.telemetry || {}),
+        latencyMs,
+        planTier,
+      };
+
+      res.json(finalResult);
     } catch (error) {
       console.error("❌ SmartERP AI Agent Error:", error);
       res.status(500).json({
@@ -204,7 +314,56 @@ router.post(
   }
 );
 
-// Legacy route compatibility
+// ── GET /api/ai/stats ─────────────────────────────────────────────────────────
+// AI Usage Statistics for Super Admin Operations Dashboard
+router.get(
+  "/stats",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      if (req.user?.role !== "super_admin") {
+        return res.status(403).json({ error: "Access denied. Super Admin only." });
+      }
+
+      const stats = await MetricsService.getAIStats();
+      res.json(stats);
+    } catch (error) {
+      console.error("❌ AI Stats Error:", error);
+      res.status(500).json({ error: "Failed to retrieve AI statistics." });
+    }
+  }
+);
+
+// ── GET /api/ai/audit-logs ───────────────────────────────────────────────────
+// Paginated AI Audit Logs for Super Admin Operations Dashboard
+router.get(
+  "/audit-logs",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      if (req.user?.role !== "super_admin") {
+        return res.status(403).json({ error: "Access denied. Super Admin only." });
+      }
+
+      const { page = 1, limit = 50, companyId, status, fromDate } = req.query;
+
+      const result = await MetricsService.getAuditLogs({
+        page: parseInt(page),
+        limit: parseInt(limit),
+        companyId: companyId || null,
+        status: status || null,
+        fromDate: fromDate || null,
+      });
+
+      res.json(result);
+    } catch (error) {
+      console.error("❌ AI Audit Logs Error:", error);
+      res.status(500).json({ error: "Failed to retrieve audit logs." });
+    }
+  }
+);
+
+// ── Legacy route compatibility ────────────────────────────────────────────────
 router.post(
   "/chat",
   authenticateToken,

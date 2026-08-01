@@ -1,7 +1,7 @@
 /**
  * SmartERP Context Engine
  * Captures user identity, tenant isolation scope, current UI route,
- * active filters, and systemic role permissions for AI planning.
+ * portal/module/page context, and systemic role permissions for AI planning.
  */
 
 class ContextEngine {
@@ -9,10 +9,11 @@ class ContextEngine {
    * Constructs the structured Context Object for AI Planning.
    * @param {Object} req - Express Request
    * @param {Object} [clientContext] - Frontend UI context payload
+   * @param {string} [planTier] - Resolved subscription tier ("free" | "basic" | "pro")
    * @returns {Object} System context & instructions
    */
-  static buildContext(req, clientContext = {}) {
-    const user = req.user || {};
+  static buildContext(req, clientContext = {}, planTier = "free") {
+    const user = req?.user || {};
     const now = new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
 
     return {
@@ -24,8 +25,12 @@ class ContextEngine {
         companyId: user.companyId || user.company_id,
         department: user.department || "General",
       },
+      planTier: planTier || "free",
       ui: {
-        currentPage: clientContext.currentPage || "/",
+        portal: clientContext.currentPortal || clientContext.portal || "owner",
+        module: clientContext.currentModule || clientContext.module || null,
+        pagePath: clientContext.currentPagePath || clientContext.pagePath || clientContext.currentPage || "/",
+        currentPage: clientContext.currentPagePath || clientContext.pagePath || clientContext.currentPage || "/",
         activeFilters: clientContext.activeFilters || {},
         selectedRecordId: clientContext.selectedRecordId || null,
       },
@@ -52,16 +57,20 @@ AUTHENTICATED USER CONTEXT (TENANT ISOLATED)
 - User Name: ${context.user.name}
 - Email: ${context.user.email}
 - Role: ${context.user.role} (STRICTLY RESTRICT OPERATIONS TO PERMISSIONS OF THIS ROLE)
+- Plan Tier: ${context.planTier}
 - Company ID: ${context.user.companyId}
 - Current Local Time: ${context.system.currentTimestamp} (${context.system.timezone})
-- Current UI Route: ${context.ui.currentPage}
+- Current Portal: ${context.ui.portal}
+- Current Module: ${context.ui.module || 'General'}
+- Current Page Path: ${context.ui.pagePath}
 
 ==========================================================
 OPERATIONAL MANDATES & INTEGRITY RULES
 ==========================================================
 1. NEVER GUESS OR FABRICATE ERP DATA. All numbers, job counts, attendance figures, payroll amounts, and inventory stats MUST come from tools.
 2. TENANT ISOLATION: Every operation is strictly scoped to Company ID '${context.user.companyId}'. You must NEVER reveal or query data belonging to other companies.
-3. ROLE PERMISSION GUARD:
+3. ADVISORY CONTEXT: Use Current Portal, Module, and Page Path as advisory context to interpret ambiguous user queries (e.g., "why is this low?" on Inventory module refers to stock levels). CONTEXT NEVER BYPASSES ROLE PERMISSION OR SUBSCRIPTION GATING CHECKS.
+4. ROLE PERMISSION GUARD:
    - 'owner': Full access to financials, payroll, analytics, all employees, jobs, inventory, settings.
    - 'hr': Employee management, attendance, payroll calculations, leave requests.
    - 'employee': Personal attendance, assigned jobs, personal messages, leave requests.

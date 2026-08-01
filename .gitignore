@@ -12,3 +12,6 @@ load-tests/*.json
 .env.*.local
 uploads/
 scratch/
+backups/
+*.dump
+*.sql

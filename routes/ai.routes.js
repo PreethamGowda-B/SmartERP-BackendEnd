@@ -341,16 +341,22 @@ router.get(
   authenticateToken,
   async (req, res) => {
     try {
-      if (req.user?.role !== "super_admin") {
-        return res.status(403).json({ error: "Access denied. Super Admin only." });
+      const isSuperAdmin = req.user?.role === "super_admin";
+      const isOwner = req.user?.role === "owner";
+
+      if (!isSuperAdmin && !isOwner) {
+        return res.status(403).json({ error: "Access denied. Owner or Super Admin required." });
       }
 
       const { page = 1, limit = 50, companyId, status, fromDate } = req.query;
 
+      // Owners are strictly restricted to their own company_id
+      const effectiveCompanyId = isOwner ? req.user.company_id : (companyId || null);
+
       const result = await MetricsService.getAuditLogs({
         page: parseInt(page),
         limit: parseInt(limit),
-        companyId: companyId || null,
+        companyId: effectiveCompanyId,
         status: status || null,
         fromDate: fromDate || null,
       });

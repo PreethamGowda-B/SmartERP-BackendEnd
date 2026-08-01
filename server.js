@@ -564,6 +564,9 @@ async function runDatabaseInitialization() {
   }
 }
 
+// ✅ Create API v1 Router
+const v1Router = express.Router();
+
 // ✅ Platform Maintenance Mode Middleware
 v1Router.use(async (req, res, next) => {
   // Always bypass maintenance mode for Super Admin management API routes

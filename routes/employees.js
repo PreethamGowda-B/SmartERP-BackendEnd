@@ -339,4 +339,41 @@ router.delete('/:id', authenticateToken, async (req, res) => {
   }
 });
 
+// ─── GET /api/employees/:id/performance ────────────────────────────────────
+// Fetch average rating and customer review history for an employee
+router.get('/:id/performance', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const companyId = req.user.companyId;
+
+    const [avgResult, reviewsResult] = await Promise.all([
+      pool.query(
+        `SELECT ROUND(AVG(rating)::numeric, 1) as average_rating,
+                COUNT(id)::int as total_reviews
+         FROM job_reviews
+         WHERE employee_id = $1`,
+        [id]
+      ),
+      pool.query(
+        `SELECT r.*, j.title as job_title, c.name as customer_name
+         FROM job_reviews r
+         LEFT JOIN jobs j ON r.job_id = j.id
+         LEFT JOIN customers c ON r.customer_id = c.id
+         WHERE r.employee_id = $1
+         ORDER BY r.created_at DESC`,
+        [id]
+      )
+    ]);
+
+    res.json({
+      average_rating: parseFloat(avgResult.rows[0]?.average_rating || 0),
+      total_reviews: parseInt(avgResult.rows[0]?.total_reviews || 0),
+      reviews: reviewsResult.rows
+    });
+  } catch (err) {
+    console.error('Error fetching employee performance reviews:', err);
+    res.status(500).json({ message: 'Server error fetching performance data' });
+  }
+});
+
 module.exports = router;

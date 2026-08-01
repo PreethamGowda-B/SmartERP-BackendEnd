@@ -62,11 +62,32 @@ async function enqueueAudit(data) {
   return auditQueue.add('log', data, { removeOnComplete: true });
 }
 
+const webhookRetryQueue = connection
+  ? new Queue('webhook-retry', QUEUE_OPTS)
+  : null;
+
+/**
+ * Offload a failed webhook event to background queue for exponential retries (3 attempts).
+ */
+async function enqueueWebhookRetry(data) {
+  if (!webhookRetryQueue) {
+    console.warn('⚠️ Redis not connected. Skipping background webhook retry.');
+    return;
+  }
+  return webhookRetryQueue.add('process_failed_webhook', data, {
+    removeOnComplete: true,
+    attempts: 3,
+    backoff: { type: 'exponential', delay: 2000 },
+  });
+}
+
 module.exports = {
   notificationQueue,
   auditQueue,
+  webhookRetryQueue,
   enqueueNotification,
   enqueueAudit,
+  enqueueWebhookRetry,
   // Expose so callers that previously used redisConnection can migrate
   redisConnection: connection,
 };

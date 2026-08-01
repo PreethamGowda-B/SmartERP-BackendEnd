@@ -90,6 +90,31 @@ async function createNotification(notificationData) {
             console.error('❌ Multi-device push failed:', pushErr.message);
         }
 
+        // 3. Send WhatsApp Notification if phone exists & channel enabled (job assignment, OTP, customer status)
+        try {
+          const { isWhatsAppConfigured, sendWhatsAppTemplateMessage } = require('../services/whatsappService');
+          if (isWhatsAppConfigured()) {
+            const uRes = await pool.query('SELECT phone FROM users WHERE id = $1', [user_id]);
+            const phone = uRes.rows[0]?.phone;
+            if (phone) {
+              let templateName = 'job_status_update';
+              if (type.includes('assign')) templateName = 'job_assignment_alert';
+              else if (type.includes('otp')) templateName = 'otp_verification';
+
+              const components = [{
+                type: 'body',
+                parameters: [{ type: 'text', text: title || 'Notification' }, { type: 'text', text: message || '' }]
+              }];
+
+              await sendWhatsAppTemplateMessage(phone, templateName, 'en_US', components);
+            }
+          } else {
+            console.log(`ℹ️ [WhatsApp Channel] Skipping WhatsApp send for user ${user_id} — Meta API credentials not configured.`);
+          }
+        } catch (waErr) {
+          console.warn('⚠️ WhatsApp dispatch warning (non-fatal):', waErr.message);
+        }
+
         console.log(`✅ Notification created and broadcast to user ${user_id}:`, title);
         return notification;
     } catch (err) {

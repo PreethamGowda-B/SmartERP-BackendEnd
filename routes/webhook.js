@@ -129,6 +129,40 @@ router.post('/razorpay', async (req, res) => {
   } catch (err) {
     await pool.query('ROLLBACK').catch(() => {});
     console.error('❌ [Razorpay Webhook] Error:', err);
+
+    // Enqueue background retry job with BullMQ (3 attempts with exponential backoff)
+    try {
+      const { enqueueWebhookRetry } = require('../utils/queue');
+      const event = req.body || {};
+      const entity = event.payload?.payment?.entity || {};
+      const notes = entity.notes || {};
+      const companyId = parseInt(notes.companyId, 10) || 0;
+      const planId = parseInt(notes.planId, 10) || null;
+
+      await enqueueWebhookRetry({
+        companyId,
+        planId,
+        billingCycle: notes.billingCycle || 'monthly',
+        paymentId: entity.id || null,
+        orderId: entity.order_id || null,
+        error: err.message
+      });
+
+      if (companyId) {
+        await pool.query(
+          `INSERT INTO subscription_events (company_id, event_type, new_plan_id, metadata, created_at)
+           VALUES ($1, 'webhook_retry_enqueued', $2, $3, NOW())`,
+          [companyId, planId, JSON.stringify({
+            razorpay_payment_id: entity.id,
+            error: err.message,
+            enqueued_at: new Date().toISOString()
+          })]
+        ).catch(() => {});
+      }
+    } catch (retryErr) {
+      console.error('❌ Could not enqueue webhook retry job:', retryErr.message);
+    }
+
     res.status(500).send('Internal server error');
   }
 });

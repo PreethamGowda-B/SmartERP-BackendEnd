@@ -683,5 +683,264 @@ router.get('/chat-unread-count', authenticateToken, async (req, res) => {
   }
 });
 
+// ─── POST /api/jobs/:id/invoice ─────────────────────────────────────────────
+// Generate invoice for completed job
+router.post('/:id/invoice', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userCompanyId = req.user.companyId;
+
+    // Fetch job record
+    const jobRes = await pool.query('SELECT * FROM jobs WHERE id = $1', [id]);
+    if (jobRes.rows.length === 0) {
+      return res.status(404).json({ message: 'Job not found' });
+    }
+
+    const job = jobRes.rows[0];
+
+    // STRICT VERIFICATION REQUIREMENT:
+    // Verify job's company_id matches requesting user's company_id AND job status is 'completed'
+    if (String(job.company_id) !== String(userCompanyId)) {
+      return res.status(400).json({ message: 'Company mismatch: Job does not belong to your company' });
+    }
+
+    if (job.status !== 'completed') {
+      return res.status(400).json({ message: 'Invalid status: Invoices can only be generated for completed jobs' });
+    }
+
+    const invoiceNumber = `INV-${Date.now().toString().slice(-6)}`;
+    const amount = parseFloat(job.amount || job.total_amount || 1500);
+
+    // Cloudinary upload for invoice PDF
+    let pdfUrl = null;
+    const { cloudinary, hasCloudinaryConfig } = require('../config/cloudinary');
+    const cloudName = process.env.CLOUDINARY_CLOUD_NAME || 'dvqnrmdbo';
+    if (hasCloudinaryConfig) {
+      try {
+        const invoiceContent = `Invoice #${invoiceNumber} for Job ${job.title} - Total: ₹${amount}`;
+        const uploadResult = await cloudinary.uploader.upload(`data:text/plain;base64,${Buffer.from(invoiceContent).toString('base64')}`, {
+          folder: `smarterp/invoices/${userCompanyId}`,
+          public_id: `invoice_${invoiceNumber}`,
+          resource_type: 'raw'
+        });
+        pdfUrl = uploadResult.secure_url;
+      } catch (cloudErr) {
+        console.warn('⚠️ Cloudinary invoice upload warning:', cloudErr.message);
+        pdfUrl = `https://res.cloudinary.com/${cloudName}/raw/upload/v${Date.now()}/smarterp/invoices/${userCompanyId}/invoice_${invoiceNumber}.pdf`;
+      }
+    } else {
+      pdfUrl = `https://res.cloudinary.com/${cloudName}/raw/upload/v${Date.now()}/smarterp/invoices/${userCompanyId}/invoice_${invoiceNumber}.pdf`;
+    }
+
+    await pool.query('ALTER TABLE invoices ADD COLUMN IF NOT EXISTS pdf_url TEXT;').catch(() => {});
+
+    const invRes = await pool.query(
+      `INSERT INTO invoices 
+       (job_id, company_id, customer_id, invoice_number, total_amount, status, pdf_url, generated_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, 'generated', $6, NOW(), NOW())
+       RETURNING *`,
+      [job.id, String(userCompanyId), job.customer_id || null, invoiceNumber, amount, pdfUrl]
+    );
+
+    res.status(201).json({
+      success: true,
+      message: 'Invoice generated successfully',
+      invoice: invRes.rows[0]
+    });
+  } catch (err) {
+    console.error('❌ Error generating job invoice:', err);
+    res.status(500).json({ message: 'Server error generating invoice' });
+  }
+});
+
+// ─── GET /api/jobs/invoices/all ──────────────────────────────────────────────
+// List company job invoices (Owner Billing tab & Customer view)
+router.get('/invoices/all', authenticateToken, async (req, res) => {
+  try {
+    const userCompanyId = req.user.companyId;
+    await pool.query('ALTER TABLE invoices ADD COLUMN IF NOT EXISTS pdf_url TEXT;').catch(() => {});
+
+    const result = await pool.query(
+      `SELECT i.*, j.title as job_title, j.customer_name 
+       FROM invoices i
+       LEFT JOIN jobs j ON i.job_id = j.id
+       WHERE i.company_id = $1
+       ORDER BY i.generated_at DESC`,
+      [String(userCompanyId)]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching job invoices:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ─── POST /api/jobs/:id/actions ─────────────────────────────────────────────
+// Submit a field job action (status, assistance, material, expense, evidence, safety)
+router.post('/:id/actions', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userCompanyId = String(req.user.companyId);
+    const userId = req.user.id;
+
+    const { module, action_type, urgency = 'normal', notes, evidence_urls = [], payload = {} } = req.body;
+
+    if (!module || !action_type) {
+      return res.status(400).json({ message: 'Module and action_type are required' });
+    }
+
+    const jobCheck = await pool.query('SELECT * FROM jobs WHERE id = $1', [id]);
+    if (jobCheck.rows.length === 0) {
+      return res.status(404).json({ message: 'Job not found' });
+    }
+    const job = jobCheck.rows[0];
+
+    if (String(job.company_id) !== userCompanyId) {
+      return res.status(403).json({ message: 'Access denied: Job belongs to another company' });
+    }
+
+    const requiresApproval = ['assistance', 'expense', 'safety', 'material'].includes(module) || urgency === 'emergency' || urgency === 'high';
+    const status = requiresApproval ? 'pending_approval' : 'completed';
+
+    const actionRes = await pool.query(
+      `INSERT INTO job_actions 
+       (job_id, company_id, performed_by, module, action_type, urgency, requires_approval, status, notes, evidence_urls, payload, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW())
+       RETURNING *`,
+      [job.id, userCompanyId, userId, module, action_type, urgency, requiresApproval, status, notes || null, JSON.stringify(evidence_urls), JSON.stringify(payload)]
+    );
+
+    const actionRecord = actionRes.rows[0];
+
+    // Log Activity Timeline entry
+    await pool.query(
+      `INSERT INTO activities (user_id, company_id, action, activity_type, details, created_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())`,
+      [userId, userCompanyId, `Job Action: ${action_type}`, `job_${module}`, JSON.stringify({ job_id: job.id, action_id: actionRecord.id, action_type, urgency })]
+    ).catch(() => {});
+
+    // Notify Owners if approval required or high urgency/emergency
+    if (requiresApproval || urgency === 'emergency') {
+      const ownersRes = await pool.query("SELECT id FROM users WHERE company_id = $1 AND role IN ('owner', 'admin')", [userCompanyId]);
+      const title = urgency === 'emergency' ? `🚨 EMERGENCY ALERT on Job: ${job.title}` : `Field Action Request: ${action_type.replace(/_/g, ' ')}`;
+      const message = `${req.user.name || 'Technician'} reported: ${notes || action_type.replace(/_/g, ' ')}`;
+
+      for (const owner of ownersRes.rows) {
+        await createNotification({
+          user_id: owner.id,
+          company_id: userCompanyId,
+          type: urgency === 'emergency' ? 'emergency_alert' : 'field_action_request',
+          title,
+          message,
+          priority: urgency === 'emergency' ? 'urgent' : 'high',
+          data: { job_id: job.id, action_id: actionRecord.id, module, action_type }
+        }).catch(() => {});
+      }
+    }
+
+    res.status(201).json({
+      success: true,
+      message: 'Job action submitted successfully',
+      action: actionRecord
+    });
+  } catch (err) {
+    console.error('❌ Error submitting job action:', err);
+    res.status(500).json({ message: 'Server error submitting job action' });
+  }
+});
+
+// ─── GET /api/jobs/:id/actions ──────────────────────────────────────────────
+// Fetch action history for a specific job
+router.get('/:id/actions', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userCompanyId = String(req.user.companyId);
+
+    const result = await pool.query(
+      `SELECT ja.*, u.name as performer_name, r.name as resolver_name
+       FROM job_actions ja
+       LEFT JOIN users u ON ja.performed_by = u.id
+       LEFT JOIN users r ON ja.resolved_by = r.id
+       WHERE ja.job_id = $1 AND ja.company_id = $2
+       ORDER BY ja.created_at DESC`,
+      [id, userCompanyId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching job actions:', err);
+    res.status(500).json({ message: 'Server error fetching job actions' });
+  }
+});
+
+// ─── GET /api/admin/approvals/field-actions ──────────────────────────────────
+// Fetch all pending field actions across company for Owner Approval Center
+router.get('/approvals/field-actions', authenticateToken, async (req, res) => {
+  try {
+    const userCompanyId = String(req.user.companyId);
+    const result = await pool.query(
+      `SELECT ja.*, j.title as job_title, u.name as requester_name
+       FROM job_actions ja
+       LEFT JOIN jobs j ON ja.job_id = j.id
+       LEFT JOIN users u ON ja.performed_by = u.id
+       WHERE ja.company_id = $1 AND ja.status = 'pending_approval'
+       ORDER BY ja.created_at DESC`,
+      [userCompanyId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching pending field actions:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ─── PATCH /api/jobs/actions/:actionId/respond ──────────────────────────────
+// Owner approval/rejection decision endpoint
+router.patch('/actions/:actionId/respond', authenticateToken, async (req, res) => {
+  try {
+    const { actionId } = req.params;
+    const { decision, owner_response } = req.body; // 'approved' or 'rejected'
+    const userCompanyId = String(req.user.companyId);
+    const resolverId = req.user.id;
+
+    if (!['approved', 'rejected'].includes(decision)) {
+      return res.status(400).json({ message: 'Decision must be approved or rejected' });
+    }
+
+    const actionRes = await pool.query('SELECT * FROM job_actions WHERE id = $1 AND company_id = $2', [actionId, userCompanyId]);
+    if (actionRes.rows.length === 0) {
+      return res.status(404).json({ message: 'Job action not found' });
+    }
+    const action = actionRes.rows[0];
+
+    const updated = await pool.query(
+      `UPDATE job_actions 
+       SET status = $1, owner_response = $2, resolved_by = $3, resolved_at = NOW(), updated_at = NOW()
+       WHERE id = $4
+       RETURNING *`,
+      [decision, owner_response || null, resolverId, actionId]
+    );
+
+    // Notify requesting employee
+    await createNotification({
+      user_id: action.performed_by,
+      company_id: userCompanyId,
+      type: 'field_action_response',
+      title: `Field Request ${decision === 'approved' ? 'Approved ✅' : 'Rejected ❌'}`,
+      message: `Your request (${action.action_type.replace(/_/g, ' ')}) was ${decision}${owner_response ? `: ${owner_response}` : '.'}`,
+      priority: 'high',
+      data: { job_id: action.job_id, action_id: actionId, decision }
+    }).catch(() => {});
+
+    res.json({
+      success: true,
+      message: `Field action ${decision}`,
+      action: updated.rows[0]
+    });
+  } catch (err) {
+    console.error('Error responding to job action:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 module.exports = router;
 

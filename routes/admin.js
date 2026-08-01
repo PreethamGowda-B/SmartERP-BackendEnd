@@ -169,7 +169,7 @@ router.patch('/companies/:id/status', async (req, res) => {
 });
 
 // ─── GET /api/admin/users ───────────────────────────────────────────────────
-// Platform-wide user list
+// Platform-wide user list (UNION of Staff users and Customer accounts)
 router.get('/users', async (req, res) => {
   try {
     const page = Math.max(1, parseInt(req.query.page) || 1);
@@ -178,14 +178,18 @@ router.get('/users', async (req, res) => {
 
     const [result, countResult] = await Promise.all([
       pool.query(
-        `SELECT u.id, u.name, u.email, u.role, u.created_at, c.company_name 
+        `SELECT u.id::text, u.name, u.email, 'staff' AS user_type, u.role, u.company_id, u.created_at, c.company_name 
          FROM users u
          LEFT JOIN companies c ON u.company_id = c.id
-         ORDER BY u.created_at DESC
+         UNION ALL
+         SELECT cust.id::text, cust.name, cust.email, 'customer' AS user_type, 'customer' AS role, cust.company_id, cust.created_at, c.company_name
+         FROM customers cust
+         LEFT JOIN companies c ON cust.company_id = c.id
+         ORDER BY created_at DESC
          LIMIT $1 OFFSET $2`,
         [limit, offset]
       ),
-      pool.query('SELECT COUNT(*) as total FROM users')
+      pool.query(`SELECT ((SELECT COUNT(*) FROM users) + (SELECT COUNT(*) FROM customers))::int as total`)
     ]);
 
     res.json({

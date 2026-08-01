@@ -559,6 +559,15 @@ async function runDatabaseInitialization() {
     } catch (saErr) {
       console.warn('⚠️  Super Admin seed failed (non-fatal):', saErr.message);
     }
+
+    // 10. Run local document storage to Cloudinary migration if local files exist
+    try {
+      const migrateDocsPath = path.join(__dirname, 'scripts', 'migrate_documents_to_cloud.js');
+      const migrateDocumentsToCloud = require(migrateDocsPath);
+      await migrateDocumentsToCloud();
+    } catch (docMigErr) {
+      console.warn('⚠️  Document cloud migration skipped or failed (non-fatal):', docMigErr.message);
+    }
   } catch (err) {
     console.error('❌ Database Initialization failed:', err.message);
   }

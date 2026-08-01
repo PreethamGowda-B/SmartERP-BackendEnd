@@ -103,7 +103,8 @@ function getBullMQConnection() {
   return bullConnection;
 }
 
-module.exports = redisClient;
-module.exports.redisClient = redisClient;
-module.exports.getSharedSubscriber = getSharedSubscriber;
-module.exports.getBullMQConnection = getBullMQConnection;
+module.exports = {
+  redisClient,
+  getSharedSubscriber,
+  getBullMQConnection,
+};

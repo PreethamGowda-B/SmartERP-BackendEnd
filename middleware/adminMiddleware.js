@@ -10,12 +10,14 @@ function authenticateSuperAdmin(req, res, next) {
     return res.status(401).json({ message: "Not authenticated" });
   }
 
-  const superAdminEmail = process.env.SUPER_ADMIN_EMAIL;
-  
-  // Requirement 1: Role must be exactly 'super_admin'
-  // Requirement 2: Email must match the verified developer email from environment variables (if set)
-  if (user.role === 'super_admin' && (!superAdminEmail || user.email === superAdminEmail)) {
-    console.log(`🛡️ Superadmin access granted to: ${user.email}`);
+  // Check if role is super_admin or email matches SUPER_ADMIN_EMAIL env var
+  const envSuperAdminEmail = process.env.SUPER_ADMIN_EMAIL?.toLowerCase().trim();
+  const userEmail = user.email?.toLowerCase().trim();
+
+  const isSuperAdminRole = user.role === 'super_admin';
+  const matchesEnvEmail = Boolean(envSuperAdminEmail && userEmail === envSuperAdminEmail);
+
+  if (isSuperAdminRole || matchesEnvEmail) {
     return next();
   }
 

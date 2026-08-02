@@ -592,25 +592,35 @@ class InvoiceService {
     try {
       await client.query('BEGIN');
 
+      // Always look up company_id and customer_id from the invoice itself.
+      // The customer portal doesn't pass them, so we resolve them server-side.
+      const invRow = await client.query(
+        `SELECT company_id, customer_id FROM invoices WHERE id = $1`,
+        [invoiceId]
+      );
+      if (invRow.rows.length === 0) throw new Error('Invoice not found');
+      const resolvedCompanyId   = companyId   || invRow.rows[0].company_id;
+      const resolvedCustomerId  = customerId  || invRow.rows[0].customer_id;
+
       const disputeRes = await client.query(
         `INSERT INTO invoice_disputes
          (invoice_id, company_id, customer_id, issue_category, description, status, created_at)
          VALUES ($1, $2, $3, $4, $5, 'open', NOW())
          RETURNING *`,
-        [invoiceId, companyId, customerId, issueCategory, description]
+        [invoiceId, resolvedCompanyId, resolvedCustomerId, issueCategory, description]
       );
 
       // Update invoice status to disputed
       await client.query(
-        `UPDATE invoices SET status = 'disputed', updated_at = NOW() WHERE id = $1 AND company_id = $2`,
-        [invoiceId, companyId]
+        `UPDATE invoices SET status = 'disputed', updated_at = NOW() WHERE id = $1`,
+        [invoiceId]
       );
 
-      // Pause AR reminder schedule
+      // Pause AR reminder schedule (best-effort)
       await client.query(
-        `UPDATE ar_collection_schedules SET is_paused = TRUE, updated_at = NOW() WHERE invoice_id = $1 AND company_id = $2`,
-        [invoiceId, companyId]
-      );
+        `UPDATE ar_collection_schedules SET is_paused = TRUE, updated_at = NOW() WHERE invoice_id = $1`,
+        [invoiceId]
+      ).catch(() => {});
 
       await client.query('COMMIT');
 

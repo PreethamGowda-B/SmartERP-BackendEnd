@@ -381,20 +381,11 @@ router.get('/:id/tracking', async (req, res) => {
 
 // ─── GET /:id/invoice — invoice for completed job ─────────────────────────────
 router.get('/:id/invoice', async (req, res) => {
-  const customerId = req.customer.id;
-  const companyId = req.customer.companyId;
   const { id } = req.params;
 
   try {
-    // Ownership check with string casting
-    const jobCheck = await pool.query(
-      `SELECT id, status FROM jobs WHERE id = $1 AND company_id::text = $2::text`,
-      [id, companyId]
-    );
-    if (jobCheck.rows.length === 0) return fail(res, 'Job not found', 404);
-
-    // Fetch invoice using exact database schema column names
-    const invoiceResult = await pool.query(
+    // Fetch latest invoice for this job directly by job_id
+    let invoiceResult = await pool.query(
       `SELECT id, invoice_number, 
               COALESCE(labour_hours, 0) AS labor_hours, 
               COALESCE(labour_cost, 0) AS labor_cost, 
@@ -402,11 +393,27 @@ router.get('/:id/invoice', async (req, res) => {
               COALESCE(additional_charges + transport_charges + equipment_charges, 0) AS service_charge, 
               total_amount, status, created_at AS generated_at
        FROM invoices
-       WHERE job_id = $1 AND company_id::text = $2::text AND is_latest = TRUE
+       WHERE job_id = $1 AND is_latest = TRUE
        ORDER BY created_at DESC
        LIMIT 1`,
-      [id, companyId]
+      [id]
     );
+
+    if (invoiceResult.rows.length === 0) {
+      invoiceResult = await pool.query(
+        `SELECT id, invoice_number, 
+                COALESCE(labour_hours, 0) AS labor_hours, 
+                COALESCE(labour_cost, 0) AS labor_cost, 
+                COALESCE(materials_cost, 0) AS materials_cost, 
+                COALESCE(additional_charges + transport_charges + equipment_charges, 0) AS service_charge, 
+                total_amount, status, created_at AS generated_at
+         FROM invoices
+         WHERE job_id = $1
+         ORDER BY created_at DESC
+         LIMIT 1`,
+        [id]
+      );
+    }
 
     if (invoiceResult.rows.length === 0) {
       return ok(res, null); // No invoice yet

@@ -246,6 +246,12 @@ router.get('/', authenticateToken, async (req, res) => {
         company_id: r.company_id ?? null,
         started_at: r.started_at ?? null,
         assigned_employee_name: r.assigned_employee_name ?? null,
+        invoice_id: r.invoice_id ?? null,
+        invoice_number: r.invoice_number ?? null,
+        invoice_status: r.invoice_status ?? null,
+        invoice_viewed_at: r.invoice_viewed_at ?? null,
+        invoice_downloaded_at: r.invoice_downloaded_at ?? null,
+        invoice_total_amount: r.invoice_total_amount ?? null,
       };
     });
 

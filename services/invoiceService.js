@@ -494,22 +494,33 @@ class InvoiceService {
    */
   static async logActivity({ invoiceId, companyId, actionType, performedByType, performedById, performedByName, ipAddress, userAgent }) {
     try {
+      // Safety net: resolve company_id from invoice if caller didn't provide it (e.g. customer portal)
+      let resolvedCompanyId = companyId;
+      if (!resolvedCompanyId) {
+        const invRow = await pool.query(`SELECT company_id FROM invoices WHERE id = $1`, [invoiceId]);
+        if (invRow.rows.length > 0) resolvedCompanyId = invRow.rows[0].company_id;
+      }
+      if (!resolvedCompanyId) {
+        console.warn(`invoiceService.logActivity: skipping — could not resolve company_id for invoice ${invoiceId}`);
+        return;
+      }
+
       await pool.query(
         `INSERT INTO invoice_activity_logs
          (invoice_id, company_id, action_type, performed_by_type, performed_by_id, performed_by_name, ip_address, user_agent, created_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())`,
-        [invoiceId, companyId, actionType, performedByType, performedById || null, performedByName || 'Customer', ipAddress || '', userAgent || '']
+        [invoiceId, resolvedCompanyId, actionType, performedByType, performedById || null, performedByName || 'Customer', ipAddress || '', userAgent || '']
       );
 
       if (actionType === 'viewed') {
         await pool.query(
-          `UPDATE invoices SET viewed_at = NOW(), status = CASE WHEN status = 'issued' THEN 'viewed' ELSE status END WHERE id = $1 AND company_id = $2`,
-          [invoiceId, companyId]
+          `UPDATE invoices SET viewed_at = NOW(), status = CASE WHEN status = 'issued' THEN 'viewed' ELSE status END WHERE id = $1`,
+          [invoiceId]
         );
       } else if (actionType === 'downloaded') {
         await pool.query(
-          `UPDATE invoices SET downloaded_at = NOW() WHERE id = $1 AND company_id = $2`,
-          [invoiceId, companyId]
+          `UPDATE invoices SET downloaded_at = NOW() WHERE id = $1`,
+          [invoiceId]
         );
       }
     } catch (err) {

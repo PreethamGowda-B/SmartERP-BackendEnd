@@ -212,7 +212,13 @@ router.post('/:id/reissue', authenticate, async (req, res) => {
 router.post('/:id/track', async (req, res) => {
   try {
     const { id } = req.params;
-    const { companyId, actionType, performedByType, performedById, performedByName } = req.body;
+    const { actionType, performedByType, performedById, performedByName } = req.body;
+    // companyId not available in customer portal — resolve from DB
+    let { companyId } = req.body;
+    if (!companyId) {
+      const invRow = await pool.query(`SELECT company_id FROM invoices WHERE id = $1`, [id]);
+      if (invRow.rows.length > 0) companyId = invRow.rows[0].company_id;
+    }
 
     const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || '';
     const userAgent = req.headers['user-agent'] || '';

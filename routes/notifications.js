@@ -72,8 +72,13 @@ router.get('/sse', authenticateToken, async (req, res) => {
   const companyId = String(req.user.companyId || '');
   if (redisShared && companyId) {
     try {
-      await redisShared.hset(`online_users:${companyId}`, userId, '1');
-      await redisShared.expire(`online_users:${companyId}`, 300); // 5 min TTL
+      const hsetFn = redisShared.hset || redisShared.hSet;
+      if (typeof hsetFn === 'function') {
+        await hsetFn.call(redisShared, `online_users:${companyId}`, userId, '1');
+      }
+      if (typeof redisShared.expire === 'function') {
+        await redisShared.expire(`online_users:${companyId}`, 300); // 5 min TTL
+      }
     } catch (e) {
       console.warn('⚠️ Could not set online status:', e.message);
     }
@@ -93,9 +98,13 @@ router.get('/sse', authenticateToken, async (req, res) => {
     }
   }
 
+  // Active Keep-Alive Ping every 15 seconds to prevent Render / Cloudflare TCP reset
   const heartbeatInterval = setInterval(() => {
-    try { res.write(`:heartbeat\n\n`); }
-    catch { clearInterval(heartbeatInterval); }
+    try {
+      res.write(`data: ${JSON.stringify({ type: 'ping', timestamp: Date.now() })}\n\n`);
+    } catch {
+      clearInterval(heartbeatInterval);
+    }
   }, 15000);
 
   // ── Redis path (cluster-safe) ─────────────────────────────────────────────

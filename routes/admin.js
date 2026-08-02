@@ -683,13 +683,26 @@ router.get('/users/:id', async (req, res) => {
       `SELECT u.id, u.name, u.email, u.role, u.phone, u.position, u.department,
               u.created_at, u.is_active, c.company_name, c.id as company_id
        FROM users u
-       LEFT JOIN companies c ON u.company_id = c.id
-       WHERE u.id = $1`,
+       LEFT JOIN companies c ON u.company_id::text = c.id::text
+       WHERE u.id::text = $1::text`,
       [id]
     );
-    if (r.rows.length === 0) return res.status(404).json({ message: 'User not found' });
-    res.json(r.rows[0]);
+    if (r.rows.length > 0) return res.json(r.rows[0]);
+
+    // Fallback: Check customers table for customer accounts
+    const cust = await pool.query(
+      `SELECT c.id, c.name, c.email, 'customer' AS role, c.phone, NULL AS position, NULL AS department,
+              c.created_at, TRUE AS is_active, comp.company_name, comp.id AS company_id
+       FROM customers c
+       LEFT JOIN companies comp ON c.company_id::text = comp.id::text
+       WHERE c.id::text = $1::text`,
+      [id]
+    );
+    if (cust.rows.length > 0) return res.json(cust.rows[0]);
+
+    return res.status(404).json({ message: 'User not found' });
   } catch (err) {
+    console.error('GET /api/admin/users/:id error:', err.message);
     res.status(500).json({ message: 'Server error' });
   }
 });

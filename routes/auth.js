@@ -710,19 +710,21 @@ router.post("/check-email", async (req, res) => {
 // ---------------------------------------------
 // ✅ Login Route
 // ---------------------------------------------
-router.post("/login", [
-  body("email").isEmail().withMessage("Valid email is required").normalizeEmail({ gmail_remove_dots: false, gmail_remove_subaddress: false, all_lowercase: true }),
-  body("password").notEmpty().withMessage("Password is required")
-], async (req, res) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) {
-    return res.status(400).json({ message: "Validation failed", errors: errors.array() });
+router.post("/login", async (req, res) => {
+  const rawIdentifier = (req.body.email || req.body.username || '').trim();
+  const password = req.body.password;
+
+  if (!rawIdentifier || !password) {
+    return res.status(400).json({ message: "Email and password are required" });
   }
 
-  const { email, password } = req.body;
+  const identifier = rawIdentifier.toLowerCase();
 
   try {
-    const result = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
+    const result = await pool.query(
+      "SELECT * FROM users WHERE LOWER(email) = $1 OR LOWER(name) = $1",
+      [identifier]
+    );
     if (result.rows.length === 0) {
       return res.status(401).json({ message: "Invalid email or password" });
     }

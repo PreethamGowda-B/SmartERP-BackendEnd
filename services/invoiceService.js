@@ -125,16 +125,22 @@ class InvoiceService {
 
       const job = jobRes.rows[0];
 
-      // 2. Check if invoice already finalized for this job
-      const existingInv = await client.query(
-        `SELECT id, invoice_number FROM invoices WHERE job_id = $1 AND company_id::text = $2::text AND is_latest = TRUE AND status != 'cancelled'`,
+      // 2. Check if invoice is already issued/paid for this job
+      const existingIssuedInv = await client.query(
+        `SELECT id, invoice_number FROM invoices WHERE job_id = $1 AND company_id::text = $2::text AND is_latest = TRUE AND status IN ('issued', 'paid')`,
         [jobId, companyId]
       );
 
-      if (existingInv.rows.length > 0) {
+      if (existingIssuedInv.rows.length > 0) {
         await client.query('COMMIT');
-        return { success: true, invoice: existingInv.rows[0], reason: 'invoice_already_exists' };
+        return { success: true, invoice: existingIssuedInv.rows[0], reason: 'invoice_already_exists' };
       }
+
+      // Archive any legacy/draft invoices for this job so the new issued invoice becomes active
+      await client.query(
+        `UPDATE invoices SET is_latest = FALSE, updated_at = NOW() WHERE job_id = $1 AND company_id::text = $2::text`,
+        [jobId, companyId]
+      );
 
       // 3. Compute Financial Totals
       const labourHours = parseFloat(invoiceData.labour_hours || 0);

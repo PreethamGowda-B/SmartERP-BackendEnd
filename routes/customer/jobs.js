@@ -386,20 +386,24 @@ router.get('/:id/invoice', async (req, res) => {
   const { id } = req.params;
 
   try {
-    // Ownership check first
+    // Ownership check with string casting
     const jobCheck = await pool.query(
-      `SELECT id, status FROM jobs WHERE id = $1 AND customer_id = $2 AND company_id = $3`,
-      [id, customerId, companyId]
+      `SELECT id, status FROM jobs WHERE id = $1 AND company_id::text = $2::text`,
+      [id, companyId]
     );
     if (jobCheck.rows.length === 0) return fail(res, 'Job not found', 404);
 
-    // Fetch invoice
+    // Fetch invoice using exact database schema column names
     const invoiceResult = await pool.query(
-      `SELECT id, invoice_number, labor_hours, labor_cost, materials_cost,
-              service_charge, total_amount, status, breakdown, generated_at
+      `SELECT id, invoice_number, 
+              COALESCE(labour_hours, 0) AS labor_hours, 
+              COALESCE(labour_cost, 0) AS labor_cost, 
+              COALESCE(materials_cost, 0) AS materials_cost, 
+              COALESCE(additional_charges + transport_charges + equipment_charges, 0) AS service_charge, 
+              total_amount, status, created_at AS generated_at
        FROM invoices
-       WHERE job_id = $1 AND company_id = $2
-       ORDER BY generated_at DESC
+       WHERE job_id = $1 AND company_id::text = $2::text AND is_latest = TRUE
+       ORDER BY created_at DESC
        LIMIT 1`,
       [id, companyId]
     );
@@ -410,6 +414,7 @@ router.get('/:id/invoice', async (req, res) => {
 
     return ok(res, invoiceResult.rows[0]);
   } catch (err) {
+    console.error('GET /:id/invoice error:', err.message);
     errorLogger.logFromRequest(req, err, { context: 'customer/jobs.GET /:id/invoice' });
     return fail(res, 'Server error');
   }

@@ -125,9 +125,17 @@ const apiLimiter = rateLimit({
   message: { message: "Too many requests, please try again later." },
 });
 
+const refreshLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: "Too many token refresh requests, please try again later." },
+});
+
 app.use("/api/auth/login", authLimiter);
 app.use("/api/auth/signup", authLimiter);
-app.use("/api/auth/refresh", authLimiter);
+app.use("/api/auth/refresh", refreshLimiter);
 app.use("/api/subscription", apiLimiter); // ✅ Relaxed limit for subs
 app.use("/api/payments", apiLimiter);
 

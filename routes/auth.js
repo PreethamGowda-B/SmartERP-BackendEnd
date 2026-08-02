@@ -841,8 +841,41 @@ router.post("/refresh", async (req, res) => {
 
     const refreshTokenData = tokenResult.rows[0];
 
-    // 2. REPLAY PROTECTION: Check if token is already revoked
+    // 2. REPLAY PROTECTION with 30-Second Concurrency Grace Period
     if (refreshTokenData.revoked) {
+      // Check if a newer valid token in the SAME token_family was created within the last 30 seconds
+      // (Handles concurrent background API requests hitting 401 simultaneously)
+      const activeFamilyRes = await pool.query(
+        `SELECT token FROM refresh_tokens 
+         WHERE token_family = $1::uuid AND revoked = FALSE AND created_at > NOW() - INTERVAL '30 seconds' 
+         ORDER BY created_at DESC LIMIT 1`,
+        [refreshTokenData.token_family]
+      );
+
+      if (activeFamilyRes.rows.length > 0) {
+        console.log(`ℹ️ Concurrent refresh detected for family ${refreshTokenData.token_family} — using active family token within 30s grace window`);
+        // Verify token & issue fresh access token without error
+        try {
+          const payload = jwt.verify(activeFamilyRes.rows[0].token, REFRESH_SECRET);
+          const userId = payload.userId || payload.id;
+          const userRes = await pool.query("SELECT id, role, email, company_id FROM users WHERE id = $1", [userId]);
+          if (userRes.rows.length > 0) {
+            const user = userRes.rows[0];
+            const newAccessToken = jwt.sign(
+              { id: user.id, userId: user.id, role: user.role, email: user.email, companyId: user.company_id },
+              ACCESS_SECRET,
+              { expiresIn: ACCESS_EXPIRY }
+            );
+            return res.json({
+              ok: true,
+              accessToken: newAccessToken,
+              refreshToken: activeFamilyRes.rows[0].token,
+              isSuperAdmin: user.role === 'super_admin'
+            });
+          }
+        } catch (_) { /* fallback to standard revocation */ }
+      }
+
       console.error(`🚨 REPLAY DETECTED for user ${refreshTokenData.user_id}! Revoking all tokens in family: ${refreshTokenData.token_family}`);
       await pool.query("UPDATE refresh_tokens SET revoked = TRUE WHERE token_family = $1::uuid", [refreshTokenData.token_family]);
       return res.status(401).json({ message: "Security alert: Token reuse detected. Session terminated." });

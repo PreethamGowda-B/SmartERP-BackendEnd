@@ -672,8 +672,8 @@ app.use("/api/customer-jobs", require("./routes/customerJobApproval")); // alias
 
 
 
-// ✅ Health check route
-app.get("/api/health", async (req, res) => {
+// ✅ Health check routes
+const healthHandler = async (req, res) => {
   try {
     const result = await pool.query("SELECT NOW()");
     res.json({
@@ -688,7 +688,11 @@ app.get("/api/health", async (req, res) => {
       database: "disconnected",
     });
   }
-});
+};
+
+app.get("/health", healthHandler);
+app.get("/api/health", healthHandler);
+app.get("/api/v1/health", healthHandler);
 
 // ✅ Info route
 app.get("/api", (req, res) => {

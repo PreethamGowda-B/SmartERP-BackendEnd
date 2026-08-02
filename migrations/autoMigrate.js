@@ -206,6 +206,7 @@ const NUMBERED_MIGRATIONS = [
     '009_payroll_validation.sql',
     '010_crm_sales_agent.sql',
     '011_standardize_uuid_and_core_rls.sql',
+    '015_finance_and_invoicing_system.sql',
 ];
 
 async function runNumberedMigrations() {

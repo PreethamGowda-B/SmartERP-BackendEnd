@@ -43,8 +43,11 @@ const corsOptions = {
   origin: function (origin, callback) {
     if (!origin) return callback(null, true);
 
+    const cleanOrigin = origin.toLowerCase().trim();
+
     const allowedOrigins = [
       "http://localhost:3000",
+      "http://localhost:3001",
       "https://smart-erp-front-end.vercel.app",
       "https://www.prozync.in",
       "https://prozync.in",
@@ -52,27 +55,23 @@ const corsOptions = {
       "https://customer.prozync.in",
       "https://superadmin.prozync.in",
       "https://api.prozync.in",
-      "http://localhost:3001",
       "https://client.prozync.in",
     ];
 
-    if (allowedOrigins.includes(origin)) {
-      return callback(null, true);
-    }
-
-    if (origin.match(/^https:\/\/smart-erp-front(-[a-z0-9]+)?(-[a-z0-9-]+)?\.vercel\.app$/)) {
-      return callback(null, true);
-    }
-    if (origin.match(/^https:\/\/smart-erp-front-[a-z0-9]+-thepreethu01-9119s-projects\.vercel\.app$/)) {
+    if (
+      allowedOrigins.includes(cleanOrigin) ||
+      cleanOrigin.endsWith(".prozync.in") ||
+      cleanOrigin.endsWith(".vercel.app")
+    ) {
       return callback(null, true);
     }
 
     console.warn("🚫 Blocked CORS request from:", origin);
-    callback(new Error("Not allowed by CORS"));
+    callback(null, false);
   },
   credentials: true,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "X-CSRF-Token"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-CSRF-Token", "X-Requested-With", "Accept"],
   exposedHeaders: ["Set-Cookie"],
   optionsSuccessStatus: 200,
 };

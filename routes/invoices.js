@@ -242,7 +242,10 @@ router.post('/:id/track', async (req, res) => {
 router.post('/:id/dispute', async (req, res) => {
   try {
     const { id } = req.params;
-    const { companyId, customerId, issueCategory, description } = req.body;
+    const { companyId, customerId } = req.body;
+    // Accept both snake_case (from customer portal) and camelCase
+    const issueCategory = req.body.issueCategory || req.body.issue_category;
+    const description = req.body.description;
 
     if (!issueCategory || !description) {
       return res.status(400).json({ error: 'Issue category and description are required' });

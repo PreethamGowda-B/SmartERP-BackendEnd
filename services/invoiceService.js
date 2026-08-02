@@ -114,7 +114,7 @@ class InvoiceService {
         `SELECT j.*, c.name AS customer_name, c.email AS customer_email, c.phone AS customer_phone
          FROM jobs j
          LEFT JOIN customers c ON j.customer_id::text = c.id::text
-         WHERE j.id = $1 AND j.company_id = $2
+         WHERE j.id = $1 AND j.company_id::text = $2::text
          FOR UPDATE OF j`,
         [jobId, companyId]
       );
@@ -127,13 +127,13 @@ class InvoiceService {
 
       // 2. Check if invoice already finalized for this job
       const existingInv = await client.query(
-        `SELECT id, invoice_number FROM invoices WHERE job_id = $1 AND company_id = $2 AND is_latest = TRUE AND status != 'cancelled'`,
+        `SELECT id, invoice_number FROM invoices WHERE job_id = $1 AND company_id::text = $2::text AND is_latest = TRUE AND status != 'cancelled'`,
         [jobId, companyId]
       );
 
       if (existingInv.rows.length > 0) {
-        await client.query('ROLLBACK');
-        return { success: false, reason: 'invoice_already_exists', invoice: existingInv.rows[0] };
+        await client.query('COMMIT');
+        return { success: true, invoice: existingInv.rows[0], reason: 'invoice_already_exists' };
       }
 
       // 3. Compute Financial Totals

@@ -958,5 +958,128 @@ router.patch('/actions/:actionId/respond', authenticateToken, async (req, res) =
   }
 });
 
+/**
+ * POST /api/jobs/:jobId/actions
+ * Employee submits field action request (Need More Workers, Equipment Needed, Safety Hazard, etc.)
+ */
+router.post('/:jobId/actions', authenticateToken, async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const companyId = req.user.companyId || req.user.company_id;
+    const userId = req.user.id || req.user.userId;
+    const userName = req.user.name || 'Employee';
+
+    const { module, action_type, urgency, notes, evidence_urls, payload } = req.body;
+
+    const jobRes = await pool.query('SELECT title FROM jobs WHERE id = $1', [jobId]);
+    const jobTitle = jobRes.rows[0]?.title || 'Job';
+
+    const result = await pool.query(
+      `INSERT INTO job_action_requests
+       (company_id, job_id, employee_id, employee_name, module, action_type, urgency, notes, evidence_urls, payload, status, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending', NOW(), NOW())
+       RETURNING *`,
+      [companyId, jobId, userId, userName, module || 'field', action_type || 'general_request', urgency || 'normal', notes || '', JSON.stringify(evidence_urls || []), JSON.stringify(payload || {})]
+    );
+
+    const actionReq = result.rows[0];
+
+    // Notify Owner
+    await createNotificationForOwners({
+      company_id: companyId,
+      type: 'job_action_request',
+      title: urgency === 'emergency' ? '🚨 EMERGENCY SOS ALERT' : `Work Request: ${action_type.replace(/_/g, ' ')}`,
+      message: `${userName} submitted a work request for "${jobTitle}": ${notes || action_type}`,
+      priority: urgency === 'emergency' ? 'urgent' : 'high',
+      data: { job_id: jobId, action_request_id: actionReq.id, url: '/owner/jobs' }
+    }).catch(() => {});
+
+    res.json({ success: true, request: actionReq });
+  } catch (err) {
+    console.error('POST /api/jobs/:jobId/actions error:', err);
+    res.status(500).json({ message: err.message || 'Server error' });
+  }
+});
+
+/**
+ * GET /api/jobs/action-requests
+ * Owner lists all employee field action requests
+ */
+router.get('/action-requests', authenticateToken, async (req, res) => {
+  try {
+    const companyId = req.user.companyId || req.user.company_id;
+    const { status, jobId } = req.query;
+
+    let query = `
+      SELECT r.*, j.title AS job_title, j.location AS job_location
+      FROM job_action_requests r
+      LEFT JOIN jobs j ON r.job_id = j.id
+      WHERE r.company_id = $1
+    `;
+    const params = [companyId];
+
+    if (status && status !== 'all') {
+      params.push(status);
+      query += ` AND r.status = $${params.length}`;
+    }
+    if (jobId) {
+      params.push(jobId);
+      query += ` AND r.job_id = $${params.length}`;
+    }
+
+    query += ` ORDER BY r.created_at DESC`;
+
+    const result = await pool.query(query, params);
+    res.json({ success: true, requests: result.rows });
+  } catch (err) {
+    console.error('GET /api/jobs/action-requests error:', err);
+    res.status(500).json({ message: err.message || 'Server error' });
+  }
+});
+
+/**
+ * PATCH /api/jobs/action-requests/:requestId
+ * Owner responds to (approves, rejects, resolves) employee work request
+ */
+router.patch('/action-requests/:requestId', authenticateToken, async (req, res) => {
+  try {
+    const { requestId } = req.params;
+    const companyId = req.user.companyId || req.user.company_id;
+    const { status, owner_response } = req.body;
+
+    const result = await pool.query(
+      `UPDATE job_action_requests
+       SET status = $1, owner_response = $2, resolved_at = CASE WHEN $1 IN ('approved', 'rejected', 'resolved') THEN NOW() ELSE resolved_at END, updated_at = NOW()
+       WHERE id = $3 AND company_id = $4
+       RETURNING *`,
+      [status || 'resolved', owner_response || '', requestId, companyId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Request not found' });
+    }
+
+    const updatedReq = result.rows[0];
+
+    // Notify Employee
+    if (updatedReq.employee_id) {
+      await createNotification({
+        user_id: updatedReq.employee_id,
+        company_id: companyId,
+        type: 'action_request_response',
+        title: `Work Request ${status === 'approved' ? 'Approved ✅' : status === 'rejected' ? 'Rejected ❌' : 'Updated 💬'}`,
+        message: `Your request (${updatedReq.action_type.replace(/_/g, ' ')}) was ${status}${owner_response ? `: ${owner_response}` : '.'}`,
+        priority: 'high',
+        data: { job_id: updatedReq.job_id, request_id: requestId, status }
+      }).catch(() => {});
+    }
+
+    res.json({ success: true, request: updatedReq });
+  } catch (err) {
+    console.error('PATCH /api/jobs/action-requests/:requestId error:', err);
+    res.status(500).json({ message: err.message || 'Server error' });
+  }
+});
+
 module.exports = router;
 

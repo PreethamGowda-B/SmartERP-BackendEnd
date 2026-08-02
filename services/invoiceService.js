@@ -125,22 +125,101 @@ class InvoiceService {
 
       const job = jobRes.rows[0];
 
-      // 2. Check if invoice is already issued/paid for this job
+      // 2. Check if invoice is already issued/paid/draft for this job — if so, update & increment edited_count
       const existingIssuedInv = await client.query(
-        `SELECT id, invoice_number FROM invoices WHERE job_id = $1 AND company_id::text = $2::text AND is_latest = TRUE AND status IN ('issued', 'paid')`,
+        `SELECT id, invoice_number, edited_count FROM invoices WHERE job_id = $1 AND company_id::text = $2::text AND is_latest = TRUE AND status IN ('issued', 'paid', 'disputed', 'viewed', 'sent')`,
         [jobId, companyId]
       );
 
       if (existingIssuedInv.rows.length > 0) {
-        await client.query('COMMIT');
-        return { success: true, invoice: existingIssuedInv.rows[0], reason: 'invoice_already_exists' };
-      }
+        const existingId = existingIssuedInv.rows[0].id;
 
-      // Archive any legacy/draft invoices for this job so the new issued invoice becomes active
-      await client.query(
-        `UPDATE invoices SET is_latest = FALSE, updated_at = NOW() WHERE job_id = $1 AND company_id::text = $2::text`,
-        [jobId, companyId]
-      );
+        // Compute Financial Totals for edit
+        const labourHours = parseFloat(invoiceData.labour_hours || 0);
+        const labourRate = parseFloat(invoiceData.labour_rate || 0);
+        const labourCost = parseFloat((labourHours * labourRate).toFixed(2));
+
+        let materialsCost = 0;
+        const lineItems = invoiceData.lineItems || [];
+        lineItems.forEach((item) => {
+          item.total_amount = parseFloat((parseFloat(item.quantity || 1) * parseFloat(item.unit_price || 0)).toFixed(2));
+          if (item.item_type === 'material') materialsCost += item.total_amount;
+        });
+
+        const equipmentCharges = parseFloat(invoiceData.equipment_charges || 0);
+        const transportCharges = parseFloat(invoiceData.transport_charges || 0);
+        const additionalCharges = parseFloat(invoiceData.additional_charges || 0);
+        const discountAmount = parseFloat(invoiceData.discount_amount || 0);
+
+        const subtotal = Math.max(0, parseFloat((labourCost + materialsCost + equipmentCharges + transportCharges + additionalCharges - discountAmount).toFixed(2)));
+        const gstRate = parseFloat(invoiceData.gst_rate || 18.0) / 100.0;
+        const totalTax = parseFloat((subtotal * gstRate).toFixed(2));
+
+        let cgst = 0, sgst = 0, igst = 0;
+        if (invoiceData.is_inter_state) {
+          igst = totalTax;
+        } else {
+          cgst = parseFloat((totalTax / 2).toFixed(2));
+          sgst = parseFloat((totalTax / 2).toFixed(2));
+        }
+
+        const totalAmount = parseFloat((subtotal + totalTax).toFixed(2));
+
+        // Update Invoice & Increment edited_count
+        const updatedInvRes = await client.query(
+          `UPDATE invoices SET
+            labour_hours = $1, labour_rate = $2, labour_cost = $3, materials_cost = $4,
+            equipment_charges = $5, transport_charges = $6, additional_charges = $7,
+            discount_amount = $8, subtotal = $9, is_inter_state = $10, gst_rate = $11,
+            cgst = $12, sgst = $13, igst = $14, total_tax = $15, total_amount = $16,
+            amount_due = GREATEST(0, $16 - amount_paid), customer_notes = $17, internal_notes = $18,
+            edited_count = COALESCE(edited_count, 0) + 1, updated_at = NOW(),
+            status = CASE WHEN status = 'disputed' THEN 'issued' ELSE status END
+           WHERE id = $19 AND company_id::text = $20::text
+           RETURNING *`,
+          [
+            labourHours, labourRate, labourCost, materialsCost,
+            equipmentCharges, transportCharges, additionalCharges,
+            discountAmount, subtotal, Boolean(invoiceData.is_inter_state),
+            invoiceData.gst_rate || 18.0, cgst, sgst, igst, totalTax,
+            totalAmount, invoiceData.customer_notes || 'Thank you for your business!',
+            invoiceData.internal_notes || '', existingId, companyId
+          ]
+        );
+
+        const updatedInvoice = updatedInvRes.rows[0];
+
+        // Replace Line Items
+        await client.query(`DELETE FROM invoice_items WHERE invoice_id = $1`, [existingId]);
+        for (const item of lineItems) {
+          await client.query(
+            `INSERT INTO invoice_items
+             (invoice_id, company_id, item_type, description, hsn_code, quantity, unit_price, total_amount)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+            [existingId, companyId, item.item_type || 'service', item.description || 'Service Item', item.hsn_code || '998311', item.quantity || 1, item.unit_price || 0, item.total_amount || 0]
+          );
+        }
+
+        // Create Activity Log entry for Edit (Issue 3 Requirement)
+        await client.query(
+          `INSERT INTO invoice_activity_logs
+           (invoice_id, company_id, action_type, performed_by_type, performed_by_id, performed_by_name, created_at)
+           VALUES ($1, $2, 'edited', 'owner', $3, 'Owner', NOW())`,
+          [existingId, companyId, userId]
+        );
+
+        // Send Notification to Customer (Issue 4 Requirement)
+        if (job.customer_id) {
+          await client.query(
+            `INSERT INTO notifications (user_id, company_id, type, title, message, priority, created_at)
+             VALUES ($1, $2, 'invoice_updated', 'Invoice Updated 📄', $3, 'high', NOW())`,
+            [job.customer_id, companyId, `Your invoice for job ${job.title} has been updated (Version 1.${updatedInvoice.edited_count}). Please review the latest version.`]
+          ).catch(() => {});
+        }
+
+        await client.query('COMMIT');
+        return { success: true, invoice: updatedInvoice, reason: 'invoice_updated', edited_count: updatedInvoice.edited_count };
+      }
 
       // 3. Compute Financial Totals
       const labourHours = parseFloat(invoiceData.labour_hours || 0);

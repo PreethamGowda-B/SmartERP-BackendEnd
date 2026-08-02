@@ -443,12 +443,36 @@ async function runDatabaseInitialization() {
       CREATE INDEX IF NOT EXISTS idx_feedback_user_id ON feedback(user_id);
 
       -- Expand notifications table for global broadcasts and metadata
-      -- C3 FIX: company_id must be UUID (not INTEGER) — consistent with schema.sql
       ALTER TABLE notifications ADD COLUMN IF NOT EXISTS company_id UUID;
       ALTER TABLE notifications ADD COLUMN IF NOT EXISTS type VARCHAR(100) DEFAULT 'system';
       ALTER TABLE notifications ADD COLUMN IF NOT EXISTS priority VARCHAR(50) DEFAULT 'normal';
       CREATE INDEX IF NOT EXISTS idx_notifications_company_id ON notifications(company_id);
       CREATE INDEX IF NOT EXISTS idx_notifications_type ON notifications(type);
+
+      -- Add edited_count to invoices table
+      ALTER TABLE invoices ADD COLUMN IF NOT EXISTS edited_count INTEGER DEFAULT 0;
+
+      -- Create job_action_requests table for employee field escalations & work requests
+      CREATE TABLE IF NOT EXISTS job_action_requests (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+        job_id UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+        employee_id UUID REFERENCES users(id) ON DELETE SET NULL,
+        employee_name VARCHAR(255),
+        module VARCHAR(100),
+        action_type VARCHAR(100) NOT NULL,
+        urgency VARCHAR(50) DEFAULT 'normal',
+        notes TEXT,
+        evidence_urls JSONB DEFAULT '[]',
+        payload JSONB DEFAULT '{}',
+        status VARCHAR(50) DEFAULT 'pending',
+        owner_response TEXT,
+        resolved_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_job_action_requests_company ON job_action_requests(company_id);
+      CREATE INDEX IF NOT EXISTS idx_job_action_requests_job ON job_action_requests(job_id);
     `);
 
     try {

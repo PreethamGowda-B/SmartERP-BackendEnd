@@ -194,13 +194,32 @@ passport.use(
 //   ?role=owner|employee         → Staff (default: owner)
 //   ?company_code=XXX            → Employee join flow
 router.get('/google', (req, res, next) => {
+  const FRONTEND = process.env.FRONTEND_ORIGIN || 'https://www.prozync.in';
+  
+  if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET) {
+    console.warn("⚠️ Google OAuth credentials not configured on backend");
+    return res.redirect(`${FRONTEND}/auth/login?error=oauth_not_configured`);
+  }
+
   const type = req.query.type === 'customer' ? 'customer' : 'staff';
   const statePayload = type === 'customer'
     ? { type: 'customer' }
     : { type: 'staff', role: req.query.role || 'owner', company_code: req.query.company_code || null };
 
   const state = Buffer.from(JSON.stringify(statePayload)).toString('base64');
-  passport.authenticate('google', { scope: ['profile', 'email'], session: false, state })(req, res, next);
+  
+  try {
+    passport.authenticate('google', { scope: ['profile', 'email'], session: false, state })(req, res, (err) => {
+      if (err) {
+        console.error('Google OAuth init error:', err.message);
+        return res.redirect(`${FRONTEND}/auth/login?error=oauth_failed`);
+      }
+      next();
+    });
+  } catch (err) {
+    console.error('Google OAuth route error:', err.message);
+    return res.redirect(`${FRONTEND}/auth/login?error=oauth_failed`);
+  }
 });
 
 // ─── Google Callback (unified) ────────────────────────────────────────────────

@@ -163,15 +163,18 @@ router.get('/', authenticateToken, async (req, res) => {
       `;
       countResult = await pool.query(`SELECT COUNT(DISTINCT j.id) FROM jobs j WHERE ${ownerWhere}`, [String(req.user.companyId)]);
       result = await pool.query(
-        `SELECT DISTINCT ON (j.id) j.*, u.email as employee_email, u.name as employee_name,
-                inv.id AS invoice_id, inv.invoice_number, inv.status AS invoice_status,
-                inv.viewed_at AS invoice_viewed_at, inv.downloaded_at AS invoice_downloaded_at,
-                inv.total_amount AS invoice_total_amount
-         FROM jobs j
-         LEFT JOIN users u ON j.assigned_to = u.id
-         LEFT JOIN invoices inv ON inv.job_id = j.id AND inv.is_latest = TRUE
-         WHERE ${ownerWhere}
-         ORDER BY j.id, j.created_at DESC
+        `SELECT * FROM (
+           SELECT DISTINCT ON (j.id) j.*, u.email as employee_email, u.name as employee_name,
+                  inv.id AS invoice_id, inv.invoice_number, inv.status AS invoice_status,
+                  inv.viewed_at AS invoice_viewed_at, inv.downloaded_at AS invoice_downloaded_at,
+                  inv.total_amount AS invoice_total_amount
+           FROM jobs j
+           LEFT JOIN users u ON j.assigned_to = u.id
+           LEFT JOIN invoices inv ON inv.job_id = j.id AND inv.is_latest = TRUE
+           WHERE ${ownerWhere}
+           ORDER BY j.id
+         ) sub
+         ORDER BY sub.created_at DESC
          LIMIT $2 OFFSET $3`,
         [String(req.user.companyId), limit, offset]
       );
@@ -198,13 +201,16 @@ router.get('/', authenticateToken, async (req, res) => {
         [String(req.user.companyId), req.user.id]
       );
       result = await pool.query(
-        `SELECT DISTINCT ON (j.id) j.*, u.name as assigned_employee_name,
-                inv.id AS invoice_id, inv.invoice_number, inv.status AS invoice_status
-         FROM jobs j
-         LEFT JOIN users u ON j.assigned_to = u.id
-         LEFT JOIN invoices inv ON inv.job_id = j.id AND inv.is_latest = TRUE
-         WHERE ${empWhere}
-         ORDER BY j.id, j.created_at DESC
+        `SELECT * FROM (
+           SELECT DISTINCT ON (j.id) j.*, u.name as assigned_employee_name,
+                  inv.id AS invoice_id, inv.invoice_number, inv.status AS invoice_status
+           FROM jobs j
+           LEFT JOIN users u ON j.assigned_to = u.id
+           LEFT JOIN invoices inv ON inv.job_id = j.id AND inv.is_latest = TRUE
+           WHERE ${empWhere}
+           ORDER BY j.id
+         ) sub
+         ORDER BY sub.created_at DESC
          LIMIT $3 OFFSET $4`,
         [String(req.user.companyId), req.user.id, limit, offset]
       );
@@ -215,17 +221,20 @@ router.get('/', authenticateToken, async (req, res) => {
         AND j.company_id::text = $1
         AND (j.source IS NULL OR j.source != 'customer' OR j.approval_status = 'approved')
       `;
-      countResult = await pool.query(`SELECT COUNT(*) FROM jobs j WHERE ${hrWhere}`, [String(req.user.companyId)]);
+      countResult = await pool.query(`SELECT COUNT(DISTINCT j.id) FROM jobs j WHERE ${hrWhere}`, [String(req.user.companyId)]);
       result = await pool.query(
-        `SELECT j.*, u.email as employee_email, u.name as employee_name,
-                inv.id AS invoice_id, inv.invoice_number, inv.status AS invoice_status,
-                inv.viewed_at AS invoice_viewed_at, inv.downloaded_at AS invoice_downloaded_at,
-                inv.total_amount AS invoice_total_amount
-         FROM jobs j 
-         LEFT JOIN users u ON j.assigned_to = u.id
-         LEFT JOIN invoices inv ON inv.job_id = j.id AND inv.is_latest = TRUE
-         WHERE ${hrWhere} 
-         ORDER BY j.created_at DESC 
+        `SELECT * FROM (
+           SELECT DISTINCT ON (j.id) j.*, u.email as employee_email, u.name as employee_name,
+                  inv.id AS invoice_id, inv.invoice_number, inv.status AS invoice_status,
+                  inv.viewed_at AS invoice_viewed_at, inv.downloaded_at AS invoice_downloaded_at,
+                  inv.total_amount AS invoice_total_amount
+           FROM jobs j 
+           LEFT JOIN users u ON j.assigned_to = u.id
+           LEFT JOIN invoices inv ON inv.job_id = j.id AND inv.is_latest = TRUE
+           WHERE ${hrWhere}
+           ORDER BY j.id
+         ) sub
+         ORDER BY sub.created_at DESC 
          LIMIT $2 OFFSET $3`,
         [String(req.user.companyId), limit, offset]
       );

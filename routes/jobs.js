@@ -259,7 +259,8 @@ router.get('/', authenticateToken, async (req, res) => {
         employee_name: r.employee_name ?? null,
         // These fields must also come from DB, not the blob
         // Low FIX: use ?? (nullish coalescing) — || would coerce '' or 0 to null
-        source: r.source ?? null,
+        source: r.source ?? (r.created_by_role === 'customer' || r.customer_id ? 'customer' : null),
+        is_customer_job: r.source === 'customer' || r.source === 'customer_portal' || r.created_by_role === 'customer' || Boolean(r.customer_id),
         approval_status: r.approval_status ?? null,
         customer_id: r.customer_id ?? null,
         company_id: r.company_id ?? null,

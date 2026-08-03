@@ -137,9 +137,40 @@ router.get('/:id', authenticate, async (req, res) => {
     const logsRes = await pool.query(`SELECT * FROM invoice_activity_logs WHERE invoice_id = $1 ORDER BY created_at DESC`, [invoice.id]);
     const paymentsRes = await pool.query(`SELECT * FROM invoice_payments WHERE invoice_id = $1 ORDER BY created_at DESC`, [invoice.id]);
 
+    // Fetch company details dynamically from DB
+    const compRes = await pool.query(`SELECT id, company_name, address, phone, contact_email, settings FROM companies WHERE id = $1`, [invoice.company_id]);
+    const compRow = compRes.rows[0] || {};
+    const s = compRow.settings || {};
+
+    const companyProfile = {
+      name: compRow.company_name || 'Business Enterprise',
+      legal_name: s.legal_name || compRow.company_name || 'Business Enterprise',
+      address: compRow.address || s.address || '',
+      city: s.city || '',
+      state: s.state || '',
+      country: s.country || 'India',
+      pincode: s.pincode || '',
+      phone: compRow.phone || s.phone || '',
+      contact_email: compRow.contact_email || s.contact_email || '',
+      website: s.website || '',
+      gstin: s.gstin || '',
+      pan: s.pan || '',
+      cin: s.cin || '',
+      bank_name: s.bank_name || '',
+      account_number: s.account_number || '',
+      ifsc_code: s.ifsc_code || '',
+      upi_id: s.upi_id || '',
+      authorized_signatory_name: s.authorized_signatory_name || '',
+      logo_url: s.logo_url || '',
+      stamp_url: s.stamp_url || '',
+      terms_and_conditions: s.terms_and_conditions || '1. Payment due within 15 days of invoice date.\n2. Interest @ 18% p.a. will be charged on overdue invoices.',
+      default_notes: s.default_notes || 'Thank you for choosing our services!'
+    };
+
     return res.json({
       success: true,
       invoice,
+      company: companyProfile,
       lineItems: itemsRes.rows,
       disputes: disputesRes.rows,
       activityLogs: logsRes.rows,
@@ -360,7 +391,37 @@ router.get('/:id/pdf', async (req, res) => {
     const invoice = invRes.rows[0];
     const itemsRes = await pool.query(`SELECT * FROM invoice_items WHERE invoice_id = $1`, [id]);
 
-    const html = pdfInvoiceService.generateInvoiceHTML(invoice, itemsRes.rows);
+    // Fetch company profile dynamically
+    const compRes = await pool.query(`SELECT id, company_name, address, phone, contact_email, settings FROM companies WHERE id = $1`, [invoice.company_id]);
+    const compRow = compRes.rows[0] || {};
+    const s = compRow.settings || {};
+
+    const companyProfile = {
+      name: compRow.company_name || 'Business Enterprise',
+      legal_name: s.legal_name || compRow.company_name || 'Business Enterprise',
+      address: compRow.address || s.address || '',
+      city: s.city || '',
+      state: s.state || '',
+      country: s.country || 'India',
+      pincode: s.pincode || '',
+      phone: compRow.phone || s.phone || '',
+      contact_email: compRow.contact_email || s.contact_email || '',
+      website: s.website || '',
+      gstin: s.gstin || '',
+      pan: s.pan || '',
+      cin: s.cin || '',
+      bank_name: s.bank_name || '',
+      account_number: s.account_number || '',
+      ifsc_code: s.ifsc_code || '',
+      upi_id: s.upi_id || '',
+      authorized_signatory_name: s.authorized_signatory_name || '',
+      logo_url: s.logo_url || '',
+      stamp_url: s.stamp_url || '',
+      terms_and_conditions: s.terms_and_conditions || '1. Payment is due within 15 days of invoice date.\n2. Interest @ 18% p.a. will be charged on overdue invoices.',
+      default_notes: s.default_notes || 'Thank you for choosing our services!'
+    };
+
+    const html = pdfInvoiceService.generateInvoiceHTML(invoice, itemsRes.rows, companyProfile);
     res.setHeader('Content-Type', 'text/html');
     return res.send(html);
   } catch (err) {

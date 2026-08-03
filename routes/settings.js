@@ -22,6 +22,7 @@ async function getCompanyForUser(req) {
                COALESCE(c.address, '')                 AS address,
                COALESCE(c.phone, '')                   AS phone,
                COALESCE(c.contact_email, '')           AS contact_email,
+               COALESCE(c.settings, '{}'::jsonb)       AS settings,
                c.created_at
         FROM companies c`;
 
@@ -37,7 +38,39 @@ async function getCompanyForUser(req) {
             [userId]
         );
     }
-    return result.rows[0] || null;
+
+    if (!result.rows.length) return null;
+    const row = result.rows[0];
+    const s = row.settings || {};
+
+    return {
+        id: row.id,
+        name: row.name,
+        legal_name: s.legal_name || row.name,
+        company_id: row.company_id,
+        address: row.address || s.address || '',
+        city: s.city || '',
+        state: s.state || '',
+        country: s.country || 'India',
+        pincode: s.pincode || '',
+        phone: row.phone || s.phone || '',
+        contact_email: row.contact_email || s.contact_email || '',
+        website: s.website || '',
+        gstin: s.gstin || '',
+        pan: s.pan || '',
+        cin: s.cin || '',
+        registration_number: s.registration_number || '',
+        bank_name: s.bank_name || '',
+        account_number: s.account_number || '',
+        ifsc_code: s.ifsc_code || '',
+        upi_id: s.upi_id || '',
+        authorized_signatory_name: s.authorized_signatory_name || '',
+        logo_url: s.logo_url || '',
+        stamp_url: s.stamp_url || '',
+        terms_and_conditions: s.terms_and_conditions || '1. Payment is due within 15 days of invoice date.\n2. Interest @ 18% p.a. will be charged on overdue invoices.',
+        default_notes: s.default_notes || 'Thank you for choosing our services!',
+        settings: s
+    };
 }
 
 // ─── GET /api/settings/profile ────────────────────────────────────────────────
@@ -185,33 +218,56 @@ router.put('/company', authenticateToken, async (req, res) => {
         }
         if (!companyDbId) return res.status(404).json({ message: 'Company not found' });
 
-        // Update company — company_name is the real column; company_id is the short code
-        // We REMOVE company_id from the SET clause to prevent owners from changing it
+        // Merge all branding, tax, and bank fields into settings JSONB
+        const existingRes = await pool.query(`SELECT settings FROM companies WHERE id = $1`, [companyDbId]);
+        const existingSettings = existingRes.rows[0]?.settings || {};
+
+        const mergedSettings = {
+            ...existingSettings,
+            ...(settings || {}),
+            legal_name: req.body.legal_name ?? settings?.legal_name ?? existingSettings.legal_name ?? name.trim(),
+            logo_url: req.body.logo_url ?? settings?.logo_url ?? existingSettings.logo_url ?? '',
+            gstin: req.body.gstin ?? settings?.gstin ?? existingSettings.gstin ?? '',
+            pan: req.body.pan ?? settings?.pan ?? existingSettings.pan ?? '',
+            cin: req.body.cin ?? settings?.cin ?? existingSettings.cin ?? '',
+            registration_number: req.body.registration_number ?? settings?.registration_number ?? existingSettings.registration_number ?? '',
+            city: req.body.city ?? settings?.city ?? existingSettings.city ?? '',
+            state: req.body.state ?? settings?.state ?? existingSettings.state ?? '',
+            country: req.body.country ?? settings?.country ?? existingSettings.country ?? 'India',
+            pincode: req.body.pincode ?? settings?.pincode ?? existingSettings.pincode ?? '',
+            website: req.body.website ?? settings?.website ?? existingSettings.website ?? '',
+            bank_name: req.body.bank_name ?? settings?.bank_name ?? existingSettings.bank_name ?? '',
+            account_number: req.body.account_number ?? settings?.account_number ?? existingSettings.account_number ?? '',
+            ifsc_code: req.body.ifsc_code ?? settings?.ifsc_code ?? existingSettings.ifsc_code ?? '',
+            upi_id: req.body.upi_id ?? settings?.upi_id ?? existingSettings.upi_id ?? '',
+            authorized_signatory_name: req.body.authorized_signatory_name ?? settings?.authorized_signatory_name ?? existingSettings.authorized_signatory_name ?? '',
+            stamp_url: req.body.stamp_url ?? settings?.stamp_url ?? existingSettings.stamp_url ?? '',
+            terms_and_conditions: req.body.terms_and_conditions ?? settings?.terms_and_conditions ?? existingSettings.terms_and_conditions ?? '',
+            default_notes: req.body.default_notes ?? settings?.default_notes ?? existingSettings.default_notes ?? ''
+        };
+
         const result = await pool.query(
             `UPDATE companies
              SET company_name   = $1,
                  address        = $2,
                  phone          = $3,
                  contact_email  = $4,
-                 settings       = COALESCE($5::jsonb, settings),
+                 settings       = $5::jsonb,
                  updated_at     = NOW()
              WHERE id = $6
-             RETURNING id,
-                       company_name         AS name,
-                       company_id,
-                       COALESCE(address,'') AS address,
-                       COALESCE(phone,'')   AS phone,
-                       COALESCE(contact_email,'') AS contact_email`,
+             RETURNING *`,
             [
                 name.trim(),
                 address?.trim() || null,
                 phone?.trim() || null,
                 contact_email?.trim() || null,
-                settings ? JSON.stringify(settings) : null,
+                JSON.stringify(mergedSettings),
                 companyDbId,
             ]
         );
-        res.json({ message: 'Company settings updated', company: result.rows[0] });
+
+        const updatedCompany = await getCompanyForUser(req);
+        res.json({ message: 'Company settings updated', company: updatedCompany });
     } catch (err) {
         console.error('PUT /settings/company error:', err.message);
         res.status(500).json({ message: "An internal server error occurred. Please try again." });

@@ -5,6 +5,8 @@ const { authenticateToken } = require('../middleware/authMiddleware');
 const { createNotification, createNotificationForCompany, createNotificationForOwners } = require('../utils/notificationHelpers');
 const { sendJobAssignedEmail, sendJobCompletedEmail } = require('../services/emailNotificationService');
 const { body, validationResult } = require('express-validator');
+const { logJobAudit } = require('../utils/auditLogger');
+const { validateStateTransition, JOB_STATES } = require('../utils/jobStateMachine');
 
 // ── Customer Portal SSE: publish job events to Redis pub/sub ──────────────────
 // Non-destructive: only fires when job has a customer_id; failure never affects response.
@@ -52,25 +54,42 @@ router.post('/', authenticateToken, loadPlan, checkPlanLimit('job'), [
     : (assignedTo ? false : true);
 
   try {
+    const ownerId = req.user.role === 'owner' ? req.user.id : null;
+    const initialState = assignedTo ? 'assigned' : 'open';
+
     const result = await pool.query(
       `INSERT INTO jobs 
-       (title, description, assigned_to, created_by, company_id, data, visible_to_all, status, priority, employee_status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'assigned')
+       (title, description, assigned_to, assigned_employee_id, owner_id, created_by, company_id, data, visible_to_all, status, priority, employee_status, state)
+       VALUES ($1, $2, $3, $3, $4, $5, $6, $7, $8, $9, $10, 'assigned', $11)
        RETURNING *`,
       [
         title,
         description,
         assignedTo,
+        ownerId,
         req.user.id,
         req.user.companyId || null,
         job,
         visibleToAll,
         job.status || 'open',
-        job.priority || 'medium'
+        job.priority || 'medium',
+        initialState,
       ]
     );
 
     const createdJob = result.rows[0];
+
+    // Audit Log
+    logJobAudit({
+      companyId: req.user.companyId,
+      jobId: createdJob.id,
+      userId: req.user.id,
+      userRole: req.user.role,
+      action: 'JOB_CREATED',
+      newState: initialState,
+      newValue: { title, assignedTo, priority: job.priority || 'medium' },
+      ipAddress: req.ip,
+    });
 
     // Send notification to assigned employee OR broadcast to all if visible to all
     try {
@@ -296,7 +315,11 @@ router.post('/:id/accept', authenticateToken, async (req, res) => {
             accepted_at     = NOW(),
             started_at      = NOW(),
             status          = 'in_progress',
+            state           = 'accepted',
             assigned_to     = $2,
+            assigned_employee_id = $2,
+            accepted_by     = $2,
+            current_worker_id = $2,
             visible_to_all  = false,
             approval_status = CASE
               WHEN source = 'customer' AND COALESCE(approval_status, 'pending_approval') = 'pending_approval'
@@ -345,6 +368,18 @@ router.post('/:id/accept', authenticateToken, async (req, res) => {
     const acceptedJob = result.rows[0];
 
     await client.query('COMMIT');
+
+    // Audit Trail Log
+    logJobAudit({
+      companyId: req.user.companyId || acceptedJob.company_id,
+      jobId: acceptedJob.id,
+      userId: req.user.id,
+      userRole: req.user.role,
+      action: 'JOB_ACCEPTED',
+      oldState: 'assigned',
+      newState: 'accepted',
+      ipAddress: req.ip,
+    });
 
     // ── Post-commit side effects (non-blocking) ───────────────────────────────
 
@@ -452,23 +487,27 @@ router.post('/:id/decline', authenticateToken, async (req, res) => {
 });
 
 /**
- * Update job progress (Employee only)
+ * Update job progress (Employee only — Accepted Technician)
  */
 router.post('/:id/progress', authenticateToken, async (req, res) => {
   const { id } = req.params;
   const { progress } = req.body;
+
+  if (req.user.role === 'owner') {
+    return res.status(403).json({
+      message: 'Owners are supervisors and cannot directly alter field progress. Use Owner Emergency Override if necessary.'
+    });
+  }
 
   if (typeof progress !== 'number' || progress < 0 || progress > 100) {
     return res.status(400).json({ message: 'Progress must be between 0 and 100' });
   }
 
   try {
-    // Check if job is assigned to this employee and accepted
     console.log(`🔍 Checking job access: JobID=${id}, UserID=${req.user.id}`);
 
-    // HARDENED: scope existence check to own company too (handles both integer and UUID company_id)
     const jobExists = await pool.query(
-      `SELECT id, assigned_to, employee_status FROM jobs j
+      `SELECT id, assigned_to, accepted_by, employee_status, state, progress FROM jobs j
        WHERE j.id = $1
          AND (j.company_id::text = $2 OR j.company_id::text IN (SELECT c.id::text FROM companies c WHERE c.id::text = $2 OR c.company_id::text = $2))`,
       [id, String(req.user.companyId)]
@@ -477,36 +516,38 @@ router.post('/:id/progress', authenticateToken, async (req, res) => {
       return res.status(404).json({ message: 'Job not found' });
     }
 
-    const checkJob = await pool.query(
-      'SELECT * FROM jobs WHERE id = $1 AND assigned_to = $2 AND employee_status = $3',
-      [id, req.user.id, 'accepted']
-    );
+    const curJob = jobExists.rows[0];
+    const isAcceptedTechnician =
+      (curJob.accepted_by && String(curJob.accepted_by) === String(req.user.id)) ||
+      (curJob.assigned_to && String(curJob.assigned_to) === String(req.user.id) && curJob.employee_status === 'accepted');
 
-    if (checkJob.rows.length === 0) {
-      console.warn(`⛔ Access denied for Job ${id} by User ${req.user.id}`);
+    if (!isAcceptedTechnician) {
+      console.warn(`⛔ Access denied for Job ${id} by User ${req.user.id} (Not accepted technician)`);
       return res.status(403).json({
-        message: 'Job not assigned to you or not accepted'
+        message: 'Only the technician who accepted this job can update field progress.'
       });
     }
 
-    // Use 'in_progress' (not 'active') as the canonical in-flight status
     let status = 'in_progress';
+    let newState = 'in_progress';
     let completed_at = null;
 
     if (progress === 100) {
       status = 'completed';
+      newState = 'completed';
       completed_at = new Date();
     }
 
-    // HARDENED: company_id in UPDATE, only allow if assigned_to = me
-    // When a customer job reaches 100%, also mark it as approved (it was clearly accepted and worked on)
     const result = await pool.query(
       `UPDATE jobs
-       SET progress      = $1,
-           status        = $2,
-           completed_at  = $3,
-           employee_status = CASE WHEN $1 = 100 THEN 'completed' ELSE employee_status END,
-           approval_status = CASE
+       SET progress            = $1,
+           status              = $2,
+           state               = $3,
+           completed_at        = $4,
+           completed_by        = CASE WHEN $1 = 100 THEN $5 ELSE completed_by END,
+           employee_status     = CASE WHEN $1 = 100 THEN 'completed' ELSE employee_status END,
+           current_worker_id   = $5,
+           approval_status     = CASE
              WHEN $1 = 100 AND source = 'customer' AND approval_status = 'pending_approval'
              THEN 'approved'
              ELSE approval_status
@@ -516,11 +557,10 @@ router.post('/:id/progress', authenticateToken, async (req, res) => {
              THEN NOW()
              ELSE approved_at
            END
-       WHERE id = $4
-         AND (company_id::text = $5 OR company_id::text IN (SELECT c.id::text FROM companies c WHERE c.id::text = $5 OR c.company_id::text = $5))
-         AND assigned_to = $6
+       WHERE id = $6
+         AND company_id::text = $7
        RETURNING *`,
-      [progress, status, completed_at, id, String(req.user.companyId), req.user.id]
+      [progress, status, newState, completed_at, req.user.id, id, String(req.user.companyId)]
     );
 
     if (result.rowCount === 0) {
@@ -528,6 +568,20 @@ router.post('/:id/progress', authenticateToken, async (req, res) => {
     }
 
     const updatedJob = result.rows[0];
+
+    // Log Audit Trail
+    logJobAudit({
+      companyId: req.user.companyId,
+      jobId: updatedJob.id,
+      userId: req.user.id,
+      userRole: req.user.role,
+      action: progress === 100 ? 'JOB_COMPLETED' : 'PROGRESS_UPDATED',
+      oldState: curJob.state,
+      newState: newState,
+      oldValue: { progress: curJob.progress },
+      newValue: { progress: updatedJob.progress },
+      ipAddress: req.ip,
+    });
 
     // Decrement active_job_count when job is completed
     if (progress === 100) {
@@ -538,7 +592,7 @@ router.post('/:id/progress', authenticateToken, async (req, res) => {
         [req.user.id]
       ).catch(e => console.error('active_job_count decrement error:', e.message));
 
-      // Generate invoice (non-blocking) — only for non-cancelled jobs
+      // Generate invoice (non-blocking)
       const { generateInvoice } = require('../services/billingService');
       generateInvoice(updatedJob.id, updatedJob.company_id || req.user.companyId)
         .catch(e => console.error('Invoice generation error:', e.message));
@@ -1074,9 +1128,197 @@ router.patch('/action-requests/:requestId', authenticateToken, async (req, res) 
       }).catch(() => {});
     }
 
-    res.json({ success: true, request: updatedReq });
+/**
+ * POST /api/jobs/:id/reassign (Owner Only)
+ * Reassign job to a different field technician
+ */
+router.post('/:id/reassign', authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== 'owner') {
+      return res.status(403).json({ message: 'Only company owners can reassign jobs.' });
+    }
+
+    const { id } = req.params;
+    const { new_employee_id, reason } = req.body;
+
+    if (!new_employee_id) {
+      return res.status(400).json({ message: 'new_employee_id is required for job reassignment.' });
+    }
+
+    const companyId = req.user.companyId || req.user.company_id;
+
+    // Fetch existing job
+    const curRes = await pool.query(
+      `SELECT * FROM jobs WHERE id = $1 AND company_id::text = $2`,
+      [id, String(companyId)]
+    );
+    if (curRes.rows.length === 0) {
+      return res.status(404).json({ message: 'Job not found' });
+    }
+    const curJob = curRes.rows[0];
+    const prevEmployeeId = curJob.assigned_to;
+
+    const result = await pool.query(
+      `UPDATE jobs
+       SET assigned_to          = $1,
+           assigned_employee_id = $1,
+           employee_status      = 'assigned',
+           state                = 'assigned',
+           accepted_by          = NULL,
+           current_worker_id    = NULL,
+           accepted_at          = NULL,
+           is_override          = TRUE,
+           override_reason      = $2,
+           override_by          = $3,
+           override_at          = NOW()
+       WHERE id = $4 AND company_id::text = $5
+       RETURNING *`,
+      [new_employee_id, reason || 'Reassigned by Owner', req.user.id, id, String(companyId)]
+    );
+
+    const updatedJob = result.rows[0];
+
+    // Audit Log
+    logJobAudit({
+      companyId,
+      jobId: id,
+      userId: req.user.id,
+      userRole: req.user.role,
+      action: 'JOB_REASSIGNED',
+      oldState: curJob.state,
+      newState: 'assigned',
+      oldValue: { assignedTo: prevEmployeeId },
+      newValue: { assignedTo: new_employee_id },
+      reason: reason || 'Reassigned by Owner',
+      ipAddress: req.ip,
+    });
+
+    // Notifications
+    try {
+      if (prevEmployeeId) {
+        await createNotification({
+          user_id: prevEmployeeId,
+          company_id: companyId,
+          type: 'job_reassigned',
+          title: 'Job Reassigned',
+          message: `Job "${curJob.title}" has been reassigned by the owner.`,
+          priority: 'medium',
+          data: { job_id: id }
+        });
+      }
+      await createNotification({
+        user_id: new_employee_id,
+        company_id: companyId,
+        type: 'job_assigned',
+        title: 'New Job Assigned',
+        message: `You have been assigned a new job: "${curJob.title}"`,
+        priority: 'high',
+        data: { job_id: id }
+      });
+    } catch (nErr) {
+      console.error('Reassign notification error:', nErr.message);
+    }
+
+    res.json({ success: true, job: updatedJob });
   } catch (err) {
-    console.error('PATCH /api/jobs/action-requests/:requestId error:', err);
+    console.error('POST /api/jobs/:id/reassign error:', err);
+    res.status(500).json({ message: err.message || 'Server error' });
+  }
+});
+
+/**
+ * POST /api/jobs/:id/override (Owner Only — Emergency Override)
+ * Supervisory override when assigned technician is unavailable
+ */
+router.post('/:id/override', authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== 'owner') {
+      return res.status(403).json({ message: 'Only company owners can execute emergency overrides.' });
+    }
+
+    const { id } = req.params;
+    const { action_type, reason, new_progress, new_employee_id } = req.body;
+
+    if (!reason || typeof reason !== 'string' || !reason.trim()) {
+      return res.status(400).json({ message: 'Compulsory override reason is required.' });
+    }
+
+    const companyId = req.user.companyId || req.user.company_id;
+
+    const curRes = await pool.query(
+      `SELECT * FROM jobs WHERE id = $1 AND company_id::text = $2`,
+      [id, String(companyId)]
+    );
+    if (curRes.rows.length === 0) {
+      return res.status(404).json({ message: 'Job not found' });
+    }
+    const curJob = curRes.rows[0];
+
+    let newStatus = curJob.status;
+    let newState = curJob.state;
+    let newProgress = curJob.progress;
+    let newAssignedTo = curJob.assigned_to;
+
+    if (action_type === 'force_complete') {
+      newStatus = 'completed';
+      newState = 'completed';
+      newProgress = 100;
+    } else if (action_type === 'return_to_assigned') {
+      newStatus = 'open';
+      newState = 'assigned';
+    } else if (action_type === 'cancel_job') {
+      newStatus = 'cancelled';
+      newState = 'cancelled';
+    } else if (action_type === 'reassign' && new_employee_id) {
+      newAssignedTo = new_employee_id;
+      newState = 'assigned';
+    } else if (action_type === 'override_progress' && typeof new_progress === 'number') {
+      newProgress = Math.min(100, Math.max(0, new_progress));
+      if (newProgress === 100) {
+        newStatus = 'completed';
+        newState = 'completed';
+      }
+    }
+
+    const result = await pool.query(
+      `UPDATE jobs
+       SET status               = $1,
+           state                = $2,
+           progress             = $3,
+           assigned_to          = $4,
+           assigned_employee_id = $4,
+           is_override          = TRUE,
+           override_reason      = $5,
+           override_by          = $6,
+           override_at          = NOW(),
+           completed_at         = CASE WHEN $1 = 'completed' THEN NOW() ELSE completed_at END,
+           completed_by         = CASE WHEN $1 = 'completed' THEN $6 ELSE completed_by END
+       WHERE id = $7 AND company_id::text = $8
+       RETURNING *`,
+      [newStatus, newState, newProgress, newAssignedTo, reason.trim(), req.user.id, id, String(companyId)]
+    );
+
+    const updatedJob = result.rows[0];
+
+    // Log Audit Trail
+    logJobAudit({
+      companyId,
+      jobId: id,
+      userId: req.user.id,
+      userRole: req.user.role,
+      action: 'EMERGENCY_OVERRIDE',
+      oldState: curJob.state,
+      newState,
+      oldValue: { status: curJob.status, progress: curJob.progress, assignedTo: curJob.assigned_to },
+      newValue: { status: newStatus, progress: newProgress, assignedTo: newAssignedTo },
+      reason: reason.trim(),
+      metadata: { action_type },
+      ipAddress: req.ip,
+    });
+
+    res.json({ success: true, job: updatedJob, message: `Emergency override executed successfully (${action_type}).` });
+  } catch (err) {
+    console.error('POST /api/jobs/:id/override error:', err);
     res.status(500).json({ message: err.message || 'Server error' });
   }
 });

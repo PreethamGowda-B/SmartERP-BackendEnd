@@ -240,19 +240,31 @@ class InvoiceService {
       const additionalCharges = parseFloat(invoiceData.additional_charges || 0);
       const discountAmount = parseFloat(invoiceData.discount_amount || 0);
 
-      const subtotal = Math.max(
+      let subtotal = Math.max(
         0,
         parseFloat(
           (labourCost + materialsCost + equipmentCharges + transportCharges + additionalCharges - discountAmount).toFixed(2)
         )
       );
 
-      const gstRate = parseFloat(invoiceData.gst_rate || 18.0) / 100.0;
-      const totalTax = parseFloat((subtotal * gstRate).toFixed(2));
+      const gstRateVal = parseFloat(invoiceData.gst_rate || 18.0);
+      const gstRate = gstRateVal / 100.0;
+      let totalTax = parseFloat((subtotal * gstRate).toFixed(2));
 
       let cgst = 0;
       let sgst = 0;
       let igst = 0;
+
+      let totalAmount = parseFloat((subtotal + totalTax).toFixed(2));
+
+      // 🚀 Handle Owner Manual Invoice Adjustment
+      const isManualAdjustment = Boolean(invoiceData.is_manual_adjustment);
+      const manualTotal = parseFloat(invoiceData.manual_grand_total);
+      if (isManualAdjustment && !isNaN(manualTotal) && manualTotal >= 0) {
+        totalAmount = manualTotal;
+        subtotal = parseFloat((totalAmount / (1 + gstRate)).toFixed(2));
+        totalTax = parseFloat((totalAmount - subtotal).toFixed(2));
+      }
 
       if (invoiceData.is_inter_state) {
         igst = totalTax;
@@ -261,7 +273,6 @@ class InvoiceService {
         sgst = parseFloat((totalTax / 2).toFixed(2));
       }
 
-      const totalAmount = parseFloat((subtotal + totalTax).toFixed(2));
       const dueDays = parseInt(invoiceData.due_days || 15, 10);
       const dueDate = new Date();
       dueDate.setDate(dueDate.getDate() + dueDays);
@@ -380,6 +391,22 @@ class InvoiceService {
         ]
       );
 
+      // Record Manual Adjustment Audit Log if enabled
+      if (isManualAdjustment) {
+        const origVal = parseFloat(invoiceData.original_grand_total || totalAmount);
+        const diffVal = parseFloat((totalAmount - origVal).toFixed(2));
+        const reasonVal = invoiceData.adjustment_reason || 'Owner Manual Adjustment';
+        await client.query(
+          `INSERT INTO invoice_activity_logs (invoice_id, actor_id, actor_name, action, notes, created_at)
+           VALUES ($1, $2, 'Owner/Admin', 'manual_adjustment', $3, NOW())`,
+          [
+            invoice.id,
+            userId || null,
+            `Original Amount: ₹${origVal} | New Amount: ₹${totalAmount} | Difference: ₹${diffVal} | Reason: ${reasonVal}`
+          ]
+        ).catch(() => {});
+      }
+
       await client.query('COMMIT');
 
       // Non-blocking audit log
@@ -387,10 +414,15 @@ class InvoiceService {
         companyId,
         actorType: 'user',
         actorId: userId,
-        actionType: 'invoice_finalized',
+        actionType: isManualAdjustment ? 'invoice_manual_adjustment' : 'invoice_finalized',
         entityType: 'invoice',
         entityId: invoice.id,
-        newValue: { invoice_number: invoiceNumber, total_amount: totalAmount },
+        newValue: {
+          invoice_number: invoiceNumber,
+          total_amount: totalAmount,
+          is_manual_adjustment: isManualAdjustment,
+          reason: invoiceData.adjustment_reason || null
+        },
       }).catch(() => {});
 
       return { success: true, invoice };

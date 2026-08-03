@@ -17,7 +17,11 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS override_reason TEXT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS override_by UUID REFERENCES users(id);
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS override_at TIMESTAMPTZ;
 
--- Backfill attribution columns safely
+-- Backfill attribution columns safely (only for valid users present in users table)
+UPDATE jobs 
+SET assigned_to = NULL
+WHERE assigned_to IS NOT NULL AND assigned_to NOT IN (SELECT id FROM users);
+
 UPDATE jobs 
 SET assigned_employee_id = assigned_to,
     accepted_by = CASE WHEN employee_status = 'accepted' THEN assigned_to ELSE NULL END,

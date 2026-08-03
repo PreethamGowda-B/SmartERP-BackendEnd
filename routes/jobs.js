@@ -1128,6 +1128,13 @@ router.patch('/action-requests/:requestId', authenticateToken, async (req, res) 
       }).catch(() => {});
     }
 
+    res.json({ success: true, request: updatedReq });
+  } catch (err) {
+    console.error('PATCH /api/jobs/action-requests/:requestId error:', err);
+    res.status(500).json({ message: err.message || 'Server error' });
+  }
+});
+
 /**
  * POST /api/jobs/:id/reassign (Owner Only)
  * Reassign job to a different field technician

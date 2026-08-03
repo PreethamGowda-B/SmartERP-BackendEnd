@@ -13,22 +13,22 @@ async function ensureWorkRequestsTable() {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS work_requests (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        company_id UUID,
+        company_id TEXT,
         request_type VARCHAR(100) NOT NULL,
         category VARCHAR(50) DEFAULT 'jobs',
         urgency VARCHAR(20) DEFAULT 'normal',
         status VARCHAR(20) DEFAULT 'pending',
-        submitted_by_id UUID,
+        submitted_by_id TEXT,
         submitted_by_name VARCHAR(255),
         submitted_by_role VARCHAR(50),
-        job_id UUID,
-        invoice_id UUID,
-        material_request_id UUID,
-        leave_request_id UUID,
+        job_id TEXT,
+        invoice_id TEXT,
+        material_request_id TEXT,
+        leave_request_id TEXT,
         title VARCHAR(255) NOT NULL,
         reason TEXT,
         response_notes TEXT,
-        resolved_by_id UUID,
+        resolved_by_id TEXT,
         resolved_by_name VARCHAR(255),
         resolved_at TIMESTAMP WITH TIME ZONE,
         evidence_urls JSONB DEFAULT '[]'::jsonb,
@@ -36,6 +36,10 @@ async function ensureWorkRequestsTable() {
         created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
         updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
       );
+      ALTER TABLE work_requests ALTER COLUMN company_id TYPE TEXT USING company_id::text;
+      ALTER TABLE work_requests ALTER COLUMN job_id TYPE TEXT USING job_id::text;
+      ALTER TABLE work_requests ALTER COLUMN invoice_id TYPE TEXT USING invoice_id::text;
+      ALTER TABLE work_requests ALTER COLUMN submitted_by_id TYPE TEXT USING submitted_by_id::text;
       CREATE INDEX IF NOT EXISTS idx_work_requests_company ON work_requests(company_id);
       CREATE INDEX IF NOT EXISTS idx_work_requests_status ON work_requests(status);
     `);
@@ -46,7 +50,7 @@ async function ensureWorkRequestsTable() {
 }
 
 // Auto-run on router load
-ensureWorkRequestsTable();
+ensureWorkRequestsTable().catch(() => {});
 router.post('/', authenticateToken, async (req, res) => {
   try {
     const companyId = req.user.companyId || req.user.company_id;
@@ -78,17 +82,17 @@ router.post('/', authenticateToken, async (req, res) => {
       ) VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NOW(), NOW())
       RETURNING *`,
       [
-        companyId,
+        String(companyId),
         request_type,
         category,
         urgency,
-        req.user.id,
+        String(req.user.id),
         req.user.name || req.user.email,
         req.user.role || 'employee',
-        job_id || null,
-        invoice_id || null,
-        material_request_id || null,
-        leave_request_id || null,
+        job_id ? String(job_id) : null,
+        invoice_id ? String(invoice_id) : null,
+        material_request_id ? String(material_request_id) : null,
+        leave_request_id ? String(leave_request_id) : null,
         title,
         reason || '',
         JSON.stringify(evidence_urls),
@@ -130,11 +134,11 @@ router.get('/', authenticateToken, async (req, res) => {
              j.title AS job_title, j.location AS job_location,
              inv.invoice_number, inv.total_amount AS invoice_total
       FROM work_requests r
-      LEFT JOIN jobs j ON r.job_id = j.id
-      LEFT JOIN invoices inv ON r.invoice_id = inv.id
-      WHERE r.company_id = $1
+      LEFT JOIN jobs j ON r.job_id::text = j.id::text
+      LEFT JOIN invoices inv ON r.invoice_id::text = inv.id::text
+      WHERE r.company_id::text = $1::text
     `;
-    const params = [companyId];
+    const params = [String(companyId)];
 
     if (category && category !== 'all') {
       params.push(category);

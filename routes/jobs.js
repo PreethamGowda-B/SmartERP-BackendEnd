@@ -167,7 +167,9 @@ router.get('/', authenticateToken, async (req, res) => {
            SELECT DISTINCT ON (j.id) j.*, u.email as employee_email, u.name as employee_name,
                   inv.id AS invoice_id, inv.invoice_number, inv.status AS invoice_status,
                   inv.viewed_at AS invoice_viewed_at, inv.downloaded_at AS invoice_downloaded_at,
-                  inv.total_amount AS invoice_total_amount
+                  inv.total_amount AS invoice_total_amount,
+                  inv.version_number AS invoice_version_number,
+                  inv.edited_count AS invoice_edited_count
            FROM jobs j
            LEFT JOIN users u ON j.assigned_to = u.id
            LEFT JOIN invoices inv ON inv.job_id = j.id AND inv.is_latest = TRUE
@@ -203,7 +205,10 @@ router.get('/', authenticateToken, async (req, res) => {
       result = await pool.query(
         `SELECT * FROM (
            SELECT DISTINCT ON (j.id) j.*, u.name as assigned_employee_name,
-                  inv.id AS invoice_id, inv.invoice_number, inv.status AS invoice_status
+                  inv.id AS invoice_id, inv.invoice_number, inv.status AS invoice_status,
+                  inv.total_amount AS invoice_total_amount,
+                  inv.version_number AS invoice_version_number,
+                  inv.edited_count AS invoice_edited_count
            FROM jobs j
            LEFT JOIN users u ON j.assigned_to = u.id
            LEFT JOIN invoices inv ON inv.job_id = j.id AND inv.is_latest = TRUE

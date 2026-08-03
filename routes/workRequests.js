@@ -5,10 +5,48 @@ const { authenticateToken } = require('../middleware/authMiddleware');
 const { createNotificationForOwners, createNotification } = require('../utils/notificationHelpers');
 const invoiceService = require('../services/invoiceService');
 
-/**
- * POST /api/work-requests
- * Submits a new canonical work request from any module (Employee, Customer, System)
- */
+let isTableInitialized = false;
+
+async function ensureWorkRequestsTable() {
+  if (isTableInitialized) return;
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS work_requests (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        company_id UUID,
+        request_type VARCHAR(100) NOT NULL,
+        category VARCHAR(50) DEFAULT 'jobs',
+        urgency VARCHAR(20) DEFAULT 'normal',
+        status VARCHAR(20) DEFAULT 'pending',
+        submitted_by_id UUID,
+        submitted_by_name VARCHAR(255),
+        submitted_by_role VARCHAR(50),
+        job_id UUID,
+        invoice_id UUID,
+        material_request_id UUID,
+        leave_request_id UUID,
+        title VARCHAR(255) NOT NULL,
+        reason TEXT,
+        response_notes TEXT,
+        resolved_by_id UUID,
+        resolved_by_name VARCHAR(255),
+        resolved_at TIMESTAMP WITH TIME ZONE,
+        evidence_urls JSONB DEFAULT '[]'::jsonb,
+        payload JSONB DEFAULT '{}'::jsonb,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_work_requests_company ON work_requests(company_id);
+      CREATE INDEX IF NOT EXISTS idx_work_requests_status ON work_requests(status);
+    `);
+    isTableInitialized = true;
+  } catch (err) {
+    console.error('❌ Error creating work_requests table:', err.message);
+  }
+}
+
+// Auto-run on router load
+ensureWorkRequestsTable();
 router.post('/', authenticateToken, async (req, res) => {
   try {
     const companyId = req.user.companyId || req.user.company_id;
@@ -83,6 +121,7 @@ router.post('/', authenticateToken, async (req, res) => {
  */
 router.get('/', authenticateToken, async (req, res) => {
   try {
+    await ensureWorkRequestsTable();
     const companyId = req.user.companyId || req.user.company_id;
     const { category, status, urgency, search } = req.query;
 

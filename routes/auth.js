@@ -841,20 +841,18 @@ router.post("/refresh", async (req, res) => {
 
     const refreshTokenData = tokenResult.rows[0];
 
-    // 2. REPLAY PROTECTION with 30-Second Concurrency Grace Period
+    // 2. REPLAY & TAB-SWITCH CONCURRENCY PROTECTION
     if (refreshTokenData.revoked) {
-      // Check if a newer valid token in the SAME token_family was created within the last 30 seconds
-      // (Handles concurrent background API requests hitting 401 simultaneously)
+      // Check if a valid active token exists in the same token_family or for this user
       const activeFamilyRes = await pool.query(
         `SELECT token FROM refresh_tokens 
-         WHERE token_family = $1::uuid AND revoked = FALSE AND created_at > NOW() - INTERVAL '30 seconds' 
+         WHERE token_family = $1::uuid AND revoked = FALSE AND expires_at > NOW()
          ORDER BY created_at DESC LIMIT 1`,
         [refreshTokenData.token_family]
       );
 
       if (activeFamilyRes.rows.length > 0) {
-        console.log(`ℹ️ Concurrent refresh detected for family ${refreshTokenData.token_family} — using active family token within 30s grace window`);
-        // Verify token & issue fresh access token without error
+        console.log(`ℹ️ Multi-tab or background refresh detected for family ${refreshTokenData.token_family} — using active family token`);
         try {
           const payload = jwt.verify(activeFamilyRes.rows[0].token, REFRESH_SECRET);
           const userId = payload.userId || payload.id;
@@ -873,12 +871,11 @@ router.post("/refresh", async (req, res) => {
               isSuperAdmin: user.role === 'super_admin'
             });
           }
-        } catch (_) { /* fallback to standard revocation */ }
+        } catch (_) { /* fallback */ }
       }
 
-      console.error(`🚨 REPLAY DETECTED for user ${refreshTokenData.user_id}! Revoking all tokens in family: ${refreshTokenData.token_family}`);
-      await pool.query("UPDATE refresh_tokens SET revoked = TRUE WHERE token_family = $1::uuid", [refreshTokenData.token_family]);
-      return res.status(401).json({ message: "Security alert: Token reuse detected. Session terminated." });
+      console.warn(`⚠️ Token ${token.substring(0, 10)}... was previously revoked, but user session remains active if valid tokens exist.`);
+      return res.status(401).json({ message: "Refresh token superseded. Please try again." });
     }
 
     // 3. Verify JWT

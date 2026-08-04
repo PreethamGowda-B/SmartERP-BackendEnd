@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router({ mergeParams: true });
 const { pool } = require("../db");
 const { authenticateToken } = require("../middleware/authMiddleware");
+const { requireClockIn } = require("../middleware/attendanceGatekeeperMiddleware");
 const { createNotification, createNotificationForOwners } = require("../utils/notificationHelpers");
 const EventMessagingService = require('../services/eventMessagingService');
 
@@ -37,7 +38,7 @@ setTimeout(ensureDbInitialized, 2000);
 
 // ── 1. POST /api/jobs/:id/proof-of-work ─────────────────────────────────────
 // Submit site photo, progress notes, and GPS check-in (Field Technicians)
-router.post("/:id/proof-of-work", authenticateToken, async (req, res) => {
+router.post("/:id/proof-of-work", authenticateToken, requireClockIn, async (req, res) => {
   try {
     await ensureDbInitialized();
     const jobId = req.params.id;

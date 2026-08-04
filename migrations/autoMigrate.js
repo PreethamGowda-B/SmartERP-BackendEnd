@@ -209,6 +209,7 @@ const NUMBERED_MIGRATIONS = [
     '015_finance_and_invoicing_system.sql',
     '017_enterprise_rbac_and_state_machine.sql',
     '018_ai_copilot_and_audit_logs.sql',
+    '019_workforce_gatekeeper_audit_logs.sql',
 ];
 
 async function runNumberedMigrations() {

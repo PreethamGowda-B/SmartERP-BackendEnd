@@ -7,6 +7,7 @@ const { sendJobAssignedEmail, sendJobCompletedEmail } = require('../services/ema
 const { body, validationResult } = require('express-validator');
 const { logJobAudit } = require('../utils/auditLogger');
 const { validateStateTransition, JOB_STATES } = require('../utils/jobStateMachine');
+const { requireClockIn } = require('../middleware/attendanceGatekeeperMiddleware');
 
 // ── Customer Portal SSE: publish job events to Redis pub/sub ──────────────────
 // Non-destructive: only fires when job has a customer_id; failure never affects response.
@@ -439,9 +440,9 @@ const handleJobAccept = async (req, res) => {
   }
 };
 
-router.post('/:id/accept', authenticateToken, handleJobAccept);
-router.put('/:id/accept', authenticateToken, handleJobAccept);
-router.patch('/:id/accept', authenticateToken, handleJobAccept);
+router.post('/:id/accept', authenticateToken, requireClockIn, handleJobAccept);
+router.put('/:id/accept', authenticateToken, requireClockIn, handleJobAccept);
+router.patch('/:id/accept', authenticateToken, requireClockIn, handleJobAccept);
 
 /**
  * Decline a job (Employee only)
@@ -501,9 +502,9 @@ const handleJobDecline = async (req, res) => {
   }
 };
 
-router.post('/:id/decline', authenticateToken, handleJobDecline);
-router.put('/:id/decline', authenticateToken, handleJobDecline);
-router.patch('/:id/decline', authenticateToken, handleJobDecline);
+router.post('/:id/decline', authenticateToken, requireClockIn, handleJobDecline);
+router.put('/:id/decline', authenticateToken, requireClockIn, handleJobDecline);
+router.patch('/:id/decline', authenticateToken, requireClockIn, handleJobDecline);
 
 /**
  * Update job progress (Employee only — Accepted Technician)
@@ -664,9 +665,9 @@ const handleJobProgress = async (req, res) => {
   }
 };
 
-router.post('/:id/progress', authenticateToken, handleJobProgress);
-router.put('/:id/progress', authenticateToken, handleJobProgress);
-router.patch('/:id/progress', authenticateToken, handleJobProgress);
+router.post('/:id/progress', authenticateToken, requireClockIn, handleJobProgress);
+router.put('/:id/progress', authenticateToken, requireClockIn, handleJobProgress);
+router.patch('/:id/progress', authenticateToken, requireClockIn, handleJobProgress);
 
 /**
  * Update job (Owner/Admin only)

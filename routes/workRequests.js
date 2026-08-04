@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
+const { requireClockIn } = require('../middleware/attendanceGatekeeperMiddleware');
 const { createNotificationForOwners, createNotification } = require('../utils/notificationHelpers');
 const invoiceService = require('../services/invoiceService');
 
@@ -72,7 +73,7 @@ async function ensureWorkRequestsTable() {
 ensureWorkRequestsTable().catch(() => {});
 
 // ─── POST /api/work-requests (Submit a new request) ──────────────────────────
-router.post('/', authenticateToken, async (req, res) => {
+router.post('/', authenticateToken, requireClockIn, async (req, res) => {
   try {
     await ensureWorkRequestsTable();
     const companyId = req.user.companyId || req.user.company_id || 1;

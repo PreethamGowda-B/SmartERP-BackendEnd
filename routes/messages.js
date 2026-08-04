@@ -155,19 +155,23 @@ router.post('/', async (req, res) => {
     const {
       conversation_id,
       content,
-      message: legacyMessage  // legacy fallback
+      message: legacyMessage,  // legacy fallback
+      message_type: clientMessageType,
+      attachment,               // { file_url, file_name, file_type, file_size, media_url, media_type }
     } = req.body;
 
     const msgContent = content ?? legacyMessage;
+    const msgType = clientMessageType || (attachment?.media_type === 'audio' ? 'audio' : attachment?.file_type?.startsWith('image/') ? 'image' : attachment ? 'document' : 'text');
 
     // Validation
     if (!conversation_id) {
       return res.status(400).json({ message: 'conversation_id is required' });
     }
-    if (!msgContent || String(msgContent).trim().length === 0) {
+    // Allow empty content if there's an attachment
+    if ((!msgContent || String(msgContent).trim().length === 0) && !attachment) {
       return res.status(400).json({ message: 'content cannot be empty' });
     }
-    if (String(msgContent).length > 2000) {
+    if (msgContent && String(msgContent).length > 2000) {
       return res.status(400).json({ message: 'Message too long (max 2000 characters)' });
     }
 
@@ -187,14 +191,18 @@ router.post('/', async (req, res) => {
     );
     const recipientId = otherParticipantResult.rows[0]?.user_id ?? null;
 
-    const trimmedContent = String(msgContent).trim();
+    const trimmedContent = String(msgContent || '').trim();
+    const mediaUrl = attachment?.media_url || attachment?.file_url || null;
+    const mediaType = attachment?.media_type || null;
+    const fileName = attachment?.file_name || null;
+    const fileSize = attachment?.file_size || null;
 
     // Insert message — production messages table has both 'message' (old, NOT NULL) and 'content' (new) columns
     const result = await pool.query(
-      `INSERT INTO messages (conversation_id, sender_id, receiver_id, message, content, message_type, created_at)
-       VALUES ($1, $2::UUID, $3::UUID, $4, $4, COALESCE($5, 'text'), NOW())
-       RETURNING id, conversation_id, sender_id, content, message, message_type, created_at`,
-      [conversation_id, String(senderId), String(recipientId), trimmedContent, 'text']
+      `INSERT INTO messages (conversation_id, sender_id, receiver_id, message, content, message_type, media_url, media_type, file_name, file_size, created_at)
+       VALUES ($1, $2::UUID, $3::UUID, $4, $4, COALESCE($5, 'text'), $6, $7, $8, $9, NOW())
+       RETURNING id, conversation_id, sender_id, content, message, message_type, media_url, media_type, file_name, file_size, created_at`,
+      [conversation_id, String(senderId), String(recipientId), trimmedContent || (fileName || 'Attachment'), msgType, mediaUrl, mediaType, fileName, fileSize]
     );
 
     const sentMessage = result.rows[0];
@@ -219,6 +227,16 @@ router.post('/', async (req, res) => {
       console.warn('⚠️ Could not fetch sender info:', infoErr.message);
     }
 
+    // Build attachment payload for SSE (if any)
+    const attachmentPayload = mediaUrl ? {
+      file_url: mediaUrl,
+      file_name: fileName,
+      file_type: attachment?.file_type || mediaType || 'application/octet-stream',
+      file_size: fileSize || 0,
+      media_url: mediaUrl,
+      media_type: mediaType || msgType,
+    } : undefined;
+
     // Broadcast real-time SSE event to recipient
     if (recipientId) {
       try {
@@ -230,8 +248,9 @@ router.post('/', async (req, res) => {
             sender_id: senderId,
             sender_name: senderName,
             content: trimmedContent,
-            message_type: 'text',
-            created_at: sentMessage.created_at
+            message_type: msgType,
+            created_at: sentMessage.created_at,
+            ...(attachmentPayload ? { attachment: attachmentPayload } : {}),
           }
         });
       } catch (broadcastErr) {
@@ -278,7 +297,8 @@ router.post('/', async (req, res) => {
       message_type: sentMessage.message_type,
       created_at: sentMessage.created_at,
       is_mine: true,
-      receipt: 'sent'
+      receipt: 'sent',
+      ...(attachmentPayload ? { attachment: attachmentPayload } : {}),
     });
   } catch (err) {
     console.error('Error sending message:', err);
@@ -311,6 +331,8 @@ router.get('/conversation/:conversationId', async (req, res) => {
       `SELECT m.id, m.conversation_id, m.sender_id, u.name AS sender_name,
               COALESCE(m.content, m.message) AS content,
               COALESCE(m.message_type, 'text') AS message_type,
+              m.media_url, m.media_type, m.file_name, m.file_size, m.duration,
+              m.erp_record_type, m.erp_record_id,
               m.created_at,
               CASE WHEN m.sender_id::text = $1 THEN true ELSE false END AS is_mine
        FROM messages m

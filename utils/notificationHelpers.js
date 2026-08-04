@@ -169,18 +169,16 @@ async function createNotification(arg1, arg2, arg3, arg4, arg5) {
  */
 function broadcastToUser(userId, message) {
     const uid = String(userId);
-    // Primary: Redis pub/sub (cluster-safe)
+    // 1. Deliver immediately to local in-process SSE connections (<1ms latency)
+    _broadcastInProcess(uid, message);
+
+    // 2. Publish to Redis pub/sub for cross-worker cluster delivery
     if (redisPublisher && redisPublisher.status === 'ready') {
         redisPublisher.publish(`employee_notifications:${uid}`, JSON.stringify(message))
             .catch(e => {
                 console.error(`❌ Redis broadcast error for user ${uid}:`, e.message);
-                // Fallback to in-process on Redis failure
-                _broadcastInProcess(uid, message);
             });
-        return;
     }
-    // Fallback: in-process Map (single-worker only)
-    _broadcastInProcess(uid, message);
 }
 
 function _broadcastInProcess(userId, message) {

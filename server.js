@@ -651,6 +651,7 @@ v1Router.use(async (req, res, next) => {
 v1Router.use("/auth", require("./routes/auth"));
 v1Router.use("/users", require("./routes/users"));
 v1Router.use("/jobs", require("./routes/jobs"));
+v1Router.use("/jobs", require("./routes/proofOfWork"));
 v1Router.use("/activities", require("./routes/activities"));
 v1Router.use("/attendance", require("./routes/attendance"));
 v1Router.use("/materials", require("./routes/materials"));

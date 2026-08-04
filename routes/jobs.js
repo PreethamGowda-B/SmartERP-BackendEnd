@@ -300,7 +300,7 @@ router.get('/', authenticateToken, async (req, res) => {
  * Accept a job (Employee only)
  * Section 1: wrapped in DB transaction — accept + started_at + active_job_count are atomic
  */
-router.post('/:id/accept', authenticateToken, async (req, res) => {
+const handleJobAccept = async (req, res) => {
   const { id } = req.params;
 
   const client = await pool.connect();
@@ -318,12 +318,6 @@ router.post('/:id/accept', authenticateToken, async (req, res) => {
       return res.status(403).json({ message: 'Job not assigned to you' });
     }
 
-    // Race condition guard: only accept if employee_status is still available (not yet accepted by anyone).
-    // The atomic UPDATE returns 0 rows if another employee already accepted.
-    // WHERE clause is intentionally permissive for "available" states:
-    //   - employee_status IN ('assigned','pending') → normal cases
-    //   - employee_status IS NULL                  → old rows where backfill hasn't run yet
-    // approval_status uses COALESCE to guarantee it never becomes NULL (prevents NOT NULL constraint violations).
     const result = await client.query(
       `UPDATE jobs
         SET employee_status = 'accepted',
@@ -356,24 +350,19 @@ router.post('/:id/accept', authenticateToken, async (req, res) => {
 
     if (result.rowCount === 0) {
       await client.query('ROLLBACK');
-      // Fetch full row to determine why the UPDATE matched 0 rows
       const current = await pool.query('SELECT * FROM jobs WHERE id = $1', [id]);
       const cur = current.rows[0];
 
-      // Log the actual state so it's easy to diagnose in server logs
       console.warn(`[jobs/accept] UPDATE returned 0 rows for job ${id}. ` +
         `employee_status=${cur?.employee_status}, assigned_to=${cur?.assigned_to}, ` +
         `status=${cur?.status}, company_id=${cur?.company_id}, requester=${req.user.id}`);
 
-      // Idempotent: this employee already accepted — return current job as success
       if (cur && cur.employee_status === 'accepted' && String(cur.assigned_to) === String(req.user.id)) {
         return res.status(200).json(cur);
       }
-      // Taken by a different employee
       if (cur && cur.employee_status === 'accepted' && cur.assigned_to && String(cur.assigned_to) !== String(req.user.id)) {
         return res.status(409).json({ message: 'Job already accepted by another employee' });
       }
-      // Job was completed or cancelled
       if (cur && ['completed', 'cancelled'].includes(cur.status)) {
         return res.status(409).json({ message: `Job is already ${cur.status}` });
       }
@@ -384,7 +373,6 @@ router.post('/:id/accept', authenticateToken, async (req, res) => {
 
     await client.query('COMMIT');
 
-    // Audit Trail Log
     logJobAudit({
       companyId: req.user.companyId || acceptedJob.company_id,
       jobId: acceptedJob.id,
@@ -396,9 +384,6 @@ router.post('/:id/accept', authenticateToken, async (req, res) => {
       ipAddress: req.ip,
     });
 
-    // ── Post-commit side effects (non-blocking) ───────────────────────────────
-
-    // Customer Portal SSE
     try {
       if (acceptedJob.customer_id && redisClient && redisClient.status === 'ready') {
         const userInfo2 = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
@@ -412,7 +397,6 @@ router.post('/:id/accept', authenticateToken, async (req, res) => {
       console.error('Customer portal SSE publish error (accept):', cpErr.message);
     }
 
-    // Notify owner
     try {
       const userInfo = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
       const employeeName = userInfo.rows[0]?.name || 'Employee';
@@ -436,16 +420,19 @@ router.post('/:id/accept', authenticateToken, async (req, res) => {
   } finally {
     client.release();
   }
-});
+};
+
+router.post('/:id/accept', authenticateToken, handleJobAccept);
+router.put('/:id/accept', authenticateToken, handleJobAccept);
+router.patch('/:id/accept', authenticateToken, handleJobAccept);
 
 /**
  * Decline a job (Employee only)
  */
-router.post('/:id/decline', authenticateToken, async (req, res) => {
+const handleJobDecline = async (req, res) => {
   const { id } = req.params;
 
   try {
-    // Check if job is assigned to this employee
     const checkJob = await pool.query(
       'SELECT * FROM jobs WHERE id = $1 AND (assigned_to = $2 OR visible_to_all = true) AND company_id::text = $3',
       [id, req.user.id, String(req.user.companyId)]
@@ -455,8 +442,6 @@ router.post('/:id/decline', authenticateToken, async (req, res) => {
       return res.status(403).json({ message: 'Job not assigned to you' });
     }
 
-    // HARDENED: company_id in UPDATE prevents cross-tenant write
-    // Atomic guard: only decline if still in 'assigned' state
     const result = await pool.query(
       `UPDATE jobs
        SET employee_status = 'declined',
@@ -474,9 +459,7 @@ router.post('/:id/decline', authenticateToken, async (req, res) => {
 
     const declinedJob = result.rows[0];
 
-    // Send notification to owner about job decline
     try {
-      // Get employee name
       const userInfo = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
       const employeeName = userInfo.rows[0]?.name || 'Employee';
 
@@ -499,12 +482,16 @@ router.post('/:id/decline', authenticateToken, async (req, res) => {
     console.error('jobs DECLINE error', err);
     res.status(500).json({ message: 'Server error' });
   }
-});
+};
+
+router.post('/:id/decline', authenticateToken, handleJobDecline);
+router.put('/:id/decline', authenticateToken, handleJobDecline);
+router.patch('/:id/decline', authenticateToken, handleJobDecline);
 
 /**
  * Update job progress (Employee only — Accepted Technician)
  */
-router.post('/:id/progress', authenticateToken, async (req, res) => {
+const handleJobProgress = async (req, res) => {
   const { id } = req.params;
   const { progress } = req.body;
 
@@ -584,7 +571,6 @@ router.post('/:id/progress', authenticateToken, async (req, res) => {
 
     const updatedJob = result.rows[0];
 
-    // Log Audit Trail
     logJobAudit({
       companyId: req.user.companyId,
       jobId: updatedJob.id,
@@ -598,7 +584,6 @@ router.post('/:id/progress', authenticateToken, async (req, res) => {
       ipAddress: req.ip,
     });
 
-    // Decrement active_job_count when job is completed
     if (progress === 100) {
       pool.query(
         `UPDATE employee_profiles
@@ -607,13 +592,11 @@ router.post('/:id/progress', authenticateToken, async (req, res) => {
         [req.user.id]
       ).catch(e => console.error('active_job_count decrement error:', e.message));
 
-      // Generate invoice (non-blocking)
       const { generateInvoice } = require('../services/billingService');
       generateInvoice(updatedJob.id, updatedJob.company_id || req.user.companyId)
         .catch(e => console.error('Invoice generation error:', e.message));
     }
 
-    // 🔔 Customer Portal: notify customer via Redis pub/sub if this is a customer job
     try {
       const redisClient = require('../utils/redis');
       if (updatedJob.customer_id && redisClient && redisClient.status === 'ready') {
@@ -626,7 +609,6 @@ router.post('/:id/progress', authenticateToken, async (req, res) => {
       console.error('Customer portal SSE publish error (progress):', cpErr.message);
     }
 
-    // Notification for job completion
     if (progress === 100) {
       try {
         const userInfo = await pool.query('SELECT name, email FROM users WHERE id = $1', [req.user.id]);
@@ -645,7 +627,6 @@ router.post('/:id/progress', authenticateToken, async (req, res) => {
           data: { job_id: updatedJob.id, employee_id: req.user.id, url: '/owner/notifications' }
         });
 
-        // 📧 Email: Notify owner of job completion  
         if (ownerResult.rows[0]) {
           sendJobCompletedEmail({
             ownerEmail: ownerResult.rows[0].email,
@@ -664,7 +645,11 @@ router.post('/:id/progress', authenticateToken, async (req, res) => {
     console.error('jobs PROGRESS error', err);
     res.status(500).json({ message: 'Server error' });
   }
-});
+};
+
+router.post('/:id/progress', authenticateToken, handleJobProgress);
+router.put('/:id/progress', authenticateToken, handleJobProgress);
+router.patch('/:id/progress', authenticateToken, handleJobProgress);
 
 /**
  * Update job (Owner/Admin only)

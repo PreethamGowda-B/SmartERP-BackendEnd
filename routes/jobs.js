@@ -832,6 +832,20 @@ router.post('/:id/invoice', authenticateToken, async (req, res) => {
       senderId: req.user.id,
     }).catch(() => {}); // non-blocking
 
+    // Notify Customer in real-time if job has a customer_id
+    if (job.customer_id) {
+      createNotification({
+        user_id: job.customer_id,
+        company_id: userCompanyId,
+        type: 'invoice_generated',
+        title: 'New Invoice Issued',
+        message: `Invoice #${invoiceNumber} for ₹${Number(amount).toLocaleString('en-IN')} has been generated.`,
+        priority: 'high',
+        actor_id: req.user.id,
+        data: { invoice_id: invRes.rows[0].id, job_id: job.id, url: '/customer/invoices' }
+      }).catch(() => {});
+    }
+
     res.status(201).json({
       success: true,
       message: 'Invoice generated successfully',

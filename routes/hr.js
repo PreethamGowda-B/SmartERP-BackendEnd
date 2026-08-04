@@ -128,6 +128,25 @@ router.post('/requests', authenticateToken, async (req, res) => {
       }).catch(() => {});
     }
 
+    // Real-time Notification to HR / Owner
+    try {
+      const isLeave = request_type === 'leave';
+      const isAttendance = request_type === 'attendance_correction';
+      const notifTitle = isLeave ? 'New Leave Request' : isAttendance ? 'Attendance Correction Request' : 'New Employee Request';
+      const notifMsg = `${userName} submitted a ${request_type.replace('_', ' ')} request (${details.leave_type || details.reason || 'Pending review'}).`;
+      await createNotificationForOwners({
+        company_id: companyId,
+        type: request_type,
+        title: notifTitle,
+        message: notifMsg,
+        priority: 'medium',
+        actor_id: userId,
+        data: { request_id: result.rows[0].id, url: '/hr/requests' }
+      });
+    } catch (nErr) {
+      console.warn('⚠️ HR submit notification warning:', nErr.message);
+    }
+
     res.status(201).json({ success: true, request: result.rows[0] });
   } catch (err) {
     console.error('Error creating employee request:', err);
@@ -199,6 +218,22 @@ router.patch('/requests/:id/review', authenticateToken, async (req, res) => {
         leaveType: (empReq.details?.leave_type) || 'Leave',
         comments: hr_comments || '',
       }).catch(() => {});
+    }
+
+    // Real-time Live Popup Notification to Employee
+    try {
+      await createNotification({
+        user_id: empReq.user_id,
+        company_id: companyId,
+        type: `${empReq.request_type}_decision`,
+        title: `Request ${status.toUpperCase()}`,
+        message: `Your ${empReq.request_type.replace('_', ' ')} request has been ${status} by ${reviewerName}.`,
+        priority: 'high',
+        actor_id: reviewerId,
+        data: { request_id: id, url: '/employee/notifications' }
+      });
+    } catch (nErr) {
+      console.warn('⚠️ HR review notification warning:', nErr.message);
     }
 
     res.json({ success: true, request: result.rows[0] });

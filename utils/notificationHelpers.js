@@ -11,8 +11,35 @@ const sseConnections = new Map();
 /**
  * Enhanced createNotification - Supporting Background Queues
  */
-async function createNotification(notificationData) {
-    const { user_id, company_id, type, title, message, priority = 'low', data = {}, idempotency_key = null, actor_id = null } = notificationData;
+async function createNotification(arg1, arg2, arg3, arg4, arg5) {
+    let opts = {};
+    if (typeof arg1 === 'object' && arg1 !== null) {
+        opts = arg1;
+    } else {
+        // Positional signature: createNotification(userId, type, title, message, url)
+        opts = {
+            user_id: arg1,
+            type: arg2 || 'system',
+            title: (typeof arg3 === 'string' && arg4) ? arg3 : 'System Notification',
+            message: (typeof arg3 === 'string' && arg4) ? arg4 : (arg3 || 'New notification received'),
+            data: { url: (typeof arg5 === 'string' ? arg5 : (typeof arg4 === 'string' && arg4.startsWith('/') ? arg4 : '/notifications')) }
+        };
+    }
+
+    let { user_id, company_id, type, title, message, priority = 'normal', data = {}, idempotency_key = null, actor_id = null } = opts;
+
+    if (!user_id) {
+        console.warn('⚠️ createNotification called without user_id');
+        return null;
+    }
+
+    // Lookup company_id if omitted
+    if (!company_id) {
+        try {
+            const uRes = await pool.query('SELECT company_id FROM users WHERE id::text = $1', [String(user_id)]);
+            if (uRes.rows[0]?.company_id) company_id = uRes.rows[0].company_id;
+        } catch {}
+    }
 
     // STRICT RULE: Never notify the same user who performed the action
     if (actor_id && String(actor_id) === String(user_id)) {
@@ -21,6 +48,18 @@ async function createNotification(notificationData) {
     }
 
     try {
+        // Ensure data is an object and has a target URL for 1-click navigation
+        if (typeof data === 'string') {
+            try { data = JSON.parse(data); } catch { data = { url: data }; }
+        }
+        if (!data.url) {
+            if (type.includes('job')) data.url = '/employee/jobs';
+            else if (type.includes('leave') || type.includes('hr') || type.includes('attendance')) data.url = '/hr/requests';
+            else if (type.includes('invoice') || type.includes('payment')) data.url = '/owner/finance';
+            else if (type.includes('payroll')) data.url = '/employee/payroll';
+            else data.url = '/notifications';
+        }
+
         // If idempotency_key provided, use ON CONFLICT DO NOTHING to deduplicate
         let result;
         if (idempotency_key) {

@@ -66,19 +66,18 @@ router.post("/:id/proof-of-work", authenticateToken, async (req, res) => {
 
     // Notify Owner
     try {
-      const ownerRes = await pool.query(
-        `SELECT id FROM users WHERE company_id = $1 AND role = 'owner' LIMIT 1`,
-        [companyId]
-      );
-      if (ownerRes.rows.length > 0) {
-        await createNotification(
-          ownerRes.rows[0].id,
-          "FIELD_PROOF_SUBMITTED",
-          `📸 Site Proof Uploaded: ${userName} uploaded site photo for job #${jobId.substring(0, 8)}`,
-          `/owner/jobs`
-        );
-      }
-    } catch {}
+      await createNotificationForOwners({
+        company_id: companyId,
+        type: 'proof_of_work',
+        title: 'Site Proof Uploaded',
+        message: `📸 Site Proof Uploaded: ${userName} uploaded site proof photo for job #${jobId.substring(0, 8)}`,
+        priority: 'medium',
+        actor_id: userId,
+        data: { job_id: jobId, url: '/owner/jobs' }
+      });
+    } catch (nErr) {
+      console.warn('⚠️ Proof of work notification warning:', nErr.message);
+    }
 
     // Auto-post proof image to job conversation thread (Enterprise Communication Backbone)
     EventMessagingService.onProofUploaded({

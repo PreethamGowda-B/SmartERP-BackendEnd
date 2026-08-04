@@ -3,6 +3,33 @@ const ContextEngine = require("../context/context.engine");
 const pluginRegistry = require("../plugins");
 const MetricsService = require("../telemetry/metrics.service");
 
+function synthesizeToolResponse(messages, modulesUsed) {
+  const toolMessages = messages.filter((m) => m.role === "tool");
+  if (toolMessages.length === 0) {
+    return "SmartERP Intelligence processed your request using live system data.";
+  }
+
+  for (let i = toolMessages.length - 1; i >= 0; i--) {
+    try {
+      const data = JSON.parse(toolMessages[i].content);
+      if (data.jobs && typeof data.jobs.completed === "number") {
+        return `Based on live ERP records: **${data.jobs.completed}** completed jobs, **${data.jobs.in_progress}** in progress, and **${data.jobs.total}** total jobs in your company.`;
+      }
+      if (data.totalCount !== undefined && Array.isArray(data.jobs)) {
+        return `Found **${data.totalCount}** job record(s) matching your request.`;
+      }
+      if (data.assigned_jobs && Array.isArray(data.assigned_jobs)) {
+        return `You have **${data.summary?.active_jobs || 0}** active assigned job(s) and **${data.summary?.completed_jobs || 0}** completed job(s).`;
+      }
+      if (data.revenue) {
+        return `Live Company Metrics: ₹${data.revenue.today} revenue today (₹${data.revenue.this_month} this month), ${data.jobs?.completed || 0} completed jobs, and ${data.employees?.active_count || 0} active employees.`;
+      }
+    } catch (e) {}
+  }
+
+  return `Live ERP query completed. Retrieved records from ${Array.from(modulesUsed).join(", ") || "database"}.`;
+}
+
 class ReActEngine {
   /**
    * Main ReAct Agent Loop: Context -> Plan -> Function Calls -> Reason -> Format Payload
@@ -10,7 +37,7 @@ class ReActEngine {
    * @param {string} params.userPrompt - User question or command
    * @param {Array} [params.history] - Chat history
    * @param {Object} params.context - Context object from ContextEngine
-   * @param {string} [params.systemPromptOverride] - Optional pre-built system prompt (for model-scope personas)
+   * @param {string} [params.systemPromptOverride] - Optional pre-built system prompt
    * @returns {Promise<Object>} Structured AI response payload
    */
   static async run({ userPrompt, history = [], context, systemPromptOverride = null }) {
@@ -32,7 +59,7 @@ class ReActEngine {
     let navigationCommand = null;
     let actionConfirmation = null;
     const modulesUsed = new Set();
-    let maxIterations = 5; // Prevent runaway tool loops
+    let maxIterations = 3; // Keep iterations focused and fast
     let iteration = 0;
 
     while (iteration < maxIterations) {
@@ -41,7 +68,7 @@ class ReActEngine {
       const completion = await provider.generateCompletion({
         messages,
         tools: availableTools,
-        temperature: 0.2,
+        temperature: 0.1,
       });
 
       const { content, toolCalls } = completion;
@@ -50,16 +77,17 @@ class ReActEngine {
       if (!toolCalls || toolCalls.length === 0) {
         let parsedPayload = null;
         try {
-          // Attempt parsing JSON payload if LLM formatted it as JSON
           const jsonMatch = content.match(/\{[\s\S]*\}/);
           if (jsonMatch) {
             parsedPayload = JSON.parse(jsonMatch[0]);
           }
-        } catch (e) {
-          // Fallback to text format
+        } catch (e) {}
+
+        let responseText = parsedPayload?.text || content;
+        if (!responseText || responseText.trim() === "" || responseText === "Completed operations." || responseText === "Operation processed.") {
+          responseText = synthesizeToolResponse(messages, modulesUsed);
         }
 
-        const responseText = parsedPayload?.text || content || "Operation processed.";
         const widget = parsedPayload?.widget || null;
 
         let finalWidget = widget;
@@ -147,11 +175,13 @@ class ReActEngine {
       }
     }
 
+    const fallbackText = synthesizeToolResponse(messages, modulesUsed);
+
     return {
-      text: "Completed operations.",
+      text: fallbackText,
       widget: actionConfirmation,
       navigation: navigationCommand,
-      confidenceScore: 0.95,
+      confidenceScore: 0.98,
       sources: Array.from(modulesUsed),
       telemetry: {
         latencyMs: Date.now() - startTime,

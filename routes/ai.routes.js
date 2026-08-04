@@ -10,6 +10,8 @@ const ReActEngine = require("../ai/planner/ReAct.engine");
 const pluginRegistry = require("../ai/plugins");
 const MetricsService = require("../ai/telemetry/metrics.service");
 
+const AIDataService = require("../services/aiDataService");
+
 let redisClient = null;
 try {
   redisClient = require("../utils/redis");
@@ -104,6 +106,53 @@ router.post(
 
       // 2. Sanitize & Defend Input
       const cleanMessage = SecurityShield.sanitizeInput(message);
+
+      // Fast-Path 1: Instant Conversational Greetings (< 10ms response, 0 LLM calls, 0 fake data)
+      const GREETING_REGEX = /^(hi+|hello+|hey+|hallo|greetings|good\s*(morning|afternoon|evening|day)|who\s*are\s*you|what\s*can\s*you\s*do|help|howdy|sup)[\s!.?]*$/i;
+      if (GREETING_REGEX.test(cleanMessage.trim())) {
+        const userName = req.user?.name || "there";
+        return res.json({
+          text: `Hello ${userName}! 👋 I'm **SmartERP Intelligence**, your enterprise AI assistant. How can I assist you today with your jobs, attendance, payroll, inventory, or financial reports?`,
+          widget: null,
+          confidenceScore: 1.0,
+          sources: ["SmartERP Intelligence"],
+          suggestedFollowUps: [
+            "How many jobs are completed?",
+            "Check today's attendance summary",
+            "Audit low stock inventory",
+            "View pending leave requests"
+          ],
+          telemetry: { latencyMs: Date.now() - startTime }
+        });
+      }
+
+      // Fast-Path 2: Direct Live ERP Data Resolvers (Ultra-Fast Response)
+      const promptLower = cleanMessage.toLowerCase();
+
+      // "completed jobs" / "how many jobs are completed"
+      if (promptLower.includes("completed job") || promptLower.includes("jobs completed") || promptLower.includes("how many jobs are completed") || promptLower.includes("how much jobs are completed")) {
+        const companyId = req.user?.companyId || req.user?.company_id || 1;
+        const ownerSummary = await AIDataService.getOwnerDashboardSummary({ companyId });
+        const completedCount = ownerSummary.jobs?.completed || 0;
+        const totalJobs = ownerSummary.jobs?.total || 0;
+
+        return res.json({
+          text: `In your company, **${completedCount}** out of **${totalJobs}** total jobs are currently completed.`,
+          widget: {
+            type: "KPI_SUMMARY",
+            title: "Completed Jobs Metric",
+            metrics: [
+              { label: "Completed Jobs", value: completedCount },
+              { label: "Total Jobs", value: totalJobs }
+            ]
+          },
+          navigation: { path: "/owner/jobs", label: "View All Jobs" },
+          confidenceScore: 1.0,
+          sources: ["Jobs Module (Live PostgreSQL)"],
+          suggestedFollowUps: ["View in-progress jobs", "Check today's revenue", "Audit low stock inventory"],
+          telemetry: { latencyMs: Date.now() - startTime }
+        });
+      }
 
       // 3. Plan-Tier Scaled Rate Limiting (Free: 5/hr, Basic: 15/hr, Pro: 30/hr)
       if (redisClient && redisClient.status === "ready") {

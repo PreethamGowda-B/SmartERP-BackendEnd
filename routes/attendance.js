@@ -296,6 +296,97 @@ router.post('/clock-out', authenticateToken, async (req, res) => {
 });
 
 /**
+ * GET /api/attendance/me
+ * Get current employee's open attendance record, history, and stats
+ */
+router.get('/me', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId || req.user.id;
+    const companyId = req.user.companyId || req.user.company_id || 1;
+    const today = new Date().toISOString().split('T')[0];
+
+    // Fetch today's record
+    const todayRes = await pool.query(
+      `SELECT * FROM attendance WHERE user_id = $1 AND date = $2`,
+      [userId, today]
+    );
+
+    // Fetch last 60 days history
+    const historyRes = await pool.query(
+      `SELECT * FROM attendance WHERE user_id = $1 ORDER BY date DESC LIMIT 60`,
+      [userId]
+    );
+
+    let openRecord = null;
+    let todayRecord = null;
+
+    if (todayRes.rows.length > 0) {
+      const row = todayRes.rows[0];
+      todayRecord = row;
+      if (row.check_in_time && !row.check_out_time) {
+        const inTimeStr = new Date(row.check_in_time).toLocaleTimeString('en-IN', { hour12: false, hour: '2-digit', minute: '2-digit' });
+        openRecord = {
+          id: row.id,
+          date: row.date ? new Date(row.date).toISOString().split('T')[0] : today,
+          clockIn: inTimeStr,
+          clock_in: row.check_in_time,
+          clockOut: null,
+          clock_out: null,
+          status: row.status || 'present'
+        };
+      }
+    }
+
+    const records = historyRes.rows.map((r) => {
+      const inTime = r.check_in_time ? new Date(r.check_in_time) : null;
+      const outTime = r.check_out_time ? new Date(r.check_out_time) : null;
+      let hoursWorked = 0;
+      if (inTime && outTime) {
+        hoursWorked = Math.round(((outTime.getTime() - inTime.getTime()) / (1000 * 60 * 60)) * 10) / 10;
+      }
+      return {
+        id: r.id,
+        date: r.date ? new Date(r.date).toISOString().split('T')[0] : today,
+        clockIn: inTime ? inTime.toLocaleTimeString('en-IN', { hour12: false, hour: '2-digit', minute: '2-digit' }) : null,
+        clockOut: outTime ? outTime.toLocaleTimeString('en-IN', { hour12: false, hour: '2-digit', minute: '2-digit' }) : null,
+        hoursWorked,
+        status: r.status || 'present',
+        is_late: Boolean(r.is_late),
+        notes: r.notes || ''
+      };
+    });
+
+    const currentMonth = new Date().getMonth() + 1;
+    const currentYear = new Date().getFullYear();
+    const monthRecords = records.filter((r) => {
+      const d = new Date(r.date);
+      return d.getMonth() + 1 === currentMonth && d.getFullYear() === currentYear;
+    });
+
+    const daysPresent = monthRecords.filter((r) => r.status === 'present' || r.status === 'late').length;
+    const lateCount = monthRecords.filter((r) => r.is_late || r.status === 'late').length;
+    const halfDayCount = monthRecords.filter((r) => r.status === 'half_day').length;
+    const totalHours = Math.round(monthRecords.reduce((sum, r) => sum + r.hoursWorked, 0) * 10) / 10;
+
+    res.json({
+      success: true,
+      openRecord,
+      today: todayRecord,
+      records,
+      stats: {
+        daysPresent,
+        totalHours,
+        lateCount,
+        halfDayCount
+      }
+    });
+  } catch (err) {
+    console.error('❌ Error in GET /api/attendance/me:', err);
+    res.status(500).json({ message: err.message || 'Server error' });
+  }
+});
+
+/**
  * GET /api/attendance/today
  * Get today's attendance status for employee
  */

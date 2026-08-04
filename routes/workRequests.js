@@ -209,22 +209,25 @@ const handleWorkRequestAction = async (req, res) => {
     if (action === 'resolve' || action === 'complete') newStatus = 'resolved';
 
     let result;
+    const userIdStr = String(req.user.id || req.user.userId || "");
+    const userNameStr = String(req.user.name || req.user.email || "Owner");
+
     try {
       result = await pool.query(
         `UPDATE work_requests
          SET status = $1,
              owner_response = $2,
-             response_notes = $2,
-             actioned_by_id = $3,
-             actioned_by_name = $4,
+             response_notes = $3,
+             actioned_by_id = $4,
+             actioned_by_name = $5,
              actioned_at = NOW(),
-             resolved_by_id = $3,
-             resolved_by_name = $4,
+             resolved_by_id = $6,
+             resolved_by_name = $7,
              resolved_at = NOW(),
              updated_at = NOW()
-         WHERE id::text = $5::text
+         WHERE id::text = $8::text
          RETURNING *`,
-        [newStatus, notes, String(req.user.id || req.user.userId), req.user.name || 'Owner', String(id)]
+        [newStatus, notes, notes, userIdStr, userNameStr, userIdStr, userNameStr, String(id)]
       );
     } catch (updateErr) {
       console.warn("⚠️ Full update failed, trying safe fallback update:", updateErr.message);

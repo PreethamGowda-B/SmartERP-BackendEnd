@@ -170,10 +170,12 @@ app.set("trust proxy", 1);
 // ✅ Common middlewares
 app.use(cookieParser());
 app.use(express.json({
+  limit: '50mb',
   verify: (req, res, buf) => {
     req.rawBody = buf.toString();
   }
 }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 // ✅ Passport — required for customer Google OAuth (customer-google strategy)
 // session: false because we use stateless JWT cookies, not server-side sessions

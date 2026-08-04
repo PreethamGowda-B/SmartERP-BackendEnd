@@ -9,6 +9,7 @@ const NavigationPlugin = require("./navigation.plugin");
 const OCRPlugin = require("./ocr.plugin");
 const GSTReconciliationPlugin = require("./gstReconciliation.plugin");
 const CrmPlugin = require("./crm.plugin");
+const LiveSummaryPlugin = require("./liveSummary.plugin");
 
 // Pro-only plugin list
 const PRO_ONLY_PLUGINS = [
@@ -20,6 +21,7 @@ const PRO_ONLY_PLUGINS = [
 // Basic-allowed plugin list
 const BASIC_ALLOWED_PLUGINS = [
   "NavigationPlugin",
+  "LiveSummaryPlugin",
   "EmployeePlugin",
   "JobsPlugin",
   "AttendancePlugin",
@@ -31,6 +33,7 @@ const BASIC_ALLOWED_PLUGINS = [
 class PluginRegistry {
   constructor() {
     this.plugins = [
+      new LiveSummaryPlugin(),
       new EmployeePlugin(),
       new JobsPlugin(),
       new AttendancePlugin(),

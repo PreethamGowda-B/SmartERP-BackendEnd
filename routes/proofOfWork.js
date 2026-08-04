@@ -2,7 +2,7 @@ const express = require("express");
 const router = express.Router({ mergeParams: true });
 const { pool } = require("../db");
 const { authenticateToken } = require("../middleware/authMiddleware");
-const { createNotification } = require("../utils/notificationHelpers");
+const { createNotification, createNotificationForOwners } = require("../utils/notificationHelpers");
 const EventMessagingService = require('../services/eventMessagingService');
 
 // Ensure proof_of_work table exists in database lazily

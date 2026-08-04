@@ -140,7 +140,7 @@ router.get('/employee/:employeeId', authenticateToken, async (req, res) => {
         const result = await pool.query(
             `SELECT id, document_type, file_url, notes, created_at
              FROM employee_documents 
-             WHERE employee_id = $1 AND company_id = $2
+             WHERE employee_id::text = $1::text AND company_id = $2
              ORDER BY created_at DESC`,
             [employeeId, companyId]
         );

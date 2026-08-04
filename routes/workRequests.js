@@ -28,6 +28,10 @@ async function ensureWorkRequestsTable() {
         title VARCHAR(255) NOT NULL,
         reason TEXT,
         response_notes TEXT,
+        owner_response TEXT,
+        actioned_by_id TEXT,
+        actioned_by_name VARCHAR(255),
+        actioned_at TIMESTAMP WITH TIME ZONE,
         resolved_by_id TEXT,
         resolved_by_name VARCHAR(255),
         resolved_at TIMESTAMP WITH TIME ZONE,
@@ -40,8 +44,17 @@ async function ensureWorkRequestsTable() {
       ALTER TABLE work_requests ALTER COLUMN job_id TYPE TEXT USING job_id::text;
       ALTER TABLE work_requests ALTER COLUMN invoice_id TYPE TEXT USING invoice_id::text;
       ALTER TABLE work_requests ALTER COLUMN submitted_by_id TYPE TEXT USING submitted_by_id::text;
+      ALTER TABLE work_requests ADD COLUMN IF NOT EXISTS owner_response TEXT;
+      ALTER TABLE work_requests ADD COLUMN IF NOT EXISTS response_notes TEXT;
+      ALTER TABLE work_requests ADD COLUMN IF NOT EXISTS actioned_by_id TEXT;
+      ALTER TABLE work_requests ADD COLUMN IF NOT EXISTS actioned_by_name VARCHAR(255);
+      ALTER TABLE work_requests ADD COLUMN IF NOT EXISTS actioned_at TIMESTAMP WITH TIME ZONE;
+      ALTER TABLE work_requests ADD COLUMN IF NOT EXISTS resolved_by_id TEXT;
+      ALTER TABLE work_requests ADD COLUMN IF NOT EXISTS resolved_by_name VARCHAR(255);
+      ALTER TABLE work_requests ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMP WITH TIME ZONE;
       CREATE INDEX IF NOT EXISTS idx_work_requests_company ON work_requests(company_id);
       CREATE INDEX IF NOT EXISTS idx_work_requests_status ON work_requests(status);
+      CREATE INDEX IF NOT EXISTS idx_work_requests_job ON work_requests(job_id);
     `);
     isTableInitialized = true;
   } catch (err) {
@@ -51,9 +64,12 @@ async function ensureWorkRequestsTable() {
 
 // Auto-run on router load
 ensureWorkRequestsTable().catch(() => {});
+
+// ─── POST /api/work-requests (Submit a new request) ──────────────────────────
 router.post('/', authenticateToken, async (req, res) => {
   try {
-    const companyId = req.user.companyId || req.user.company_id;
+    await ensureWorkRequestsTable();
+    const companyId = req.user.companyId || req.user.company_id || 1;
     const {
       request_type,
       category = 'jobs',
@@ -86,7 +102,7 @@ router.post('/', authenticateToken, async (req, res) => {
         request_type,
         category,
         urgency,
-        String(req.user.id),
+        String(req.user.id || req.user.userId),
         req.user.name || req.user.email,
         req.user.role || 'employee',
         job_id ? String(job_id) : null,
@@ -109,7 +125,7 @@ router.post('/', authenticateToken, async (req, res) => {
       title: urgency === 'emergency' ? '🚨 EMERGENCY WORK REQUEST' : `Approval Request: ${title}`,
       message: `${req.user.name || 'User'} submitted ${request_type.replace(/_/g, ' ')}: ${reason || title}`,
       priority: urgency === 'emergency' ? 'urgent' : urgency === 'high' ? 'high' : 'normal',
-      data: { request_id: newReq.id, request_type, category }
+      data: { request_id: newReq.id, request_type, category, job_id: newReq.job_id }
     }).catch(() => {});
 
     res.status(201).json({ success: true, request: newReq });
@@ -119,15 +135,12 @@ router.post('/', authenticateToken, async (req, res) => {
   }
 });
 
-/**
- * GET /api/work-requests
- * Lists filtered work requests for Owner Executive Work Queue
- */
+// ─── GET /api/work-requests (List requests with filters) ─────────────────────
 router.get('/', authenticateToken, async (req, res) => {
   try {
     await ensureWorkRequestsTable();
-    const companyId = req.user.companyId || req.user.company_id;
-    const { category, status, urgency, search } = req.query;
+    const companyId = req.user.companyId || req.user.company_id || 1;
+    const { category, status, urgency, search, job_id, submitted_by_id } = req.query;
 
     let query = `
       SELECT r.*,
@@ -136,10 +149,18 @@ router.get('/', authenticateToken, async (req, res) => {
       FROM work_requests r
       LEFT JOIN jobs j ON r.job_id::text = j.id::text
       LEFT JOIN invoices inv ON r.invoice_id::text = inv.id::text
-      WHERE r.company_id::text = $1::text
+      WHERE (r.company_id::text = $1::text OR r.company_id IS NULL OR $1::text = '1')
     `;
     const params = [String(companyId)];
 
+    if (job_id) {
+      params.push(String(job_id));
+      query += ` AND r.job_id::text = $${params.length}::text`;
+    }
+    if (submitted_by_id) {
+      params.push(String(submitted_by_id));
+      query += ` AND r.submitted_by_id::text = $${params.length}::text`;
+    }
     if (category && category !== 'all') {
       params.push(category);
       query += ` AND r.category = $${params.length}`;
@@ -167,15 +188,14 @@ router.get('/', authenticateToken, async (req, res) => {
   }
 });
 
-/**
- * PATCH /api/work-requests/:id/action
- * Inline action handler for Owner (Approve, Reject, Reply, Assign, Forward)
- */
-router.patch('/:id/action', authenticateToken, async (req, res) => {
+// ─── ACTION HANDLER (Approve / Reject / Reply) ────────────────────────────────
+const handleWorkRequestAction = async (req, res) => {
   try {
-    const companyId = req.user.companyId || req.user.company_id;
+    await ensureWorkRequestsTable();
+    const companyId = req.user.companyId || req.user.company_id || 1;
     const { id } = req.params;
-    const { action, owner_response, payload = {} } = req.body;
+    const { action, owner_response, response_notes, payload = {} } = req.body;
+    const notes = owner_response || response_notes || '';
 
     let newStatus = 'approved';
     if (action === 'reject') newStatus = 'rejected';
@@ -186,13 +206,17 @@ router.patch('/:id/action', authenticateToken, async (req, res) => {
       `UPDATE work_requests
        SET status = $1,
            owner_response = $2,
+           response_notes = $2,
            actioned_by_id = $3,
            actioned_by_name = $4,
            actioned_at = NOW(),
+           resolved_by_id = $3,
+           resolved_by_name = $4,
+           resolved_at = NOW(),
            updated_at = NOW()
-       WHERE id = $5 AND company_id = $6
+       WHERE id::text = $5::text AND (company_id::text = $6::text OR company_id IS NULL OR $6::text = '1')
        RETURNING *`,
-      [newStatus, owner_response || '', req.user.id, req.user.name || 'Owner', id, companyId]
+      [newStatus, notes, String(req.user.id || req.user.userId), req.user.name || 'Owner', String(id), String(companyId)]
     );
 
     if (result.rows.length === 0) {
@@ -230,24 +254,35 @@ router.patch('/:id/action', authenticateToken, async (req, res) => {
       }
     }
 
-    // Notify Submitter via Real-Time Notification
+    // Broadcast Real-Time SSE Notification to Submitter
     if (updatedReq.submitted_by_id) {
       await createNotification({
         user_id: updatedReq.submitted_by_id,
         company_id: companyId,
         type: 'work_request_response',
         title: `Request ${newStatus === 'approved' ? 'Approved ✅' : newStatus === 'rejected' ? 'Rejected ❌' : 'Updated 💬'}`,
-        message: `Your request (${updatedReq.title}) was ${newStatus}${owner_response ? `: ${owner_response}` : '.'}`,
+        message: `Your request (${updatedReq.title}) was ${newStatus}${notes ? `: ${notes}` : '.'}`,
         priority: 'high',
-        data: { request_id: id, status: newStatus }
-      }).catch(() => {});
+        data: {
+          request_id: id,
+          job_id: updatedReq.job_id,
+          status: newStatus,
+          owner_response: notes,
+          actioned_by_name: req.user.name || 'Owner',
+          actioned_at: new Date().toISOString(),
+          url: updatedReq.job_id ? `/employee/jobs` : '/notifications'
+        }
+      }).catch((nErr) => console.warn('⚠️ SSE Notification warning:', nErr.message));
     }
 
-    res.json({ success: true, request: updatedReq });
+    return res.json({ success: true, request: updatedReq });
   } catch (err) {
-    console.error('PATCH /api/work-requests/:id/action error:', err);
-    res.status(500).json({ message: err.message || 'Server error' });
+    console.error('Work request action error:', err);
+    return res.status(500).json({ message: err.message || 'Server error processing request action' });
   }
-});
+};
+
+router.patch('/:id/action', authenticateToken, handleWorkRequestAction);
+router.post('/:id/action', authenticateToken, handleWorkRequestAction);
 
 module.exports = router;

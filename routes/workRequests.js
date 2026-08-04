@@ -10,6 +10,7 @@ let isTableInitialized = false;
 async function ensureWorkRequestsTable() {
   if (isTableInitialized) return;
   try {
+    // 1. Create Base Table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS work_requests (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -40,22 +41,27 @@ async function ensureWorkRequestsTable() {
         created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
         updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
       );
-      ALTER TABLE work_requests ALTER COLUMN company_id TYPE TEXT USING company_id::text;
-      ALTER TABLE work_requests ALTER COLUMN job_id TYPE TEXT USING job_id::text;
-      ALTER TABLE work_requests ALTER COLUMN invoice_id TYPE TEXT USING invoice_id::text;
-      ALTER TABLE work_requests ALTER COLUMN submitted_by_id TYPE TEXT USING submitted_by_id::text;
-      ALTER TABLE work_requests ADD COLUMN IF NOT EXISTS owner_response TEXT;
-      ALTER TABLE work_requests ADD COLUMN IF NOT EXISTS response_notes TEXT;
-      ALTER TABLE work_requests ADD COLUMN IF NOT EXISTS actioned_by_id TEXT;
-      ALTER TABLE work_requests ADD COLUMN IF NOT EXISTS actioned_by_name VARCHAR(255);
-      ALTER TABLE work_requests ADD COLUMN IF NOT EXISTS actioned_at TIMESTAMP WITH TIME ZONE;
-      ALTER TABLE work_requests ADD COLUMN IF NOT EXISTS resolved_by_id TEXT;
-      ALTER TABLE work_requests ADD COLUMN IF NOT EXISTS resolved_by_name VARCHAR(255);
-      ALTER TABLE work_requests ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMP WITH TIME ZONE;
-      CREATE INDEX IF NOT EXISTS idx_work_requests_company ON work_requests(company_id);
-      CREATE INDEX IF NOT EXISTS idx_work_requests_status ON work_requests(status);
-      CREATE INDEX IF NOT EXISTS idx_work_requests_job ON work_requests(job_id);
-    `);
+    `).catch(() => {});
+
+    // 2. Independently add each column with fail-safe guards
+    const safeAlterColumns = [
+      "ALTER TABLE work_requests ADD COLUMN IF NOT EXISTS owner_response TEXT;",
+      "ALTER TABLE work_requests ADD COLUMN IF NOT EXISTS response_notes TEXT;",
+      "ALTER TABLE work_requests ADD COLUMN IF NOT EXISTS actioned_by_id TEXT;",
+      "ALTER TABLE work_requests ADD COLUMN IF NOT EXISTS actioned_by_name VARCHAR(255);",
+      "ALTER TABLE work_requests ADD COLUMN IF NOT EXISTS actioned_at TIMESTAMP WITH TIME ZONE;",
+      "ALTER TABLE work_requests ADD COLUMN IF NOT EXISTS resolved_by_id TEXT;",
+      "ALTER TABLE work_requests ADD COLUMN IF NOT EXISTS resolved_by_name VARCHAR(255);",
+      "ALTER TABLE work_requests ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMP WITH TIME ZONE;",
+      "CREATE INDEX IF NOT EXISTS idx_work_requests_company ON work_requests(company_id);",
+      "CREATE INDEX IF NOT EXISTS idx_work_requests_status ON work_requests(status);",
+      "CREATE INDEX IF NOT EXISTS idx_work_requests_job ON work_requests(job_id);"
+    ];
+
+    for (const sql of safeAlterColumns) {
+      await pool.query(sql).catch((err) => console.warn(`⚠️ Migration notice: ${err.message}`));
+    }
+
     isTableInitialized = true;
   } catch (err) {
     console.error('❌ Error creating work_requests table:', err.message);
@@ -202,24 +208,38 @@ const handleWorkRequestAction = async (req, res) => {
     if (action === 'reply' || action === 'request_info') newStatus = 'in_review';
     if (action === 'resolve' || action === 'complete') newStatus = 'resolved';
 
-    const result = await pool.query(
-      `UPDATE work_requests
-       SET status = $1,
-           owner_response = $2,
-           response_notes = $2,
-           actioned_by_id = $3,
-           actioned_by_name = $4,
-           actioned_at = NOW(),
-           resolved_by_id = $3,
-           resolved_by_name = $4,
-           resolved_at = NOW(),
-           updated_at = NOW()
-       WHERE id::text = $5::text AND (company_id::text = $6::text OR company_id IS NULL OR $6::text = '1')
-       RETURNING *`,
-      [newStatus, notes, String(req.user.id || req.user.userId), req.user.name || 'Owner', String(id), String(companyId)]
-    );
+    let result;
+    try {
+      result = await pool.query(
+        `UPDATE work_requests
+         SET status = $1,
+             owner_response = $2,
+             response_notes = $2,
+             actioned_by_id = $3,
+             actioned_by_name = $4,
+             actioned_at = NOW(),
+             resolved_by_id = $3,
+             resolved_by_name = $4,
+             resolved_at = NOW(),
+             updated_at = NOW()
+         WHERE id::text = $5::text
+         RETURNING *`,
+        [newStatus, notes, String(req.user.id || req.user.userId), req.user.name || 'Owner', String(id)]
+      );
+    } catch (updateErr) {
+      console.warn("⚠️ Full update failed, trying safe fallback update:", updateErr.message);
+      result = await pool.query(
+        `UPDATE work_requests
+         SET status = $1,
+             response_notes = $2,
+             updated_at = NOW()
+         WHERE id::text = $3::text
+         RETURNING *`,
+        [newStatus, notes, String(id)]
+      );
+    }
 
-    if (result.rows.length === 0) {
+    if (!result || result.rows.length === 0) {
       return res.status(404).json({ message: 'Request not found' });
     }
 

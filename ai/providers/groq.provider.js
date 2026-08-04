@@ -2,6 +2,31 @@ const BaseAIProvider = require("./provider.interface");
 const Groq = require("groq-sdk");
 const { groqConcurrencyLimiter } = require("../../utils/asyncLimiter");
 
+function sanitizeToolArgs(rawArgs) {
+  let args = {};
+  if (typeof rawArgs === "string") {
+    try {
+      args = JSON.parse(rawArgs);
+    } catch (e) {
+      return rawArgs;
+    }
+  } else if (typeof rawArgs === "object" && rawArgs !== null) {
+    args = { ...rawArgs };
+  } else {
+    return rawArgs;
+  }
+
+  for (const key of Object.keys(args)) {
+    if (typeof args[key] === "string" && !isNaN(args[key]) && args[key].trim() !== "") {
+      const num = Number(args[key]);
+      if (!isNaN(num)) {
+        args[key] = num;
+      }
+    }
+  }
+  return typeof rawArgs === "string" ? JSON.stringify(args) : args;
+}
+
 function parsePseudoToolCalls(str) {
   if (!str || typeof str !== "string") return [];
   const toolCalls = [];
@@ -15,7 +40,7 @@ function parsePseudoToolCalls(str) {
       type: "function",
       function: {
         name: fnName,
-        arguments: rawArgs,
+        arguments: sanitizeToolArgs(rawArgs),
       },
     });
   }
@@ -61,6 +86,22 @@ class GroqProvider extends BaseAIProvider {
         let content = message.content || "";
         let toolCalls = message.tool_calls || [];
 
+        // Sanitize any tool call arguments returned directly by Groq
+        if (toolCalls && toolCalls.length > 0) {
+          toolCalls = toolCalls.map((tc) => {
+            if (tc.function && tc.function.arguments) {
+              return {
+                ...tc,
+                function: {
+                  ...tc.function,
+                  arguments: sanitizeToolArgs(tc.function.arguments),
+                },
+              };
+            }
+            return tc;
+          });
+        }
+
         // Check if Llama returned pseudo-XML function call in content
         if (content.includes("<function=")) {
           const parsedCalls = parsePseudoToolCalls(content);
@@ -81,7 +122,7 @@ class GroqProvider extends BaseAIProvider {
         const errMsg = err?.message || String(err || "");
 
         // Intercept Llama 3.3 failed_generation 400 errors containing tool call pseudo-XML
-        if (errStr.includes("failed_generation") || errStr.includes("tool_<function") || errMsg.includes("<function=")) {
+        if (errStr.includes("failed_generation") || errStr.includes("tool_<function") || errMsg.includes("<function=") || errStr.includes("tool call validation failed")) {
           const parsedCalls = parsePseudoToolCalls(errStr + " " + errMsg);
           if (parsedCalls.length > 0) {
             return {

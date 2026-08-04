@@ -189,7 +189,7 @@ router.get('/', authenticateToken, async (req, res) => {
                   inv.edited_count AS invoice_edited_count
            FROM jobs j
            LEFT JOIN users u ON j.assigned_to = u.id
-           LEFT JOIN invoices inv ON inv.job_id = j.id AND inv.is_latest = TRUE
+           LEFT JOIN invoices inv ON inv.job_id::text = j.id::text
            WHERE ${ownerWhere}
            ORDER BY j.id
          ) sub
@@ -228,7 +228,7 @@ router.get('/', authenticateToken, async (req, res) => {
                   inv.edited_count AS invoice_edited_count
            FROM jobs j
            LEFT JOIN users u ON j.assigned_to = u.id
-           LEFT JOIN invoices inv ON inv.job_id = j.id AND inv.is_latest = TRUE
+           LEFT JOIN invoices inv ON inv.job_id::text = j.id::text
            WHERE ${empWhere}
            ORDER BY j.id
          ) sub
@@ -252,7 +252,7 @@ router.get('/', authenticateToken, async (req, res) => {
                   inv.total_amount AS invoice_total_amount
            FROM jobs j 
            LEFT JOIN users u ON j.assigned_to = u.id
-           LEFT JOIN invoices inv ON inv.job_id = j.id AND inv.is_latest = TRUE
+           LEFT JOIN invoices inv ON inv.job_id::text = j.id::text
            WHERE ${hrWhere}
            ORDER BY j.id
          ) sub

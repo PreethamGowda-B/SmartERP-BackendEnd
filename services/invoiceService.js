@@ -127,8 +127,8 @@ class InvoiceService {
 
       // 2. Check if invoice is already issued/paid/draft for this job — if so, update & increment edited_count
       const existingIssuedInv = await client.query(
-        `SELECT id, invoice_number, edited_count FROM invoices WHERE job_id = $1 AND company_id::text = $2::text AND is_latest = TRUE AND status IN ('issued', 'paid', 'disputed', 'viewed', 'sent')`,
-        [jobId, companyId]
+        `SELECT id, invoice_number, edited_count FROM invoices WHERE job_id::text = $1::text AND company_id::text = $2::text ORDER BY created_at DESC LIMIT 1`,
+        [String(jobId), String(companyId)]
       );
 
       if (existingIssuedInv.rows.length > 0) {
@@ -151,11 +151,23 @@ class InvoiceService {
         const additionalCharges = parseFloat(invoiceData.additional_charges || 0);
         const discountAmount = parseFloat(invoiceData.discount_amount || 0);
 
-        const subtotal = Math.max(0, parseFloat((labourCost + materialsCost + equipmentCharges + transportCharges + additionalCharges - discountAmount).toFixed(2)));
-        const gstRate = parseFloat(invoiceData.gst_rate || 18.0) / 100.0;
-        const totalTax = parseFloat((subtotal * gstRate).toFixed(2));
+        let subtotal = Math.max(0, parseFloat((labourCost + materialsCost + equipmentCharges + transportCharges + additionalCharges - discountAmount).toFixed(2)));
+        const gstRateVal = parseFloat(invoiceData.gst_rate || 18.0);
+        const gstRate = gstRateVal / 100.0;
+        let totalTax = parseFloat((subtotal * gstRate).toFixed(2));
 
         let cgst = 0, sgst = 0, igst = 0;
+        let totalAmount = parseFloat((subtotal + totalTax).toFixed(2));
+
+        // Handle Owner Manual Invoice Adjustment
+        const isManualAdjustment = Boolean(invoiceData.is_manual_adjustment);
+        const manualTotal = parseFloat(invoiceData.manual_grand_total);
+        if (isManualAdjustment && !isNaN(manualTotal) && manualTotal >= 0) {
+          totalAmount = manualTotal;
+          subtotal = parseFloat((totalAmount / (1 + gstRate)).toFixed(2));
+          totalTax = parseFloat((totalAmount - subtotal).toFixed(2));
+        }
+
         if (invoiceData.is_inter_state) {
           igst = totalTax;
         } else {
@@ -163,9 +175,7 @@ class InvoiceService {
           sgst = parseFloat((totalTax / 2).toFixed(2));
         }
 
-        const totalAmount = parseFloat((subtotal + totalTax).toFixed(2));
-
-        // Update Invoice & Increment edited_count
+        // Update Invoice & Increment edited_count, transition draft -> issued
         const updatedInvRes = await client.query(
           `UPDATE invoices SET
             labour_hours = $1, labour_rate = $2, labour_cost = $3, materials_cost = $4,
@@ -174,8 +184,8 @@ class InvoiceService {
             cgst = $12, sgst = $13, igst = $14, total_tax = $15, total_amount = $16,
             amount_due = GREATEST(0, $16 - amount_paid), customer_notes = $17, internal_notes = $18,
             edited_count = COALESCE(edited_count, 0) + 1, updated_at = NOW(),
-            status = CASE WHEN status = 'disputed' THEN 'issued' ELSE status END
-           WHERE id = $19 AND company_id::text = $20::text
+            status = CASE WHEN status IN ('draft', 'disputed') THEN 'issued' ELSE status END
+           WHERE id::text = $19::text AND company_id::text = $20::text
            RETURNING *`,
           [
             labourHours, labourRate, labourCost, materialsCost,
@@ -183,7 +193,7 @@ class InvoiceService {
             discountAmount, subtotal, Boolean(invoiceData.is_inter_state),
             invoiceData.gst_rate || 18.0, cgst, sgst, igst, totalTax,
             totalAmount, invoiceData.customer_notes || 'Thank you for your business!',
-            invoiceData.internal_notes || '', existingId, companyId
+            invoiceData.internal_notes || '', String(existingId), String(companyId)
           ]
         );
 
@@ -216,6 +226,12 @@ class InvoiceService {
             [job.customer_id, companyId, `Your invoice for job ${job.title} has been updated (Version 1.${updatedInvoice.edited_count}). Please review the latest version.`]
           ).catch(() => {});
         }
+
+        // Ensure jobs table links to updated invoice
+        await client.query(
+          `UPDATE jobs SET invoice_id = $1, updated_at = NOW() WHERE id::text = $2::text`,
+          [String(updatedInvoice.id), String(jobId)]
+        ).catch(() => {});
 
         await client.query('COMMIT');
         return { success: true, invoice: updatedInvoice, reason: 'invoice_updated', edited_count: updatedInvoice.edited_count };

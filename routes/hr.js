@@ -389,4 +389,143 @@ router.post('/announcements', authenticateToken, async (req, res) => {
   }
 });
 
+router.delete('/announcements/:id', authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== 'owner' && req.user.role !== 'admin' && req.user.role !== 'hr') {
+      return res.status(403).json({ message: 'Unauthorized' });
+    }
+    const { id } = req.params;
+    const companyId = req.user.companyId;
+    await pool.query('DELETE FROM announcements WHERE id = $1 AND company_id = $2', [id, companyId]);
+    res.json({ success: true, message: 'Announcement deleted' });
+  } catch (err) {
+    console.error('Error deleting announcement:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ── Leaves Endpoints ────────────────────────────────────────────────────────
+router.get('/leaves', authenticateToken, async (req, res) => {
+  try {
+    const companyId = req.user.companyId;
+    const userId = req.user.userId || req.user.id;
+    const role = req.user.role;
+
+    let query = `SELECT * FROM hr_employee_requests WHERE company_id = $1 AND request_type = 'leave'`;
+    let params = [companyId];
+
+    if (role === 'employee') {
+      query += ` AND user_id = $2`;
+      params.push(userId);
+    }
+    query += ` ORDER BY created_at DESC LIMIT 100`;
+
+    const result = await pool.query(query, params);
+    const leaves = result.rows.map(r => {
+      const details = typeof r.details === 'string' ? JSON.parse(r.details || '{}') : (r.details || {});
+      return {
+        id: r.id,
+        user_id: r.user_id,
+        employee_name: r.employee_name,
+        leave_type: details.leave_type || details.type || 'Leave',
+        start_date: details.start_date || details.from_date || r.created_at,
+        end_date: details.end_date || details.to_date || r.created_at,
+        reason: details.reason || 'No reason provided',
+        status: r.status,
+        hr_comments: r.hr_comments,
+        created_at: r.created_at
+      };
+    });
+
+    res.json(leaves);
+  } catch (err) {
+    console.error('Error fetching leaves:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+router.post('/leaves', authenticateToken, async (req, res) => {
+  try {
+    const companyId = req.user.companyId;
+    const userId = req.user.userId || req.user.id;
+    const userName = req.user.name || 'Employee';
+    const { leave_type, start_date, end_date, reason } = req.body;
+
+    if (!reason || !start_date || !end_date) {
+      return res.status(400).json({ message: 'start_date, end_date, and reason are required' });
+    }
+
+    const details = { leave_type: leave_type || 'Casual', start_date, end_date, reason };
+
+    const result = await pool.query(
+      `INSERT INTO hr_employee_requests (company_id, user_id, employee_name, request_type, details)
+       VALUES ($1, $2, $3, 'leave', $4)
+       RETURNING *`,
+      [companyId, userId, userName, JSON.stringify(details)]
+    );
+
+    const row = result.rows[0];
+    const leave = {
+      id: row.id,
+      user_id: row.user_id,
+      employee_name: row.employee_name,
+      leave_type: details.leave_type,
+      start_date: details.start_date,
+      end_date: details.end_date,
+      reason: details.reason,
+      status: row.status,
+      created_at: row.created_at
+    };
+
+    res.status(201).json(leave);
+  } catch (err) {
+    console.error('Error creating leave:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+router.patch('/leaves/:id/status', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status, hr_comments } = req.body;
+    const companyId = req.user.companyId;
+    const reviewerName = req.user.name || 'HR Manager';
+
+    if (!['approved', 'rejected'].includes(status)) {
+      return res.status(400).json({ message: 'Invalid status' });
+    }
+
+    const result = await pool.query(
+      `UPDATE hr_employee_requests 
+       SET status = $1, hr_comments = $2, reviewed_by = $3, reviewed_at = NOW()
+       WHERE id = $4 AND company_id = $5 AND request_type = 'leave'
+       RETURNING *`,
+      [status, hr_comments || null, reviewerName, id, companyId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Leave request not found' });
+    }
+
+    const row = result.rows[0];
+    const details = typeof row.details === 'string' ? JSON.parse(row.details || '{}') : (row.details || {});
+
+    res.json({
+      id: row.id,
+      user_id: row.user_id,
+      employee_name: row.employee_name,
+      leave_type: details.leave_type || 'Leave',
+      start_date: details.start_date || details.from_date,
+      end_date: details.end_date || details.to_date,
+      reason: details.reason,
+      status: row.status,
+      hr_comments: row.hr_comments,
+      created_at: row.created_at
+    });
+  } catch (err) {
+    console.error('Error updating leave status:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 module.exports = router;

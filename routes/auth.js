@@ -862,122 +862,119 @@ router.post("/refresh", async (req, res) => {
 
     // 2. REPLAY & TAB-SWITCH CONCURRENCY PROTECTION
     if (refreshTokenData.revoked) {
-      // Check if a valid active token exists in the same token_family or for this user
-      const activeFamilyRes = await pool.query(
-        `SELECT token FROM refresh_tokens 
-         WHERE token_family = $1::uuid AND revoked = FALSE AND expires_at > NOW()
-         ORDER BY created_at DESC LIMIT 1`,
-        [refreshTokenData.token_family]
-      );
+      if (refreshTokenData.token_family) {
+        const activeFamilyRes = await pool.query(
+          `SELECT token FROM refresh_tokens 
+           WHERE token_family = $1::uuid AND revoked = FALSE AND expires_at > NOW()
+           ORDER BY created_at DESC LIMIT 1`,
+          [refreshTokenData.token_family]
+        );
 
-      if (activeFamilyRes.rows.length > 0) {
-        console.log(`ℹ️ Multi-tab or background refresh detected for family ${refreshTokenData.token_family} — using active family token`);
-        try {
-          const payload = jwt.verify(activeFamilyRes.rows[0].token, REFRESH_SECRET);
-          const userId = payload.userId || payload.id;
-          const userRes = await pool.query("SELECT id, role, email, company_id FROM users WHERE id = $1", [userId]);
-          if (userRes.rows.length > 0) {
-            const user = userRes.rows[0];
-            const newAccessToken = jwt.sign(
-              { id: user.id, userId: user.id, role: user.role, email: user.email, companyId: user.company_id },
-              ACCESS_SECRET,
-              { expiresIn: ACCESS_EXPIRY }
-            );
-            return res.json({
-              ok: true,
-              accessToken: newAccessToken,
-              refreshToken: activeFamilyRes.rows[0].token,
-              isSuperAdmin: user.role === 'super_admin'
-            });
-          }
-        } catch (_) { /* fallback */ }
+        if (activeFamilyRes.rows.length > 0) {
+          try {
+            const payload = jwt.verify(activeFamilyRes.rows[0].token, REFRESH_SECRET);
+            const userId = payload.userId || payload.id;
+            const userRes = await pool.query("SELECT id, role, email, company_id FROM users WHERE id = $1", [userId]);
+            if (userRes.rows.length > 0) {
+              const user = userRes.rows[0];
+              const newAccessToken = jwt.sign(
+                { id: user.id, userId: user.id, role: user.role, email: user.email, companyId: user.company_id },
+                ACCESS_SECRET,
+                { expiresIn: ACCESS_EXPIRY }
+              );
+              return res.json({
+                ok: true,
+                accessToken: newAccessToken,
+                refreshToken: activeFamilyRes.rows[0].token,
+                isSuperAdmin: user.role === 'super_admin'
+              });
+            }
+          } catch (_) { /* fallback */ }
+        }
       }
 
-      console.warn(`⚠️ Token ${token.substring(0, 10)}... was previously revoked, but user session remains active if valid tokens exist.`);
-      return res.status(401).json({ message: "Refresh token superseded. Please try again." });
+      console.warn(`⚠️ Token ${token.substring(0, 10)}... was previously revoked.`);
+      return res.status(401).json({ message: "Refresh token superseded. Please log in again." });
     }
 
-    // 3. Verify JWT
-    jwt.verify(token, REFRESH_SECRET, async (err, payload) => {
-      if (err) {
-        console.warn(`⚠️ Refresh attempt failed: JWT verification error: ${err.message}`);
-        // Even if expired, if it's in DB and not revoked, we should probably just treat as invalid
-        return res.status(403).json({ message: "Invalid token" });
-      }
+    // 3. Verify JWT (Synchronous check inside try-catch)
+    let payload;
+    try {
+      payload = jwt.verify(token, REFRESH_SECRET);
+    } catch (jwtErr) {
+      console.warn(`⚠️ Refresh attempt failed: JWT verification error: ${jwtErr.message}`);
+      return res.status(401).json({ message: "Invalid or expired refresh token" });
+    }
 
-      const userId = payload.userId || payload.id;
+    const userId = payload.userId || payload.id;
 
-      try {
-        // 4. Fetch User Data
-        const userRes = await pool.query("SELECT id, role, email, company_id FROM users WHERE id = $1", [userId]);
-        if (userRes.rows.length === 0) {
-          return res.status(401).json({ message: "User not found" });
-        }
-        const user = userRes.rows[0];
+    // 4. Fetch User Data
+    const userRes = await pool.query("SELECT id, role, email, company_id FROM users WHERE id = $1", [userId]);
+    if (userRes.rows.length === 0) {
+      return res.status(401).json({ message: "User not found" });
+    }
+    const user = userRes.rows[0];
 
-        // 5. Check Suspension (Role exemption still applies)
-        if (user.role !== 'super_admin' && user.company_id) {
-          const compRes = await pool.query("SELECT status FROM companies WHERE id = $1", [user.company_id]);
-          if (compRes.rows.length > 0 && compRes.rows[0].status === 'suspended') {
-            return res.status(403).json({
-              message: "Account Suspended/Disabled",
-              error: "company_suspended",
-              details: "Your account is suspended/disabled. Please contact prozyncinnovations@gmail.com"
-            });
-          }
-        }
-
-        // 6. ROTATION: Mark old token as revoked
-        await pool.query("UPDATE refresh_tokens SET revoked = TRUE WHERE id = $1", [refreshTokenData.id]);
-
-        // 7. Issue NEW tokens (Keep same Family)
-        const newAccessToken = jwt.sign(
-          { id: user.id, userId: user.id, role: user.role, email: user.email, companyId: user.company_id },
-          ACCESS_SECRET,
-          { expiresIn: ACCESS_EXPIRY }
-        );
-        const newRefreshToken = jwt.sign({ id: user.id, userId: user.id }, REFRESH_SECRET, { expiresIn: REFRESH_EXPIRY });
-
-        // Save new token to DB
-        await pool.query(
-          `INSERT INTO refresh_tokens (user_id, token, token_family, expires_at, created_at, user_agent, ip_address)
-           VALUES ($1::uuid, $2, $3::uuid, NOW() + INTERVAL '30 days', NOW(), $4, $5)`,
-          [user.id, newRefreshToken, refreshTokenData.token_family, req.headers["user-agent"], req.ip]
-        );
-
-        // 8. Set Cookies based on role
-        const isSuperAdmin = user.role === 'super_admin';
-        const accessCookieName = isSuperAdmin ? COOKIE_ACCESS_ADMIN : COOKIE_ACCESS_USER;
-        const refreshCookieName = isSuperAdmin ? COOKIE_REFRESH_ADMIN : COOKIE_REFRESH_USER;
-
-        const cookieOpts = {
-          httpOnly: true,
-          sameSite: "none",
-          secure: true,
-          path: "/",
-        };
-
-        res.cookie(accessCookieName, newAccessToken, { ...cookieOpts, maxAge: ACCESS_MAX_AGE });
-        res.cookie(refreshCookieName, newRefreshToken, { ...cookieOpts, maxAge: REFRESH_MAX_AGE });
-
-        console.log(`✅ Token rotated for ${user.email} (Family: ${refreshTokenData.token_family})`);
-
-        res.json({
-          ok: true,
-          accessToken: newAccessToken,
-          refreshToken: newRefreshToken,
-          isSuperAdmin
+    // 5. Check Suspension
+    if (user.role !== 'super_admin' && user.company_id) {
+      const compRes = await pool.query("SELECT status FROM companies WHERE id = $1", [user.company_id]);
+      if (compRes.rows.length > 0 && compRes.rows[0].status === 'suspended') {
+        return res.status(403).json({
+          message: "Account Suspended/Disabled",
+          error: "company_suspended",
+          details: "Your account is suspended/disabled. Please contact prozyncinnovations@gmail.com"
         });
-      } catch (rotationErr) {
-        console.error("❌ Rotation internal error:", rotationErr);
-        res.status(500).json({ message: "Internal error during refresh" });
       }
+    }
+
+    // 6. ROTATION: Mark old token as revoked
+    await pool.query("UPDATE refresh_tokens SET revoked = TRUE WHERE id = $1", [refreshTokenData.id]);
+
+    // 7. Issue NEW tokens
+    const newAccessToken = jwt.sign(
+      { id: user.id, userId: user.id, role: user.role, email: user.email, companyId: user.company_id },
+      ACCESS_SECRET,
+      { expiresIn: ACCESS_EXPIRY }
+    );
+    const newRefreshToken = jwt.sign({ id: user.id, userId: user.id }, REFRESH_SECRET, { expiresIn: REFRESH_EXPIRY });
+
+    const familyToUse = refreshTokenData.token_family || crypto.randomUUID();
+
+    // Save new token to DB
+    await pool.query(
+      `INSERT INTO refresh_tokens (user_id, token, token_family, expires_at, created_at, user_agent, ip_address)
+       VALUES ($1::uuid, $2, $3::uuid, NOW() + INTERVAL '30 days', NOW(), $4, $5)`,
+      [user.id, newRefreshToken, familyToUse, req.headers["user-agent"] || null, req.ip || null]
+    );
+
+    // 8. Set Cookies based on role
+    const isSuperAdmin = user.role === 'super_admin';
+    const accessCookieName = isSuperAdmin ? COOKIE_ACCESS_ADMIN : COOKIE_ACCESS_USER;
+    const refreshCookieName = isSuperAdmin ? COOKIE_REFRESH_ADMIN : COOKIE_REFRESH_USER;
+
+    const cookieOpts = {
+      httpOnly: true,
+      sameSite: "none",
+      secure: true,
+      path: "/",
+    };
+
+    res.cookie(accessCookieName, newAccessToken, { ...cookieOpts, maxAge: ACCESS_MAX_AGE });
+    res.cookie(refreshCookieName, newRefreshToken, { ...cookieOpts, maxAge: REFRESH_MAX_AGE });
+
+    console.log(`✅ Token rotated for ${user.email} (Family: ${familyToUse})`);
+
+    return res.json({
+      ok: true,
+      accessToken: newAccessToken,
+      refreshToken: newRefreshToken,
+      isSuperAdmin
     });
   } catch (err) {
-    console.error("❌ Refresh route error:", err.message);
-    res.status(500).json({
+    console.error("❌ Refresh route error:", err.message || err);
+    return res.status(401).json({
       message: "Server error during refresh",
-      error: "Internal Server Error"
+      error: "Unauthorized"
     });
   }
 });

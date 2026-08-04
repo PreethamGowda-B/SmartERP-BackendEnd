@@ -114,20 +114,26 @@ router.post('/', authenticateToken, loadPlan, checkPlanLimit('job'), [
           priority: job.priority || 'medium',
           data: { job_id: createdJob.id, job_title: title, url: '/employee/notifications' }
         });
-        // 📧 Email: Notify assigned employee
-        const empResult = await pool.query('SELECT email, name FROM users WHERE id = $1', [assignedTo]);
-        const ownerResult = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
-        if (empResult.rows[0]) {
-          sendJobAssignedEmail({
-            employeeEmail: empResult.rows[0].email,
-            employeeName: empResult.rows[0].name,
-            jobTitle: title,
-            jobDescription: description,
-            priority: job.priority || 'medium',
-            deadline: job.deadline,
-            ownerName: ownerResult.rows[0]?.name
-          });
-        }
+        // 📧 Email: Notify assigned employee asynchronously (non-blocking)
+        setImmediate(async () => {
+          try {
+            const empResult = await pool.query('SELECT email, name FROM users WHERE id = $1', [assignedTo]);
+            const ownerResult = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+            if (empResult.rows[0]) {
+              sendJobAssignedEmail({
+                employeeEmail: empResult.rows[0].email,
+                employeeName: empResult.rows[0].name,
+                jobTitle: title,
+                jobDescription: description,
+                priority: job.priority || 'medium',
+                deadline: job.deadline,
+                ownerName: ownerResult.rows[0]?.name
+              });
+            }
+          } catch (e) {
+            console.warn('⚠️ Async job assigned email warning:', e.message);
+          }
+        });
       }
     } catch (notifErr) {
       console.error('❌ Failed to send job notification:', notifErr);

@@ -85,74 +85,69 @@ async function createNotification(arg1, arg2, arg3, arg4, arg5) {
 
         const notification = result.rows[0];
 
-        // 1. Broadcast to user via SSE (Real-time Web UI)
+        // 1. Instant Real-time Web UI Delivery via SSE (<1ms in-process, instant Redis pubsub)
         broadcastToUser(user_id, {
             type: 'notification',
             data: notification
         });
 
-        // 2. Send Push Notification (Real-time Background/Mobile)
-        try {
-            // Fetch all active devices for this user
-            const deviceResult = await pool.query(
-                'SELECT fcm_token FROM user_devices WHERE user_id = $1',
-                [user_id]
-            );
-            const tokens = deviceResult.rows.map(r => r.fcm_token);
+        // 2. Background Processing for Push & External Channels (Non-blocking)
+        setImmediate(async () => {
+            // Push Notification (Mobile/FCM)
+            try {
+                const deviceResult = await pool.query(
+                    'SELECT fcm_token FROM user_devices WHERE user_id = $1',
+                    [user_id]
+                );
+                const tokens = deviceResult.rows.map(r => r.fcm_token);
 
-            if (tokens.length > 0) {
-                console.log(`📡 Attempting multicast push for user ${user_id} to ${tokens.length} devices`);
+                if (tokens.length > 0) {
+                    let finalUrl = data?.url;
+                    if (!finalUrl) {
+                        if (type.startsWith('job')) finalUrl = '/notifications';
+                        else if (type.startsWith('attendance')) finalUrl = '/attendance';
+                        else if (type.startsWith('material_request')) finalUrl = '/inventory';
+                        else if (type.startsWith('payroll')) finalUrl = '/payroll';
+                        else finalUrl = '/notifications';
+                    }
 
-                let finalUrl = data?.url;
-                if (!finalUrl) {
-                    if (type.startsWith('job')) finalUrl = '/notifications';
-                    else if (type.startsWith('attendance')) finalUrl = '/attendance';
-                    else if (type.startsWith('material_request')) finalUrl = '/inventory';
-                    else if (type.startsWith('payroll')) finalUrl = '/payroll';
-                    else finalUrl = '/notifications';
+                    const pushData = {
+                        type,
+                        notificationId: notification.id.toString(),
+                        url: finalUrl,
+                        ...data
+                    };
+
+                    const { sendMulticastPush } = require('../services/firebaseService');
+                    await sendMulticastPush(tokens, title, message, pushData);
                 }
-
-                const pushData = {
-                    type,
-                    notificationId: notification.id.toString(),
-                    url: finalUrl,
-                    ...data
-                };
-
-                const { sendMulticastPush } = require('../services/firebaseService');
-                await sendMulticastPush(tokens, title, message, pushData);
-                console.log(`✅ Multi-device push sent successfully to user ${user_id}`);
-            } else {
-                console.log(`⚠️ No registered devices for user ${user_id}. Skipping push.`);
+            } catch (pushErr) {
+                console.error('❌ Multi-device push failed:', pushErr.message);
             }
-        } catch (pushErr) {
-            console.error('❌ Multi-device push failed:', pushErr.message);
-        }
 
-        // 3. Send WhatsApp Notification if phone exists & channel enabled (job assignment, OTP, customer status)
-        try {
-          const { isWhatsAppConfigured, sendWhatsAppTemplateMessage } = require('../services/whatsappService');
-          if (isWhatsAppConfigured()) {
-            const uRes = await pool.query('SELECT phone FROM users WHERE id = $1', [user_id]);
-            const phone = uRes.rows[0]?.phone;
-            if (phone) {
-              let templateName = 'job_status_update';
-              if (type.includes('assign')) templateName = 'job_assignment_alert';
-              else if (type.includes('otp')) templateName = 'otp_verification';
+            // WhatsApp Notification Channel
+            try {
+                const { isWhatsAppConfigured, sendWhatsAppTemplateMessage } = require('../services/whatsappService');
+                if (isWhatsAppConfigured()) {
+                    const uRes = await pool.query('SELECT phone FROM users WHERE id = $1', [user_id]);
+                    const phone = uRes.rows[0]?.phone;
+                    if (phone) {
+                        let templateName = 'job_status_update';
+                        if (type.includes('assign')) templateName = 'job_assignment_alert';
+                        else if (type.includes('otp')) templateName = 'otp_verification';
 
-              const components = [{
-                type: 'body',
-                parameters: [{ type: 'text', text: title || 'Notification' }, { type: 'text', text: message || '' }]
-              }];
+                        const components = [{
+                            type: 'body',
+                            parameters: [{ type: 'text', text: title || 'Notification' }, { type: 'text', text: message || '' }]
+                        }];
 
-              await sendWhatsAppTemplateMessage(phone, templateName, 'en_US', components);
+                        await sendWhatsAppTemplateMessage(phone, templateName, 'en_US', components);
+                    }
+                }
+            } catch (waErr) {
+                console.warn('⚠️ WhatsApp dispatch warning:', waErr.message);
             }
-          } else {
-            console.log(`ℹ️ [WhatsApp Channel] Skipping WhatsApp send for user ${user_id} — Meta API credentials not configured.`);
-          }
-        } catch (waErr) {
-          console.warn('⚠️ WhatsApp dispatch warning (non-fatal):', waErr.message);
-        }
+        });
 
         console.log(`✅ Notification created and broadcast to user ${user_id}:`, title);
         return notification;

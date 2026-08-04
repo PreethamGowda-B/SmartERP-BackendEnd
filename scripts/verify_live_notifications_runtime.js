@@ -85,6 +85,11 @@ async function setupTestUsers() {
       await subscriber.subscribe(`employee_notifications:${u.id}`).catch(() => {});
     }
   }
+
+  // Warm up DB connection pool & Redis pubsub so cold-start isn't charged to Event 1
+  await pool.query('SELECT 1');
+  await new Promise(r => setTimeout(r, 200));
+  console.log('✅ Connection pool & PubSub warmed up cleanly.');
 }
 
 async function runTestScenario(eventId, eventName, fromRole, toRole, triggerFn) {
@@ -94,23 +99,25 @@ async function runTestScenario(eventId, eventName, fromRole, toRole, triggerFn) 
   const initialCount = targetSub ? targetSub.eventsReceived.length : 0;
 
   let error = null;
+  let timings = {};
   try {
-    await triggerFn();
+    timings = await triggerFn() || {};
   } catch (err) {
     error = err.message;
   }
 
-  // Allow short delay for SSE dispatch
-  await new Promise(r => setTimeout(r, 100));
+  await new Promise(r => setTimeout(r, 50));
   const endTime = Date.now();
 
   const currentCount = targetSub ? targetSub.eventsReceived.length : 0;
   const receivedNewEvent = currentCount > initialCount;
   const latestEvent = receivedNewEvent ? targetSub.eventsReceived[targetSub.eventsReceived.length - 1] : null;
 
-  const latency = latestEvent ? (latestEvent.timestamp - startTime) : (endTime - startTime);
-  const passed = receivedNewEvent && !error;
+  const sseDeliveryLatency = latestEvent && timings.notifStartTime 
+    ? (latestEvent.timestamp - timings.notifStartTime) 
+    : (latestEvent ? latestEvent.timestamp - startTime : endTime - startTime);
 
+  const passed = receivedNewEvent && !error;
   const targetUrl = latestEvent?.notification?.data?.url || latestEvent?.notification?.data?.targetUrl || 'N/A';
 
   results.push({
@@ -119,17 +126,20 @@ async function runTestScenario(eventId, eventName, fromRole, toRole, triggerFn) 
     fromRole,
     toRole,
     passed,
-    latencyMs: latency,
+    dbLatencyMs: timings.dbLatencyMs || 0,
+    notifLatencyMs: timings.notifLatencyMs || 0,
+    sseDeliveryLatencyMs: sseDeliveryLatency,
+    totalWorkflowMs: endTime - startTime,
     targetUrl,
     error: error || (receivedNewEvent ? null : 'SSE Notification Event Not Delivered')
   });
 
-  console.log(`${passed ? '✅ PASS' : '❌ FAIL'} [Event ${eventId}] ${eventName} (${fromRole} -> ${toRole}) | Latency: ${latency}ms | Target URL: ${targetUrl}`);
+  console.log(`${passed ? '✅ PASS' : '❌ FAIL'} [Event ${eventId}] ${eventName} | SSE Latency: ${sseDeliveryLatency}ms | DB Write: ${timings.dbLatencyMs || 0}ms | Total Workflow: ${endTime - startTime}ms`);
 }
 
 async function executeAllVerifications() {
   console.log('\n=========================================================');
-  console.log('🚀 LIVE RUNTIME NOTIFICATION SYSTEM VERIFICATION SUITE');
+  console.log('🚀 STAGE-BY-STAGE REAL-TIME NOTIFICATION VERIFICATION SUITE');
   console.log('=========================================================\n');
 
   await setupTestUsers();
@@ -143,12 +153,15 @@ async function executeAllVerifications() {
 
   // 1. Owner creates job -> Employee popup
   await runTestScenario(1, 'Owner creates job', 'owner', 'employee', async () => {
+    const t0 = Date.now();
     await pool.query(
       `INSERT INTO jobs (id, company_id, title, assigned_to, created_by, status)
        VALUES ($1, $2, 'HVAC Compressor Overhaul', $3, $4, 'open')
        ON CONFLICT (id) DO UPDATE SET title = 'HVAC Compressor Overhaul'`,
       [testJobId, TEST_COMPANY_ID, emp.id, owner.id]
     );
+    const t1 = Date.now();
+    const notifStartTime = Date.now();
     await createNotification({
       user_id: emp.id,
       company_id: TEST_COMPANY_ID,
@@ -159,10 +172,16 @@ async function executeAllVerifications() {
       actor_id: owner.id,
       data: { job_id: testJobId, url: '/employee/jobs' }
     });
+    const t2 = Date.now();
+    return { dbLatencyMs: t1 - t0, notifLatencyMs: t2 - t1, notifStartTime };
   });
 
   // 2. Owner assigns/reassigns job -> Employee popup
   await runTestScenario(2, 'Owner reassigns job', 'owner', 'employee', async () => {
+    const t0 = Date.now();
+    await pool.query('UPDATE jobs SET assigned_to = $1 WHERE id = $2', [emp.id, testJobId]);
+    const t1 = Date.now();
+    const notifStartTime = Date.now();
     await createNotification({
       user_id: emp.id,
       company_id: TEST_COMPANY_ID,
@@ -173,6 +192,8 @@ async function executeAllVerifications() {
       actor_id: owner.id,
       data: { job_id: testJobId, url: '/employee/jobs' }
     });
+    const t2 = Date.now();
+    return { dbLatencyMs: t1 - t0, notifLatencyMs: t2 - t1, notifStartTime };
   });
 
   // 3. Employee accepts job -> Owner popup

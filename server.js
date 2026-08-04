@@ -509,7 +509,6 @@ async function runDatabaseInitialization() {
     }
 
     // 5. Workflow Enhancement migration (approval workflow, SLA, billing, etc.)
-    // Run statement-by-statement so a single FK/column failure doesn't abort the rest
     try {
       const fs = require('fs');
       const path = require('path');
@@ -519,8 +518,15 @@ async function runDatabaseInitialization() {
       );
       await runSqlStatements(workflowSql, 'migration.workflow_enhancement');
       console.log('✅ Workflow Enhancement migration complete');
+
+      const hrMasterSql = fs.readFileSync(
+        path.join(__dirname, 'migrations', 'hr_master_backbone_schema.sql'),
+        'utf8'
+      );
+      await runSqlStatements(hrMasterSql, 'migration.hr_master_backbone');
+      console.log('✅ Enterprise HR Master Backbone schema applied');
     } catch (wfErr) {
-      console.error('⚠️  Workflow Enhancement migration failed:', wfErr.message);
+      console.error('⚠️  Workflow/HR migration failed:', wfErr.message);
       const errorLogger = require('./utils/errorLogger');
       errorLogger.log(wfErr, { context: 'migration.workflow_enhancement' });
     }

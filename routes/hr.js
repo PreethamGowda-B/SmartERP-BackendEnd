@@ -4,240 +4,324 @@ const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 const { createNotification } = require('../utils/notificationHelpers');
 
-// 📥 ANNOUNCEMENTS ROUTES
+// ── HR Audit Logging Helper ──────────────────────────────────────────────────
+async function logHrAudit({ companyId, performedBy, performedByName, action, targetEmployeeId, targetEmployeeName, oldValue, newValue, reason, req }) {
+  try {
+    const ip = req?.headers['x-forwarded-for'] || req?.socket?.remoteAddress || '127.0.0.1';
+    const device = req?.headers['user-agent'] || 'Unknown Device';
+    await pool.query(
+      `INSERT INTO hr_audit_logs 
+       (company_id, performed_by, performed_by_name, action, target_employee_id, target_employee_name, old_value, new_value, reason, ip_address, device_info)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+      [
+        companyId,
+        String(performedBy),
+        performedByName || 'HR Manager',
+        action,
+        targetEmployeeId ? String(targetEmployeeId) : null,
+        targetEmployeeName || null,
+        oldValue ? JSON.stringify(oldValue) : null,
+        newValue ? JSON.stringify(newValue) : null,
+        reason || null,
+        ip,
+        device
+      ]
+    );
+  } catch (err) {
+    console.error('⚠️ Error logging HR audit trail:', err.message);
+  }
+}
 
-// GET /api/hr/announcements - Fetch all company announcements
-router.get('/announcements', authenticateToken, async (req, res) => {
+// ── 1. GET /api/hr/analytics — Master HR Executive Dashboard Metrics ─────────
+router.get('/analytics', authenticateToken, async (req, res) => {
   try {
     const companyId = req.user.companyId;
-    const role = req.user.role;
 
-    // Filter by target_role if not owner
-    let query = 'SELECT a.*, u.name as creator_name FROM announcements a JOIN users u ON a.created_by = u.id WHERE a.company_id = $1';
+    const headcountRes = await pool.query(`SELECT COUNT(*) as total FROM users WHERE company_id = $1 AND is_active = true`, [companyId]);
+    const presentRes = await pool.query(`SELECT COUNT(DISTINCT user_id) as count FROM attendance WHERE company_id = $1 AND date = CURRENT_DATE AND status IN ('present', 'arrived')`, [companyId]);
+    const lateRes = await pool.query(`SELECT COUNT(DISTINCT user_id) as count FROM attendance WHERE company_id = $1 AND date = CURRENT_DATE AND is_late = true`, [companyId]);
+    const pendingReqRes = await pool.query(`SELECT COUNT(*) as count FROM hr_employee_requests WHERE company_id = $1 AND status = 'pending'`, [companyId]);
+    const recruitmentRes = await pool.query(`SELECT COUNT(*) as count FROM hr_recruitment_candidates WHERE company_id = $1 AND stage NOT IN ('joined', 'rejected')`, [companyId]);
+    const assetRes = await pool.query(`SELECT COUNT(*) as count FROM hr_assets WHERE company_id = $1 AND return_status = 'assigned'`, [companyId]);
+
+    res.json({
+      success: true,
+      analytics: {
+        totalHeadcount: parseInt(headcountRes.rows[0]?.total || 0),
+        presentToday: parseInt(presentRes.rows[0]?.count || 0),
+        lateToday: parseInt(lateRes.rows[0]?.count || 0),
+        pendingRequests: parseInt(pendingReqRes.rows[0]?.count || 0),
+        activeRecruitment: parseInt(recruitmentRes.rows[0]?.count || 0),
+        assignedAssets: parseInt(assetRes.rows[0]?.count || 0),
+      }
+    });
+  } catch (err) {
+    console.error('Error fetching HR analytics:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ── 2. GET & POST /api/hr/requests — Unified Employee Request Processing ───
+router.get('/requests', authenticateToken, async (req, res) => {
+  try {
+    const companyId = req.user.companyId;
+    const { status = 'all' } = req.query;
+
+    let query = `SELECT * FROM hr_employee_requests WHERE company_id = $1`;
     let params = [companyId];
 
-    if (role !== 'owner' && role !== 'admin' && role !== 'hr') {
-      query += " AND (target_role = 'all' OR target_role = 'employee')";
+    if (status !== 'all') {
+      query += ` AND status = $2`;
+      params.push(status);
     }
-
-    query += ' ORDER BY a.created_at DESC LIMIT 50';
+    query += ` ORDER BY created_at DESC LIMIT 100`;
 
     const result = await pool.query(query, params);
-    res.json(result.rows);
+    res.json({ success: true, requests: result.rows });
   } catch (err) {
-    console.error('Error fetching announcements:', err);
+    console.error('Error fetching HR requests:', err);
     res.status(500).json({ message: 'Server error' });
   }
 });
 
-// POST /api/hr/announcements - Create an announcement (Owner/Admin)
-router.post('/announcements', authenticateToken, async (req, res) => {
+router.post('/requests', authenticateToken, async (req, res) => {
   try {
-    if (req.user.role !== 'owner' && req.user.role !== 'admin' && req.user.role !== 'hr') {
-      return res.status(403).json({ message: 'Unauthorized' });
-    }
-
-    const { title, content, priority = 'medium', target_role = 'all' } = req.body;
     const companyId = req.user.companyId;
     const userId = req.user.userId || req.user.id;
+    const userName = req.user.name || 'Employee';
+    const { request_type, details } = req.body;
 
-    if (!title || !content) {
-      return res.status(400).json({ message: 'Title and content are required' });
+    if (!request_type || !details) {
+      return res.status(400).json({ message: 'request_type and details are required' });
     }
 
     const result = await pool.query(
-      `INSERT INTO announcements (company_id, created_by, title, content, priority, target_role)
-       VALUES ($1, $2, $3, $4, $5, $6)
+      `INSERT INTO hr_employee_requests (company_id, user_id, employee_name, request_type, details)
+       VALUES ($1, $2, $3, $4, $5)
        RETURNING *`,
-      [companyId, userId, title, content, priority, target_role]
+      [companyId, userId, userName, request_type, JSON.stringify(details)]
     );
 
-    const announcement = result.rows[0];
+    await logHrAudit({
+      companyId,
+      performedBy: userId,
+      performedByName: userName,
+      action: `SUBMIT_${request_type.toUpperCase()}_REQUEST`,
+      targetEmployeeId: userId,
+      targetEmployeeName: userName,
+      newValue: details,
+      reason: details.reason || 'Submitted via Employee Portal ESS',
+      req
+    });
 
-    // Broadcast notifications to all users in the company
-    try {
-      const usersRes = await pool.query(
-        'SELECT id FROM users WHERE company_id = $1 AND id != $2',
-        [companyId, userId]
-      );
-
-      for (const targetUser of usersRes.rows) {
-        await createNotification({
-          user_id: targetUser.id,
-          company_id: companyId,
-          type: 'announcement',
-          title: `📢 New Announcement: ${title}`,
-          message: content.substring(0, 100) + (content.length > 100 ? '...' : ''),
-          priority: priority === 'high' ? 'high' : 'medium',
-          data: { announcement_id: announcement.id, url: '/owner/hr-hub' } // Frontend will handle routing
-        });
-      }
-    } catch (notifErr) {
-      console.error('Failed to broadcast announcement notifications:', notifErr.message);
-    }
-
-    res.status(201).json(announcement);
+    res.status(201).json({ success: true, request: result.rows[0] });
   } catch (err) {
-    console.error('Error creating announcement:', err);
+    console.error('Error creating employee request:', err);
     res.status(500).json({ message: 'Server error' });
   }
 });
 
-// DELETE /api/hr/announcements/:id - Delete an announcement
-router.delete('/announcements/:id', authenticateToken, async (req, res) => {
+router.patch('/requests/:id/review', authenticateToken, async (req, res) => {
   try {
-    if (req.user.role !== 'owner' && req.user.role !== 'admin' && req.user.role !== 'hr') {
-      return res.status(403).json({ message: 'Unauthorized' });
-    }
-
     const { id } = req.params;
+    const { status, hr_comments } = req.body;
     const companyId = req.user.companyId;
-
-    const result = await pool.query(
-      'DELETE FROM announcements WHERE id = $1 AND company_id = $2 RETURNING id',
-      [id, companyId]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ message: 'Announcement not found' });
-    }
-
-    res.json({ message: 'Announcement deleted' });
-  } catch (err) {
-    console.error('Error deleting announcement:', err);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-// 📥 LEAVE REQUESTS ROUTES
-
-// GET /api/hr/leaves - Fetch leave requests (Role-based)
-router.get('/leaves', authenticateToken, async (req, res) => {
-  try {
-    const userId = req.user.userId || req.user.id;
-    const companyId = req.user.companyId;
-    const role = req.user.role;
-
-    let query = `
-      SELECT lr.*, u.name as employee_name, u.position as employee_position
-      FROM leave_requests lr
-      JOIN users u ON lr.user_id = u.id
-      WHERE lr.company_id = $1
-    `;
-    let params = [companyId];
-
-    if (role !== 'owner' && role !== 'admin' && role !== 'hr') {
-      query += ' AND lr.user_id = $2';
-      params.push(userId);
-    }
-
-    query += ' ORDER BY lr.created_at DESC';
-
-    const result = await pool.query(query, params);
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Error fetching leaves:', err);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-// POST /api/hr/leaves - Submit a leave request (Employee)
-router.post('/leaves', authenticateToken, async (req, res) => {
-  try {
-    const { leave_type, start_date, end_date, reason } = req.body;
-    const userId = req.user.userId || req.user.id;
-    const companyId = req.user.companyId;
-
-    if (!leave_type || !start_date || !end_date) {
-      return res.status(400).json({ message: 'Missing required fields' });
-    }
-
-    const result = await pool.query(
-      `INSERT INTO leave_requests (company_id, user_id, leave_type, start_date, end_date, reason, status)
-       VALUES ($1, $2, $3, $4, $5, $6, 'pending')
-       RETURNING *`,
-      [companyId, userId, leave_type, start_date, end_date, reason]
-    );
-
-    const leave = result.rows[0];
-
-    // Notify company owner/admins
-    try {
-      const adminsRes = await pool.query(
-        "SELECT id FROM users WHERE company_id = $1 AND role IN ('owner', 'admin', 'hr')",
-        [companyId]
-      );
-
-      for (const admin of adminsRes.rows) {
-        await createNotification({
-          user_id: admin.id,
-          company_id: companyId,
-          type: 'leave_request',
-          title: '📝 New Leave Request',
-          message: `An employee has requested ${leave_type} leave.`,
-          priority: 'medium',
-          data: { leave_id: leave.id, url: '/owner/hr-hub' }
-        });
-      }
-    } catch (notifErr) {
-      console.error('Failed to notify admins of leave request:', notifErr.message);
-    }
-
-    res.status(201).json(leave);
-  } catch (err) {
-    console.error('Error submitting leave:', err);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-// PATCH /api/hr/leaves/:id/status - Approve or Reject leave (Owner/Admin)
-router.patch('/leaves/:id/status', authenticateToken, async (req, res) => {
-  try {
-    if (req.user.role !== 'owner' && req.user.role !== 'admin' && req.user.role !== 'hr') {
-      return res.status(403).json({ message: 'Unauthorized' });
-    }
-
-    const { id } = req.params;
-    const { status, admin_notes } = req.body;
-    const approvedBy = req.user.userId || req.user.id;
-    const companyId = req.user.companyId;
+    const reviewerId = req.user.userId || req.user.id;
+    const reviewerName = req.user.name || 'HR Manager';
 
     if (!['approved', 'rejected'].includes(status)) {
       return res.status(400).json({ message: 'Invalid status' });
     }
 
+    const reqRes = await pool.query(`SELECT * FROM hr_employee_requests WHERE id = $1 AND company_id = $2`, [id, companyId]);
+    if (reqRes.rows.length === 0) return res.status(404).json({ message: 'Request not found' });
+
+    const empReq = reqRes.rows[0];
+
     const result = await pool.query(
-      `UPDATE leave_requests
-       SET status = $1, admin_notes = $2, approved_by = $3, updated_at = NOW()
+      `UPDATE hr_employee_requests 
+       SET status = $1, hr_comments = $2, reviewed_by = $3, reviewed_at = NOW()
        WHERE id = $4 AND company_id = $5
        RETURNING *`,
-      [status, admin_notes, approvedBy, id, companyId]
+      [status, hr_comments || null, reviewerName, id, companyId]
     );
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({ message: 'Leave request not found' });
+    // Dynamic Downstream Logic Based on Request Type
+    if (status === 'approved') {
+      if (empReq.request_type === 'attendance_correction') {
+        const det = empReq.details || {};
+        if (det.date) {
+          await pool.query(
+            `UPDATE attendance SET status = 'present', is_late = false, updated_at = NOW()
+             WHERE user_id = $1 AND company_id = $2 AND date = $3`,
+            [empReq.user_id, companyId, det.date]
+          );
+        }
+      }
     }
 
-    const updatedLeave = result.rows[0];
+    await logHrAudit({
+      companyId,
+      performedBy: reviewerId,
+      performedByName: reviewerName,
+      action: `${status.toUpperCase()}_${empReq.request_type.toUpperCase()}_REQUEST`,
+      targetEmployeeId: empReq.user_id,
+      targetEmployeeName: empReq.employee_name,
+      oldValue: { status: empReq.status },
+      newValue: { status, hr_comments },
+      reason: hr_comments || 'HR Manager review decision',
+      req
+    });
 
-    // Notify the employee
-    try {
-      await createNotification({
-        user_id: updatedLeave.user_id,
-        company_id: companyId,
-        type: 'leave_status_update',
-        title: `🏖️ Leave Request ${status.toUpperCase()}`,
-        message: `Your ${updatedLeave.leave_type} leave request has been ${status}.`,
-        priority: status === 'approved' ? 'medium' : 'high',
-        data: { leave_id: updatedLeave.id, status, url: '/employee/hr-hub' }
-      });
-    } catch (notifErr) {
-      console.error('Failed to notify employee of leave status update:', notifErr.message);
-    }
-
-    res.json(updatedLeave);
+    res.json({ success: true, request: result.rows[0] });
   } catch (err) {
-    console.error('Error updating leave status:', err);
+    console.error('Error reviewing HR request:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ── 3. GET & POST /api/hr/recruitment — ATS Candidates & Offer Letters ──────
+router.get('/recruitment', authenticateToken, async (req, res) => {
+  try {
+    const companyId = req.user.companyId;
+    const result = await pool.query(`SELECT * FROM hr_recruitment_candidates WHERE company_id = $1 ORDER BY created_at DESC`, [companyId]);
+    res.json({ success: true, candidates: result.rows });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+router.post('/recruitment', authenticateToken, async (req, res) => {
+  try {
+    const companyId = req.user.companyId;
+    const { name, email, phone, designation, department, stage = 'sourced', interview_rating = 0.0 } = req.body;
+
+    const result = await pool.query(
+      `INSERT INTO hr_recruitment_candidates (company_id, name, email, phone, designation, department, stage, interview_rating)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+      [companyId, name, email, phone, designation, department, stage, interview_rating]
+    );
+
+    res.status(201).json({ success: true, candidate: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ── 4. GET & POST /api/hr/skills — Skill Matrix & Certifications ─────────────
+router.get('/skills', authenticateToken, async (req, res) => {
+  try {
+    const companyId = req.user.companyId;
+    const result = await pool.query(
+      `SELECT s.*, u.name as employee_name, u.email as employee_email 
+       FROM hr_skills_certifications s 
+       JOIN users u ON s.user_id::text = u.id::text 
+       WHERE s.company_id = $1 ORDER BY s.created_at DESC`,
+      [companyId]
+    );
+    res.json({ success: true, skills: result.rows });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+router.post('/skills', authenticateToken, async (req, res) => {
+  try {
+    const companyId = req.user.companyId;
+    const { user_id, skill_name, certification_name, issuing_authority, expiry_date } = req.body;
+
+    const result = await pool.query(
+      `INSERT INTO hr_skills_certifications (company_id, user_id, skill_name, certification_name, issuing_authority, expiry_date)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [companyId, user_id, skill_name, certification_name, issuing_authority, expiry_date || null]
+    );
+
+    res.status(201).json({ success: true, skill: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ── 5. GET & POST /api/hr/assets — IT & Field Hardware Inventory ────────────
+router.get('/assets', authenticateToken, async (req, res) => {
+  try {
+    const companyId = req.user.companyId;
+    const result = await pool.query(
+      `SELECT a.*, u.name as assigned_employee_name 
+       FROM hr_assets a 
+       LEFT JOIN users u ON a.assigned_to::text = u.id::text 
+       WHERE a.company_id = $1 ORDER BY a.created_at DESC`,
+      [companyId]
+    );
+    res.json({ success: true, assets: result.rows });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+router.post('/assets', authenticateToken, async (req, res) => {
+  try {
+    const companyId = req.user.companyId;
+    const { asset_name, asset_tag, category, assigned_to, condition = 'good' } = req.body;
+
+    const result = await pool.query(
+      `INSERT INTO hr_assets (company_id, asset_name, asset_tag, category, assigned_to, assigned_at, condition)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+      [companyId, asset_name, asset_tag, category, assigned_to || null, assigned_to ? new Date() : null, condition]
+    );
+
+    res.status(201).json({ success: true, asset: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ── 6. GET /api/hr/audit-logs — HR Immutable Audit Trail ────────────────────
+router.get('/audit-logs', authenticateToken, async (req, res) => {
+  try {
+    const companyId = req.user.companyId;
+    const result = await pool.query(`SELECT * FROM hr_audit_logs WHERE company_id = $1 ORDER BY created_at DESC LIMIT 100`, [companyId]);
+    res.json({ success: true, logs: result.rows });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ── Legacy Announcement & Leave Routes ─────────────────────────────────────
+router.get('/announcements', authenticateToken, async (req, res) => {
+  try {
+    const companyId = req.user.companyId;
+    const role = req.user.role;
+    let query = 'SELECT a.*, u.name as creator_name FROM announcements a JOIN users u ON a.created_by = u.id WHERE a.company_id = $1';
+    let params = [companyId];
+    if (role !== 'owner' && role !== 'admin' && role !== 'hr') {
+      query += " AND (target_role = 'all' OR target_role = 'employee')";
+    }
+    query += ' ORDER BY a.created_at DESC LIMIT 50';
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+router.post('/announcements', authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== 'owner' && req.user.role !== 'admin' && req.user.role !== 'hr') {
+      return res.status(403).json({ message: 'Unauthorized' });
+    }
+    const { title, content, priority = 'medium', target_role = 'all' } = req.body;
+    const companyId = req.user.companyId;
+    const userId = req.user.userId || req.user.id;
+
+    const result = await pool.query(
+      `INSERT INTO announcements (company_id, created_by, title, content, priority, target_role)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [companyId, userId, title, content, priority, target_role]
+    );
+
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
     res.status(500).json({ message: 'Server error' });
   }
 });

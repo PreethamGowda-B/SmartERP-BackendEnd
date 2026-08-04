@@ -529,7 +529,13 @@ async function runDatabaseInitialization() {
         'utf8'
       );
       await runSqlStatements(msgIdxSql, 'migration.messaging_performance_indexes');
-      console.log('✅ Messaging performance database indexes applied');
+
+      const commBackboneSql = fs.readFileSync(
+        path.join(__dirname, 'migrations', 'enterprise_communication_backbone.sql'),
+        'utf8'
+      );
+      await runSqlStatements(commBackboneSql, 'migration.enterprise_communication_backbone');
+      console.log('✅ Enterprise Communication Backbone database schema applied');
     } catch (wfErr) {
       console.error('⚠️  Workflow/HR/Messaging migration failed:', wfErr.message);
       const errorLogger = require('./utils/errorLogger');

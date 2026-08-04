@@ -35,20 +35,24 @@ router.post('/', authenticateToken, async (req, res) => {
         }
 
         const userName = userResult.rows[0]?.name || userResult.rows[0]?.email || 'Unknown';
+        const companyId = req.user.companyId || userResult.rows[0]?.company_id || null;
+
+        const isValidUuid = (str) => typeof str === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str);
+        const safeRequestedBy = isValidUuid(String(userId)) ? String(userId) : null;
 
         const result = await pool.query(
             `INSERT INTO material_requests 
        (item_name, quantity, urgency, description, requested_by, requested_by_name, company_id, created_at) 
-       VALUES ($1, $2, $3, $4, $5::uuid, $6, $7, NOW()) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW()) 
        RETURNING *`,
             [
                 item_name.trim(),
                 parseInt(quantity),
                 urgency || 'Medium',
                 description?.trim() || null,
-                String(userId),
+                safeRequestedBy,
                 userName,
-                req.user.companyId || null
+                companyId
             ]
         );
 
@@ -112,23 +116,25 @@ router.get('/', authenticateToken, async (req, res) => {
                     requested_by, requested_by_name, created_at, updated_at,
                     reviewed_by, reviewed_at
                 FROM material_requests 
-                WHERE company_id = $1
+                WHERE company_id::text = $1::text OR company_id IS NULL
                 ORDER BY created_at DESC
             `;
-            params = [companyId];
+            params = [String(companyId || '')];
         } else {
-            // Employee sees only their own requests
-            // Use ::text cast on both sides — works for both UUID and INTEGER PKs
+            // Employee sees their own requests by user ID or name
+            const userRes = await pool.query('SELECT name FROM users WHERE id::text = $1::text', [String(userId)]);
+            const userName = userRes.rows[0]?.name || '';
+
             query = `
                 SELECT 
                     id, item_name, quantity, urgency, description, status,
                     requested_by, requested_by_name, created_at, updated_at,
                     reviewed_by, reviewed_at
                 FROM material_requests 
-                WHERE requested_by::text = $1::text
+                WHERE requested_by::text = $1::text OR ($2 != '' AND requested_by_name = $2)
                 ORDER BY created_at DESC
             `;
-            params = [String(userId)];
+            params = [String(userId), userName];
         }
 
         console.log('📝 Executing query with params:', params);

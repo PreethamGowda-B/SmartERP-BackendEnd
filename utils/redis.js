@@ -37,7 +37,8 @@ function attachListeners(client, label) {
       console.warn(`⚠️ Redis [${label}] connection limit reached (non-fatal)`);
     } else if (
       !err.message?.includes('Connection is closed') &&
-      !err.message?.includes('connect ECONNREFUSED')
+      !err.message?.includes('connect ECONNREFUSED') &&
+      !err.message?.includes('Stream isn\'t writeable')
     ) {
       console.warn(`⚠️ Redis [${label}] error:`, err.message);
     }
@@ -79,7 +80,7 @@ function getSharedSubscriber() {
 }
 
 // ─── Slot 3: BullMQ connection (lazy singleton) ───────────────────────────────
-// BullMQ requires maxRetriesPerRequest: null.
+// BullMQ requires maxRetriesPerRequest: null and enableOfflineQueue: true.
 // We expose this via a getter so queue.js can reuse the same connection
 // instead of creating a new one on import.
 let bullConnection = null;
@@ -89,10 +90,10 @@ function getBullMQConnection() {
   try {
     bullConnection = new Redis(REDIS_URL, {
       maxRetriesPerRequest: null,  // required by BullMQ
-      enableOfflineQueue: false,
+      enableOfflineQueue: true,    // required by BullMQ & ioredis for Worker polling loop
       retryStrategy(times) {
-        if (times > 3) return null;
-        return Math.min(times * 1000, 3000);
+        if (times > 10) return null;
+        return Math.min(times * 500, 3000);
       },
     });
     attachListeners(bullConnection, 'bullmq');

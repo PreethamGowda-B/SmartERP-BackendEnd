@@ -524,9 +524,14 @@ async function runDatabaseInitialization() {
         'utf8'
       );
       await runSqlStatements(hrMasterSql, 'migration.hr_master_backbone');
-      console.log('✅ Enterprise HR Master Backbone schema applied');
+      const msgIdxSql = fs.readFileSync(
+        path.join(__dirname, 'migrations', 'messaging_performance_indexes.sql'),
+        'utf8'
+      );
+      await runSqlStatements(msgIdxSql, 'migration.messaging_performance_indexes');
+      console.log('✅ Messaging performance database indexes applied');
     } catch (wfErr) {
-      console.error('⚠️  Workflow/HR migration failed:', wfErr.message);
+      console.error('⚠️  Workflow/HR/Messaging migration failed:', wfErr.message);
       const errorLogger = require('./utils/errorLogger');
       errorLogger.log(wfErr, { context: 'migration.workflow_enhancement' });
     }

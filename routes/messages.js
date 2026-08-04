@@ -45,23 +45,21 @@ router.get('/contacts', async (req, res) => {
 
     const users = result.rows;
 
-    // Enrich each user with online status from Redis
+    // Enrich each user with online status using a SINGLE bulk Redis query
     const redisKey = `online_users:${companyId}`;
-    const usersWithStatus = await Promise.all(
-      users.map(async (user) => {
-        let online_status = false;
-        try {
-          if (redisClient && redisClient.status === 'ready') {
-            const val = await redisClient.hget(redisKey, String(user.user_id));
-            online_status = val !== null && val !== '0';
-          }
-        } catch (redisErr) {
-          // Redis failure — fall back to false (already set above)
-          console.warn('⚠️ Redis hget failed for contacts online status:', redisErr.message);
-        }
-        return { ...user, online_status };
-      })
-    );
+    let onlineMap = {};
+    try {
+      if (redisClient && redisClient.status === 'ready') {
+        onlineMap = (await redisClient.hgetall(redisKey)) || {};
+      }
+    } catch (redisErr) {
+      console.warn('⚠️ Redis hgetall failed for contacts online status:', redisErr.message);
+    }
+
+    const usersWithStatus = users.map((user) => ({
+      ...user,
+      online_status: Boolean(onlineMap[String(user.user_id)])
+    }));
 
     res.json(usersWithStatus);
   } catch (err) {
@@ -376,30 +374,26 @@ router.get('/conversations', async (req, res) => {
     );
 
     const redisKey = `online_users:${companyId}`;
-    const rows = await Promise.all(
-      result.rows.map(async (row) => {
-        let other_user_online = false;
-        try {
-          if (redisClient && redisClient.status === 'ready') {
-            const val = await redisClient.hget(redisKey, String(row.other_user_id));
-            other_user_online = val !== null && val !== '0';
-          }
-        } catch (redisErr) {
-          console.warn('⚠️ Redis hget failed for conversations online status:', redisErr.message);
-        }
-        return {
-          conversation_id: row.conversation_id,
-          other_user_id: row.other_user_id,
-          other_user_name: row.other_user_name,
-          other_user_role: row.other_user_role,
-          last_message: row.last_message ?? null,
-          last_message_time: row.last_message_time ? new Date(row.last_message_time).toISOString() : null,
-          unread_count: parseInt(row.unread_count, 10),
-          is_last_message_mine: row.is_last_message_mine ?? false,
-          other_user_online,
-        };
-      })
-    );
+    let onlineMap = {};
+    try {
+      if (redisClient && redisClient.status === 'ready') {
+        onlineMap = (await redisClient.hgetall(redisKey)) || {};
+      }
+    } catch (redisErr) {
+      console.warn('⚠️ Redis hgetall failed for conversations online status:', redisErr.message);
+    }
+
+    const rows = result.rows.map((row) => ({
+      conversation_id: row.conversation_id,
+      other_user_id: row.other_user_id,
+      other_user_name: row.other_user_name,
+      other_user_role: row.other_user_role,
+      last_message: row.last_message ?? null,
+      last_message_time: row.last_message_time ? new Date(row.last_message_time).toISOString() : null,
+      unread_count: parseInt(row.unread_count, 10),
+      is_last_message_mine: row.is_last_message_mine ?? false,
+      other_user_online: Boolean(onlineMap[String(row.other_user_id)]),
+    }));
 
     res.json(rows);
   } catch (err) {

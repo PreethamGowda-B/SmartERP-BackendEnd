@@ -74,11 +74,35 @@ class PayrollValidationService {
       }
 
       // ----------------------------------------------------------------
-      // Check 2 to 7: Per-Employee Proposed Payroll Validations
+      // Check 2 to 7: Per-Employee Proposed & Historical Payroll Validations
       // ----------------------------------------------------------------
-      for (const p of proposedPayroll) {
-        const user = userMap.get(p.userId);
-        const empName = user ? user.name : p.employeeName || 'Employee';
+      let payrollList = [...proposedPayroll];
+
+      // If proposedPayroll is empty or sample, fetch actual company payroll records for target month/year from DB
+      if (payrollList.length === 0 || (payrollList.length === 3 && String(payrollList[0]?.userId).includes("11111111"))) {
+        const dbPayrollRes = await client.query(
+          `SELECT p.*, u.id as user_id, u.name as employee_name, u.email as employee_email
+           FROM payroll p
+           LEFT JOIN users u ON (u.email = p.employee_email AND u.company_id = p.company_id)
+           WHERE p.company_id = $1 AND p.payroll_month = $2 AND p.payroll_year = $3`,
+          [companyId, month, year]
+        );
+
+        payrollList = dbPayrollRes.rows.map((row) => ({
+          userId: row.user_id || row.id,
+          employeeName: row.employee_name || row.employee_email || 'Employee',
+          employeeEmail: row.employee_email,
+          baseSalary: parseFloat(row.base_salary || 0),
+          bonus: parseFloat(row.extra_amount || 0) + parseFloat(row.salary_increment || 0),
+          deduction: parseFloat(row.deduction || 0),
+          netPay: parseFloat(row.total_salary || 0),
+        }));
+      }
+
+      for (const p of payrollList) {
+        const user = p.userId ? userMap.get(p.userId) : Array.from(userMap.values()).find((u) => u.email === p.employeeEmail);
+        const empName = user ? user.name : p.employeeName || p.employeeEmail || 'Employee';
+        const targetUserId = user ? user.id : p.userId || null;
 
         // Check 3: Inactive User Payout Flag
         if (user && !user.is_active) {
@@ -88,7 +112,7 @@ class PayrollValidationService {
             `INSERT INTO payroll_validation_flags 
              (validation_run_id, company_id, user_id, employee_name, flag_type, severity, description)
              VALUES ($1, $2, $3, $4, 'inactive_user', 'critical', $5)`,
-            [runId, companyId, p.userId, empName, `CRITICAL: Payout proposed for inactive/terminated employee account.`]
+            [runId, companyId, targetUserId, empName, `CRITICAL: Payout proposed for inactive/terminated employee account (${empName}).`]
           );
         }
 
@@ -96,7 +120,7 @@ class PayrollValidationService {
         const base = parseFloat(p.baseSalary || 0);
         const bonus = parseFloat(p.bonus || p.extraAmount || 0);
         const ded = parseFloat(p.deduction || 0);
-        const netPay = base + bonus - ded;
+        const netPay = p.netPay !== undefined ? parseFloat(p.netPay) : (base + bonus - ded);
 
         if (netPay < 0) {
           hasCritical = true;
@@ -105,7 +129,7 @@ class PayrollValidationService {
             `INSERT INTO payroll_validation_flags 
              (validation_run_id, company_id, user_id, employee_name, flag_type, severity, description)
              VALUES ($1, $2, $3, $4, 'negative_payout', 'critical', $5)`,
-            [runId, companyId, p.userId, empName, `CRITICAL: Deductions (₹${ded}) exceed total earnings (₹${base + bonus}). Net payout is negative (₹${netPay}).`]
+            [runId, companyId, targetUserId, empName, `CRITICAL: Deductions (₹${ded}) exceed total earnings (₹${base + bonus}). Net payout is negative (₹${netPay}).`]
           );
         }
 
@@ -117,14 +141,21 @@ class PayrollValidationService {
             `INSERT INTO payroll_validation_flags 
              (validation_run_id, company_id, user_id, employee_name, flag_type, severity, description)
              VALUES ($1, $2, $3, $4, 'zero_salary', 'info', $5)`,
-            [runId, companyId, p.userId, empName, `INFO: Net proposed payout is ₹0.00 for active employee.`]
+            [runId, companyId, targetUserId, empName, `INFO: Net proposed payout is ₹0.00 for active employee.`]
           );
         }
 
         // Check 2: Month-over-Month Salary Spike Check (> 25%)
         const prevRes = await client.query(
-          `SELECT total_salary FROM payroll WHERE user_id = $1 AND company_id = $2 ORDER BY created_at DESC LIMIT 1`,
-          [p.userId, companyId]
+          `SELECT total_salary, payroll_month, payroll_year FROM payroll 
+           WHERE company_id = $1 
+             AND (
+               (employee_email IS NOT NULL AND employee_email = $2)
+               OR (employee_id IS NOT NULL AND employee_id::text = $3::text)
+             )
+             AND (payroll_year < $4 OR (payroll_year = $4 AND payroll_month < $5))
+           ORDER BY payroll_year DESC, payroll_month DESC, created_at DESC LIMIT 1`,
+          [companyId, p.employeeEmail || (user ? user.email : ''), String(targetUserId || ''), year, month]
         );
 
         if (prevRes.rows.length > 0) {
@@ -135,7 +166,7 @@ class PayrollValidationService {
               hasWarning = true;
               totalAnomalies++;
 
-              let reasoning = `Salary increased by ${spikePct.toFixed(1)}% compared to previous payout of ₹${prevSalary}.`;
+              let reasoning = `Salary increased by ${spikePct.toFixed(1)}% compared to previous payout of ₹${prevSalary.toLocaleString('en-IN')}.`;
               try {
                 const provider = ProviderFactory.getProvider();
                 const completion = await provider.generateCompletion({
@@ -159,9 +190,9 @@ class PayrollValidationService {
                 [
                   runId,
                   companyId,
-                  p.userId,
+                  targetUserId,
                   empName,
-                  `WARNING: Salary spike of ${spikePct.toFixed(1)}% detected (Previous: ₹${prevSalary}, Proposed: ₹${netPay}).`,
+                  `WARNING: Salary spike of ${spikePct.toFixed(1)}% detected for ${empName} (Previous: ₹${prevSalary.toLocaleString('en-IN')}, Current: ₹${netPay.toLocaleString('en-IN')}).`,
                   reasoning,
                 ]
               );

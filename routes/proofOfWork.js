@@ -3,9 +3,12 @@ const router = express.Router({ mergeParams: true });
 const { pool } = require("../db");
 const { authenticateToken } = require("../middleware/authMiddleware");
 const { createNotification } = require("../utils/notificationHelpers");
+const EventMessagingService = require('../services/eventMessagingService');
 
-// Ensure proof_of_work table exists in database
-async function initDb() {
+// Ensure proof_of_work table exists in database lazily
+let isInitialized = false;
+async function ensureDbInitialized() {
+  if (isInitialized) return;
   try {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS job_proof_of_work (
@@ -24,16 +27,19 @@ async function initDb() {
         created_at TIMESTAMP DEFAULT NOW()
       );
     `);
+    isInitialized = true;
   } catch (err) {
-    console.error("⚠️ Error initializing job_proof_of_work table:", err.message);
+    console.warn("⚠️ Warning initializing job_proof_of_work table (will retry on request):", err.message);
   }
 }
-initDb();
+// Deferred initialization
+setTimeout(ensureDbInitialized, 2000);
 
 // ── 1. POST /api/jobs/:id/proof-of-work ─────────────────────────────────────
 // Submit site photo, progress notes, and GPS check-in (Field Technicians)
 router.post("/:id/proof-of-work", authenticateToken, async (req, res) => {
   try {
+    await ensureDbInitialized();
     const jobId = req.params.id;
     const { photo_url, notes, gps_latitude, gps_longitude, stage = "in_progress" } = req.body;
     const userId = req.user?.userId || req.user?.id;
@@ -73,6 +79,16 @@ router.post("/:id/proof-of-work", authenticateToken, async (req, res) => {
         );
       }
     } catch {}
+
+    // Auto-post proof image to job conversation thread (Enterprise Communication Backbone)
+    EventMessagingService.onProofUploaded({
+      jobId,
+      companyId,
+      photoUrl: photo_url || '',
+      notes: notes || '',
+      technicianName: userName,
+      senderId: userId,
+    }).catch(() => {}); // non-blocking
 
     return res.status(201).json({
       success: true,

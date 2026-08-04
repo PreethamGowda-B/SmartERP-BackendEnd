@@ -3,6 +3,7 @@ const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 const { createNotification } = require('../utils/notificationHelpers');
+const EventMessagingService = require('../services/eventMessagingService');
 
 // ── HR Audit Logging Helper ──────────────────────────────────────────────────
 async function logHrAudit({ companyId, performedBy, performedByName, action, targetEmployeeId, targetEmployeeName, oldValue, newValue, reason, req }) {
@@ -114,6 +115,19 @@ router.post('/requests', authenticateToken, async (req, res) => {
       req
     });
 
+    // Auto-post leave ERP card to employee↔HR conversation
+    if (request_type === 'leave') {
+      EventMessagingService.onLeaveRequestSubmitted({
+        companyId,
+        employeeId: userId,
+        employeeName: userName,
+        leaveType: details.leave_type || 'Leave',
+        fromDate: details.from_date || details.date || 'TBD',
+        toDate: details.to_date || details.date || 'TBD',
+        requestId: result.rows[0].id,
+      }).catch(() => {});
+    }
+
     res.status(201).json({ success: true, request: result.rows[0] });
   } catch (err) {
     console.error('Error creating employee request:', err);
@@ -172,6 +186,20 @@ router.patch('/requests/:id/review', authenticateToken, async (req, res) => {
       reason: hr_comments || 'HR Manager review decision',
       req
     });
+
+    // Auto-post HR decision to employee↔HR conversation
+    if (empReq.request_type === 'leave') {
+      EventMessagingService.onLeaveDecision({
+        companyId,
+        employeeId: empReq.user_id,
+        hrId: reviewerId,
+        hrName: reviewerName,
+        requestId: id,
+        status,
+        leaveType: (empReq.details?.leave_type) || 'Leave',
+        comments: hr_comments || '',
+      }).catch(() => {});
+    }
 
     res.json({ success: true, request: result.rows[0] });
   } catch (err) {

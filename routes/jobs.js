@@ -25,6 +25,7 @@ function publishCustomerJobEvent(jobId, eventPayload) {
 
 
 const { loadPlan, checkPlanLimit } = require('../middleware/planMiddleware');
+const EventMessagingService = require('../services/eventMessagingService');
 
 /**
  * Create a new job
@@ -131,6 +132,16 @@ router.post('/', authenticateToken, loadPlan, checkPlanLimit('job'), [
     } catch (notifErr) {
       console.error('❌ Failed to send job notification:', notifErr);
     }
+
+    // Auto-spawn job conversation thread (Enterprise Communication Backbone)
+    EventMessagingService.onJobCreated({
+      jobId: createdJob.id,
+      companyId: req.user.companyId,
+      title,
+      customerId: createdJob.customer_id || null,
+      ownerId: req.user.id,
+      assignedEmployeeId: assignedTo || null,
+    }).catch(() => {}); // non-blocking, never breaks response
 
     res.json(createdJob);
   } catch (err) {
@@ -811,6 +822,15 @@ router.post('/:id/invoice', authenticateToken, async (req, res) => {
        RETURNING *`,
       [job.id, String(userCompanyId), job.customer_id || null, invoiceNumber, amount, pdfUrl]
     );
+
+    // Post invoice ERP card to job conversation thread (Enterprise Communication Backbone)
+    EventMessagingService.onInvoiceIssued({
+      jobId: job.id,
+      companyId: userCompanyId,
+      invoiceNumber,
+      totalAmount: amount,
+      senderId: req.user.id,
+    }).catch(() => {}); // non-blocking
 
     res.status(201).json({
       success: true,

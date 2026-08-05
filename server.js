@@ -702,6 +702,10 @@ v1Router.use("/audit-logs", require("./routes/ai.routes"));
 v1Router.use("/invoices", require("./routes/invoices"));
 v1Router.use("/finance", require("./routes/finance"));
 v1Router.use("/work-requests", require("./routes/workRequests"));
+v1Router.use("/machines", require("./routes/machines"));
+v1Router.use("/plants", require("./routes/plants"));
+v1Router.use("/quotations", require("./routes/quotations"));
+v1Router.use("/remote-support", require("./routes/remoteSupport"));
 
 
 // ✅ Meta WhatsApp Business Cloud API Webhook routes

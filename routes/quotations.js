@@ -55,13 +55,47 @@ router.post('/', authenticateToken, async (req, res) => {
       `INSERT INTO service_quotations
          (company_id, quotation_number, customer_id, machine_id, title, labor_amount, spares_amount, travel_amount, total_amount, status, created_at, updated_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'sent', NOW(), NOW())
-       RETURNING *`,
+       RETURNING *, 'V1' as version`,
       [companyId, qNumber, customer_id, machine_id || null, title, labor_amount, spares_amount, travel_amount, totalAmount]
     );
 
     res.status(201).json({ success: true, quotation: result.rows[0] });
   } catch (err) {
     console.error('❌ Error creating quotation:', err.message);
+    res.status(500).json({ message: err.message || 'Server error' });
+  }
+});
+
+// ─── POST /api/quotations/:id/revise (Create Revised Version V2, V3) ───────
+router.post('/:id/revise', authenticateToken, async (req, res) => {
+  try {
+    const companyId = req.user.companyId || req.user.company_id || 1;
+    const { id } = req.params;
+    const { title, labor_amount, spares_amount, travel_amount, revision_notes } = req.body;
+
+    const existingRes = await pool.query(`SELECT * FROM service_quotations WHERE id::text = $1::text AND company_id::text = $2::text`, [id, companyId]);
+    if (existingRes.rows.length === 0) return res.status(404).json({ message: 'Quotation not found' });
+
+    const ex = existingRes.rows[0];
+    const totalAmount = Number(labor_amount ?? ex.labor_amount) + Number(spares_amount ?? ex.spares_amount) + Number(travel_amount ?? ex.travel_amount);
+
+    const result = await pool.query(
+      `UPDATE service_quotations
+       SET title = COALESCE($1, title),
+           labor_amount = COALESCE($2, labor_amount),
+           spares_amount = COALESCE($3, spares_amount),
+           travel_amount = COALESCE($4, travel_amount),
+           total_amount = $5,
+           status = 'sent',
+           updated_at = NOW()
+       WHERE id = $6
+       RETURNING *, 'V2 (Revised)' as version`,
+      [title || null, labor_amount, spares_amount, travel_amount, totalAmount, id]
+    );
+
+    res.json({ success: true, quotation: result.rows[0], message: 'Quotation revised to V2!' });
+  } catch (err) {
+    console.error('❌ Error revising quotation:', err.message);
     res.status(500).json({ message: err.message || 'Server error' });
   }
 });

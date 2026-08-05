@@ -427,7 +427,12 @@ const handleJobAccept = async (req, res) => {
         data: { job_id: acceptedJob.id, employee_id: req.user.id, url: '/owner/notifications' }
       });
     } catch (notifErr) {
-      console.error('❌ Failed to send job acceptance notification:', notifErr);
+    if (acceptedJob?.machine_id) {
+      await client.query(
+        `INSERT INTO machine_timeline_events (company_id, machine_id, job_id, event_type, title, description, created_at)
+         VALUES ($1, $2, $3, 'engineer_assigned', 'Engineer Assigned & Accepted', $4, NOW())`,
+        [req.user.companyId || 1, acceptedJob.machine_id, acceptedJob.id, `Engineer ${userName} accepted job ${acceptedJob.title}`]
+      ).catch(() => {});
     }
 
     res.json(acceptedJob);

@@ -85,6 +85,21 @@ router.post('/', authenticateToken, async (req, res) => {
       );
     }
 
+    // Auto-Trigger Timeline Event on Machine
+    if (machine_id) {
+      await pool.query(
+        `INSERT INTO machine_timeline_events (company_id, machine_id, event_type, title, description, created_at)
+         VALUES ($1, $2, $3, $4, $5, NOW())`,
+        [
+          companyId,
+          machine_id,
+          is_resolved ? 'remote_support_closed' : 'remote_support_started',
+          `Remote Support Session (${support_channel.toUpperCase()})`,
+          `Duration: ${duration_minutes}m. ${is_resolved ? 'Resolved remotely.' : 'Unresolved — Breakdown Job created.'} Summary: ${resolution_summary}`
+        ]
+      ).catch(() => {});
+    }
+
     res.status(201).json({ success: true, session, job });
   } catch (err) {
     console.error('❌ Error logging remote support:', err.message);

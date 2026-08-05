@@ -158,6 +158,18 @@ router.get('/:id', authenticateToken, async (req, res) => {
       [machine.customer_id]
     ).catch(() => ({ rows: [] }));
 
+    // Fetch Alarm History
+    const alarmsRes = await pool.query(
+      `SELECT alarm_code, controller_type, count(*) as frequency, max(created_at) as last_occurred FROM jobs WHERE machine_id::text = $1::text AND alarm_code IS NOT NULL AND alarm_code != '' GROUP BY alarm_code, controller_type ORDER BY frequency DESC`,
+      [id]
+    ).catch(() => ({ rows: [] }));
+
+    // Fetch Remote Support Sessions
+    const remoteRes = await pool.query(
+      `SELECT * FROM remote_support_sessions WHERE machine_id::text = $1::text ORDER BY created_at DESC LIMIT 10`,
+      [id]
+    ).catch(() => ({ rows: [] }));
+
     res.json({
       success: true,
       machine: {
@@ -167,6 +179,8 @@ router.get('/:id', authenticateToken, async (req, res) => {
         recent_jobs: jobsRes.rows,
         active_job: jobsRes.rows.find((j) => j.status === 'in_progress' || j.status === 'open' || j.status === 'assigned') || null,
         amc_contract: amcRes.rows[0] || null,
+        alarm_history: alarmsRes.rows,
+        remote_sessions: remoteRes.rows,
       },
     });
   } catch (err) {

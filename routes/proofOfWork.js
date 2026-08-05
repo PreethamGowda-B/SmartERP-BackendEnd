@@ -80,6 +80,20 @@ router.post("/:id/proof-of-work", authenticateToken, requireClockIn, async (req,
       console.warn('⚠️ Proof of work notification warning:', nErr.message);
     }
 
+    // Auto-Trigger Timeline Event on Machine
+    try {
+      const jobRes = await pool.query(`SELECT machine_id, title FROM jobs WHERE id::text = $1::text`, [jobId]);
+      if (jobRes.rows[0]?.machine_id) {
+        await pool.query(
+          `INSERT INTO machine_timeline_events (company_id, machine_id, job_id, event_type, title, description, created_at)
+           VALUES ($1, $2, $3, 'proof_submitted', 'Site Proof & Progress Uploaded', $4, NOW())`,
+          [companyId, jobRes.rows[0].machine_id, jobId, `Engineer ${userName} uploaded site proof for job ${jobRes.rows[0].title}. Notes: ${notes || 'No notes'}`]
+        );
+      }
+    } catch (tErr) {
+      console.warn('⚠️ Timeline trigger notice:', tErr.message);
+    }
+
     // Auto-post proof image to job conversation thread (Enterprise Communication Backbone)
     EventMessagingService.onProofUploaded({
       jobId,

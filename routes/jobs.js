@@ -148,7 +148,7 @@ router.post('/', authenticateToken, loadPlan, checkPlanLimit('job'), [
       customerId: createdJob.customer_id || null,
       ownerId: req.user.id,
       assignedEmployeeId: assignedTo || null,
-    }).catch(() => {}); // non-blocking, never breaks response
+    }).catch(() => { }); // non-blocking, never breaks response
 
     res.json(createdJob);
   } catch (err) {
@@ -427,144 +427,144 @@ const handleJobAccept = async (req, res) => {
         data: { job_id: acceptedJob.id, employee_id: req.user.id, url: '/owner/notifications' }
       });
     } catch (notifErr) {
-    if (acceptedJob?.machine_id) {
-      await client.query(
-        `INSERT INTO machine_timeline_events (company_id, machine_id, job_id, event_type, title, description, created_at)
+      if (acceptedJob?.machine_id) {
+        await client.query(
+          `INSERT INTO machine_timeline_events (company_id, machine_id, job_id, event_type, title, description, created_at)
          VALUES ($1, $2, $3, 'engineer_assigned', 'Engineer Assigned & Accepted', $4, NOW())`,
-        [req.user.companyId || 1, acceptedJob.machine_id, acceptedJob.id, `Engineer ${userName} accepted job ${acceptedJob.title}`]
-      ).catch(() => {});
+          [req.user.companyId || 1, acceptedJob.machine_id, acceptedJob.id, `Engineer ${userName} accepted job ${acceptedJob.title}`]
+        ).catch(() => { });
+      }
+
+      res.json(acceptedJob);
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => { });
+      console.error('jobs ACCEPT error', err);
+      res.status(500).json({ message: 'Server error' });
+    } finally {
+      client.release();
     }
+  };
 
-    res.json(acceptedJob);
-  } catch (err) {
-    await client.query('ROLLBACK').catch(() => { });
-    console.error('jobs ACCEPT error', err);
-    res.status(500).json({ message: 'Server error' });
-  } finally {
-    client.release();
-  }
-};
+  router.post('/:id/accept', authenticateToken, requireClockIn, handleJobAccept);
+  router.put('/:id/accept', authenticateToken, requireClockIn, handleJobAccept);
+  router.patch('/:id/accept', authenticateToken, requireClockIn, handleJobAccept);
 
-router.post('/:id/accept', authenticateToken, requireClockIn, handleJobAccept);
-router.put('/:id/accept', authenticateToken, requireClockIn, handleJobAccept);
-router.patch('/:id/accept', authenticateToken, requireClockIn, handleJobAccept);
+  /**
+   * Decline a job (Employee only)
+   */
+  const handleJobDecline = async (req, res) => {
+    const { id } = req.params;
 
-/**
- * Decline a job (Employee only)
- */
-const handleJobDecline = async (req, res) => {
-  const { id } = req.params;
+    try {
+      const checkJob = await pool.query(
+        'SELECT * FROM jobs WHERE id = $1 AND (assigned_to = $2 OR visible_to_all = true) AND company_id::text = $3',
+        [id, req.user.id, String(req.user.companyId)]
+      );
 
-  try {
-    const checkJob = await pool.query(
-      'SELECT * FROM jobs WHERE id = $1 AND (assigned_to = $2 OR visible_to_all = true) AND company_id::text = $3',
-      [id, req.user.id, String(req.user.companyId)]
-    );
+      if (checkJob.rows.length === 0) {
+        return res.status(403).json({ message: 'Job not assigned to you' });
+      }
 
-    if (checkJob.rows.length === 0) {
-      return res.status(403).json({ message: 'Job not assigned to you' });
-    }
-
-    const result = await pool.query(
-      `UPDATE jobs
+      const result = await pool.query(
+        `UPDATE jobs
        SET employee_status = 'declined',
            declined_at     = NOW()
        WHERE id = $1
          AND company_id::text = $2
          AND (employee_status IN ('assigned', 'pending') OR employee_status IS NULL)
        RETURNING *`,
-      [id, String(req.user.companyId)]
-    );
+        [id, String(req.user.companyId)]
+      );
 
-    if (result.rowCount === 0) {
-      return res.status(409).json({ message: 'Job not available for decline (already accepted or wrong company)' });
+      if (result.rowCount === 0) {
+        return res.status(409).json({ message: 'Job not available for decline (already accepted or wrong company)' });
+      }
+
+      const declinedJob = result.rows[0];
+
+      try {
+        const userInfo = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+        const employeeName = userInfo.rows[0]?.name || 'Employee';
+
+        await createNotification({
+          user_id: declinedJob.created_by,
+          company_id: req.user.companyId,
+          type: 'job_declined',
+          title: 'Job Declined',
+          message: `${employeeName} declined the job: ${declinedJob.title}`,
+          priority: 'high',
+          data: { job_id: declinedJob.id, employee_id: req.user.id, url: '/owner/notifications' }
+        });
+        console.log(`✅ Notified owner about job decline`);
+      } catch (notifErr) {
+        console.error('❌ Failed to send job decline notification:', notifErr);
+      }
+
+      res.json(declinedJob);
+    } catch (err) {
+      console.error('jobs DECLINE error', err);
+      res.status(500).json({ message: 'Server error' });
+    }
+  };
+
+  router.post('/:id/decline', authenticateToken, requireClockIn, handleJobDecline);
+  router.put('/:id/decline', authenticateToken, requireClockIn, handleJobDecline);
+  router.patch('/:id/decline', authenticateToken, requireClockIn, handleJobDecline);
+
+  /**
+   * Update job progress (Employee only — Accepted Technician)
+   */
+  const handleJobProgress = async (req, res) => {
+    const { id } = req.params;
+    const { progress } = req.body;
+
+    if (req.user.role === 'owner') {
+      return res.status(403).json({
+        message: 'Owners are supervisors and cannot directly alter field progress. Use Owner Emergency Override if necessary.'
+      });
     }
 
-    const declinedJob = result.rows[0];
+    if (typeof progress !== 'number' || progress < 0 || progress > 100) {
+      return res.status(400).json({ message: 'Progress must be between 0 and 100' });
+    }
 
     try {
-      const userInfo = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
-      const employeeName = userInfo.rows[0]?.name || 'Employee';
+      console.log(`🔍 Checking job access: JobID=${id}, UserID=${req.user.id}`);
 
-      await createNotification({
-        user_id: declinedJob.created_by,
-        company_id: req.user.companyId,
-        type: 'job_declined',
-        title: 'Job Declined',
-        message: `${employeeName} declined the job: ${declinedJob.title}`,
-        priority: 'high',
-        data: { job_id: declinedJob.id, employee_id: req.user.id, url: '/owner/notifications' }
-      });
-      console.log(`✅ Notified owner about job decline`);
-    } catch (notifErr) {
-      console.error('❌ Failed to send job decline notification:', notifErr);
-    }
-
-    res.json(declinedJob);
-  } catch (err) {
-    console.error('jobs DECLINE error', err);
-    res.status(500).json({ message: 'Server error' });
-  }
-};
-
-router.post('/:id/decline', authenticateToken, requireClockIn, handleJobDecline);
-router.put('/:id/decline', authenticateToken, requireClockIn, handleJobDecline);
-router.patch('/:id/decline', authenticateToken, requireClockIn, handleJobDecline);
-
-/**
- * Update job progress (Employee only — Accepted Technician)
- */
-const handleJobProgress = async (req, res) => {
-  const { id } = req.params;
-  const { progress } = req.body;
-
-  if (req.user.role === 'owner') {
-    return res.status(403).json({
-      message: 'Owners are supervisors and cannot directly alter field progress. Use Owner Emergency Override if necessary.'
-    });
-  }
-
-  if (typeof progress !== 'number' || progress < 0 || progress > 100) {
-    return res.status(400).json({ message: 'Progress must be between 0 and 100' });
-  }
-
-  try {
-    console.log(`🔍 Checking job access: JobID=${id}, UserID=${req.user.id}`);
-
-    const jobExists = await pool.query(
-      `SELECT id, assigned_to, accepted_by, employee_status, state, progress FROM jobs j
+      const jobExists = await pool.query(
+        `SELECT id, assigned_to, accepted_by, employee_status, state, progress FROM jobs j
        WHERE j.id = $1
          AND (j.company_id::text = $2 OR j.company_id::text IN (SELECT c.id::text FROM companies c WHERE c.id::text = $2 OR c.company_id::text = $2))`,
-      [id, String(req.user.companyId)]
-    );
-    if (jobExists.rows.length === 0) {
-      return res.status(404).json({ message: 'Job not found' });
-    }
+        [id, String(req.user.companyId)]
+      );
+      if (jobExists.rows.length === 0) {
+        return res.status(404).json({ message: 'Job not found' });
+      }
 
-    const curJob = jobExists.rows[0];
-    const isAcceptedTechnician =
-      (curJob.accepted_by && String(curJob.accepted_by) === String(req.user.id)) ||
-      (curJob.assigned_to && String(curJob.assigned_to) === String(req.user.id) && curJob.employee_status === 'accepted');
+      const curJob = jobExists.rows[0];
+      const isAcceptedTechnician =
+        (curJob.accepted_by && String(curJob.accepted_by) === String(req.user.id)) ||
+        (curJob.assigned_to && String(curJob.assigned_to) === String(req.user.id) && curJob.employee_status === 'accepted');
 
-    if (!isAcceptedTechnician) {
-      console.warn(`⛔ Access denied for Job ${id} by User ${req.user.id} (Not accepted technician)`);
-      return res.status(403).json({
-        message: 'Only the technician who accepted this job can update field progress.'
-      });
-    }
+      if (!isAcceptedTechnician) {
+        console.warn(`⛔ Access denied for Job ${id} by User ${req.user.id} (Not accepted technician)`);
+        return res.status(403).json({
+          message: 'Only the technician who accepted this job can update field progress.'
+        });
+      }
 
-    let status = 'in_progress';
-    let newState = 'in_progress';
-    let completed_at = null;
+      let status = 'in_progress';
+      let newState = 'in_progress';
+      let completed_at = null;
 
-    if (progress === 100) {
-      status = 'completed';
-      newState = 'completed';
-      completed_at = new Date();
-    }
+      if (progress === 100) {
+        status = 'completed';
+        newState = 'completed';
+        completed_at = new Date();
+      }
 
-    const result = await pool.query(
-      `UPDATE jobs
+      const result = await pool.query(
+        `UPDATE jobs
        SET progress            = $1,
            status              = $2,
            state               = $3,
@@ -585,111 +585,111 @@ const handleJobProgress = async (req, res) => {
        WHERE id = $6
          AND company_id::text = $7
        RETURNING *`,
-      [progress, status, newState, completed_at, req.user.id, id, String(req.user.companyId)]
-    );
+        [progress, status, newState, completed_at, req.user.id, id, String(req.user.companyId)]
+      );
 
-    if (result.rowCount === 0) {
-      return res.status(403).json({ message: 'Cannot update job — access denied or already completed' });
-    }
+      if (result.rowCount === 0) {
+        return res.status(403).json({ message: 'Cannot update job — access denied or already completed' });
+      }
 
-    const updatedJob = result.rows[0];
+      const updatedJob = result.rows[0];
 
-    logJobAudit({
-      companyId: req.user.companyId,
-      jobId: updatedJob.id,
-      userId: req.user.id,
-      userRole: req.user.role,
-      action: progress === 100 ? 'JOB_COMPLETED' : 'PROGRESS_UPDATED',
-      oldState: curJob.state,
-      newState: newState,
-      oldValue: { progress: curJob.progress },
-      newValue: { progress: updatedJob.progress },
-      ipAddress: req.ip,
-    });
+      logJobAudit({
+        companyId: req.user.companyId,
+        jobId: updatedJob.id,
+        userId: req.user.id,
+        userRole: req.user.role,
+        action: progress === 100 ? 'JOB_COMPLETED' : 'PROGRESS_UPDATED',
+        oldState: curJob.state,
+        newState: newState,
+        oldValue: { progress: curJob.progress },
+        newValue: { progress: updatedJob.progress },
+        ipAddress: req.ip,
+      });
 
-    if (progress === 100) {
-      pool.query(
-        `UPDATE employee_profiles
+      if (progress === 100) {
+        pool.query(
+          `UPDATE employee_profiles
          SET active_job_count = GREATEST(0, COALESCE(active_job_count, 0) - 1)
          WHERE user_id = $1`,
-        [req.user.id]
-      ).catch(e => console.error('active_job_count decrement error:', e.message));
+          [req.user.id]
+        ).catch(e => console.error('active_job_count decrement error:', e.message));
 
-      const { generateInvoice } = require('../services/billingService');
-      generateInvoice(updatedJob.id, updatedJob.company_id || req.user.companyId)
-        .catch(e => console.error('Invoice generation error:', e.message));
+        const { generateInvoice } = require('../services/billingService');
+        generateInvoice(updatedJob.id, updatedJob.company_id || req.user.companyId)
+          .catch(e => console.error('Invoice generation error:', e.message));
+      }
+
+      try {
+        const redisClient = require('../utils/redis');
+        if (updatedJob.customer_id && redisClient && redisClient.status === 'ready') {
+          const eventPayload = progress === 100
+            ? { type: 'job_completed', jobId: updatedJob.id, completedAt: new Date().toISOString() }
+            : { type: 'job_progress', jobId: updatedJob.id, progress, status: updatedJob.status };
+          redisClient.publish(`customer_job_events:${updatedJob.id}`, JSON.stringify(eventPayload));
+        }
+      } catch (cpErr) {
+        console.error('Customer portal SSE publish error (progress):', cpErr.message);
+      }
+
+      if (progress === 100) {
+        try {
+          const userInfo = await pool.query('SELECT name, email FROM users WHERE id = $1', [req.user.id]);
+          const employeeName = userInfo.rows[0]?.name || 'Employee';
+          const ownerResult = await pool.query(
+            "SELECT u.email, u.name FROM users u WHERE u.id = $1",
+            [updatedJob.created_by]
+          );
+
+          await createNotificationForOwners({
+            company_id: req.user.companyId,
+            type: 'job_completed',
+            title: 'Job Completed',
+            message: `${employeeName} completed the job: ${updatedJob.title}`,
+            priority: 'medium',
+            data: { job_id: updatedJob.id, employee_id: req.user.id, url: '/owner/notifications' }
+          });
+
+          if (ownerResult.rows[0]) {
+            sendJobCompletedEmail({
+              ownerEmail: ownerResult.rows[0].email,
+              ownerName: ownerResult.rows[0].name,
+              employeeName,
+              jobTitle: updatedJob.title
+            });
+          }
+        } catch (notifErr) {
+          console.error('❌ Failed to send job completion notification:', notifErr);
+        }
+      }
+
+      res.json(updatedJob);
+    } catch (err) {
+      console.error('jobs PROGRESS error', err);
+      res.status(500).json({ message: 'Server error' });
+    }
+  };
+
+  router.post('/:id/progress', authenticateToken, requireClockIn, handleJobProgress);
+  router.put('/:id/progress', authenticateToken, requireClockIn, handleJobProgress);
+  router.patch('/:id/progress', authenticateToken, requireClockIn, handleJobProgress);
+
+  /**
+   * Update job (Owner/Admin only)
+   */
+  router.put('/:id', authenticateToken, async (req, res) => {
+    const { id } = req.params;
+    const updates = req.body || {};
+    const companyId = req.user.companyId;
+
+    // Only owners and admins can update jobs
+    if (req.user.role !== 'owner' && req.user.role !== 'admin') {
+      return res.status(403).json({ message: 'Only owners can update jobs' });
     }
 
     try {
-      const redisClient = require('../utils/redis');
-      if (updatedJob.customer_id && redisClient && redisClient.status === 'ready') {
-        const eventPayload = progress === 100
-          ? { type: 'job_completed', jobId: updatedJob.id, completedAt: new Date().toISOString() }
-          : { type: 'job_progress', jobId: updatedJob.id, progress, status: updatedJob.status };
-        redisClient.publish(`customer_job_events:${updatedJob.id}`, JSON.stringify(eventPayload));
-      }
-    } catch (cpErr) {
-      console.error('Customer portal SSE publish error (progress):', cpErr.message);
-    }
-
-    if (progress === 100) {
-      try {
-        const userInfo = await pool.query('SELECT name, email FROM users WHERE id = $1', [req.user.id]);
-        const employeeName = userInfo.rows[0]?.name || 'Employee';
-        const ownerResult = await pool.query(
-          "SELECT u.email, u.name FROM users u WHERE u.id = $1",
-          [updatedJob.created_by]
-        );
-
-        await createNotificationForOwners({
-          company_id: req.user.companyId,
-          type: 'job_completed',
-          title: 'Job Completed',
-          message: `${employeeName} completed the job: ${updatedJob.title}`,
-          priority: 'medium',
-          data: { job_id: updatedJob.id, employee_id: req.user.id, url: '/owner/notifications' }
-        });
-
-        if (ownerResult.rows[0]) {
-          sendJobCompletedEmail({
-            ownerEmail: ownerResult.rows[0].email,
-            ownerName: ownerResult.rows[0].name,
-            employeeName,
-            jobTitle: updatedJob.title
-          });
-        }
-      } catch (notifErr) {
-        console.error('❌ Failed to send job completion notification:', notifErr);
-      }
-    }
-
-    res.json(updatedJob);
-  } catch (err) {
-    console.error('jobs PROGRESS error', err);
-    res.status(500).json({ message: 'Server error' });
-  }
-};
-
-router.post('/:id/progress', authenticateToken, requireClockIn, handleJobProgress);
-router.put('/:id/progress', authenticateToken, requireClockIn, handleJobProgress);
-router.patch('/:id/progress', authenticateToken, requireClockIn, handleJobProgress);
-
-/**
- * Update job (Owner/Admin only)
- */
-router.put('/:id', authenticateToken, async (req, res) => {
-  const { id } = req.params;
-  const updates = req.body || {};
-  const companyId = req.user.companyId;
-
-  // Only owners and admins can update jobs
-  if (req.user.role !== 'owner' && req.user.role !== 'admin') {
-    return res.status(403).json({ message: 'Only owners can update jobs' });
-  }
-
-  try {
-    const result = await pool.query(
-      `UPDATE jobs SET
+      const result = await pool.query(
+        `UPDATE jobs SET
          title = COALESCE($1, title),
          description = COALESCE($2, description),
          assigned_to = COALESCE($3, assigned_to),
@@ -700,519 +700,519 @@ router.put('/:id', authenticateToken, async (req, res) => {
          END
        WHERE id = $6 AND company_id = $7
        RETURNING *`,
-      [
-        updates.title,
-        updates.description,
-        (updates.assignedEmployees && updates.assignedEmployees[0]) ||
-        updates.assignedTo ||
-        null,
-        typeof updates.visible_to_all !== 'undefined'
-          ? updates.visible_to_all
-          : null,
-        updates,
-        id,
-        companyId,
-      ]
-    );
+        [
+          updates.title,
+          updates.description,
+          (updates.assignedEmployees && updates.assignedEmployees[0]) ||
+          updates.assignedTo ||
+          null,
+          typeof updates.visible_to_all !== 'undefined'
+            ? updates.visible_to_all
+            : null,
+          updates,
+          id,
+          companyId,
+        ]
+      );
 
-    if (!result.rows[0]) {
-      return res.status(404).json({ message: 'Job not found or access denied' });
+      if (!result.rows[0]) {
+        return res.status(404).json({ message: 'Job not found or access denied' });
+      }
+      res.json(result.rows[0]);
+    } catch (err) {
+      console.error('jobs PUT error', err);
+      res.status(500).json({ message: 'Server error' });
     }
-    res.json(result.rows[0]);
-  } catch (err) {
-    console.error('jobs PUT error', err);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
+  });
 
-/**
- * Delete job (Owner/Admin only)
- */
-router.delete('/:id', authenticateToken, async (req, res) => {
-  const { id } = req.params;
-  const companyId = req.user.companyId;
+  /**
+   * Delete job (Owner/Admin only)
+   */
+  router.delete('/:id', authenticateToken, async (req, res) => {
+    const { id } = req.params;
+    const companyId = req.user.companyId;
 
-  // Only owners and admins can delete jobs
-  if (req.user.role !== 'owner' && req.user.role !== 'admin') {
-    return res.status(403).json({ message: 'Only owners can delete jobs' });
-  }
-
-  try {
-    const result = await pool.query(
-      'DELETE FROM jobs WHERE id = $1 AND company_id = $2 RETURNING id',
-      [id, companyId]
-    );
-    if (result.rowCount === 0) {
-      return res.status(404).json({ message: 'Job not found or access denied' });
+    // Only owners and admins can delete jobs
+    if (req.user.role !== 'owner' && req.user.role !== 'admin') {
+      return res.status(403).json({ message: 'Only owners can delete jobs' });
     }
-    res.json({ success: true });
-  } catch (err) {
-    console.error('jobs DELETE error', err);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
 
-/**
- * GET /jobs/chat-unread-count — Employee gets total unread messages across all jobs
- * NOTE: GET/POST /:id/messages were removed (duplicates of /api/messages/job/:jobId).
- * The canonical chat routes live in routes/messages.js.
- */
-router.get('/chat-unread-count', authenticateToken, async (req, res) => {
-  const employeeId = req.user.id;
-  try {
-    const result = await pool.query(
-      `SELECT COUNT(*) as count
+    try {
+      const result = await pool.query(
+        'DELETE FROM jobs WHERE id = $1 AND company_id = $2 RETURNING id',
+        [id, companyId]
+      );
+      if (result.rowCount === 0) {
+        return res.status(404).json({ message: 'Job not found or access denied' });
+      }
+      res.json({ success: true });
+    } catch (err) {
+      console.error('jobs DELETE error', err);
+      res.status(500).json({ message: 'Server error' });
+    }
+  });
+
+  /**
+   * GET /jobs/chat-unread-count — Employee gets total unread messages across all jobs
+   * NOTE: GET/POST /:id/messages were removed (duplicates of /api/messages/job/:jobId).
+   * The canonical chat routes live in routes/messages.js.
+   */
+  router.get('/chat-unread-count', authenticateToken, async (req, res) => {
+    const employeeId = req.user.id;
+    try {
+      const result = await pool.query(
+        `SELECT COUNT(*) as count
        FROM job_messages jm
        INNER JOIN jobs j ON j.id = jm.job_id
        WHERE j.assigned_to = $1
          AND jm.sender_type = 'customer'
          AND jm.read_by_employee = FALSE`,
-      [employeeId]
-    );
-    res.json({ count: parseInt(result.rows[0].count) });
-  } catch (err) {
-    console.error('chat unread count error:', err.message);
-    res.json({ count: 0 });
-  }
-});
-
-// ─── POST /api/jobs/:id/invoice ─────────────────────────────────────────────
-// Generate invoice for completed job
-router.post('/:id/invoice', authenticateToken, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const userCompanyId = req.user.companyId;
-
-    // Fetch job record
-    const jobRes = await pool.query('SELECT * FROM jobs WHERE id = $1', [id]);
-    if (jobRes.rows.length === 0) {
-      return res.status(404).json({ message: 'Job not found' });
+        [employeeId]
+      );
+      res.json({ count: parseInt(result.rows[0].count) });
+    } catch (err) {
+      console.error('chat unread count error:', err.message);
+      res.json({ count: 0 });
     }
+  });
 
-    const job = jobRes.rows[0];
+  // ─── POST /api/jobs/:id/invoice ─────────────────────────────────────────────
+  // Generate invoice for completed job
+  router.post('/:id/invoice', authenticateToken, async (req, res) => {
+    try {
+      const { id } = req.params;
+      const userCompanyId = req.user.companyId;
 
-    // STRICT VERIFICATION REQUIREMENT:
-    // Verify job's company_id matches requesting user's company_id AND job status is 'completed'
-    if (String(job.company_id) !== String(userCompanyId)) {
-      return res.status(400).json({ message: 'Company mismatch: Job does not belong to your company' });
-    }
+      // Fetch job record
+      const jobRes = await pool.query('SELECT * FROM jobs WHERE id = $1', [id]);
+      if (jobRes.rows.length === 0) {
+        return res.status(404).json({ message: 'Job not found' });
+      }
 
-    if (job.status !== 'completed') {
-      return res.status(400).json({ message: 'Invalid status: Invoices can only be generated for completed jobs' });
-    }
+      const job = jobRes.rows[0];
 
-    const invoiceNumber = `INV-${Date.now().toString().slice(-6)}`;
-    const amount = parseFloat(job.amount || job.total_amount || 1500);
+      // STRICT VERIFICATION REQUIREMENT:
+      // Verify job's company_id matches requesting user's company_id AND job status is 'completed'
+      if (String(job.company_id) !== String(userCompanyId)) {
+        return res.status(400).json({ message: 'Company mismatch: Job does not belong to your company' });
+      }
 
-    // Cloudinary upload for invoice PDF
-    let pdfUrl = null;
-    const { cloudinary, hasCloudinaryConfig } = require('../config/cloudinary');
-    const cloudName = process.env.CLOUDINARY_CLOUD_NAME || 'dvqnrmdbo';
-    if (hasCloudinaryConfig) {
-      try {
-        const invoiceContent = `Invoice #${invoiceNumber} for Job ${job.title} - Total: ₹${amount}`;
-        const uploadResult = await cloudinary.uploader.upload(`data:text/plain;base64,${Buffer.from(invoiceContent).toString('base64')}`, {
-          folder: `smarterp/invoices/${userCompanyId}`,
-          public_id: `invoice_${invoiceNumber}`,
-          resource_type: 'raw'
-        });
-        pdfUrl = uploadResult.secure_url;
-      } catch (cloudErr) {
-        console.warn('⚠️ Cloudinary invoice upload warning:', cloudErr.message);
+      if (job.status !== 'completed') {
+        return res.status(400).json({ message: 'Invalid status: Invoices can only be generated for completed jobs' });
+      }
+
+      const invoiceNumber = `INV-${Date.now().toString().slice(-6)}`;
+      const amount = parseFloat(job.amount || job.total_amount || 1500);
+
+      // Cloudinary upload for invoice PDF
+      let pdfUrl = null;
+      const { cloudinary, hasCloudinaryConfig } = require('../config/cloudinary');
+      const cloudName = process.env.CLOUDINARY_CLOUD_NAME || 'dvqnrmdbo';
+      if (hasCloudinaryConfig) {
+        try {
+          const invoiceContent = `Invoice #${invoiceNumber} for Job ${job.title} - Total: ₹${amount}`;
+          const uploadResult = await cloudinary.uploader.upload(`data:text/plain;base64,${Buffer.from(invoiceContent).toString('base64')}`, {
+            folder: `smarterp/invoices/${userCompanyId}`,
+            public_id: `invoice_${invoiceNumber}`,
+            resource_type: 'raw'
+          });
+          pdfUrl = uploadResult.secure_url;
+        } catch (cloudErr) {
+          console.warn('⚠️ Cloudinary invoice upload warning:', cloudErr.message);
+          pdfUrl = `https://res.cloudinary.com/${cloudName}/raw/upload/v${Date.now()}/smarterp/invoices/${userCompanyId}/invoice_${invoiceNumber}.pdf`;
+        }
+      } else {
         pdfUrl = `https://res.cloudinary.com/${cloudName}/raw/upload/v${Date.now()}/smarterp/invoices/${userCompanyId}/invoice_${invoiceNumber}.pdf`;
       }
-    } else {
-      pdfUrl = `https://res.cloudinary.com/${cloudName}/raw/upload/v${Date.now()}/smarterp/invoices/${userCompanyId}/invoice_${invoiceNumber}.pdf`;
-    }
 
-    await pool.query('ALTER TABLE invoices ADD COLUMN IF NOT EXISTS pdf_url TEXT;').catch(() => {});
+      await pool.query('ALTER TABLE invoices ADD COLUMN IF NOT EXISTS pdf_url TEXT;').catch(() => { });
 
-    const invRes = await pool.query(
-      `INSERT INTO invoices 
+      const invRes = await pool.query(
+        `INSERT INTO invoices 
        (job_id, company_id, customer_id, invoice_number, total_amount, status, pdf_url, generated_at, updated_at)
        VALUES ($1, $2, $3, $4, $5, 'generated', $6, NOW(), NOW())
        RETURNING *`,
-      [job.id, String(userCompanyId), job.customer_id || null, invoiceNumber, amount, pdfUrl]
-    );
+        [job.id, String(userCompanyId), job.customer_id || null, invoiceNumber, amount, pdfUrl]
+      );
 
-    // Post invoice ERP card to job conversation thread (Enterprise Communication Backbone)
-    EventMessagingService.onInvoiceIssued({
-      jobId: job.id,
-      companyId: userCompanyId,
-      invoiceNumber,
-      totalAmount: amount,
-      senderId: req.user.id,
-    }).catch(() => {}); // non-blocking
+      // Post invoice ERP card to job conversation thread (Enterprise Communication Backbone)
+      EventMessagingService.onInvoiceIssued({
+        jobId: job.id,
+        companyId: userCompanyId,
+        invoiceNumber,
+        totalAmount: amount,
+        senderId: req.user.id,
+      }).catch(() => { }); // non-blocking
 
-    // Notify Customer in real-time if job has a customer_id
-    if (job.customer_id) {
-      createNotification({
-        user_id: job.customer_id,
-        company_id: userCompanyId,
-        type: 'invoice_generated',
-        title: 'New Invoice Issued',
-        message: `Invoice #${invoiceNumber} for ₹${Number(amount).toLocaleString('en-IN')} has been generated.`,
-        priority: 'high',
-        actor_id: req.user.id,
-        data: { invoice_id: invRes.rows[0].id, job_id: job.id, url: '/customer/invoices' }
-      }).catch(() => {});
+      // Notify Customer in real-time if job has a customer_id
+      if (job.customer_id) {
+        createNotification({
+          user_id: job.customer_id,
+          company_id: userCompanyId,
+          type: 'invoice_generated',
+          title: 'New Invoice Issued',
+          message: `Invoice #${invoiceNumber} for ₹${Number(amount).toLocaleString('en-IN')} has been generated.`,
+          priority: 'high',
+          actor_id: req.user.id,
+          data: { invoice_id: invRes.rows[0].id, job_id: job.id, url: '/customer/invoices' }
+        }).catch(() => { });
+      }
+
+      res.status(201).json({
+        success: true,
+        message: 'Invoice generated successfully',
+        invoice: invRes.rows[0]
+      });
+    } catch (err) {
+      console.error('❌ Error generating job invoice:', err);
+      res.status(500).json({ message: 'Server error generating invoice' });
     }
+  });
 
-    res.status(201).json({
-      success: true,
-      message: 'Invoice generated successfully',
-      invoice: invRes.rows[0]
-    });
-  } catch (err) {
-    console.error('❌ Error generating job invoice:', err);
-    res.status(500).json({ message: 'Server error generating invoice' });
-  }
-});
+  // ─── GET /api/jobs/invoices/all ──────────────────────────────────────────────
+  // List company job invoices (Owner Billing tab & Customer view)
+  router.get('/invoices/all', authenticateToken, async (req, res) => {
+    try {
+      const userCompanyId = req.user.companyId;
+      await pool.query('ALTER TABLE invoices ADD COLUMN IF NOT EXISTS pdf_url TEXT;').catch(() => { });
 
-// ─── GET /api/jobs/invoices/all ──────────────────────────────────────────────
-// List company job invoices (Owner Billing tab & Customer view)
-router.get('/invoices/all', authenticateToken, async (req, res) => {
-  try {
-    const userCompanyId = req.user.companyId;
-    await pool.query('ALTER TABLE invoices ADD COLUMN IF NOT EXISTS pdf_url TEXT;').catch(() => {});
-
-    const result = await pool.query(
-      `SELECT i.*, j.title as job_title, j.customer_name 
+      const result = await pool.query(
+        `SELECT i.*, j.title as job_title, j.customer_name 
        FROM invoices i
        LEFT JOIN jobs j ON i.job_id = j.id
        WHERE i.company_id = $1
        ORDER BY i.generated_at DESC`,
-      [String(userCompanyId)]
-    );
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Error fetching job invoices:', err);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-// ─── POST /api/jobs/:id/actions ─────────────────────────────────────────────
-// Submit a field job action (status, assistance, material, expense, evidence, safety)
-router.post('/:id/actions', authenticateToken, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const userCompanyId = String(req.user.companyId);
-    const userId = req.user.id;
-
-    const { module, action_type, urgency = 'normal', notes, evidence_urls = [], payload = {} } = req.body;
-
-    if (!module || !action_type) {
-      return res.status(400).json({ message: 'Module and action_type are required' });
+        [String(userCompanyId)]
+      );
+      res.json(result.rows);
+    } catch (err) {
+      console.error('Error fetching job invoices:', err);
+      res.status(500).json({ message: 'Server error' });
     }
+  });
 
-    const jobCheck = await pool.query('SELECT * FROM jobs WHERE id = $1', [id]);
-    if (jobCheck.rows.length === 0) {
-      return res.status(404).json({ message: 'Job not found' });
-    }
-    const job = jobCheck.rows[0];
+  // ─── POST /api/jobs/:id/actions ─────────────────────────────────────────────
+  // Submit a field job action (status, assistance, material, expense, evidence, safety)
+  router.post('/:id/actions', authenticateToken, async (req, res) => {
+    try {
+      const { id } = req.params;
+      const userCompanyId = String(req.user.companyId);
+      const userId = req.user.id;
 
-    if (String(job.company_id) !== userCompanyId) {
-      return res.status(403).json({ message: 'Access denied: Job belongs to another company' });
-    }
+      const { module, action_type, urgency = 'normal', notes, evidence_urls = [], payload = {} } = req.body;
 
-    const requiresApproval = ['assistance', 'expense', 'safety', 'material'].includes(module) || urgency === 'emergency' || urgency === 'high';
-    const status = requiresApproval ? 'pending_approval' : 'completed';
+      if (!module || !action_type) {
+        return res.status(400).json({ message: 'Module and action_type are required' });
+      }
 
-    const actionRes = await pool.query(
-      `INSERT INTO job_actions 
+      const jobCheck = await pool.query('SELECT * FROM jobs WHERE id = $1', [id]);
+      if (jobCheck.rows.length === 0) {
+        return res.status(404).json({ message: 'Job not found' });
+      }
+      const job = jobCheck.rows[0];
+
+      if (String(job.company_id) !== userCompanyId) {
+        return res.status(403).json({ message: 'Access denied: Job belongs to another company' });
+      }
+
+      const requiresApproval = ['assistance', 'expense', 'safety', 'material'].includes(module) || urgency === 'emergency' || urgency === 'high';
+      const status = requiresApproval ? 'pending_approval' : 'completed';
+
+      const actionRes = await pool.query(
+        `INSERT INTO job_actions 
        (job_id, company_id, performed_by, module, action_type, urgency, requires_approval, status, notes, evidence_urls, payload, created_at, updated_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW())
        RETURNING *`,
-      [job.id, userCompanyId, userId, module, action_type, urgency, requiresApproval, status, notes || null, JSON.stringify(evidence_urls), JSON.stringify(payload)]
-    );
+        [job.id, userCompanyId, userId, module, action_type, urgency, requiresApproval, status, notes || null, JSON.stringify(evidence_urls), JSON.stringify(payload)]
+      );
 
-    const actionRecord = actionRes.rows[0];
+      const actionRecord = actionRes.rows[0];
 
-    // Log Activity Timeline entry
-    await pool.query(
-      `INSERT INTO activities (user_id, company_id, action, activity_type, details, created_at)
+      // Log Activity Timeline entry
+      await pool.query(
+        `INSERT INTO activities (user_id, company_id, action, activity_type, details, created_at)
        VALUES ($1, $2, $3, $4, $5, NOW())`,
-      [userId, userCompanyId, `Job Action: ${action_type}`, `job_${module}`, JSON.stringify({ job_id: job.id, action_id: actionRecord.id, action_type, urgency })]
-    ).catch(() => {});
+        [userId, userCompanyId, `Job Action: ${action_type}`, `job_${module}`, JSON.stringify({ job_id: job.id, action_id: actionRecord.id, action_type, urgency })]
+      ).catch(() => { });
 
-    // Notify Owners if approval required or high urgency/emergency
-    if (requiresApproval || urgency === 'emergency') {
-      const ownersRes = await pool.query("SELECT id FROM users WHERE company_id = $1 AND role IN ('owner', 'admin')", [userCompanyId]);
-      const title = urgency === 'emergency' ? `🚨 EMERGENCY ALERT on Job: ${job.title}` : `Field Action Request: ${action_type.replace(/_/g, ' ')}`;
-      const message = `${req.user.name || 'Technician'} reported: ${notes || action_type.replace(/_/g, ' ')}`;
+      // Notify Owners if approval required or high urgency/emergency
+      if (requiresApproval || urgency === 'emergency') {
+        const ownersRes = await pool.query("SELECT id FROM users WHERE company_id = $1 AND role IN ('owner', 'admin')", [userCompanyId]);
+        const title = urgency === 'emergency' ? `🚨 EMERGENCY ALERT on Job: ${job.title}` : `Field Action Request: ${action_type.replace(/_/g, ' ')}`;
+        const message = `${req.user.name || 'Technician'} reported: ${notes || action_type.replace(/_/g, ' ')}`;
 
-      for (const owner of ownersRes.rows) {
-        await createNotification({
-          user_id: owner.id,
-          company_id: userCompanyId,
-          type: urgency === 'emergency' ? 'emergency_alert' : 'field_action_request',
-          title,
-          message,
-          priority: urgency === 'emergency' ? 'urgent' : 'high',
-          data: { job_id: job.id, action_id: actionRecord.id, module, action_type }
-        }).catch(() => {});
+        for (const owner of ownersRes.rows) {
+          await createNotification({
+            user_id: owner.id,
+            company_id: userCompanyId,
+            type: urgency === 'emergency' ? 'emergency_alert' : 'field_action_request',
+            title,
+            message,
+            priority: urgency === 'emergency' ? 'urgent' : 'high',
+            data: { job_id: job.id, action_id: actionRecord.id, module, action_type }
+          }).catch(() => { });
+        }
       }
+
+      res.status(201).json({
+        success: true,
+        message: 'Job action submitted successfully',
+        action: actionRecord
+      });
+    } catch (err) {
+      console.error('❌ Error submitting job action:', err);
+      res.status(500).json({ message: 'Server error submitting job action' });
     }
+  });
 
-    res.status(201).json({
-      success: true,
-      message: 'Job action submitted successfully',
-      action: actionRecord
-    });
-  } catch (err) {
-    console.error('❌ Error submitting job action:', err);
-    res.status(500).json({ message: 'Server error submitting job action' });
-  }
-});
+  // ─── GET /api/jobs/:id/actions ──────────────────────────────────────────────
+  // Fetch action history for a specific job
+  router.get('/:id/actions', authenticateToken, async (req, res) => {
+    try {
+      const { id } = req.params;
+      const userCompanyId = String(req.user.companyId);
 
-// ─── GET /api/jobs/:id/actions ──────────────────────────────────────────────
-// Fetch action history for a specific job
-router.get('/:id/actions', authenticateToken, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const userCompanyId = String(req.user.companyId);
-
-    const result = await pool.query(
-      `SELECT ja.*, u.name as performer_name, r.name as resolver_name
+      const result = await pool.query(
+        `SELECT ja.*, u.name as performer_name, r.name as resolver_name
        FROM job_actions ja
        LEFT JOIN users u ON ja.performed_by = u.id
        LEFT JOIN users r ON ja.resolved_by = r.id
        WHERE ja.job_id = $1 AND ja.company_id = $2
        ORDER BY ja.created_at DESC`,
-      [id, userCompanyId]
-    );
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Error fetching job actions:', err);
-    res.status(500).json({ message: 'Server error fetching job actions' });
-  }
-});
+        [id, userCompanyId]
+      );
+      res.json(result.rows);
+    } catch (err) {
+      console.error('Error fetching job actions:', err);
+      res.status(500).json({ message: 'Server error fetching job actions' });
+    }
+  });
 
-// ─── GET /api/admin/approvals/field-actions ──────────────────────────────────
-// Fetch all pending field actions across company for Owner Approval Center
-router.get('/approvals/field-actions', authenticateToken, async (req, res) => {
-  try {
-    const userCompanyId = String(req.user.companyId);
-    const result = await pool.query(
-      `SELECT ja.*, j.title as job_title, u.name as requester_name
+  // ─── GET /api/admin/approvals/field-actions ──────────────────────────────────
+  // Fetch all pending field actions across company for Owner Approval Center
+  router.get('/approvals/field-actions', authenticateToken, async (req, res) => {
+    try {
+      const userCompanyId = String(req.user.companyId);
+      const result = await pool.query(
+        `SELECT ja.*, j.title as job_title, u.name as requester_name
        FROM job_actions ja
        LEFT JOIN jobs j ON ja.job_id = j.id
        LEFT JOIN users u ON ja.performed_by = u.id
        WHERE ja.company_id = $1 AND ja.status = 'pending_approval'
        ORDER BY ja.created_at DESC`,
-      [userCompanyId]
-    );
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Error fetching pending field actions:', err);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-// ─── PATCH /api/jobs/actions/:actionId/respond ──────────────────────────────
-// Owner approval/rejection decision endpoint
-router.patch('/actions/:actionId/respond', authenticateToken, async (req, res) => {
-  try {
-    const { actionId } = req.params;
-    const { decision, owner_response } = req.body; // 'approved' or 'rejected'
-    const userCompanyId = String(req.user.companyId);
-    const resolverId = req.user.id;
-
-    if (!['approved', 'rejected'].includes(decision)) {
-      return res.status(400).json({ message: 'Decision must be approved or rejected' });
+        [userCompanyId]
+      );
+      res.json(result.rows);
+    } catch (err) {
+      console.error('Error fetching pending field actions:', err);
+      res.status(500).json({ message: 'Server error' });
     }
+  });
 
-    const actionRes = await pool.query('SELECT * FROM job_actions WHERE id = $1 AND company_id = $2', [actionId, userCompanyId]);
-    if (actionRes.rows.length === 0) {
-      return res.status(404).json({ message: 'Job action not found' });
-    }
-    const action = actionRes.rows[0];
+  // ─── PATCH /api/jobs/actions/:actionId/respond ──────────────────────────────
+  // Owner approval/rejection decision endpoint
+  router.patch('/actions/:actionId/respond', authenticateToken, async (req, res) => {
+    try {
+      const { actionId } = req.params;
+      const { decision, owner_response } = req.body; // 'approved' or 'rejected'
+      const userCompanyId = String(req.user.companyId);
+      const resolverId = req.user.id;
 
-    const updated = await pool.query(
-      `UPDATE job_actions 
+      if (!['approved', 'rejected'].includes(decision)) {
+        return res.status(400).json({ message: 'Decision must be approved or rejected' });
+      }
+
+      const actionRes = await pool.query('SELECT * FROM job_actions WHERE id = $1 AND company_id = $2', [actionId, userCompanyId]);
+      if (actionRes.rows.length === 0) {
+        return res.status(404).json({ message: 'Job action not found' });
+      }
+      const action = actionRes.rows[0];
+
+      const updated = await pool.query(
+        `UPDATE job_actions 
        SET status = $1, owner_response = $2, resolved_by = $3, resolved_at = NOW(), updated_at = NOW()
        WHERE id = $4
        RETURNING *`,
-      [decision, owner_response || null, resolverId, actionId]
-    );
+        [decision, owner_response || null, resolverId, actionId]
+      );
 
-    // Notify requesting employee
-    await createNotification({
-      user_id: action.performed_by,
-      company_id: userCompanyId,
-      type: 'field_action_response',
-      title: `Field Request ${decision === 'approved' ? 'Approved ✅' : 'Rejected ❌'}`,
-      message: `Your request (${action.action_type.replace(/_/g, ' ')}) was ${decision}${owner_response ? `: ${owner_response}` : '.'}`,
-      priority: 'high',
-      data: { job_id: action.job_id, action_id: actionId, decision }
-    }).catch(() => {});
+      // Notify requesting employee
+      await createNotification({
+        user_id: action.performed_by,
+        company_id: userCompanyId,
+        type: 'field_action_response',
+        title: `Field Request ${decision === 'approved' ? 'Approved ✅' : 'Rejected ❌'}`,
+        message: `Your request (${action.action_type.replace(/_/g, ' ')}) was ${decision}${owner_response ? `: ${owner_response}` : '.'}`,
+        priority: 'high',
+        data: { job_id: action.job_id, action_id: actionId, decision }
+      }).catch(() => { });
 
-    res.json({
-      success: true,
-      message: `Field action ${decision}`,
-      action: updated.rows[0]
-    });
-  } catch (err) {
-    console.error('Error responding to job action:', err);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
+      res.json({
+        success: true,
+        message: `Field action ${decision}`,
+        action: updated.rows[0]
+      });
+    } catch (err) {
+      console.error('Error responding to job action:', err);
+      res.status(500).json({ message: 'Server error' });
+    }
+  });
 
-/**
- * POST /api/jobs/:jobId/actions
- * Employee submits field action request (Need More Workers, Equipment Needed, Safety Hazard, etc.)
- */
-router.post('/:jobId/actions', authenticateToken, async (req, res) => {
-  try {
-    const { jobId } = req.params;
-    const companyId = req.user.companyId || req.user.company_id;
-    const userId = req.user.id || req.user.userId;
-    const userName = req.user.name || 'Employee';
+  /**
+   * POST /api/jobs/:jobId/actions
+   * Employee submits field action request (Need More Workers, Equipment Needed, Safety Hazard, etc.)
+   */
+  router.post('/:jobId/actions', authenticateToken, async (req, res) => {
+    try {
+      const { jobId } = req.params;
+      const companyId = req.user.companyId || req.user.company_id;
+      const userId = req.user.id || req.user.userId;
+      const userName = req.user.name || 'Employee';
 
-    const { module, action_type, urgency, notes, evidence_urls, payload } = req.body;
+      const { module, action_type, urgency, notes, evidence_urls, payload } = req.body;
 
-    const jobRes = await pool.query('SELECT title FROM jobs WHERE id = $1', [jobId]);
-    const jobTitle = jobRes.rows[0]?.title || 'Job';
+      const jobRes = await pool.query('SELECT title FROM jobs WHERE id = $1', [jobId]);
+      const jobTitle = jobRes.rows[0]?.title || 'Job';
 
-    const result = await pool.query(
-      `INSERT INTO job_action_requests
+      const result = await pool.query(
+        `INSERT INTO job_action_requests
        (company_id, job_id, employee_id, employee_name, module, action_type, urgency, notes, evidence_urls, payload, status, created_at, updated_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending', NOW(), NOW())
        RETURNING *`,
-      [companyId, jobId, userId, userName, module || 'field', action_type || 'general_request', urgency || 'normal', notes || '', JSON.stringify(evidence_urls || []), JSON.stringify(payload || {})]
-    );
+        [companyId, jobId, userId, userName, module || 'field', action_type || 'general_request', urgency || 'normal', notes || '', JSON.stringify(evidence_urls || []), JSON.stringify(payload || {})]
+      );
 
-    const actionReq = result.rows[0];
+      const actionReq = result.rows[0];
 
-    // Notify Owner
-    await createNotificationForOwners({
-      company_id: companyId,
-      type: 'job_action_request',
-      title: urgency === 'emergency' ? '🚨 EMERGENCY SOS ALERT' : `Work Request: ${action_type.replace(/_/g, ' ')}`,
-      message: `${userName} submitted a work request for "${jobTitle}": ${notes || action_type}`,
-      priority: urgency === 'emergency' ? 'urgent' : 'high',
-      data: { job_id: jobId, action_request_id: actionReq.id, url: '/owner/jobs' }
-    }).catch(() => {});
+      // Notify Owner
+      await createNotificationForOwners({
+        company_id: companyId,
+        type: 'job_action_request',
+        title: urgency === 'emergency' ? '🚨 EMERGENCY SOS ALERT' : `Work Request: ${action_type.replace(/_/g, ' ')}`,
+        message: `${userName} submitted a work request for "${jobTitle}": ${notes || action_type}`,
+        priority: urgency === 'emergency' ? 'urgent' : 'high',
+        data: { job_id: jobId, action_request_id: actionReq.id, url: '/owner/jobs' }
+      }).catch(() => { });
 
-    res.json({ success: true, request: actionReq });
-  } catch (err) {
-    console.error('POST /api/jobs/:jobId/actions error:', err);
-    res.status(500).json({ message: err.message || 'Server error' });
-  }
-});
+      res.json({ success: true, request: actionReq });
+    } catch (err) {
+      console.error('POST /api/jobs/:jobId/actions error:', err);
+      res.status(500).json({ message: err.message || 'Server error' });
+    }
+  });
 
-/**
- * GET /api/jobs/action-requests
- * Owner lists all employee field action requests
- */
-router.get('/action-requests', authenticateToken, async (req, res) => {
-  try {
-    const companyId = req.user.companyId || req.user.company_id;
-    const { status, jobId } = req.query;
+  /**
+   * GET /api/jobs/action-requests
+   * Owner lists all employee field action requests
+   */
+  router.get('/action-requests', authenticateToken, async (req, res) => {
+    try {
+      const companyId = req.user.companyId || req.user.company_id;
+      const { status, jobId } = req.query;
 
-    let query = `
+      let query = `
       SELECT r.*, j.title AS job_title, j.location AS job_location
       FROM job_action_requests r
       LEFT JOIN jobs j ON r.job_id = j.id
       WHERE r.company_id = $1
     `;
-    const params = [companyId];
+      const params = [companyId];
 
-    if (status && status !== 'all') {
-      params.push(status);
-      query += ` AND r.status = $${params.length}`;
+      if (status && status !== 'all') {
+        params.push(status);
+        query += ` AND r.status = $${params.length}`;
+      }
+      if (jobId) {
+        params.push(jobId);
+        query += ` AND r.job_id = $${params.length}`;
+      }
+
+      query += ` ORDER BY r.created_at DESC`;
+
+      const result = await pool.query(query, params);
+      res.json({ success: true, requests: result.rows });
+    } catch (err) {
+      console.error('GET /api/jobs/action-requests error:', err);
+      res.status(500).json({ message: err.message || 'Server error' });
     }
-    if (jobId) {
-      params.push(jobId);
-      query += ` AND r.job_id = $${params.length}`;
-    }
+  });
 
-    query += ` ORDER BY r.created_at DESC`;
+  /**
+   * PATCH /api/jobs/action-requests/:requestId
+   * Owner responds to (approves, rejects, resolves) employee work request
+   */
+  router.patch('/action-requests/:requestId', authenticateToken, async (req, res) => {
+    try {
+      const { requestId } = req.params;
+      const companyId = req.user.companyId || req.user.company_id;
+      const { status, owner_response } = req.body;
 
-    const result = await pool.query(query, params);
-    res.json({ success: true, requests: result.rows });
-  } catch (err) {
-    console.error('GET /api/jobs/action-requests error:', err);
-    res.status(500).json({ message: err.message || 'Server error' });
-  }
-});
-
-/**
- * PATCH /api/jobs/action-requests/:requestId
- * Owner responds to (approves, rejects, resolves) employee work request
- */
-router.patch('/action-requests/:requestId', authenticateToken, async (req, res) => {
-  try {
-    const { requestId } = req.params;
-    const companyId = req.user.companyId || req.user.company_id;
-    const { status, owner_response } = req.body;
-
-    const result = await pool.query(
-      `UPDATE job_action_requests
+      const result = await pool.query(
+        `UPDATE job_action_requests
        SET status = $1, owner_response = $2, resolved_at = CASE WHEN $1 IN ('approved', 'rejected', 'resolved') THEN NOW() ELSE resolved_at END, updated_at = NOW()
        WHERE id = $3 AND company_id = $4
        RETURNING *`,
-      [status || 'resolved', owner_response || '', requestId, companyId]
-    );
+        [status || 'resolved', owner_response || '', requestId, companyId]
+      );
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({ message: 'Request not found' });
+      if (result.rows.length === 0) {
+        return res.status(404).json({ message: 'Request not found' });
+      }
+
+      const updatedReq = result.rows[0];
+
+      // Notify Employee
+      if (updatedReq.employee_id) {
+        await createNotification({
+          user_id: updatedReq.employee_id,
+          company_id: companyId,
+          type: 'action_request_response',
+          title: `Work Request ${status === 'approved' ? 'Approved ✅' : status === 'rejected' ? 'Rejected ❌' : 'Updated 💬'}`,
+          message: `Your request (${updatedReq.action_type.replace(/_/g, ' ')}) was ${status}${owner_response ? `: ${owner_response}` : '.'}`,
+          priority: 'high',
+          data: { job_id: updatedReq.job_id, request_id: requestId, status }
+        }).catch(() => { });
+      }
+
+      res.json({ success: true, request: updatedReq });
+    } catch (err) {
+      console.error('PATCH /api/jobs/action-requests/:requestId error:', err);
+      res.status(500).json({ message: err.message || 'Server error' });
     }
+  });
 
-    const updatedReq = result.rows[0];
+  /**
+   * POST /api/jobs/:id/reassign (Owner Only)
+   * Reassign job to a different field technician
+   */
+  router.post('/:id/reassign', authenticateToken, async (req, res) => {
+    try {
+      if (req.user.role !== 'owner') {
+        return res.status(403).json({ message: 'Only company owners can reassign jobs.' });
+      }
 
-    // Notify Employee
-    if (updatedReq.employee_id) {
-      await createNotification({
-        user_id: updatedReq.employee_id,
-        company_id: companyId,
-        type: 'action_request_response',
-        title: `Work Request ${status === 'approved' ? 'Approved ✅' : status === 'rejected' ? 'Rejected ❌' : 'Updated 💬'}`,
-        message: `Your request (${updatedReq.action_type.replace(/_/g, ' ')}) was ${status}${owner_response ? `: ${owner_response}` : '.'}`,
-        priority: 'high',
-        data: { job_id: updatedReq.job_id, request_id: requestId, status }
-      }).catch(() => {});
-    }
+      const { id } = req.params;
+      const { new_employee_id, reason } = req.body;
 
-    res.json({ success: true, request: updatedReq });
-  } catch (err) {
-    console.error('PATCH /api/jobs/action-requests/:requestId error:', err);
-    res.status(500).json({ message: err.message || 'Server error' });
-  }
-});
+      if (!new_employee_id) {
+        return res.status(400).json({ message: 'new_employee_id is required for job reassignment.' });
+      }
 
-/**
- * POST /api/jobs/:id/reassign (Owner Only)
- * Reassign job to a different field technician
- */
-router.post('/:id/reassign', authenticateToken, async (req, res) => {
-  try {
-    if (req.user.role !== 'owner') {
-      return res.status(403).json({ message: 'Only company owners can reassign jobs.' });
-    }
+      const companyId = req.user.companyId || req.user.company_id;
 
-    const { id } = req.params;
-    const { new_employee_id, reason } = req.body;
+      // Fetch existing job
+      const curRes = await pool.query(
+        `SELECT * FROM jobs WHERE id = $1 AND company_id::text = $2`,
+        [id, String(companyId)]
+      );
+      if (curRes.rows.length === 0) {
+        return res.status(404).json({ message: 'Job not found' });
+      }
+      const curJob = curRes.rows[0];
+      const prevEmployeeId = curJob.assigned_to;
 
-    if (!new_employee_id) {
-      return res.status(400).json({ message: 'new_employee_id is required for job reassignment.' });
-    }
-
-    const companyId = req.user.companyId || req.user.company_id;
-
-    // Fetch existing job
-    const curRes = await pool.query(
-      `SELECT * FROM jobs WHERE id = $1 AND company_id::text = $2`,
-      [id, String(companyId)]
-    );
-    if (curRes.rows.length === 0) {
-      return res.status(404).json({ message: 'Job not found' });
-    }
-    const curJob = curRes.rows[0];
-    const prevEmployeeId = curJob.assigned_to;
-
-    const result = await pool.query(
-      `UPDATE jobs
+      const result = await pool.query(
+        `UPDATE jobs
        SET assigned_to          = $1,
            assigned_employee_id = $1,
            employee_status      = 'assigned',
@@ -1226,115 +1226,115 @@ router.post('/:id/reassign', authenticateToken, async (req, res) => {
            override_at          = NOW()
        WHERE id = $4 AND company_id::text = $5
        RETURNING *`,
-      [new_employee_id, reason || 'Reassigned by Owner', req.user.id, id, String(companyId)]
-    );
+        [new_employee_id, reason || 'Reassigned by Owner', req.user.id, id, String(companyId)]
+      );
 
-    const updatedJob = result.rows[0];
+      const updatedJob = result.rows[0];
 
-    // Audit Log
-    logJobAudit({
-      companyId,
-      jobId: id,
-      userId: req.user.id,
-      userRole: req.user.role,
-      action: 'JOB_REASSIGNED',
-      oldState: curJob.state,
-      newState: 'assigned',
-      oldValue: { assignedTo: prevEmployeeId },
-      newValue: { assignedTo: new_employee_id },
-      reason: reason || 'Reassigned by Owner',
-      ipAddress: req.ip,
-    });
+      // Audit Log
+      logJobAudit({
+        companyId,
+        jobId: id,
+        userId: req.user.id,
+        userRole: req.user.role,
+        action: 'JOB_REASSIGNED',
+        oldState: curJob.state,
+        newState: 'assigned',
+        oldValue: { assignedTo: prevEmployeeId },
+        newValue: { assignedTo: new_employee_id },
+        reason: reason || 'Reassigned by Owner',
+        ipAddress: req.ip,
+      });
 
-    // Notifications
-    try {
-      if (prevEmployeeId) {
+      // Notifications
+      try {
+        if (prevEmployeeId) {
+          await createNotification({
+            user_id: prevEmployeeId,
+            company_id: companyId,
+            type: 'job_reassigned',
+            title: 'Job Reassigned',
+            message: `Job "${curJob.title}" has been reassigned by the owner.`,
+            priority: 'medium',
+            data: { job_id: id }
+          });
+        }
         await createNotification({
-          user_id: prevEmployeeId,
+          user_id: new_employee_id,
           company_id: companyId,
-          type: 'job_reassigned',
-          title: 'Job Reassigned',
-          message: `Job "${curJob.title}" has been reassigned by the owner.`,
-          priority: 'medium',
+          type: 'job_assigned',
+          title: 'New Job Assigned',
+          message: `You have been assigned a new job: "${curJob.title}"`,
+          priority: 'high',
           data: { job_id: id }
         });
+      } catch (nErr) {
+        console.error('Reassign notification error:', nErr.message);
       }
-      await createNotification({
-        user_id: new_employee_id,
-        company_id: companyId,
-        type: 'job_assigned',
-        title: 'New Job Assigned',
-        message: `You have been assigned a new job: "${curJob.title}"`,
-        priority: 'high',
-        data: { job_id: id }
-      });
-    } catch (nErr) {
-      console.error('Reassign notification error:', nErr.message);
+
+      res.json({ success: true, job: updatedJob });
+    } catch (err) {
+      console.error('POST /api/jobs/:id/reassign error:', err);
+      res.status(500).json({ message: err.message || 'Server error' });
     }
+  });
 
-    res.json({ success: true, job: updatedJob });
-  } catch (err) {
-    console.error('POST /api/jobs/:id/reassign error:', err);
-    res.status(500).json({ message: err.message || 'Server error' });
-  }
-});
+  /**
+   * POST /api/jobs/:id/override (Owner Only — Emergency Override)
+   * Supervisory override when assigned technician is unavailable
+   */
+  router.post('/:id/override', authenticateToken, async (req, res) => {
+    try {
+      if (req.user.role !== 'owner') {
+        return res.status(403).json({ message: 'Only company owners can execute emergency overrides.' });
+      }
 
-/**
- * POST /api/jobs/:id/override (Owner Only — Emergency Override)
- * Supervisory override when assigned technician is unavailable
- */
-router.post('/:id/override', authenticateToken, async (req, res) => {
-  try {
-    if (req.user.role !== 'owner') {
-      return res.status(403).json({ message: 'Only company owners can execute emergency overrides.' });
-    }
+      const { id } = req.params;
+      const { action_type, reason, new_progress, new_employee_id } = req.body;
 
-    const { id } = req.params;
-    const { action_type, reason, new_progress, new_employee_id } = req.body;
+      if (!reason || typeof reason !== 'string' || !reason.trim()) {
+        return res.status(400).json({ message: 'Compulsory override reason is required.' });
+      }
 
-    if (!reason || typeof reason !== 'string' || !reason.trim()) {
-      return res.status(400).json({ message: 'Compulsory override reason is required.' });
-    }
+      const companyId = req.user.companyId || req.user.company_id;
 
-    const companyId = req.user.companyId || req.user.company_id;
+      const curRes = await pool.query(
+        `SELECT * FROM jobs WHERE id = $1 AND company_id::text = $2`,
+        [id, String(companyId)]
+      );
+      if (curRes.rows.length === 0) {
+        return res.status(404).json({ message: 'Job not found' });
+      }
+      const curJob = curRes.rows[0];
 
-    const curRes = await pool.query(
-      `SELECT * FROM jobs WHERE id = $1 AND company_id::text = $2`,
-      [id, String(companyId)]
-    );
-    if (curRes.rows.length === 0) {
-      return res.status(404).json({ message: 'Job not found' });
-    }
-    const curJob = curRes.rows[0];
+      let newStatus = curJob.status;
+      let newState = curJob.state;
+      let newProgress = curJob.progress;
+      let newAssignedTo = curJob.assigned_to;
 
-    let newStatus = curJob.status;
-    let newState = curJob.state;
-    let newProgress = curJob.progress;
-    let newAssignedTo = curJob.assigned_to;
-
-    if (action_type === 'force_complete') {
-      newStatus = 'completed';
-      newState = 'completed';
-      newProgress = 100;
-    } else if (action_type === 'return_to_assigned') {
-      newStatus = 'open';
-      newState = 'assigned';
-    } else if (action_type === 'cancel_job') {
-      newStatus = 'cancelled';
-      newState = 'cancelled';
-    } else if (action_type === 'reassign' && new_employee_id) {
-      newAssignedTo = new_employee_id;
-      newState = 'assigned';
-    } else if (action_type === 'override_progress' && typeof new_progress === 'number') {
-      newProgress = Math.min(100, Math.max(0, new_progress));
-      if (newProgress === 100) {
+      if (action_type === 'force_complete') {
         newStatus = 'completed';
         newState = 'completed';
+        newProgress = 100;
+      } else if (action_type === 'return_to_assigned') {
+        newStatus = 'open';
+        newState = 'assigned';
+      } else if (action_type === 'cancel_job') {
+        newStatus = 'cancelled';
+        newState = 'cancelled';
+      } else if (action_type === 'reassign' && new_employee_id) {
+        newAssignedTo = new_employee_id;
+        newState = 'assigned';
+      } else if (action_type === 'override_progress' && typeof new_progress === 'number') {
+        newProgress = Math.min(100, Math.max(0, new_progress));
+        if (newProgress === 100) {
+          newStatus = 'completed';
+          newState = 'completed';
+        }
       }
-    }
 
-    const result = await pool.query(
-      `UPDATE jobs
+      const result = await pool.query(
+        `UPDATE jobs
        SET status               = $1,
            state                = $2,
            progress             = $3,
@@ -1348,33 +1348,33 @@ router.post('/:id/override', authenticateToken, async (req, res) => {
            completed_by         = CASE WHEN $1 = 'completed' THEN $6 ELSE completed_by END
        WHERE id = $7 AND company_id::text = $8
        RETURNING *`,
-      [newStatus, newState, newProgress, newAssignedTo, reason.trim(), req.user.id, id, String(companyId)]
-    );
+        [newStatus, newState, newProgress, newAssignedTo, reason.trim(), req.user.id, id, String(companyId)]
+      );
 
-    const updatedJob = result.rows[0];
+      const updatedJob = result.rows[0];
 
-    // Log Audit Trail
-    logJobAudit({
-      companyId,
-      jobId: id,
-      userId: req.user.id,
-      userRole: req.user.role,
-      action: 'EMERGENCY_OVERRIDE',
-      oldState: curJob.state,
-      newState,
-      oldValue: { status: curJob.status, progress: curJob.progress, assignedTo: curJob.assigned_to },
-      newValue: { status: newStatus, progress: newProgress, assignedTo: newAssignedTo },
-      reason: reason.trim(),
-      metadata: { action_type },
-      ipAddress: req.ip,
-    });
+      // Log Audit Trail
+      logJobAudit({
+        companyId,
+        jobId: id,
+        userId: req.user.id,
+        userRole: req.user.role,
+        action: 'EMERGENCY_OVERRIDE',
+        oldState: curJob.state,
+        newState,
+        oldValue: { status: curJob.status, progress: curJob.progress, assignedTo: curJob.assigned_to },
+        newValue: { status: newStatus, progress: newProgress, assignedTo: newAssignedTo },
+        reason: reason.trim(),
+        metadata: { action_type },
+        ipAddress: req.ip,
+      });
 
-    res.json({ success: true, job: updatedJob, message: `Emergency override executed successfully (${action_type}).` });
-  } catch (err) {
-    console.error('POST /api/jobs/:id/override error:', err);
-    res.status(500).json({ message: err.message || 'Server error' });
-  }
-});
+      res.json({ success: true, job: updatedJob, message: `Emergency override executed successfully (${action_type}).` });
+    } catch (err) {
+      console.error('POST /api/jobs/:id/override error:', err);
+      res.status(500).json({ message: err.message || 'Server error' });
+    }
+  });
 
-module.exports = router;
+  module.exports = router;
 

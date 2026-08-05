@@ -212,6 +212,7 @@ const NUMBERED_MIGRATIONS = [
     '019_workforce_gatekeeper_audit_logs.sql',
     '020_cnc_service_edition.sql',
     '021_cnc_phase2.sql',
+    '022_cnc_phase3.sql',
 ];
 
 async function runNumberedMigrations() {

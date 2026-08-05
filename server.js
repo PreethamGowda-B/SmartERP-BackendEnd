@@ -398,9 +398,104 @@ async function runDatabaseInitialization() {
     await fixDatabaseConstraints();
 
     // 2. Auto-migrate schema
-    const { fixMaterialRequestsSchema, setupDocumentsTable } = require('./migrations/autoMigrate');
+    const { fixMaterialRequestsSchema, setupDocumentsTable, runNumberedMigrations } = require('./migrations/autoMigrate');
     await fixMaterialRequestsSchema();
     await setupDocumentsTable();
+    await runNumberedMigrations();
+
+    // 2b. Ensure all CNC tables & SLA columns exist
+    await pool.query(`
+      ALTER TABLE jobs ADD COLUMN IF NOT EXISTS sla_target_hours NUMERIC DEFAULT 4.0;
+      ALTER TABLE jobs ADD COLUMN IF NOT EXISTS sla_status VARCHAR(50) DEFAULT 'on_track';
+      ALTER TABLE jobs ADD COLUMN IF NOT EXISTS sla_response_minutes INTEGER;
+      ALTER TABLE jobs ADD COLUMN IF NOT EXISTS sla_resolution_minutes INTEGER;
+      ALTER TABLE jobs ADD COLUMN IF NOT EXISTS machine_id TEXT;
+      ALTER TABLE jobs ADD COLUMN IF NOT EXISTS controller_type VARCHAR(100);
+      ALTER TABLE jobs ADD COLUMN IF NOT EXISTS alarm_code VARCHAR(100);
+      ALTER TABLE jobs ADD COLUMN IF NOT EXISTS service_type VARCHAR(50) DEFAULT 'breakdown';
+
+      CREATE TABLE IF NOT EXISTS warranty_claims (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        company_id TEXT NOT NULL,
+        claim_number VARCHAR(100),
+        machine_id TEXT,
+        job_id TEXT,
+        spare_part_name VARCHAR(255),
+        part_name VARCHAR(255),
+        serial_number VARCHAR(100),
+        supplier_name VARCHAR(255),
+        vendor_name VARCHAR(255),
+        failure_reason TEXT,
+        claim_type VARCHAR(50) DEFAULT 'spare_part',
+        status VARCHAR(50) DEFAULT 'submitted',
+        claim_amount NUMERIC(10,2) DEFAULT 0.00,
+        supplier_credit_amount NUMERIC(10,2) DEFAULT 0.00,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS cnc_vendors (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        company_id TEXT NOT NULL,
+        vendor_name VARCHAR(255) NOT NULL,
+        contact_person VARCHAR(255),
+        phone VARCHAR(50),
+        email VARCHAR(255),
+        rating NUMERIC(3,1) DEFAULT 4.8,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS purchase_orders (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        company_id TEXT NOT NULL,
+        po_number VARCHAR(100) NOT NULL,
+        vendor_name VARCHAR(255) NOT NULL,
+        job_id TEXT,
+        parts_description TEXT NOT NULL,
+        total_cost NUMERIC(12,2) DEFAULT 0.00,
+        status VARCHAR(50) DEFAULT 'issued',
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS engineer_routes (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        company_id TEXT NOT NULL,
+        engineer_id TEXT NOT NULL,
+        engineer_name VARCHAR(255) NOT NULL,
+        route_date DATE DEFAULT CURRENT_DATE,
+        stops_count INT DEFAULT 1,
+        total_km NUMERIC(6,1) DEFAULT 0.0,
+        optimized_minutes INT DEFAULT 0,
+        status VARCHAR(50) DEFAULT 'active',
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS automation_rules (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        company_id TEXT NOT NULL,
+        rule_name VARCHAR(255) NOT NULL,
+        trigger_event VARCHAR(100) NOT NULL,
+        action_type VARCHAR(100) NOT NULL,
+        is_active BOOLEAN DEFAULT TRUE,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS ai_action_audit_trail (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        company_id TEXT NOT NULL,
+        user_id TEXT,
+        user_name VARCHAR(255),
+        prompt TEXT,
+        ai_interpretation TEXT,
+        workflow_type VARCHAR(100),
+        execution_level INT DEFAULT 1,
+        approval_status VARCHAR(50) DEFAULT 'executed',
+        result_summary TEXT,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+      );
+    `).catch(e => console.warn('⚠️ CNC tables initialization warning:', e.message));
 
     // 3. OTP setup and Core optimization
     await pool.query(`

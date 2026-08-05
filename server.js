@@ -706,6 +706,11 @@ v1Router.use("/machines", require("./routes/machines"));
 v1Router.use("/plants", require("./routes/plants"));
 v1Router.use("/quotations", require("./routes/quotations"));
 v1Router.use("/remote-support", require("./routes/remoteSupport"));
+v1Router.use("/command-center", require("./routes/commandCenter"));
+v1Router.use("/sla", require("./routes/sla"));
+v1Router.use("/warranty-claims", require("./routes/warrantyClaims"));
+v1Router.use("/search", require("./routes/enterpriseSearch"));
+v1Router.use("/customer-reports", require("./routes/customerReports"));
 
 
 // ✅ Meta WhatsApp Business Cloud API Webhook routes

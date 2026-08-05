@@ -211,6 +211,7 @@ const NUMBERED_MIGRATIONS = [
     '018_ai_copilot_and_audit_logs.sql',
     '019_workforce_gatekeeper_audit_logs.sql',
     '020_cnc_service_edition.sql',
+    '021_cnc_phase2.sql',
 ];
 
 async function runNumberedMigrations() {

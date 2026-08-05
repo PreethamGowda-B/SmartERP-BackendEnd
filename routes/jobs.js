@@ -427,15 +427,18 @@ const handleJobAccept = async (req, res) => {
         data: { job_id: acceptedJob.id, employee_id: req.user.id, url: '/owner/notifications' }
       });
     } catch (notifErr) {
-      if (acceptedJob?.machine_id) {
-        await client.query(
-          `INSERT INTO machine_timeline_events (company_id, machine_id, job_id, event_type, title, description, created_at)
-         VALUES ($1, $2, $3, 'engineer_assigned', 'Engineer Assigned & Accepted', $4, NOW())`,
-          [req.user.companyId || 1, acceptedJob.machine_id, acceptedJob.id, `Engineer ${userName} accepted job ${acceptedJob.title}`]
-        ).catch(() => { });
-      }
+      console.error('❌ Failed to send job acceptance notification:', notifErr.message);
+    }
 
-      res.json(acceptedJob);
+    if (acceptedJob?.machine_id) {
+      await client.query(
+        `INSERT INTO machine_timeline_events (company_id, machine_id, job_id, event_type, title, description, created_at)
+         VALUES ($1, $2, $3, 'engineer_assigned', 'Engineer Assigned & Accepted', $4, NOW())`,
+        [req.user.companyId || 1, acceptedJob.machine_id, acceptedJob.id, `Engineer ${req.user.name || 'Technician'} accepted job ${acceptedJob.title}`]
+      ).catch(() => { });
+    }
+
+    res.json(acceptedJob);
     } catch (err) {
       await client.query('ROLLBACK').catch(() => { });
       console.error('jobs ACCEPT error', err);

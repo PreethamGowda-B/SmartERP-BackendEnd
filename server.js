@@ -717,6 +717,9 @@ v1Router.use("/ai/auto-schedule", require("./routes/autoSchedule"));
 v1Router.use("/automation-center", require("./routes/automationCenter"));
 v1Router.use("/executive-bi", require("./routes/executiveBI"));
 v1Router.use("/superadmin/health-metrics", require("./routes/superadminHealth"));
+v1Router.use("/vendors", require("./routes/cncVendors"));
+v1Router.use("/route-optimization", require("./routes/routeOptimization"));
+v1Router.use("/saas", require("./routes/saasManagement"));
 
 
 // ✅ Meta WhatsApp Business Cloud API Webhook routes

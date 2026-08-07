@@ -44,6 +44,17 @@ async function logJobAudit({
         ipAddress,
       ]
     );
+    // Mirror into unified system activities audit trail
+    await pool.query(
+      `INSERT INTO activities (user_id, action, details, created_at)
+       VALUES ($1, $2, $3, NOW())`,
+      [
+        userId || '00000000-0000-0000-0000-000000000000',
+        action,
+        JSON.stringify({ companyId, jobId, userRole, oldState, newState, ipAddress, ...metadata }),
+      ]
+    ).catch(() => {});
+
     console.log(`📝 Immutable Audit Logged: [${action}] for Job ${jobId} (User: ${userId}, Role: ${userRole})`);
   } catch (err) {
     console.error('❌ Failed to log job audit trail:', err.message);

@@ -3,45 +3,83 @@ const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 
-// ─── GET /api/sla (Fetch SLA Compliance Metrics & Active Breaches) ─────────
+// ─── GET /api/sla (Fetch Live SLA Compliance Metrics & Dynamic Timers) ─────
 router.get('/', authenticateToken, async (req, res) => {
   try {
     const companyId = req.user.companyId || req.user.company_id || 1;
 
     const result = await pool.query(
-      `SELECT id, title, priority, status, created_at, accepted_at, completed_at,
-              COALESCE(sla_target_hours, 4.0) as sla_target_hours,
-              COALESCE(sla_status, 'on_track') as sla_status,
-              COALESCE(sla_response_minutes, 0) as sla_response_minutes,
-              COALESCE(sla_resolution_minutes, 0) as sla_resolution_minutes
+      `SELECT id, title, priority, status, service_type, created_at, assigned_at, accepted_at,
+              travel_started_at, site_reached_at, repair_started_at, completed_at, closed_at,
+              customer_name, machine_id,
+              COALESCE(sla_target_hours, CASE 
+                WHEN priority = 'urgent' OR service_type = 'breakdown' THEN 2.0
+                WHEN priority = 'high' THEN 4.0
+                ELSE 8.0
+              END) as target_hours
        FROM jobs
        WHERE (company_id::text = $1::text OR company_id = $2) AND status NOT IN ('cancelled')
        ORDER BY created_at DESC LIMIT 50`,
       [companyId.toString(), parseInt(companyId, 10) || 1]
     ).catch(() => ({ rows: [] }));
 
-    const onTrack = result.rows.filter((j) => j.sla_status === 'on_track' || !j.sla_status).length;
-    const warning = result.rows.filter((j) => j.sla_status === 'warning').length;
-    const breached = result.rows.filter((j) => j.sla_status === 'breached').length;
+    const now = new Date();
+
+    const jobsWithSla = result.rows.map((j) => {
+      const createdAt = new Date(j.created_at);
+      const targetHours = parseFloat(j.target_hours) || 4.0;
+      const deadline = new Date(createdAt.getTime() + targetHours * 60 * 60 * 1000);
+
+      // Timestamps duration calculations (in minutes)
+      const responseMins = j.accepted_at ? Math.round((new Date(j.accepted_at) - createdAt) / (1000 * 60)) : (j.assigned_at ? Math.round((new Date(j.assigned_at) - createdAt) / (1000 * 60)) : Math.round((now - createdAt) / (1000 * 60)));
+      const travelMins = j.site_reached_at && j.travel_started_at ? Math.round((new Date(j.site_reached_at) - new Date(j.travel_started_at)) / (1000 * 60)) : 0;
+      const repairMins = j.completed_at && (j.repair_started_at || j.site_reached_at) ? Math.round((new Date(j.completed_at) - new Date(j.repair_started_at || j.site_reached_at)) / (1000 * 60)) : 0;
+      const totalResolutionMins = j.completed_at ? Math.round((new Date(j.completed_at) - createdAt) / (1000 * 60)) : Math.round((now - createdAt) / (1000 * 60));
+
+      const remainingMins = Math.round((deadline - (j.completed_at ? new Date(j.completed_at) : now)) / (1000 * 60));
+
+      let slaStatus = 'on_track';
+      if (j.completed_at) {
+        slaStatus = totalResolutionMins <= targetHours * 60 ? 'on_track' : 'breached';
+      } else if (remainingMins < 0) {
+        slaStatus = 'breached';
+      } else if (remainingMins < 60) {
+        slaStatus = 'warning';
+      }
+
+      return {
+        ...j,
+        sla_target_hours: targetHours,
+        sla_status: slaStatus,
+        sla_response_minutes: Math.max(0, responseMins),
+        sla_travel_minutes: Math.max(0, travelMins),
+        sla_repair_minutes: Math.max(0, repairMins),
+        sla_resolution_minutes: Math.max(0, totalResolutionMins),
+        remaining_minutes: remainingMins,
+        deadline: deadline.toISOString(),
+      };
+    });
+
+    const onTrack = jobsWithSla.filter((j) => j.sla_status === 'on_track').length;
+    const warning = jobsWithSla.filter((j) => j.sla_status === 'warning').length;
+    const breached = jobsWithSla.filter((j) => j.sla_status === 'breached').length;
 
     res.json({
       success: true,
       metrics: {
-        total_jobs_monitored: result.rows.length,
+        total_jobs_monitored: jobsWithSla.length,
         on_track_count: onTrack,
         warning_count: warning,
         breached_count: breached,
-        sla_compliance_percentage: result.rows.length > 0 ? Math.round(((onTrack + warning) / result.rows.length) * 100) : 100,
+        sla_compliance_percentage: jobsWithSla.length > 0 ? Math.round(((onTrack + warning) / jobsWithSla.length) * 100) : 100,
+        average_response_minutes: jobsWithSla.length > 0 ? Math.round(jobsWithSla.reduce((sum, j) => sum + j.sla_response_minutes, 0) / jobsWithSla.length) : 0,
+        average_resolution_minutes: jobsWithSla.length > 0 ? Math.round(jobsWithSla.reduce((sum, j) => sum + j.sla_resolution_minutes, 0) / jobsWithSla.length) : 0,
       },
-      jobs: result.rows,
+      jobs: jobsWithSla,
     });
   } catch (err) {
     console.error('❌ Error fetching SLA metrics:', err.message);
-    res.status(200).json({
-      success: true,
-      metrics: { total_jobs_monitored: 0, on_track_count: 0, warning_count: 0, breached_count: 0, sla_compliance_percentage: 100 },
-      jobs: []
-    });
+    res.status(500).json({ message: err.message || 'Server error' });
   }
 });
 

@@ -2,6 +2,8 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
+const { evaluateAutomationRules } = require('../helpers/evaluateAutomations');
+const { emitSystemEvent } = require('../helpers/eventBus');
 
 // ─── GET /api/automation-center (Fetch Active Zero-Code Rules) ─────────────
 router.get('/', authenticateToken, async (req, res) => {
@@ -16,7 +18,7 @@ router.get('/', authenticateToken, async (req, res) => {
     res.json({ success: true, rules: result.rows });
   } catch (err) {
     console.error('❌ Error fetching automation rules:', err.message);
-    res.status(200).json({ success: true, rules: [] });
+    res.status(500).json({ message: err.message || 'Server error' });
   }
 });
 
@@ -35,31 +37,40 @@ router.post('/', authenticateToken, async (req, res) => {
        VALUES ($1, $2, $3, $4, true, NOW(), NOW())
        RETURNING *`,
       [companyId.toString(), rule_name, trigger_event, action_type]
-    ).catch(() => ({
-      rows: [{
-        id: `rule-${Date.now()}`,
-        rule_name,
-        trigger_event,
-        action_type,
-        is_active: true,
-        created_at: new Date().toISOString()
-      }]
-    }));
+    );
 
-    res.status(201).json({ success: true, rule: result.rows[0] });
+    const newRule = result.rows[0];
+
+    await emitSystemEvent('AUTOMATION_RULE_CREATED', {
+      companyId,
+      userId: req.user.id || req.user.userId,
+      action: `Created Automation Rule: ${rule_name}`,
+      details: { trigger_event, action_type },
+    });
+
+    res.status(201).json({ success: true, rule: newRule });
   } catch (err) {
     console.error('❌ Error creating automation rule:', err.message);
-    res.status(200).json({
-      success: true,
-      rule: {
-        id: `rule-${Date.now()}`,
-        rule_name: req.body.rule_name || 'Auto Escalation',
-        trigger_event: req.body.trigger_event || 'breakdown_reported',
-        action_type: req.body.action_type || 'notify_owner',
-        is_active: true,
-        created_at: new Date().toISOString()
-      }
-    });
+    res.status(500).json({ message: err.message || 'Server error' });
+  }
+});
+
+// ─── POST /api/automation-center/evaluate (Trigger Rule Evaluation Manually) ─
+router.post('/evaluate', authenticateToken, async (req, res) => {
+  try {
+    const companyId = req.user.companyId || req.user.company_id || 1;
+    const { trigger_event, jobId, machineId, itemId, details } = req.body;
+
+    if (!trigger_event) {
+      return res.status(400).json({ message: 'trigger_event is required' });
+    }
+
+    await evaluateAutomationRules(trigger_event, { companyId, jobId, machineId, itemId, details });
+
+    res.json({ success: true, message: `Automation rules evaluated for event ${trigger_event}` });
+  } catch (err) {
+    console.error('❌ Error evaluating automation rules:', err.message);
+    res.status(500).json({ message: err.message || 'Server error' });
   }
 });
 

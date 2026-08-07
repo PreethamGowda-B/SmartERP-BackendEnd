@@ -54,7 +54,7 @@ function authenticateToken(req, res, next) {
 
   // Fallback to cookies
   if (!token && req.cookies) {
-    token = req.cookies.superadmin_access_token || req.cookies.user_access_token || req.cookies.access_token;
+    token = req.cookies.superadmin_access_token || req.cookies.user_access_token || req.cookies.access_token || req.cookies.customer_access_token;
   }
 
   if (!token) {

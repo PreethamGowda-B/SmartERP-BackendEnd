@@ -24,6 +24,8 @@ router.use('/jobs/:id/review', authenticateCustomer, require('./reviews'));
 router.use('/profile', authenticateCustomer, require('./profile'));
 router.use('/recurring', authenticateCustomer, require('./recurring'));
 router.use('/notifications', authenticateCustomer, require('./notifications'));
+router.use('/machines', authenticateCustomer, require('./machines'));
+router.use('/documents', authenticateCustomer, require('./documents'));
 
 
 // ── Validate company — public convenience endpoint (also on auth router) ──────

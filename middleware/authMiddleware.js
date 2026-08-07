@@ -54,7 +54,7 @@ function authenticateToken(req, res, next) {
 
   // Fallback to cookies
   if (!token && req.cookies) {
-    token = req.cookies.superadmin_access_token || req.cookies.user_access_token || req.cookies.access_token || req.cookies.customer_access_token;
+    token = req.cookies.superadmin_access_token || req.cookies.user_access_token || req.cookies.access_token;
   }
 
   if (!token) {
@@ -69,6 +69,10 @@ function authenticateToken(req, res, next) {
   jwt.verify(token, process.env.JWT_SECRET, async (err, payload) => {
     if (err) {
       return res.status(401).json({ message: "Invalid or expired token" });
+    }
+
+    if (payload.role === 'customer') {
+      return res.status(403).json({ message: "Access denied: Customer tokens cannot access staff endpoints" });
     }
     
     // Check if company is suspended (Only if not super_admin) — Redis-cached with 60s TTL

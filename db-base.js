@@ -10,8 +10,13 @@ function resolveSsl() {
   return false;
 }
 
+function cleanConnectionString(url) {
+  if (!url) return url;
+  return url.replace(/sslmode=(prefer|require|verify-ca)/gi, 'sslmode=verify-full');
+}
+
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: cleanConnectionString(process.env.DATABASE_URL),
   ssl: resolveSsl(),
   // Default pool max is intentionally low (5) to let Neon free-tier compute scale to zero.
   // Override with DB_POOL_MAX env var on paid plans or self-hosted Postgres.

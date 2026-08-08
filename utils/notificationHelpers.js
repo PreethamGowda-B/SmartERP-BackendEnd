@@ -1,5 +1,5 @@
 const { pool } = require('../db');
-const redisPublisher = require('./redis');
+const { redisClient } = require('./redis');
 const { sendPushNotification } = require('../services/firebaseService');
 
 // Store active SSE connections: { userId: [response1, response2, ...] }
@@ -168,8 +168,8 @@ function broadcastToUser(userId, message) {
     _broadcastInProcess(uid, message);
 
     // 2. Publish to Redis pub/sub for cross-worker cluster delivery
-    if (redisPublisher && redisPublisher.status === 'ready') {
-        redisPublisher.publish(`employee_notifications:${uid}`, JSON.stringify(message))
+    if (redisClient && (redisClient.status === 'ready' || redisClient.status === 'connecting')) {
+        redisClient.publish(`employee_notifications:${uid}`, JSON.stringify(message))
             .catch(e => {
                 console.error(`❌ Redis broadcast error for user ${uid}:`, e.message);
             });

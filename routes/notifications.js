@@ -112,6 +112,7 @@ router.get('/sse', authenticateToken, async (req, res) => {
   const subscriber = getSharedSubscriber();
 
   if (subscriber) {
+    registerSSEConnection(userId, res);
     const channel = `employee_notifications:${userId}`;
     if (!global._sseListeners) global._sseListeners = new Map();
     const sseListeners = global._sseListeners;
@@ -144,6 +145,7 @@ router.get('/sse', authenticateToken, async (req, res) => {
     req.on('close', async () => {
       console.log(`📡 SSE connection closed for user ${userId}`);
       clearInterval(heartbeatInterval);
+      unregisterSSEConnection(userId, res);
 
       listenerSet.delete(res);
       if (listenerSet.size === 0) {

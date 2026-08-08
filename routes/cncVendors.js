@@ -51,18 +51,7 @@ router.post('/po', authenticateToken, async (req, res) => {
     res.status(201).json({ success: true, purchase_order: result.rows[0] });
   } catch (err) {
     console.error('❌ Error creating purchase order:', err.message);
-    res.status(200).json({
-      success: true,
-      purchase_order: {
-        id: `po-${Date.now()}`,
-        po_number: `PO-${Date.now().toString().slice(-6)}`,
-        vendor_name: req.body.vendor_name || 'Fanuc India Spares Ltd',
-        parts_description: req.body.parts_description || 'Spindle Servo Motor 7.5kW',
-        total_cost: req.body.total_cost || 45000,
-        status: 'issued',
-        created_at: new Date().toISOString()
-      }
-    });
+    res.status(500).json({ message: err.message || 'Server error creating purchase order' });
   }
 });
 

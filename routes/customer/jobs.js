@@ -126,7 +126,7 @@ router.post('/', [
 
   const customerId = req.customer.id;
   const companyId = req.customer.companyId;
-  const { title, description, priority, scheduled_at } = req.body;
+  const { title, description, priority, scheduled_at, machine_id, alarm_code, service_type } = req.body;
 
   // Section 10: Redis-based rate limiting — max 10 job creations per minute per customer
   try {
@@ -200,11 +200,11 @@ router.post('/', [
          (title, description, priority, ai_suggested_priority, priority_overridden,
           status, approval_status, approved_at,
           customer_id, company_id, source, visible_to_all, created_by, employee_status,
-          scheduled_at)
+          scheduled_at, machine_id, alarm_code, service_type)
        VALUES ($1, $2, $3, $4, $5,
                'open', $6, $7,
                $8, $9, 'customer', $10, NULL, 'assigned',
-               $11)
+               $11, $12, $13, $14)
        RETURNING *`,
       [
         title,
@@ -216,11 +216,11 @@ router.post('/', [
         approvedAt,
         customerId,
         companyId,
-        // visible_to_all: TRUE only when auto-approved so the job is immediately
-        // visible to employees. When pending_approval, keep it FALSE until the
-        // owner explicitly approves it — this prevents it from appearing in Tasks.
         autoApprove,
         scheduled_at || null,
+        machine_id || null,
+        alarm_code || null,
+        service_type || 'breakdown',
       ]
     );
 

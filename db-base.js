@@ -20,11 +20,11 @@ const pool = new Pool({
   ssl: resolveSsl(),
   // Default pool max is intentionally low (5) to let Neon free-tier compute scale to zero.
   // Override with DB_POOL_MAX env var on paid plans or self-hosted Postgres.
-  max: parseInt(process.env.DB_POOL_MAX || '5'),
+  max: parseInt(process.env.DB_POOL_MAX || '10'),
   // Aggressive idle timeout so Neon compute can sleep between bursts of traffic.
   idleTimeoutMillis: parseInt(process.env.DB_IDLE_TIMEOUT_MS || '10000'),
-  connectionTimeoutMillis: 5000, // Fail fast under overload
-  statement_timeout: 10000,      // 10s query safety limit to prevent deadlocks
+  connectionTimeoutMillis: 15000, // 15s connection queue timeout under load
+  statement_timeout: 15000,      // 15s query safety limit
 });
 
 pool.on('error', (err) => {

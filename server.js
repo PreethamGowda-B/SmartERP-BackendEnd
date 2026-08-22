@@ -150,6 +150,42 @@ const customerAuthLimiter = rateLimit({
 app.use("/api/customer/auth", customerAuthLimiter);
 app.use("/api/v1/customer/auth", customerAuthLimiter);
 
+// ✅ Health check routes (mounted before rate limiters & v1Router for maximum speed & unthrottled uptime monitoring)
+const healthHandler = async (req, res) => {
+  try {
+    const result = await new Promise((resolve, reject) => {
+      storage.run({ bypassRls: true }, async () => {
+        try {
+          const r = await pool.query("SELECT NOW()");
+          resolve(r);
+        } catch (e) {
+          reject(e);
+        }
+      });
+    });
+    res.json({
+      status: "ok",
+      database: "connected",
+      time: result.rows[0].now,
+    });
+  } catch (err) {
+    console.error("❌ Health check failed:", err.message);
+    res.status(500).json({
+      status: "error",
+      database: "disconnected",
+      message: err.message,
+    });
+  }
+};
+
+app.get("/health", healthHandler);
+app.get("/api/health", healthHandler);
+app.get("/api/v1/health", healthHandler);
+
+// ✅ Info & Root routes
+app.get("/api", (req, res) => res.json({ status: "ok" }));
+app.get("/", (req, res) => res.status(200).json({ status: "ok" }));
+
 // General API rate limiter — protects all other routes (300 req/15min per IP)
 const generalApiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -158,8 +194,12 @@ const generalApiLimiter = rateLimit({
   legacyHeaders: false,
   message: { message: "Too many requests, please try again later." },
   skip: (req) => {
-    // Skip for already-limited auth routes
-    return req.path.startsWith('/api/auth/') || req.path.startsWith('/api/v1/auth/');
+    // Skip for already-limited auth & health routes
+    return (
+      req.path.startsWith('/api/auth/') ||
+      req.path.startsWith('/api/v1/auth/') ||
+      req.path.includes('/health')
+    );
   }
 });
 app.use("/api", generalApiLimiter);
@@ -834,41 +874,6 @@ app.use("/api/v1/customer", require("./routes/customer/index")); // v1 alias
 // ✅ Customer Job Approval Workflow (Owner/HR portal)
 app.use("/api/v1/customer-jobs", require("./routes/customerJobApproval"));
 app.use("/api/customer-jobs", require("./routes/customerJobApproval")); // alias
-
-
-
-
-// ✅ Health check routes
-const healthHandler = async (req, res) => {
-  try {
-    const result = await pool.query("SELECT NOW()");
-    res.json({
-      status: "ok",
-      database: "connected",
-      time: result.rows[0].now,
-    });
-  } catch (err) {
-    console.error("❌ Health check failed:", err.message);
-    res.status(500).json({
-      status: "error",
-      database: "disconnected",
-    });
-  }
-};
-
-app.get("/health", healthHandler);
-app.get("/api/health", healthHandler);
-app.get("/api/v1/health", healthHandler);
-
-// ✅ Info route
-app.get("/api", (req, res) => {
-  res.json({ status: "ok" });
-});
-
-// ✅ Root (for Render homepage)
-app.get("/", (req, res) => {
-  res.status(200).json({ status: "ok" });
-});
 
 // ✅ Global Error Handler (MUST BE LAST)
 if (process.env.SENTRY_DSN) {

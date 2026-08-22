@@ -24,9 +24,22 @@ function cleanConnectionString(url) {
   return url.replace(/sslmode=(prefer|require|verify-ca)/gi, 'sslmode=verify-full');
 }
 
+const ipv4Lookup = (hostname, options, callback) => {
+  if (typeof options === 'function') {
+    callback = options;
+    options = { family: 4 };
+  } else if (typeof options === 'number') {
+    options = { family: 4 };
+  } else {
+    options = Object.assign({}, options, { family: 4 });
+  }
+  return dns.lookup(hostname, options, callback);
+};
+
 const pool = new Pool({
   connectionString: cleanConnectionString(process.env.DATABASE_URL),
   ssl: resolveSsl(),
+  lookup: ipv4Lookup,
   // Default pool max is 10 connections
   max: parseInt(process.env.DB_POOL_MAX || '10'),
   idleTimeoutMillis: parseInt(process.env.DB_IDLE_TIMEOUT_MS || '10000'),

@@ -129,6 +129,33 @@ passport.use(
             await pool.query('UPDATE users SET google_id = $1 WHERE id = $2', [googleId, user.id]);
             user.google_id = googleId;
           }
+
+          // Safeguard: If existing user has role='owner' but no company_id, auto-create company
+          if (user.role === 'owner' && !user.company_id) {
+            const { generateCompanyId } = require('../utils/companyIdGenerator');
+            companyCode = await generateCompanyId();
+            const companyName = `${name || user.name || 'Owner'}'s Company`;
+
+            const companyResult = await pool.query(
+              `INSERT INTO companies (company_id, company_name, plan_id, subscription_status,
+                                      is_on_trial, trial_started_at, trial_ends_at,
+                                      subscription_expires_at, is_first_login, created_at)
+               VALUES ($1, $2, 3, 'trial', TRUE, NOW(), NOW() + INTERVAL '30 days',
+                       NOW() + INTERVAL '30 days', TRUE, NOW())
+               RETURNING id, company_id`,
+              [companyCode, companyName]
+            );
+            companyId = companyResult.rows[0].id;
+
+            await pool.query(
+              'UPDATE users SET company_id = $1, company_code = $2 WHERE id = $3',
+              [companyId, companyCode, user.id]
+            );
+            await pool.query('UPDATE companies SET owner_id = $1 WHERE id = $2', [user.id, companyId]);
+
+            user.company_id = companyId;
+            user.company_code = companyCode;
+          }
         } else {
           // New staff user
           if (role === 'owner') {

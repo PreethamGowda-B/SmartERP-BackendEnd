@@ -16,6 +16,7 @@
   "dependencies": {
     "@sentry/node": "^10.43.0",
     "@sentry/profiling-node": "^10.43.0",
+    "archiver": "^8.0.0",
     "bcrypt": "^5.1.0",
     "bullmq": "^5.41.3",
     "cloudinary": "^1.41.3",

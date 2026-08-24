@@ -860,6 +860,7 @@ v1Router.use("/superadmin/health-metrics", require("./routes/superadminHealth"))
 v1Router.use("/vendors", require("./routes/cncVendors"));
 v1Router.use("/route-optimization", require("./routes/routeOptimization"));
 v1Router.use("/saas", require("./routes/saasManagement"));
+v1Router.use("/export", require("./routes/export"));
 
 
 // ✅ Meta WhatsApp Business Cloud API Webhook routes

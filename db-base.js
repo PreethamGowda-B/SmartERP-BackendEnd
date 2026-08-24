@@ -21,6 +21,14 @@ function resolveSsl() {
 
 function cleanConnectionString(url) {
   if (!url) return url;
+  // Automatically rewrite IPv6-only direct Supabase host to verified IPv4 Pooler host for Render compatibility
+  const supabaseDirectMatch = url.match(/postgresql:\/\/postgres(?:\.([a-z0-9]+))?:([^@]+)@db\.([a-z0-9]+)\.supabase\.co(?::\d+)?\/(.+)/i);
+  if (supabaseDirectMatch) {
+    const projectRef = supabaseDirectMatch[3] || supabaseDirectMatch[1];
+    const password = supabaseDirectMatch[2];
+    const dbPath = supabaseDirectMatch[4];
+    url = `postgresql://postgres.${projectRef}:${password}@aws-0-ap-northeast-1.pooler.supabase.com:6543/${dbPath}`;
+  }
   return url.replace(/sslmode=(prefer|require|verify-ca)/gi, 'sslmode=verify-full');
 }
 

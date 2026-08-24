@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS payroll_validation_runs (
   created_by UUID NOT NULL REFERENCES users(id),
   month INT NOT NULL,
   year INT NOT NULL,
+  status VARCHAR(50) DEFAULT 'processing',
   total_employees_checked INT DEFAULT 0,
   total_anomalies_found INT DEFAULT 0,
   risk_level payroll_risk_level DEFAULT 'low',

@@ -880,9 +880,10 @@ const handleJobAccept = async (req, res) => {
       await pool.query('ALTER TABLE invoices ADD COLUMN IF NOT EXISTS pdf_url TEXT;').catch(() => { });
 
       const result = await pool.query(
-        `SELECT i.*, j.title as job_title, j.customer_name 
+        `SELECT i.*, j.title as job_title, COALESCE(i.customer_name, c.name, 'Customer') as customer_name 
        FROM invoices i
        LEFT JOIN jobs j ON i.job_id = j.id
+       LEFT JOIN customers c ON j.customer_id = c.id
        WHERE i.company_id = $1
        ORDER BY i.generated_at DESC`,
         [String(userCompanyId)]

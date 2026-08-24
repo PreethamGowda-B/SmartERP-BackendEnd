@@ -1,6 +1,5 @@
 const jwt = require("jsonwebtoken");
-
-const redisClient = require("../utils/redis");
+const { redisClient } = require("../utils/redis");
 const { setTenantContext } = require("./tenantContext");
 
 const SUSPENSION_CACHE_TTL = 60; // seconds

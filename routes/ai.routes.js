@@ -14,7 +14,7 @@ const AIDataService = require("../services/aiDataService");
 
 let redisClient = null;
 try {
-  redisClient = require("../utils/redis");
+  ({ redisClient } = require("../utils/redis"));
 } catch {
   // Redis optional
 }

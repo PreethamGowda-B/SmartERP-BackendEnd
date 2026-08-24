@@ -12,7 +12,7 @@ const { body, validationResult } = require("express-validator");
 require("dotenv").config();
 const crypto = require("crypto");
 // ✅ Required at top-level — used in Google OAuth callback and all OTP/exchange routes
-const redisClient = require("../utils/redis");
+const { redisClient } = require("../utils/redis");
 const { storage } = require("../middleware/als");
 
 // ✅ RLS bypass — auth routes query users/companies by email BEFORE any company

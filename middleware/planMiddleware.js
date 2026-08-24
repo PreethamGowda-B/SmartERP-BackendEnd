@@ -4,7 +4,7 @@
  */
 
 const { pool } = require('../db');
-const redisClient = require('../utils/redis');
+const { redisClient } = require('../utils/redis');
 
 const PLAN_CACHE_TTL = 300; // 5 minutes in seconds
 

@@ -16,33 +16,16 @@ CREATE TABLE IF NOT EXISTS ai_audit_logs (
 );
 
 -- 2. Add AI creation metadata columns to core tables safely
-DO $$ 
-BEGIN
-    -- Jobs
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='jobs' AND column_name='is_ai_created') THEN
-        ALTER TABLE jobs ADD COLUMN is_ai_created BOOLEAN DEFAULT FALSE;
-        ALTER TABLE jobs ADD COLUMN created_by TEXT;
-        ALTER TABLE jobs ADD COLUMN created_through TEXT;
-    END IF;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS is_ai_created BOOLEAN DEFAULT FALSE;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS created_through TEXT;
 
-    -- Invoices
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='invoices' AND column_name='is_ai_created') THEN
-        ALTER TABLE invoices ADD COLUMN is_ai_created BOOLEAN DEFAULT FALSE;
-        ALTER TABLE invoices ADD COLUMN created_by TEXT;
-        ALTER TABLE invoices ADD COLUMN created_through TEXT;
-    END IF;
+ALTER TABLE invoices ADD COLUMN IF NOT EXISTS is_ai_created BOOLEAN DEFAULT FALSE;
+ALTER TABLE invoices ADD COLUMN IF NOT EXISTS created_by TEXT;
+ALTER TABLE invoices ADD COLUMN IF NOT EXISTS created_through TEXT;
 
-    -- Leave Requests
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='leave_requests' AND column_name='is_ai_created') THEN
-        ALTER TABLE leave_requests ADD COLUMN is_ai_created BOOLEAN DEFAULT FALSE;
-        ALTER TABLE leave_requests ADD COLUMN created_by TEXT;
-        ALTER TABLE leave_requests ADD COLUMN created_through TEXT;
-    END IF;
+ALTER TABLE leave_requests ADD COLUMN IF NOT EXISTS is_ai_created BOOLEAN DEFAULT FALSE;
+ALTER TABLE leave_requests ADD COLUMN IF NOT EXISTS created_by TEXT;
+ALTER TABLE leave_requests ADD COLUMN IF NOT EXISTS created_through TEXT;
 
-    -- Material Requests
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='material_requests' AND column_name='is_ai_created') THEN
-        ALTER TABLE material_requests ADD COLUMN is_ai_created BOOLEAN DEFAULT FALSE;
-        ALTER TABLE material_requests ADD COLUMN created_by TEXT;
-        ALTER TABLE material_requests ADD COLUMN created_through TEXT;
-    END IF;
-END $$;
+ALTER TABLE material_requests ADD COLUMN IF NOT EXISTS is_ai_created BOOLEAN DEFAULT FALSE;
+ALTER TABLE material_requests ADD COLUMN IF NOT EXISTS created_through TEXT;

@@ -53,7 +53,7 @@ CREATE INDEX IF NOT EXISTS idx_ai_audit_status ON ai_action_audit_trail(approval
 CREATE TABLE IF NOT EXISTS predictive_alerts (
   id SERIAL PRIMARY KEY,
   company_id TEXT NOT NULL,
-  machine_id INTEGER REFERENCES customer_machines(id) ON DELETE CASCADE,
+  machine_id UUID REFERENCES customer_machines(id) ON DELETE CASCADE,
   alert_type VARCHAR(100) NOT NULL, -- 'health_decline', 'alarm_repetition', 'amc_expiring', 'stock_low'
   severity VARCHAR(50) DEFAULT 'warning', -- 'info', 'warning', 'critical'
   title VARCHAR(255) NOT NULL,

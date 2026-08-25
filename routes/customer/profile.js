@@ -96,4 +96,71 @@ router.put('/', [
   }
 });
 
+// ─── POST /deletion/request ──────────────────────────────────────────────────
+// Step 1: Customer Deletion Challenge Request
+const AccountDeletionService = require('../../services/accountDeletionService');
+
+router.post('/deletion/request', async (req, res) => {
+  try {
+    const customerId = req.customer?.id || req.customer?.userId;
+    const companyId = req.customer?.companyId || req.customer?.company_id;
+    if (!customerId) {
+      return res.status(401).json({ success: false, message: 'Unauthorized: Missing customer session' });
+    }
+    const { password, is_oauth } = req.body;
+
+    const result = await AccountDeletionService.requestCustomerDeletion({
+      customerId,
+      companyId,
+      password,
+      isOAuth: is_oauth || false,
+      ipAddress: req.ip || req.headers['x-forwarded-for'],
+      userAgent: req.headers['user-agent']
+    });
+
+    res.json(result);
+  } catch (err) {
+    if (err.status) {
+      return res.status(err.status).json({ success: false, message: err.message });
+    }
+    console.error('❌ Error requesting customer deletion:', err.message);
+    res.status(500).json({ success: false, message: 'Server error requesting account deletion' });
+  }
+});
+
+// ─── POST /deletion/confirm ──────────────────────────────────────────────────
+// Step 2: Confirm Customer Deletion
+router.post('/deletion/confirm', async (req, res) => {
+  try {
+    const customerId = req.customer?.id || req.customer?.userId;
+    const companyId = req.customer?.companyId || req.customer?.company_id;
+    if (!customerId) {
+      return res.status(401).json({ success: false, message: 'Unauthorized: Missing customer session' });
+    }
+    const { challenge_token, confirmation_phrase, reason } = req.body;
+
+    const result = await AccountDeletionService.confirmCustomerDeletion({
+      customerId,
+      companyId,
+      challengeToken: challenge_token,
+      confirmationPhrase: confirmation_phrase,
+      ipAddress: req.ip || req.headers['x-forwarded-for'],
+      userAgent: req.headers['user-agent'],
+      reason
+    });
+
+    // Clear customer cookies
+    res.clearCookie('customer_access_token', { path: '/' });
+    res.clearCookie('customer_refresh_token', { path: '/' });
+
+    res.json(result);
+  } catch (err) {
+    if (err.status) {
+      return res.status(err.status).json({ success: false, message: err.message });
+    }
+    console.error('❌ Error executing customer deletion:', err.message);
+    res.status(500).json({ success: false, message: 'Server error executing account deletion' });
+  }
+});
+
 module.exports = router;

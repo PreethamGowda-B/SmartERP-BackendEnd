@@ -6,7 +6,10 @@ const { authenticateToken } = require('../middleware/authMiddleware');
 // ─── POST /api/route-optimization (Calculate Multi-Stop Dispatch Route) ────
 router.post('/', authenticateToken, async (req, res) => {
   try {
-    const companyId = req.user.companyId || req.user.company_id || 1;
+    const companyId = req.user.companyId || req.user.company_id;
+    if (!companyId) {
+      return res.status(401).json({ message: 'Unauthorized: Missing company context.' });
+    }
     const { engineer_name = 'Field Engineer', stops = [] } = req.body;
 
     const stopCount = Math.max(1, stops.length || 3);

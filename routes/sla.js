@@ -6,22 +6,37 @@ const { authenticateToken } = require('../middleware/authMiddleware');
 // ─── GET /api/sla (Fetch Live SLA Compliance Metrics & Dynamic Timers) ─────
 router.get('/', authenticateToken, async (req, res) => {
   try {
-    const companyId = req.user.companyId || req.user.company_id || 1;
+    const companyId = req.user.companyId || req.user.company_id;
+    if (!companyId && req.user.role !== 'super_admin') {
+      return res.status(401).json({ message: 'Unauthorized: Missing company context.' });
+    }
 
-    const result = await pool.query(
-      `SELECT id, title, priority, status, service_type, created_at, assigned_at, accepted_at,
-              travel_started_at, site_reached_at, repair_started_at, completed_at, closed_at,
-              customer_name, machine_id,
-              COALESCE(sla_target_hours, CASE 
-                WHEN priority = 'urgent' OR service_type = 'breakdown' THEN 2.0
-                WHEN priority = 'high' THEN 4.0
-                ELSE 8.0
-              END) as target_hours
-       FROM jobs
-       WHERE (company_id::text = $1::text OR company_id = $2) AND status NOT IN ('cancelled')
-       ORDER BY created_at DESC LIMIT 50`,
-      [companyId.toString(), parseInt(companyId, 10) || 1]
-    ).catch(() => ({ rows: [] }));
+    const query = req.user.role === 'super_admin'
+      ? `SELECT id, title, priority, status, service_type, created_at, assigned_at, accepted_at,
+                travel_started_at, site_reached_at, repair_started_at, completed_at, closed_at,
+                customer_name, machine_id,
+                COALESCE(sla_target_hours, CASE 
+                  WHEN priority = 'urgent' OR service_type = 'breakdown' THEN 2.0
+                  WHEN priority = 'high' THEN 4.0
+                  ELSE 8.0
+                END) as target_hours
+         FROM jobs
+         WHERE status NOT IN ('cancelled')
+         ORDER BY created_at DESC LIMIT 50`
+      : `SELECT id, title, priority, status, service_type, created_at, assigned_at, accepted_at,
+                travel_started_at, site_reached_at, repair_started_at, completed_at, closed_at,
+                customer_name, machine_id,
+                COALESCE(sla_target_hours, CASE 
+                  WHEN priority = 'urgent' OR service_type = 'breakdown' THEN 2.0
+                  WHEN priority = 'high' THEN 4.0
+                  ELSE 8.0
+                END) as target_hours
+         FROM jobs
+         WHERE company_id::text = $1::text AND status NOT IN ('cancelled')
+         ORDER BY created_at DESC LIMIT 50`;
+
+    const params = req.user.role === 'super_admin' ? [] : [String(companyId)];
+    const result = await pool.query(query, params).catch(() => ({ rows: [] }));
 
     const now = new Date();
 

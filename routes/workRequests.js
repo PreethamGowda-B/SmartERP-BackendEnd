@@ -76,7 +76,10 @@ ensureWorkRequestsTable().catch(() => {});
 router.post('/', authenticateToken, requireClockIn, async (req, res) => {
   try {
     await ensureWorkRequestsTable();
-    const companyId = req.user.companyId || req.user.company_id || 1;
+    const companyId = req.user.companyId || req.user.company_id;
+    if (!companyId) {
+      return res.status(401).json({ message: 'Unauthorized: Missing company context.' });
+    }
     const {
       request_type,
       category = 'jobs',
@@ -146,7 +149,10 @@ router.post('/', authenticateToken, requireClockIn, async (req, res) => {
 router.get('/', authenticateToken, async (req, res) => {
   try {
     await ensureWorkRequestsTable();
-    const companyId = req.user.companyId || req.user.company_id || 1;
+    const companyId = req.user.companyId || req.user.company_id;
+    if (!companyId && req.user.role !== 'super_admin') {
+      return res.status(401).json({ message: 'Unauthorized: Missing company context.' });
+    }
     const { category, status, urgency, search, job_id, submitted_by_id } = req.query;
 
     let query = `
@@ -156,9 +162,14 @@ router.get('/', authenticateToken, async (req, res) => {
       FROM work_requests r
       LEFT JOIN jobs j ON r.job_id::text = j.id::text
       LEFT JOIN invoices inv ON r.invoice_id::text = inv.id::text
-      WHERE (r.company_id::text = $1::text OR r.company_id IS NULL OR $1::text = '1')
+      WHERE 1=1
     `;
-    const params = [String(companyId)];
+    const params = [];
+
+    if (req.user.role !== 'super_admin') {
+      params.push(String(companyId));
+      query += ` AND r.company_id::text = $${params.length}::text`;
+    }
 
     if (job_id) {
       params.push(String(job_id));
@@ -199,7 +210,19 @@ router.get('/', authenticateToken, async (req, res) => {
 const handleWorkRequestAction = async (req, res) => {
   try {
     await ensureWorkRequestsTable();
-    const companyId = req.user.companyId || req.user.company_id || 1;
+    const userRole = req.user.role;
+    const isSuperAdmin = userRole === 'super_admin';
+    const isAuthorizedRole = ['owner', 'admin', 'hr', 'super_admin'].includes(userRole);
+
+    if (!isAuthorizedRole) {
+      return res.status(403).json({ message: 'Access denied: Only owners, admins, or HR can action work requests.' });
+    }
+
+    const companyId = req.user.companyId || req.user.company_id;
+    if (!companyId && !isSuperAdmin) {
+      return res.status(401).json({ message: 'Unauthorized: Missing company context.' });
+    }
+
     const { id } = req.params;
     const { action, owner_response, response_notes, payload = {} } = req.body;
     const notes = owner_response || response_notes || '';
@@ -213,9 +236,8 @@ const handleWorkRequestAction = async (req, res) => {
     const userIdStr = String(req.user.id || req.user.userId || "");
     const userNameStr = String(req.user.name || req.user.email || "Owner");
 
-    try {
-      result = await pool.query(
-        `UPDATE work_requests
+    const updateQuery = isSuperAdmin
+      ? `UPDATE work_requests
          SET status = $1,
              owner_response = $2,
              response_notes = $3,
@@ -227,24 +249,46 @@ const handleWorkRequestAction = async (req, res) => {
              resolved_at = NOW(),
              updated_at = NOW()
          WHERE id::text = $8::text
-         RETURNING *`,
-        [newStatus, notes, notes, userIdStr, userNameStr, userIdStr, userNameStr, String(id)]
-      );
+         RETURNING *`
+      : `UPDATE work_requests
+         SET status = $1,
+             owner_response = $2,
+             response_notes = $3,
+             actioned_by_id = $4,
+             actioned_by_name = $5,
+             actioned_at = NOW(),
+             resolved_by_id = $6,
+             resolved_by_name = $7,
+             resolved_at = NOW(),
+             updated_at = NOW()
+         WHERE id::text = $8::text AND company_id::text = $9::text
+         RETURNING *`;
+
+    const updateParams = isSuperAdmin
+      ? [newStatus, notes, notes, userIdStr, userNameStr, userIdStr, userNameStr, String(id)]
+      : [newStatus, notes, notes, userIdStr, userNameStr, userIdStr, userNameStr, String(id), String(companyId)];
+
+    try {
+      result = await pool.query(updateQuery, updateParams);
     } catch (updateErr) {
       console.warn("⚠️ Full update failed, trying safe fallback update:", updateErr.message);
-      result = await pool.query(
-        `UPDATE work_requests
-         SET status = $1,
-             response_notes = $2,
-             updated_at = NOW()
-         WHERE id::text = $3::text
-         RETURNING *`,
-        [newStatus, notes, String(id)]
-      );
+      const fallbackQuery = isSuperAdmin
+        ? `UPDATE work_requests
+           SET status = $1, response_notes = $2, updated_at = NOW()
+           WHERE id::text = $3::text
+           RETURNING *`
+        : `UPDATE work_requests
+           SET status = $1, response_notes = $2, updated_at = NOW()
+           WHERE id::text = $3::text AND company_id::text = $4::text
+           RETURNING *`;
+      const fallbackParams = isSuperAdmin
+        ? [newStatus, notes, String(id)]
+        : [newStatus, notes, String(id), String(companyId)];
+      result = await pool.query(fallbackQuery, fallbackParams);
     }
 
     if (!result || result.rows.length === 0) {
-      return res.status(404).json({ message: 'Request not found' });
+      return res.status(404).json({ message: 'Request not found or does not belong to your company' });
     }
 
     const updatedReq = result.rows[0];

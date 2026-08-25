@@ -26,8 +26,10 @@ async function main() {
     await pool.query('ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO smarterp_app');
     await pool.query('ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO smarterp_app');
 
-    console.log('Granting smarterp_app role to neondb_owner...');
-    await pool.query('GRANT smarterp_app TO neondb_owner');
+    console.log('Granting smarterp_app role to current user (postgres / neondb_owner)...');
+    const userRes = await pool.query('SELECT CURRENT_USER');
+    const currentUser = userRes.rows[0].current_user;
+    await pool.query(`GRANT smarterp_app TO "${currentUser}"`);
 
     console.log('✅ App role setup complete!');
   } catch (err) {

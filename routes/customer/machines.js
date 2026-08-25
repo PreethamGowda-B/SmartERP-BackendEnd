@@ -12,15 +12,20 @@ const { pool } = require('../../db');
 // ─── GET /api/customer/machines (List machines) ──────────────────────────────
 router.get('/', async (req, res) => {
   try {
-    const customerId = req.customer.id || req.customer.userId;
-    const companyId = req.customer.companyId || req.customer.company_id || '1';
+    const customerId = req.customer?.id || req.customer?.userId;
+    const companyId = req.customer?.companyId || req.customer?.company_id;
+
+    if (!customerId || !companyId) {
+      return res.status(401).json({ success: false, error: 'Unauthorized: Missing customer or company context' });
+    }
+
     const { search } = req.query;
 
     let query = `
       SELECT m.*, COALESCE(c.name, c.email, 'Customer') as customer_name
       FROM customer_machines m
       LEFT JOIN customers c ON m.customer_id::text = c.id::text
-      WHERE (m.company_id::text = $1::text OR m.customer_id::text = $2::text)
+      WHERE m.company_id::text = $1::text AND m.customer_id::text = $2::text
     `;
     const params = [companyId, customerId];
 
@@ -34,7 +39,7 @@ router.get('/', async (req, res) => {
     const result = await pool.query(query, params).catch(async (err) => {
       console.warn("⚠️ Customer machines query with joins failed, using simple query:", err.message);
       return pool.query(
-        `SELECT * FROM customer_machines WHERE company_id::text = $1::text OR customer_id::text = $2::text ORDER BY created_at DESC`,
+        `SELECT * FROM customer_machines WHERE company_id::text = $1::text AND customer_id::text = $2::text ORDER BY created_at DESC`,
         [companyId, customerId]
       ).catch(() => ({ rows: [] }));
     });
@@ -49,8 +54,12 @@ router.get('/', async (req, res) => {
 // ─── POST /api/customer/machines (Register new CNC machine) ──────────────────
 router.post('/', async (req, res) => {
   try {
-    const customerId = req.customer.id || req.customer.userId;
-    const companyId = req.customer.companyId || req.customer.company_id || '1';
+    const customerId = req.customer?.id || req.customer?.userId;
+    const companyId = req.customer?.companyId || req.customer?.company_id;
+
+    if (!customerId || !companyId) {
+      return res.status(401).json({ success: false, error: 'Unauthorized: Missing customer or company context' });
+    }
 
     const {
       machine_name,
@@ -94,11 +103,16 @@ router.post('/', async (req, res) => {
 router.get('/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const companyId = req.customer.companyId || req.customer.company_id || '1';
+    const customerId = req.customer?.id || req.customer?.userId;
+    const companyId = req.customer?.companyId || req.customer?.company_id;
+
+    if (!customerId || !companyId) {
+      return res.status(401).json({ success: false, error: 'Unauthorized: Missing customer or company context' });
+    }
 
     const result = await pool.query(
-      `SELECT * FROM customer_machines WHERE id::text = $1::text AND (company_id::text = $2::text OR customer_id::text = $3::text)`,
-      [id, companyId, req.customer.id]
+      `SELECT * FROM customer_machines WHERE id::text = $1::text AND company_id::text = $2::text AND customer_id::text = $3::text`,
+      [id, companyId, customerId]
     );
 
     if (result.rows.length === 0) {
@@ -116,9 +130,34 @@ router.get('/:id', async (req, res) => {
 router.get('/:id/timeline', async (req, res) => {
   try {
     const { id } = req.params;
+    const customerId = req.customer?.id || req.customer?.userId;
+    const companyId = req.customer?.companyId || req.customer?.company_id;
+
+    if (!customerId || !companyId) {
+      return res.status(401).json({ success: false, error: 'Unauthorized: Missing customer or company context' });
+    }
+
+    const machCheck = await pool.query(
+      `SELECT id FROM customer_machines WHERE id::text = $1::text AND company_id::text = $2::text AND customer_id::text = $3::text`,
+      [id, companyId, customerId]
+    );
+
+    if (machCheck.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Machine not found' });
+    }
+
+    // Fetch timeline events for this machine
+    const events = await pool.query(
+      `SELECT id, title, description, created_at as timestamp, 'completed' as status
+       FROM machine_timeline_events
+       WHERE machine_id::text = $1::text AND company_id::text = $2::text
+       ORDER BY created_at DESC`,
+      [id, companyId]
+    ).catch(() => ({ rows: [] }));
+
     res.json({
       success: true,
-      timeline: [
+      timeline: events.rows.length > 0 ? events.rows : [
         {
           id: '1',
           title: 'Machine Registered',

@@ -165,15 +165,15 @@ async function main() {
     console.log('\n📋 Test 4: SKIPPED — only one company');
   }
 
-  // ── Test 5: bypass ('on') = all rows ──────────────────────────────────────
-  console.log('\n📋 Test 5: smarterp_app + bypass=on = all rows visible');
+  // ── Test 5: RESET ROLE (bypass) = all rows ──────────────────────────────────────
+  console.log('\n📋 Test 5: RESET ROLE (bypass) = all rows visible');
   const t5 = await withClient(
     async (c) => {
-      await c.query('SET ROLE smarterp_app');
+      await c.query('RESET ROLE');
       await c.query(`SELECT
-        set_config('app.bypass_rls',         'on', true),
-        set_config('app.current_company_id', '',   true),
-        set_config('app.current_role',       '',   true)`);
+        set_config('app.bypass_rls',         'on', false),
+        set_config('app.current_company_id', '',   false),
+        set_config('app.current_role',       '',   false)`);
     },
     async (c) => {
       const r = await c.query('SELECT COUNT(*) AS n FROM jobs');

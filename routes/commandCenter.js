@@ -6,59 +6,86 @@ const { authenticateToken } = require('../middleware/authMiddleware');
 // ─── GET /api/command-center (Executive CNC Operations Hub Payload) ───────
 router.get('/', authenticateToken, async (req, res) => {
   try {
-    const companyId = req.user.companyId || req.user.company_id || 1;
+    const userRole = req.user.role;
+    if (!['owner', 'admin', 'hr', 'super_admin'].includes(userRole)) {
+      return res.status(403).json({ message: 'Access denied: Only owners, admins, or HR can access the command center.' });
+    }
+
+    const companyId = req.user.companyId || req.user.company_id;
+    if (!companyId && userRole !== 'super_admin') {
+      return res.status(401).json({ message: 'Unauthorized: Missing company context.' });
+    }
+
+    const isSuperAdmin = userRole === 'super_admin';
+    const params = isSuperAdmin ? [] : [String(companyId)];
 
     // 1. Active Jobs Count & Breakdown Counts
-    const jobsRes = await pool.query(
-      `SELECT status, priority, service_type, created_at, scheduled_at, assigned_employee_id, count(*) as count
-       FROM jobs
-       WHERE (company_id::text = $1::text OR company_id = $2) AND status NOT IN ('completed', 'cancelled')
-       GROUP BY status, priority, service_type, created_at, scheduled_at, assigned_employee_id`,
-      [companyId.toString(), parseInt(companyId, 10) || 1]
-    ).catch(() => ({ rows: [] }));
+    const jobsQuery = isSuperAdmin
+      ? `SELECT status, priority, service_type, created_at, scheduled_at, assigned_employee_id, count(*) as count
+         FROM jobs
+         WHERE status NOT IN ('completed', 'cancelled')
+         GROUP BY status, priority, service_type, created_at, scheduled_at, assigned_employee_id`
+      : `SELECT status, priority, service_type, created_at, scheduled_at, assigned_employee_id, count(*) as count
+         FROM jobs
+         WHERE company_id::text = $1::text AND status NOT IN ('completed', 'cancelled')
+         GROUP BY status, priority, service_type, created_at, scheduled_at, assigned_employee_id`;
+
+    const jobsRes = await pool.query(jobsQuery, params).catch(() => ({ rows: [] }));
 
     // 2. Technicians Online (Clocked in today without clock_out)
-    const techOnlineRes = await pool.query(
-      `SELECT count(DISTINCT user_id) as count
-       FROM attendance
-       WHERE (company_id::text = $1::text OR company_id = $2)
-         AND date = CURRENT_DATE
-         AND clock_out_time IS NULL`,
-      [companyId.toString(), parseInt(companyId, 10) || 1]
-    ).catch(() => ({ rows: [{ count: 0 }] }));
+    const techQuery = isSuperAdmin
+      ? `SELECT count(DISTINCT user_id) as count
+         FROM attendance
+         WHERE date = CURRENT_DATE
+           AND clock_out_time IS NULL`
+      : `SELECT count(DISTINCT user_id) as count
+         FROM attendance
+         WHERE company_id::text = $1::text
+           AND date = CURRENT_DATE
+           AND clock_out_time IS NULL`;
+
+    const techOnlineRes = await pool.query(techQuery, params).catch(() => ({ rows: [{ count: 0 }] }));
 
     // 3. Machines Health & Breakdown Summary
-    const machinesRes = await pool.query(
-      `SELECT id, machine_name, health_score, status FROM customer_machines WHERE company_id::text = $1::text OR company_id = $2`,
-      [companyId.toString(), parseInt(companyId, 10) || 1]
-    ).catch(() => ({ rows: [] }));
+    const machQuery = isSuperAdmin
+      ? `SELECT id, machine_name, health_score, status FROM customer_machines`
+      : `SELECT id, machine_name, health_score, status FROM customer_machines WHERE company_id::text = $1::text`;
+
+    const machinesRes = await pool.query(machQuery, params).catch(() => ({ rows: [] }));
 
     // 4. SLA Warning Flags & Breaches Count
-    const slaRes = await pool.query(
-      `SELECT count(*) as count FROM jobs WHERE (company_id::text = $1::text OR company_id = $2) AND sla_status = 'breached'`,
-      [companyId.toString(), parseInt(companyId, 10) || 1]
-    ).catch(() => ({ rows: [{ count: 0 }] }));
+    const slaQuery = isSuperAdmin
+      ? `SELECT count(*) as count FROM jobs WHERE sla_status = 'breached'`
+      : `SELECT count(*) as count FROM jobs WHERE company_id::text = $1::text AND sla_status = 'breached'`;
+
+    const slaRes = await pool.query(slaQuery, params).catch(() => ({ rows: [{ count: 0 }] }));
 
     // 5. Active Remote Support Sessions
-    const remoteRes = await pool.query(
-      `SELECT count(*) as count FROM remote_support_sessions WHERE (company_id::text = $1::text OR company_id = $2) AND status = 'in_progress'`,
-      [companyId.toString(), parseInt(companyId, 10) || 1]
-    ).catch(() => ({ rows: [{ count: 0 }] }));
+    const remoteQuery = isSuperAdmin
+      ? `SELECT count(*) as count FROM remote_support_sessions WHERE status = 'in_progress'`
+      : `SELECT count(*) as count FROM remote_support_sessions WHERE company_id::text = $1::text AND status = 'in_progress'`;
+
+    const remoteRes = await pool.query(remoteQuery, params).catch(() => ({ rows: [{ count: 0 }] }));
 
     // 6. Active Warranty Claims
-    const warrantyRes = await pool.query(
-      `SELECT count(*) as count FROM warranty_claims WHERE (company_id::text = $1::text OR company_id = $2) AND status IN ('submitted', 'under_review')`,
-      [companyId.toString(), parseInt(companyId, 10) || 1]
-    ).catch(() => ({ rows: [{ count: 0 }] }));
+    const warQuery = isSuperAdmin
+      ? `SELECT count(*) as count FROM warranty_claims WHERE status IN ('submitted', 'under_review')`
+      : `SELECT count(*) as count FROM warranty_claims WHERE company_id::text = $1::text AND status IN ('submitted', 'under_review')`;
+
+    const warrantyRes = await pool.query(warQuery, params).catch(() => ({ rows: [{ count: 0 }] }));
 
     // 7. Top Alarm Codes Frequency
-    const alarmsRes = await pool.query(
-      `SELECT alarm_code, count(*) as frequency
-       FROM jobs
-       WHERE (company_id::text = $1::text OR company_id = $2) AND alarm_code IS NOT NULL AND alarm_code != ''
-       GROUP BY alarm_code ORDER BY frequency DESC LIMIT 5`,
-      [companyId.toString(), parseInt(companyId, 10) || 1]
-    ).catch(() => ({ rows: [] }));
+    const alarmQuery = isSuperAdmin
+      ? `SELECT alarm_code, count(*) as frequency
+         FROM jobs
+         WHERE alarm_code IS NOT NULL AND alarm_code != ''
+         GROUP BY alarm_code ORDER BY frequency DESC LIMIT 5`
+      : `SELECT alarm_code, count(*) as frequency
+         FROM jobs
+         WHERE company_id::text = $1::text AND alarm_code IS NOT NULL AND alarm_code != ''
+         GROUP BY alarm_code ORDER BY frequency DESC LIMIT 5`;
+
+    const alarmsRes = await pool.query(alarmQuery, params).catch(() => ({ rows: [] }));
 
     // 8. Recent Service Tickets / Jobs (Latest 10)
     const recentJobsRes = await pool.query(

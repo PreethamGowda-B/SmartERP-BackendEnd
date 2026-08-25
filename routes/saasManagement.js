@@ -6,7 +6,10 @@ const { authenticateToken } = require('../middleware/authMiddleware');
 // ─── POST /api/saas/onboarding (Self-Service Company Initialization Wizard) ──
 router.post('/onboarding', authenticateToken, async (req, res) => {
   try {
-    const companyId = req.user.companyId || req.user.company_id || 1;
+    const companyId = req.user.companyId || req.user.company_id;
+    if (!companyId) {
+      return res.status(401).json({ message: 'Unauthorized: Missing company context.' });
+    }
     const { company_name, industry_type = 'CNC Service', estimated_machines = 10, plan_tier = 'pro' } = req.body;
 
     await pool.query(

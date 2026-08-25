@@ -214,6 +214,7 @@ const NUMBERED_MIGRATIONS = [
     '021_cnc_phase2.sql',
     '022_cnc_phase3.sql',
     '023_cnc_master_release.sql',
+    '024_secure_account_deletion.sql',
 ];
 
 async function runNumberedMigrations() {

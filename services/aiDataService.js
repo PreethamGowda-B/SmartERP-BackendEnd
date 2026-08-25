@@ -257,7 +257,7 @@ class AIDataService {
         `INSERT INTO ai_audit_logs 
          (user_id, user_name, role, company_id, prompt, action_name, affected_record_id, status, details, created_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())`,
-        [String(userId || ""), userName || "User", role || "employee", companyId || 1, prompt, actionName, String(affectedRecordId || ""), status, JSON.stringify(details)]
+        [String(userId || ""), userName || "User", role || "employee", companyId || null, prompt, actionName, String(affectedRecordId || ""), status, JSON.stringify(details)]
       );
     } catch (err) {
       console.warn("⚠️ AI Audit Logging failed:", err.message);

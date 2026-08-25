@@ -6,15 +6,18 @@ const { authenticateToken } = require('../middleware/authMiddleware');
 // ─── POST /api/ai/auto-schedule (Engineer Match Ranking Engine) ───────────
 router.post('/', authenticateToken, async (req, res) => {
   try {
-    const companyId = req.user.companyId || req.user.company_id || 1;
+    const companyId = req.user.companyId || req.user.company_id;
+    if (!companyId) {
+      return res.status(401).json({ message: 'Unauthorized: Missing company context.' });
+    }
     const { controller_type = 'Fanuc 0i-MF', service_type = 'breakdown' } = req.body;
 
     const employees = await pool.query(
       `SELECT u.id, u.name, ep.position, ep.status, ep.active_job_count
        FROM users u
        LEFT JOIN employee_profiles ep ON u.id::text = ep.user_id::text
-       WHERE u.company_id::text = $1::text OR ep.company_id::text = $1::text`,
-      [companyId]
+       WHERE u.company_id::text = $1::text`,
+      [String(companyId)]
     ).catch(() => ({ rows: [] }));
 
     const rankings = employees.rows.map((emp, i) => {

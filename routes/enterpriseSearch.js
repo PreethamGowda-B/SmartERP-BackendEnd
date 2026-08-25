@@ -6,7 +6,10 @@ const { authenticateToken } = require('../middleware/authMiddleware');
 // ─── GET /api/search/global (Global Ctrl+K Search Engine across 16 Entities) ──
 router.get('/global', authenticateToken, async (req, res) => {
   try {
-    const companyId = req.user.companyId || req.user.company_id || 1;
+    const companyId = req.user.companyId || req.user.company_id;
+    if (!companyId && req.user.role !== 'super_admin') {
+      return res.status(401).json({ message: 'Unauthorized: Missing company context.' });
+    }
     const { q } = req.query;
 
     if (!q || q.trim().length < 2) {
@@ -22,7 +25,7 @@ router.get('/global', authenticateToken, async (req, res) => {
        FROM customer_machines
        WHERE company_id::text = $1::text AND (machine_name ILIKE $2 OR serial_number ILIKE $2 OR make ILIKE $2 OR model ILIKE $2 OR controller_type ILIKE $2)
        LIMIT 5`,
-      [companyId, searchTerm]
+      [String(companyId), searchTerm]
     ).catch(() => ({ rows: [] }));
     results.push(...mRes.rows);
 
@@ -32,7 +35,7 @@ router.get('/global', authenticateToken, async (req, res) => {
        FROM jobs
        WHERE company_id::text = $1::text AND (title ILIKE $2 OR alarm_code ILIKE $2 OR description ILIKE $2)
        LIMIT 5`,
-      [companyId, searchTerm]
+      [String(companyId), searchTerm]
     ).catch(() => ({ rows: [] }));
     results.push(...jRes.rows);
 
@@ -42,17 +45,17 @@ router.get('/global', authenticateToken, async (req, res) => {
        FROM service_quotations
        WHERE company_id::text = $1::text AND (title ILIKE $2 OR quotation_number ILIKE $2)
        LIMIT 5`,
-      [companyId, searchTerm]
+      [String(companyId), searchTerm]
     ).catch(() => ({ rows: [] }));
     results.push(...qRes.rows);
 
-    // Search Customers
+    // Search Customers strictly scoped to this company
     const cRes = await pool.query(
       `SELECT id, name as title, email as subtitle, 'customer' as category, '/owner/customers' as url
        FROM customers
-       WHERE (company_id::text = $1::text OR company_id IS NULL) AND (name ILIKE $2 OR email ILIKE $2 OR phone ILIKE $2)
+       WHERE company_id::text = $1::text AND (name ILIKE $2 OR email ILIKE $2 OR phone ILIKE $2)
        LIMIT 5`,
-      [companyId, searchTerm]
+      [String(companyId), searchTerm]
     ).catch(() => ({ rows: [] }));
     results.push(...cRes.rows);
 

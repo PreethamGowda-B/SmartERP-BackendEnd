@@ -173,13 +173,29 @@ router.patch('/:id/status', authenticateToken, async (req, res) => {
   }
 
   try {
-    const result = await pool.query(
-      `UPDATE feedback SET status = $1 WHERE id = $2 RETURNING *`,
-      [status, id]
-    );
+    let result;
+    if (req.user.role === 'super_admin') {
+      result = await pool.query(
+        `UPDATE feedback SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING *`,
+        [status, id]
+      );
+    } else {
+      const companyId = req.user.companyId || req.user.company_id;
+      if (!companyId) {
+        return res.status(401).json({ error: 'Unauthorized: Missing company context.' });
+      }
+      result = await pool.query(
+        `UPDATE feedback
+         SET status = $1, updated_at = NOW()
+         WHERE id = $2
+           AND user_id IN (SELECT id FROM users WHERE company_id::text = $3::text)
+         RETURNING *`,
+        [status, id, String(companyId)]
+      );
+    }
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Feedback not found' });
+      return res.status(404).json({ error: 'Feedback not found or does not belong to your company' });
     }
 
     res.json({ success: true, data: result.rows[0] });

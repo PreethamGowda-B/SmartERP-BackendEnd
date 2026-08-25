@@ -26,7 +26,7 @@ async function main() {
       privs.rows.forEach(r => console.log(`  ${r.table_name}: ${r.privilege_type}`));
     }
 
-    // Check if neondb_owner can SET ROLE to smarterp_app
+    // Check if connection user can SET ROLE to smarterp_app
     const membership = await client.query(`
       SELECT
         r.rolname AS member,
@@ -34,10 +34,10 @@ async function main() {
       FROM pg_roles r
       JOIN pg_auth_members am ON am.member = r.oid
       JOIN pg_roles m ON m.oid = am.roleid
-      WHERE r.rolname = 'neondb_owner'
+      WHERE r.rolname = CURRENT_USER
       ORDER BY m.rolname
     `);
-    console.log('\nRoles neondb_owner is member of:');
+    console.log('\nRoles current user is member of:');
     if (membership.rows.length === 0) {
       console.log('  ⚠️  Not a member of smarterp_app — SET ROLE will fail');
     } else {

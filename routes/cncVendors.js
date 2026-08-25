@@ -6,17 +6,23 @@ const { authenticateToken } = require('../middleware/authMiddleware');
 // ─── GET /api/vendors (Fetch CNC Spare Vendors & Purchase Orders) ────────────
 router.get('/', authenticateToken, async (req, res) => {
   try {
-    const companyId = req.user.companyId || req.user.company_id || 1;
+    const companyId = req.user.companyId || req.user.company_id;
+    if (!companyId && req.user.role !== 'super_admin') {
+      return res.status(401).json({ message: 'Unauthorized: Missing company context.' });
+    }
 
-    const vendorsRes = await pool.query(
-      `SELECT * FROM cnc_vendors WHERE company_id::text = $1::text OR company_id = $2 ORDER BY created_at DESC`,
-      [companyId.toString(), parseInt(companyId, 10) || 1]
-    ).catch(() => ({ rows: [] }));
+    const queryVendors = req.user.role === 'super_admin'
+      ? `SELECT * FROM cnc_vendors ORDER BY created_at DESC`
+      : `SELECT * FROM cnc_vendors WHERE company_id::text = $1::text ORDER BY created_at DESC`;
 
-    const posRes = await pool.query(
-      `SELECT * FROM purchase_orders WHERE company_id::text = $1::text OR company_id = $2 ORDER BY created_at DESC`,
-      [companyId.toString(), parseInt(companyId, 10) || 1]
-    ).catch(() => ({ rows: [] }));
+    const queryPOs = req.user.role === 'super_admin'
+      ? `SELECT * FROM purchase_orders ORDER BY created_at DESC`
+      : `SELECT * FROM purchase_orders WHERE company_id::text = $1::text ORDER BY created_at DESC`;
+
+    const params = req.user.role === 'super_admin' ? [] : [String(companyId)];
+
+    const vendorsRes = await pool.query(queryVendors, params).catch(() => ({ rows: [] }));
+    const posRes = await pool.query(queryPOs, params).catch(() => ({ rows: [] }));
 
     res.json({
       success: true,
@@ -25,14 +31,17 @@ router.get('/', authenticateToken, async (req, res) => {
     });
   } catch (err) {
     console.error('❌ Error fetching CNC Vendors:', err.message);
-    res.status(200).json({ success: true, vendors: [], purchase_orders: [] });
+    res.status(500).json({ success: false, message: err.message || 'Server error' });
   }
 });
 
 // ─── POST /api/vendors/po (Create Spare Part Purchase Order) ──────────────
 router.post('/po', authenticateToken, async (req, res) => {
   try {
-    const companyId = req.user.companyId || req.user.company_id || 1;
+    const companyId = req.user.companyId || req.user.company_id;
+    if (!companyId) {
+      return res.status(401).json({ message: 'Unauthorized: Missing company context.' });
+    }
     const { vendor_name, parts_description, total_cost = 0, job_id } = req.body;
 
     if (!vendor_name || !parts_description) {
@@ -45,7 +54,7 @@ router.post('/po', authenticateToken, async (req, res) => {
       `INSERT INTO purchase_orders (company_id, po_number, vendor_name, job_id, parts_description, total_cost, status, created_at, updated_at)
        VALUES ($1, $2, $3, $4, $5, $6, 'issued', NOW(), NOW())
        RETURNING *`,
-      [companyId.toString(), poNum, vendor_name, job_id || null, parts_description, total_cost]
+      [String(companyId), poNum, vendor_name, job_id || null, parts_description, total_cost]
     );
 
     res.status(201).json({ success: true, purchase_order: result.rows[0] });

@@ -69,10 +69,9 @@ async function applyRlsToClient(client) {
     );
   } else if (companyId) {
     // Authenticated tenant request — we have a valid company context.
-    // Set session variables so RLS policies can filter by company.
-    // Note: keep RESET ROLE so neondb_owner's BYPASSRLS allows the query through,
-    // and the session variable-based policies do the tenant isolation.
-    try { await client.query('RESET ROLE'); } catch { /* ignore */ }
+    // Set role to smarterp_app (NOBYPASSRLS) so PostgreSQL RLS policies are strictly enforced.
+    // Set session variables so RLS policies filter by company.
+    try { await client.query('SET ROLE smarterp_app'); } catch { /* ignore */ }
     await client.query(
       `SELECT
          set_config('app.bypass_rls',         'off', true),

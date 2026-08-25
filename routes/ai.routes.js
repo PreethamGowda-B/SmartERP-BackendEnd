@@ -131,7 +131,10 @@ router.post(
 
       // "completed jobs" / "how many jobs are completed"
       if (promptLower.includes("completed job") || promptLower.includes("jobs completed") || promptLower.includes("how many jobs are completed") || promptLower.includes("how much jobs are completed")) {
-        const companyId = req.user?.companyId || req.user?.company_id || 1;
+        const companyId = req.user?.companyId || req.user?.company_id;
+        if (!companyId) {
+          return res.status(401).json({ message: 'Unauthorized: Missing company context.' });
+        }
         const ownerSummary = await AIDataService.getOwnerDashboardSummary({ companyId });
         const completedCount = ownerSummary.jobs?.completed || 0;
         const totalJobs = ownerSummary.jobs?.total || 0;

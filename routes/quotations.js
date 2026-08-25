@@ -6,7 +6,10 @@ const { authenticateToken } = require('../middleware/authMiddleware');
 // ─── GET /api/quotations ───────────────────────────────────────────────────
 router.get('/', authenticateToken, async (req, res) => {
   try {
-    const companyId = req.user.companyId || req.user.company_id || 1;
+    const companyId = req.user.companyId || req.user.company_id;
+    if (!companyId && req.user.role !== 'super_admin') {
+      return res.status(401).json({ message: 'Unauthorized: Missing company context.' });
+    }
     const { customer_id, status } = req.query;
 
     let query = `
@@ -14,9 +17,14 @@ router.get('/', authenticateToken, async (req, res) => {
       FROM service_quotations q
       LEFT JOIN customers c ON q.customer_id::text = c.id::text
       LEFT JOIN customer_machines m ON q.machine_id::text = m.id::text
-      WHERE q.company_id::text = $1::text
+      WHERE 1=1
     `;
-    const params = [companyId];
+    const params = [];
+
+    if (req.user.role !== 'super_admin') {
+      params.push(String(companyId));
+      query += ` AND q.company_id::text = $${params.length}::text`;
+    }
 
     if (customer_id) {
       params.push(customer_id);
@@ -41,7 +49,10 @@ router.get('/', authenticateToken, async (req, res) => {
 // ─── POST /api/quotations (Create Service Quotation/Estimate) ──────────────
 router.post('/', authenticateToken, async (req, res) => {
   try {
-    const companyId = req.user.companyId || req.user.company_id || 1;
+    const companyId = req.user.companyId || req.user.company_id;
+    if (!companyId) {
+      return res.status(401).json({ message: 'Unauthorized: Missing company context.' });
+    }
     const { customer_id, machine_id, title, labor_amount = 0, spares_amount = 0, travel_amount = 0 } = req.body;
 
     if (!customer_id || !title) {
@@ -56,7 +67,7 @@ router.post('/', authenticateToken, async (req, res) => {
          (company_id, quotation_number, customer_id, machine_id, title, labor_amount, spares_amount, travel_amount, total_amount, status, created_at, updated_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'sent', NOW(), NOW())
        RETURNING *, 'V1' as version`,
-      [companyId, qNumber, customer_id, machine_id || null, title, labor_amount, spares_amount, travel_amount, totalAmount]
+      [String(companyId), qNumber, customer_id, machine_id || null, title, labor_amount, spares_amount, travel_amount, totalAmount]
     );
 
     res.status(201).json({ success: true, quotation: result.rows[0] });
@@ -69,29 +80,51 @@ router.post('/', authenticateToken, async (req, res) => {
 // ─── POST /api/quotations/:id/revise (Create Revised Version V2, V3) ───────
 router.post('/:id/revise', authenticateToken, async (req, res) => {
   try {
-    const companyId = req.user.companyId || req.user.company_id || 1;
+    const companyId = req.user.companyId || req.user.company_id;
+    if (!companyId && req.user.role !== 'super_admin') {
+      return res.status(401).json({ message: 'Unauthorized: Missing company context.' });
+    }
     const { id } = req.params;
     const { title, labor_amount, spares_amount, travel_amount, revision_notes } = req.body;
 
-    const existingRes = await pool.query(`SELECT * FROM service_quotations WHERE id::text = $1::text AND company_id::text = $2::text`, [id, companyId]);
+    const existingRes = req.user.role === 'super_admin'
+      ? await pool.query(`SELECT * FROM service_quotations WHERE id::text = $1::text`, [id])
+      : await pool.query(`SELECT * FROM service_quotations WHERE id::text = $1::text AND company_id::text = $2::text`, [id, String(companyId)]);
+
     if (existingRes.rows.length === 0) return res.status(404).json({ message: 'Quotation not found' });
 
     const ex = existingRes.rows[0];
     const totalAmount = Number(labor_amount ?? ex.labor_amount) + Number(spares_amount ?? ex.spares_amount) + Number(travel_amount ?? ex.travel_amount);
 
-    const result = await pool.query(
-      `UPDATE service_quotations
-       SET title = COALESCE($1, title),
-           labor_amount = COALESCE($2, labor_amount),
-           spares_amount = COALESCE($3, spares_amount),
-           travel_amount = COALESCE($4, travel_amount),
-           total_amount = $5,
-           status = 'sent',
-           updated_at = NOW()
-       WHERE id = $6
-       RETURNING *, 'V2 (Revised)' as version`,
-      [title || null, labor_amount, spares_amount, travel_amount, totalAmount, id]
-    );
+    const updateQuery = req.user.role === 'super_admin'
+      ? `UPDATE service_quotations
+         SET title = COALESCE($1, title),
+             labor_amount = COALESCE($2, labor_amount),
+             spares_amount = COALESCE($3, spares_amount),
+             travel_amount = COALESCE($4, travel_amount),
+             total_amount = $5,
+             status = 'sent',
+             updated_at = NOW()
+         WHERE id::text = $6::text
+         RETURNING *, 'V2 (Revised)' as version`
+      : `UPDATE service_quotations
+         SET title = COALESCE($1, title),
+             labor_amount = COALESCE($2, labor_amount),
+             spares_amount = COALESCE($3, spares_amount),
+             travel_amount = COALESCE($4, travel_amount),
+             total_amount = $5,
+             status = 'sent',
+             updated_at = NOW()
+         WHERE id::text = $6::text AND company_id::text = $7::text
+         RETURNING *, 'V2 (Revised)' as version`;
+
+    const updateParams = req.user.role === 'super_admin'
+      ? [title || null, labor_amount, spares_amount, travel_amount, totalAmount, id]
+      : [title || null, labor_amount, spares_amount, travel_amount, totalAmount, id, String(companyId)];
+
+    const result = await pool.query(updateQuery, updateParams);
+
+    if (result.rows.length === 0) return res.status(404).json({ message: 'Quotation not found or access denied.' });
 
     res.json({ success: true, quotation: result.rows[0], message: 'Quotation revised to V2!' });
   } catch (err) {
@@ -103,13 +136,15 @@ router.post('/:id/revise', authenticateToken, async (req, res) => {
 // ─── POST /api/quotations/:id/approve (Approve & Convert to Job) ────────────
 router.post('/:id/approve', authenticateToken, async (req, res) => {
   try {
-    const companyId = req.user.companyId || req.user.company_id || 1;
+    const companyId = req.user.companyId || req.user.company_id;
+    if (!companyId && req.user.role !== 'super_admin') {
+      return res.status(401).json({ message: 'Unauthorized: Missing company context.' });
+    }
     const { id } = req.params;
 
-    const qRes = await pool.query(
-      `SELECT * FROM service_quotations WHERE id::text = $1::text AND company_id::text = $2::text`,
-      [id, companyId]
-    );
+    const qRes = req.user.role === 'super_admin'
+      ? await pool.query(`SELECT * FROM service_quotations WHERE id::text = $1::text`, [id])
+      : await pool.query(`SELECT * FROM service_quotations WHERE id::text = $1::text AND company_id::text = $2::text`, [id, String(companyId)]);
 
     if (qRes.rows.length === 0) {
       return res.status(404).json({ message: 'Quotation not found' });
@@ -126,7 +161,7 @@ router.post('/:id/approve', authenticateToken, async (req, res) => {
         `[Approved Quotation ${q.quotation_number}] ${q.title}`,
         `Approved Service Estimate: Total ₹${q.total_amount}. Labor: ₹${q.labor_amount}, Spares: ₹${q.spares_amount}, Travel: ₹${q.travel_amount}`,
         q.customer_id,
-        companyId,
+        q.company_id,
         q.machine_id,
       ]
     );
@@ -135,8 +170,8 @@ router.post('/:id/approve', authenticateToken, async (req, res) => {
 
     // Update quotation state
     await pool.query(
-      `UPDATE service_quotations SET status = 'converted_to_job', job_id = $1, updated_at = NOW() WHERE id = $2`,
-      [job.id, id]
+      `UPDATE service_quotations SET status = 'converted_to_job', job_id = $1, updated_at = NOW() WHERE id::text = $2::text AND company_id::text = $3::text`,
+      [job.id, id, String(q.company_id)]
     );
 
     // Log timeline event
@@ -144,7 +179,7 @@ router.post('/:id/approve', authenticateToken, async (req, res) => {
       await pool.query(
         `INSERT INTO machine_timeline_events (company_id, machine_id, job_id, event_type, title, description, created_at)
          VALUES ($1, $2, $3, 'work_started', 'Quotation Approved & Job Created', $4, NOW())`,
-        [companyId, q.machine_id, job.id, `Quotation ${q.quotation_number} approved by customer for ₹${q.total_amount}`]
+        [q.company_id, q.machine_id, job.id, `Quotation ${q.quotation_number} approved by customer for ₹${q.total_amount}`]
       ).catch(() => {});
     }
 

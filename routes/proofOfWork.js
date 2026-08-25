@@ -1,10 +1,30 @@
 const express = require("express");
 const router = express.Router({ mergeParams: true });
+const jwt = require("jsonwebtoken");
 const { pool } = require("../db");
 const { authenticateToken } = require("../middleware/authMiddleware");
 const { requireClockIn } = require("../middleware/attendanceGatekeeperMiddleware");
 const { createNotification, createNotificationForOwners } = require("../utils/notificationHelpers");
 const EventMessagingService = require('../services/eventMessagingService');
+
+// Helper to authenticate request via JWT (supports staff, customer, and signed query tokens)
+function resolveCaller(req) {
+  if (req.user) return req.user;
+  if (req.customer) return { ...req.customer, role: 'customer' };
+
+  const token = req.query?.token ||
+    (req.headers.authorization && req.headers.authorization.startsWith('Bearer ') ? req.headers.authorization.split(' ')[1] : null) ||
+    req.cookies?.customer_access_token || req.cookies?.user_access_token || req.cookies?.access_token;
+
+  if (!token) return null;
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    return decoded;
+  } catch {
+    return null;
+  }
+}
 
 // Ensure proof_of_work table exists in database lazily
 let isInitialized = false;
@@ -45,10 +65,23 @@ router.post("/:id/proof-of-work", authenticateToken, requireClockIn, async (req,
     const { photo_url, notes, gps_latitude, gps_longitude, stage = "in_progress" } = req.body;
     const userId = req.user?.userId || req.user?.id;
     const userName = req.user?.name || "Technician";
-    const companyId = req.user?.companyId;
+    const companyId = req.user?.companyId || req.user?.company_id;
+
+    if (!companyId) {
+      return res.status(401).json({ message: "Unauthorized: Missing company context." });
+    }
 
     if (!photo_url && !notes) {
       return res.status(400).json({ message: "Photo URL or site notes are required." });
+    }
+
+    // Verify job belongs to technician's company
+    const jobCheck = await pool.query(
+      `SELECT id, machine_id, title FROM jobs WHERE id::text = $1::text AND company_id::text = $2::text`,
+      [jobId, String(companyId)]
+    );
+    if (jobCheck.rows.length === 0) {
+      return res.status(404).json({ message: "Job not found in your company." });
     }
 
     const result = await pool.query(
@@ -61,8 +94,8 @@ router.post("/:id/proof-of-work", authenticateToken, requireClockIn, async (req,
 
     // Update job stage if provided
     await pool.query(
-      `UPDATE jobs SET stage = $1, updated_at = NOW() WHERE id = $2`,
-      [stage, jobId]
+      `UPDATE jobs SET stage = $1, updated_at = NOW() WHERE id = $2 AND company_id::text = $3::text`,
+      [stage, jobId, String(companyId)]
     );
 
     // Notify Owner
@@ -71,7 +104,7 @@ router.post("/:id/proof-of-work", authenticateToken, requireClockIn, async (req,
         company_id: companyId,
         type: 'proof_of_work',
         title: 'Site Proof Uploaded',
-        message: `📸 Site Proof Uploaded: ${userName} uploaded site proof photo for job #${jobId.substring(0, 8)}`,
+        message: `📸 Site Proof Uploaded: ${userName} uploaded site proof photo for job #${String(jobId).substring(0, 8)}`,
         priority: 'medium',
         actor_id: userId,
         data: { job_id: jobId, url: '/owner/jobs' }
@@ -82,12 +115,11 @@ router.post("/:id/proof-of-work", authenticateToken, requireClockIn, async (req,
 
     // Auto-Trigger Timeline Event on Machine
     try {
-      const jobRes = await pool.query(`SELECT machine_id, title FROM jobs WHERE id::text = $1::text`, [jobId]);
-      if (jobRes.rows[0]?.machine_id) {
+      if (jobCheck.rows[0]?.machine_id) {
         await pool.query(
           `INSERT INTO machine_timeline_events (company_id, machine_id, job_id, event_type, title, description, created_at)
            VALUES ($1, $2, $3, 'proof_submitted', 'Site Proof & Progress Uploaded', $4, NOW())`,
-          [companyId, jobRes.rows[0].machine_id, jobId, `Engineer ${userName} uploaded site proof for job ${jobRes.rows[0].title}. Notes: ${notes || 'No notes'}`]
+          [companyId, jobCheck.rows[0].machine_id, jobId, `Engineer ${userName} uploaded site proof for job ${jobCheck.rows[0].title}. Notes: ${notes || 'No notes'}`]
         );
       }
     } catch (tErr) {
@@ -119,11 +151,43 @@ router.post("/:id/proof-of-work", authenticateToken, requireClockIn, async (req,
 // Fetch complete audit trail of site proof photos, GPS, & signatures
 router.get("/:id/proof-of-work", async (req, res) => {
   try {
+    const caller = resolveCaller(req);
+    if (!caller) {
+      return res.status(401).json({ message: "Authentication required to access proof of work." });
+    }
+
     const jobId = req.params.id;
-    const result = await pool.query(
-      `SELECT * FROM job_proof_of_work WHERE job_id = $1 ORDER BY created_at ASC`,
+
+    // Look up job in DB to verify caller authorization
+    const jobRes = await pool.query(
+      `SELECT id, company_id, customer_id, assigned_to FROM jobs WHERE id::text = $1::text`,
       [jobId]
     );
+
+    if (jobRes.rows.length === 0) {
+      return res.status(404).json({ message: "Job not found." });
+    }
+
+    const job = jobRes.rows[0];
+    const callerCompanyId = String(caller.companyId || caller.company_id || '');
+    const callerId = String(caller.id || caller.userId || caller.customerId || '');
+    const callerRole = caller.role || '';
+
+    // Authorization check
+    const isSuperAdmin = callerRole === 'super_admin' || caller.isSuperAdmin;
+    const isCompanyStaff = callerCompanyId && callerCompanyId === String(job.company_id);
+    const isAssignedTech = callerId && callerId === String(job.assigned_to);
+    const isAuthorizedCustomer = job.customer_id && callerId === String(job.customer_id);
+
+    if (!isSuperAdmin && !isCompanyStaff && !isAssignedTech && !isAuthorizedCustomer) {
+      return res.status(403).json({ message: "Access denied: You are not authorized to view proof of work for this job." });
+    }
+
+    const result = await pool.query(
+      `SELECT * FROM job_proof_of_work WHERE job_id::text = $1::text ORDER BY created_at ASC`,
+      [jobId]
+    );
+
     return res.json({
       success: true,
       proofs: result.rows,
@@ -138,6 +202,11 @@ router.get("/:id/proof-of-work", async (req, res) => {
 // Customer E-Signature sign-off approval (Customer Portal)
 router.post("/:id/customer-signoff", async (req, res) => {
   try {
+    const caller = resolveCaller(req);
+    if (!caller) {
+      return res.status(401).json({ message: "Authentication required for customer sign-off." });
+    }
+
     const jobId = req.params.id;
     const { signature_url, feedback_rating, customer_notes } = req.body;
 
@@ -145,37 +214,56 @@ router.post("/:id/customer-signoff", async (req, res) => {
       return res.status(400).json({ message: "Digital customer signature is required." });
     }
 
+    // Look up job in DB
+    const jobRes = await pool.query(
+      `SELECT id, company_id, customer_id, title, budget, estimated_cost, status FROM jobs WHERE id::text = $1::text`,
+      [jobId]
+    );
+
+    if (jobRes.rows.length === 0) {
+      return res.status(404).json({ message: "Job not found." });
+    }
+
+    const job = jobRes.rows[0];
+    const callerCompanyId = String(caller.companyId || caller.company_id || '');
+    const callerId = String(caller.id || caller.userId || caller.customerId || '');
+    const callerRole = caller.role || '';
+
+    // Authorization: Must be the authorized customer for this job
+    const isSuperAdmin = callerRole === 'super_admin';
+    const isJobCustomer = job.customer_id && callerId === String(job.customer_id) && callerCompanyId === String(job.company_id);
+
+    if (!isSuperAdmin && !isJobCustomer) {
+      return res.status(403).json({ message: "Access denied: Only the customer assigned to this job can submit sign-off." });
+    }
+
     // Save sign-off record
     const result = await pool.query(
       `INSERT INTO job_proof_of_work 
-       (job_id, notes, stage, customer_signature_url, signed_at)
-       VALUES ($1, $2, 'completed', $3, NOW())
+       (job_id, company_id, notes, stage, customer_signature_url, signed_at)
+       VALUES ($1, $2, $3, 'completed', $4, NOW())
        RETURNING *`,
-      [jobId, customer_notes ? `Customer Feedback: ${customer_notes}` : "Customer Digital Sign-off Completed", signature_url]
+      [jobId, job.company_id, customer_notes ? `Customer Feedback: ${customer_notes}` : "Customer Digital Sign-off Completed", signature_url]
     );
 
     // Auto-complete job & update status
     await pool.query(
-      `UPDATE jobs SET status = 'completed', stage = 'Completed', progress = 100, updated_at = NOW() WHERE id = $1`,
+      `UPDATE jobs SET status = 'completed', stage = 'Completed', progress = 100, updated_at = NOW() WHERE id::text = $1::text`,
       [jobId]
     );
 
-    // Check if invoice exists; if not, create draft invoice automatically
+    // Check if invoice exists; if not, create draft invoice automatically with verified job.company_id
     try {
-      const invCheck = await pool.query(`SELECT id FROM invoices WHERE job_id = $1`, [jobId]);
+      const invCheck = await pool.query(`SELECT id FROM invoices WHERE job_id::text = $1::text`, [jobId]);
       if (invCheck.rows.length === 0) {
-        const jobRes = await pool.query(`SELECT * FROM jobs WHERE id = $1`, [jobId]);
-        if (jobRes.rows.length > 0) {
-          const j = jobRes.rows[0];
-          const invNum = `INV-${Date.now()}-${String(jobId).substring(0, 8).toUpperCase()}`;
-          const totalAmt = Number(j.budget || j.estimated_cost || 0);
+        const invNum = `INV-${Date.now()}-${String(jobId).substring(0, 8).toUpperCase()}`;
+        const totalAmt = Number(job.budget || job.estimated_cost || 0);
 
-          await pool.query(
-            `INSERT INTO invoices (company_id, job_id, invoice_number, total_amount, status)
-             VALUES ($1, $2, $3, $4, 'issued')`,
-            [j.company_id || 1, jobId, invNum, totalAmt]
-          );
-        }
+        await pool.query(
+          `INSERT INTO invoices (company_id, customer_id, job_id, invoice_number, total_amount, status)
+           VALUES ($1, $2, $3, $4, $5, 'issued')`,
+          [job.company_id, job.customer_id || null, jobId, invNum, totalAmt]
+        );
       }
     } catch (invErr) {
       console.warn("⚠️ Could not auto-generate invoice upon customer signoff:", invErr.message);

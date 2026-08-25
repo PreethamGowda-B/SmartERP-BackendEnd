@@ -826,6 +826,7 @@ v1Router.use("/messages", require("./routes/messages"));
 v1Router.use("/dashboard", require("./routes/dashboard"));
 v1Router.use("/reports", require("./routes/reports"));
 v1Router.use("/settings", require("./routes/settings"));
+v1Router.use("/account", require("./routes/account"));
 v1Router.use("/location", require("./routes/location"));
 v1Router.use("/subscription", require("./routes/subscription"));
 v1Router.use("/hr", require("./routes/hr"));

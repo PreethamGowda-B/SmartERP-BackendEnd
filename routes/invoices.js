@@ -8,6 +8,7 @@
 
 const express = require('express');
 const router = express.Router();
+const jwt = require('jsonwebtoken');
 const { pool } = require('../db');
 const authMiddleware = require('../middleware/authMiddleware');
 const invoiceService = require('../services/invoiceService');
@@ -17,6 +18,64 @@ const emailService = require('../services/emailNotificationService');
 
 // Middleware to extract tenant context
 const authenticate = authMiddleware.authenticateToken || authMiddleware;
+
+/**
+ * Generates a signed token for secure invoice PDF access.
+ */
+function generateInvoiceToken(invoiceId, companyId, expiresIn = '30d') {
+  return jwt.sign(
+    { invoiceId, companyId, type: 'invoice_pdf' },
+    process.env.JWT_SECRET,
+    { expiresIn }
+  );
+}
+
+/**
+ * Verifies access to invoice PDF via session or signed token.
+ */
+function verifyInvoiceAccess(req, invoice) {
+  const token = req.query.token ||
+    (req.headers.authorization && req.headers.authorization.startsWith('Bearer ') ? req.headers.authorization.split(' ')[1] : null) ||
+    req.cookies?.access_token || req.cookies?.user_access_token || req.cookies?.customer_access_token || req.cookies?.superadmin_access_token;
+
+  if (token) {
+    try {
+      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      if (decoded.type === 'invoice_pdf' && decoded.invoiceId === invoice.id) {
+        return true;
+      }
+      const tokenCompanyId = decoded.companyId || decoded.company_id;
+      if (tokenCompanyId && String(tokenCompanyId) === String(invoice.company_id)) {
+        return true;
+      }
+      if (decoded.role === 'super_admin' || decoded.isSuperAdmin) {
+        return true;
+      }
+      const tokenCustomerId = decoded.customerId || decoded.customer_id || decoded.id || decoded.userId;
+      if (invoice.customer_id && tokenCustomerId && String(tokenCustomerId) === String(invoice.customer_id)) {
+        return true;
+      }
+    } catch (e) {
+      // Invalid or expired token
+    }
+  }
+
+  if (req.user) {
+    const userCompanyId = req.user.companyId || req.user.company_id;
+    if (userCompanyId && String(userCompanyId) === String(invoice.company_id)) {
+      return true;
+    }
+    if (req.user.role === 'super_admin') {
+      return true;
+    }
+    const userCustomerId = req.user.customerId || req.user.customer_id || req.user.id;
+    if (invoice.customer_id && userCustomerId && String(userCustomerId) === String(invoice.customer_id)) {
+      return true;
+    }
+  }
+
+  return false;
+}
 
 /**
  * GET /api/invoices
@@ -244,12 +303,14 @@ router.post('/:id/track', async (req, res) => {
   try {
     const { id } = req.params;
     const { actionType, performedByType, performedById, performedByName } = req.body;
-    // companyId not available in customer portal — resolve from DB
-    let { companyId } = req.body;
-    if (!companyId) {
-      const invRow = await pool.query(`SELECT company_id FROM invoices WHERE id = $1`, [id]);
-      if (invRow.rows.length > 0) companyId = invRow.rows[0].company_id;
+
+    // Securely resolve company_id and customer_id directly from the database
+    const invRow = await pool.query(`SELECT company_id, customer_id FROM invoices WHERE id = $1`, [id]);
+    if (invRow.rows.length === 0) {
+      return res.status(404).json({ error: 'Invoice not found' });
     }
+
+    const { company_id: companyId, customer_id: customerId } = invRow.rows[0];
 
     const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || '';
     const userAgent = req.headers['user-agent'] || '';
@@ -259,7 +320,7 @@ router.post('/:id/track', async (req, res) => {
       companyId,
       actionType,
       performedByType: performedByType || 'customer',
-      performedById,
+      performedById: performedById || customerId,
       performedByName,
       ipAddress: clientIp,
       userAgent,
@@ -279,7 +340,6 @@ router.post('/:id/track', async (req, res) => {
 router.post('/:id/dispute', async (req, res) => {
   try {
     const { id } = req.params;
-    const { companyId, customerId } = req.body;
     // Accept both snake_case (from customer portal) and camelCase
     const issueCategory = req.body.issueCategory || req.body.issue_category;
     const description = req.body.description;
@@ -287,6 +347,14 @@ router.post('/:id/dispute', async (req, res) => {
     if (!issueCategory || !description) {
       return res.status(400).json({ error: 'Issue category and description are required' });
     }
+
+    // Securely resolve company_id and customer_id directly from the database
+    const invRow = await pool.query(`SELECT company_id, customer_id FROM invoices WHERE id = $1`, [id]);
+    if (invRow.rows.length === 0) {
+      return res.status(404).json({ error: 'Invoice not found' });
+    }
+
+    const { company_id: companyId, customer_id: customerId } = invRow.rows[0];
 
     const result = await invoiceService.submitDispute({
       invoiceId: id,
@@ -378,6 +446,7 @@ router.patch('/disputes/:disputeId/resolve', authenticate, async (req, res) => {
 /**
  * GET /api/invoices/:id/pdf
  * Streams invoice PDF binary / HTML file.
+ * Requires valid authenticated session or signed access token.
  */
 router.get('/:id/pdf', async (req, res) => {
   try {
@@ -385,10 +454,16 @@ router.get('/:id/pdf', async (req, res) => {
 
     const invRes = await pool.query(`SELECT * FROM invoices WHERE id = $1`, [id]);
     if (invRes.rows.length === 0) {
-      return res.status(404).send('Invoice not found');
+      return res.status(404).json({ error: 'Invoice not found' });
     }
 
     const invoice = invRes.rows[0];
+
+    // Cryptographic validation: user session or signed access token required
+    if (!verifyInvoiceAccess(req, invoice)) {
+      return res.status(401).json({ error: 'Unauthorized: Valid authentication session or signed token required' });
+    }
+
     const itemsRes = await pool.query(`SELECT * FROM invoice_items WHERE invoice_id = $1`, [id]);
 
     // Fetch company profile dynamically
@@ -452,6 +527,9 @@ router.post('/:id/send-whatsapp', authenticate, async (req, res) => {
       return res.status(400).json({ error: 'Customer phone number is required' });
     }
 
+    const signedToken = generateInvoiceToken(invoice.id, invoice.company_id, '30d');
+    const invoiceLink = `https://www.prozync.in/customer/invoices/${invoice.id}?token=${signedToken}`;
+
     const result = await whatsappService.sendWhatsAppTemplateMessage(
       targetPhone,
       'job_status_update',
@@ -462,7 +540,7 @@ router.post('/:id/send-whatsapp', authenticate, async (req, res) => {
           parameters: [
             { type: 'text', text: invoice.customer_name || 'Customer' },
             { type: 'text', text: `Invoice ${invoice.invoice_number} (₹${invoice.total_amount})` },
-            { type: 'text', text: `View invoice at https://www.prozync.in/customer/invoices/${invoice.id}` },
+            { type: 'text', text: `View invoice at ${invoiceLink}` },
           ],
         },
       ]
@@ -518,6 +596,9 @@ router.post('/:id/send-email', authenticate, async (req, res) => {
       return res.status(400).json({ error: 'Customer email address is required' });
     }
 
+    const signedToken = generateInvoiceToken(invoice.id, invoice.company_id, '30d');
+    const signedPdfUrl = `https://api.prozync.in/api/invoices/${invoice.id}/pdf?token=${signedToken}`;
+
     // Trigger Email Notification (Issue 8 Requirement)
     let emailResult = { success: true, messageId: `msg_${Date.now()}` };
     try {
@@ -527,7 +608,7 @@ router.post('/:id/send-email', authenticate, async (req, res) => {
           customerName: invoice.customer_name || 'Customer',
           invoiceNumber: invoice.invoice_number,
           totalAmount: invoice.total_amount,
-          pdfUrl: `https://api.prozync.in/api/invoices/${invoice.id}/pdf`,
+          pdfUrl: signedPdfUrl,
         });
       }
     } catch (eErr) {

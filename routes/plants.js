@@ -6,11 +6,14 @@ const { authenticateToken } = require('../middleware/authMiddleware');
 // ─── GET /api/plants ────────────────────────────────────────────────────────
 router.get('/', authenticateToken, async (req, res) => {
   try {
-    const companyId = req.user.companyId || req.user.company_id || 1;
+    const companyId = req.user.companyId || req.user.company_id;
+    if (!companyId && req.user.role !== 'super_admin') {
+      return res.status(401).json({ message: 'Unauthorized: Missing company context.' });
+    }
     const { customer_id } = req.query;
 
-    let query = `SELECT * FROM customer_plants WHERE company_id::text = $1::text`;
-    const params = [companyId];
+    let query = req.user.role === 'super_admin' ? `SELECT * FROM customer_plants WHERE 1=1` : `SELECT * FROM customer_plants WHERE company_id::text = $1::text`;
+    const params = req.user.role === 'super_admin' ? [] : [String(companyId)];
 
     if (customer_id) {
       params.push(customer_id);
@@ -30,7 +33,10 @@ router.get('/', authenticateToken, async (req, res) => {
 // ─── POST /api/plants ───────────────────────────────────────────────────────
 router.post('/', authenticateToken, async (req, res) => {
   try {
-    const companyId = req.user.companyId || req.user.company_id || 1;
+    const companyId = req.user.companyId || req.user.company_id;
+    if (!companyId) {
+      return res.status(401).json({ message: 'Unauthorized: Missing company context.' });
+    }
     const { customer_id, plant_name, code, address, contact_person, contact_phone } = req.body;
 
     if (!customer_id || !plant_name) {
@@ -41,7 +47,7 @@ router.post('/', authenticateToken, async (req, res) => {
       `INSERT INTO customer_plants (company_id, customer_id, plant_name, code, address, contact_person, contact_phone, created_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
        RETURNING *`,
-      [companyId, customer_id, plant_name, code || null, address || null, contact_person || null, contact_phone || null]
+      [String(companyId), customer_id, plant_name, code || null, address || null, contact_person || null, contact_phone || null]
     );
 
     res.status(201).json({ success: true, plant: result.rows[0] });

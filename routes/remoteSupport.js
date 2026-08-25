@@ -6,7 +6,10 @@ const { authenticateToken } = require('../middleware/authMiddleware');
 // ─── GET /api/remote-support ────────────────────────────────────────────────
 router.get('/', authenticateToken, async (req, res) => {
   try {
-    const companyId = req.user.companyId || req.user.company_id || 1;
+    const companyId = req.user.companyId || req.user.company_id;
+    if (!companyId && req.user.role !== 'super_admin') {
+      return res.status(401).json({ message: 'Unauthorized: Missing company context.' });
+    }
     const { customer_id, machine_id } = req.query;
 
     let query = `
@@ -15,9 +18,14 @@ router.get('/', authenticateToken, async (req, res) => {
       LEFT JOIN customers c ON r.customer_id::text = c.id::text
       LEFT JOIN customer_machines m ON r.machine_id::text = m.id::text
       LEFT JOIN users u ON r.engineer_id::text = u.id::text
-      WHERE r.company_id::text = $1::text
+      WHERE 1=1
     `;
-    const params = [companyId];
+    const params = [];
+
+    if (req.user.role !== 'super_admin') {
+      params.push(String(companyId));
+      query += ` AND r.company_id::text = $${params.length}::text`;
+    }
 
     if (customer_id) {
       params.push(customer_id);
@@ -42,7 +50,10 @@ router.get('/', authenticateToken, async (req, res) => {
 // ─── POST /api/remote-support (Log Remote Support Session) ─────────────────
 router.post('/', authenticateToken, async (req, res) => {
   try {
-    const companyId = req.user.companyId || req.user.company_id || 1;
+    const companyId = req.user.companyId || req.user.company_id;
+    if (!companyId) {
+      return res.status(401).json({ message: 'Unauthorized: Missing company context.' });
+    }
     const engineerId = req.user.userId || req.user.id;
     const { customer_id, machine_id, support_channel, duration_minutes = 15, resolution_summary, is_resolved = true } = req.body;
 

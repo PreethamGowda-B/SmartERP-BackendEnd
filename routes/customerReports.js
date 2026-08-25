@@ -6,11 +6,20 @@ const { authenticateToken } = require('../middleware/authMiddleware');
 // ─── GET /api/customer-reports (Performance Analytics & MTTR/MTBF) ─────────
 router.get('/', authenticateToken, async (req, res) => {
   try {
-    const companyId = req.user.companyId || req.user.company_id || 1;
+    const userRole = req.user.role;
+    const isAuthorized = ['owner', 'admin', 'hr', 'super_admin'].includes(userRole);
+    if (!isAuthorized) {
+      return res.status(403).json({ message: 'Access denied: Only owners, admins, or HR can access performance analytics reports.' });
+    }
+
+    const companyId = req.user.companyId || req.user.company_id;
+    if (!companyId && userRole !== 'super_admin') {
+      return res.status(401).json({ message: 'Unauthorized: Missing company context.' });
+    }
 
     const machines = await pool.query(
       `SELECT count(*) as total, avg(health_score) as avg_health FROM customer_machines WHERE company_id::text = $1::text`,
-      [companyId]
+      [String(companyId)]
     ).catch(() => ({ rows: [{ total: 0, avg_health: 100 }] }));
 
     const jobs = await pool.query(
@@ -20,7 +29,7 @@ router.get('/', authenticateToken, async (req, res) => {
               avg(sla_resolution_minutes) as avg_mttr_minutes
        FROM jobs
        WHERE company_id::text = $1::text`,
-      [companyId]
+      [String(companyId)]
     ).catch(() => ({ rows: [{ total_jobs: 0, breakdown_count: 0, pm_count: 0, avg_mttr_minutes: 120 }] }));
 
     const data = jobs.rows[0] || {};

@@ -29,6 +29,7 @@
 20. [Final Report](#20-final-report)
 21. [August 2026 Platform Hardening — Changes & New Features](#21-august-2026-platform-hardening--changes--new-features)
 22. [August 2026 Supabase Migration, IPv4 Socket Routing & Flagship Enterprise Evolution](#22-august-2026-supabase-migration-ipv4-socket-routing--flagship-enterprise-evolution)
+23. [August 2026 Production Security Hardening, Multi-Tenant RLS & Privacy Erasure System](#23-august-2026-production-security-hardening-multi-tenant-rls--privacy-erasure-system)
 
 ---
 
@@ -2991,4 +2992,107 @@ Factory owners and customers in India communicate primarily via WhatsApp. Provid
    - Added `status VARCHAR(50)` to `payroll_validation_runs`.
    - Fixed `predictive_alerts.machine_id` type to `UUID` matching `customer_machines.id`.
    - Joined `customers` table in `/api/jobs/invoices/all` to eliminate `column j.customer_name does not exist` errors.
+
+---
+
+## 23. August 2026 Production Security Hardening, Multi-Tenant RLS & Privacy Erasure System
+
+### 23.1 Fail-Closed PostgreSQL Row-Level Security (RLS) Engine
+
+**Context & Core Architectural Fix:**
+In multi-tenant cloud architectures, application-layer `WHERE company_id = $1` filters are susceptible to developer omission. SmartERP implements a strict database-level backstop via PostgreSQL Row-Level Security:
+
+1. **Role Demotion & RLS Enforcement**:
+   - In `db.js`, `applyRlsToClient(client)` evaluates the `AsyncLocalStorage` tenant context (`storage.getStore()`).
+   - When a web request is executing (`isWebRequest === true` and `bypassRls !== true`), the connection issues:
+     ```sql
+     SET ROLE smarterp_app;
+     SET app.current_company_id = '<company_id>';
+     SET app.current_role = '<role>';
+     SET app.current_user_id = '<user_id>';
+     ```
+   - The non-superuser role `smarterp_app` does **NOT** have `BYPASSRLS`. All database queries are automatically evaluated against the RLS policies in `migrations/011_standardize_uuid_and_core_rls.sql` and `migrations/rls_policies.sql`.
+   - If an unauthenticated or context-less query runs under `smarterp_app`, it returns 0 rows (**fail-closed security**).
+
+2. **Core Protected Tables**:
+   - `users`, `jobs`, `attendance`, `payroll`, `inventory_items`, `invoices`, `work_requests`, `customer_machines`, `documents`, `feedback`, `quotations`, `warranty_claims`.
+
+---
+
+### 23.2 Comprehensive Security Audit & P0-P3 Vulnerability Remediations
+
+A systematic audit across all backend routes resolved 9 major security findings:
+
+1. **P0 #1: Customer Document Tenant Isolation** ([`routes/customer/documents.js`](file:///c:/Users/mrpre/Desktop/SMARTERP/SmartERP-Backend/routes/customer/documents.js)):
+   - Replaced loose `WHERE customer_id = $1 OR company_id = $2` with strict `WHERE customer_id = $1 AND company_id = $2`, preventing cross-customer data leakage.
+2. **P0 #2: Customer Machine Ownership Verification** ([`routes/customer/machines.js`](file:///c:/Users/mrpre/Desktop/SMARTERP/SmartERP-Backend/routes/customer/machines.js)):
+   - Added explicit verification ensuring the machine's `customer_id` and `company_id` match the authenticated customer session before returning details.
+3. **P0 #3: Proof-of-Work Tamper Proofing & Digital Sign-off** ([`routes/proofOfWork.js`](file:///c:/Users/mrpre/Desktop/SMARTERP/SmartERP-Backend/routes/proofOfWork.js)):
+   - Protected `GET /api/jobs/:id/proof-of-work` with strict token auth (`authenticateToken` or customer JWT validation).
+   - `POST /api/jobs/:id/customer-signoff` enforces cryptographic digital signatures and customer ownership before accepting sign-off.
+4. **P1 #4: Work Request Action RBAC Enforcement** ([`routes/workRequests.js`](file:///c:/Users/mrpre/Desktop/SMARTERP/SmartERP-Backend/routes/workRequests.js)):
+   - Blocked standard employees from approving/rejecting work requests (`requireRole(['owner', 'admin', 'hr'])`).
+5. **P1 #5: Warranty Claims Tenant Isolation & Resolution Guards** ([`routes/warrantyClaims.js`](file:///c:/Users/mrpre/Desktop/SMARTERP/SmartERP-Backend/routes/warrantyClaims.js)):
+   - Bound all queries to `company_id` extracted from JWT claims.
+   - Enforced owner/admin role requirement on `/resolve` and `/reject` endpoints.
+6. **P1 #6: Feedback Status Mutation Authorization** ([`routes/feedback.js`](file:///c:/Users/mrpre/Desktop/SMARTERP/SmartERP-Backend/routes/feedback.js)):
+   - Restricted `PATCH /api/feedback/:id/status` to administrative roles and added strict enum validation (`'pending'`, `'reviewed'`, `'resolved'`).
+7. **P2 #7: Enterprise Global Search Scoping** ([`routes/enterpriseSearch.js`](file:///c:/Users/mrpre/Desktop/SMARTERP/SmartERP-Backend/routes/enterpriseSearch.js)):
+   - Added tenant parameterization (`company_id = $1`) across all search sub-queries (jobs, inventory, employees, machines).
+8. **P2 #8: Customer Reports Owner Guard** ([`routes/customerReports.js`](file:///c:/Users/mrpre/Desktop/SMARTERP/SmartERP-Backend/routes/customerReports.js)):
+   - Protected sensitive customer spend and analytics endpoints with `requireOwner`.
+9. **P3 #9: Quotation Revision Isolation** ([`routes/quotations.js`](file:///c:/Users/mrpre/Desktop/SMARTERP/SmartERP-Backend/routes/quotations.js)):
+   - Scoped `POST /api/quotations/:id/revise` to verified tenant `company_id` with atomic revision number incrementation.
+
+---
+
+### 23.3 Production-Grade Secure Account Deletion & Privacy Erasure System
+
+Implemented a complete, auditable, and statutory-compliant account deletion workflow across the platform.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as User / Customer
+    participant UI as Danger Zone Component
+    participant API as Account Deletion Service
+    participant Redis as Redis Challenge Store
+    participant DB as PostgreSQL Database
+
+    User->>UI: Clicks "Delete Account"
+    UI->>User: Prompts for Password / Re-Auth
+    User->>UI: Enters Current Password
+    UI->>API: POST /api/account/deletion/request
+    API->>DB: Check Sole Owner Blockers & Verify Password
+    API->>Redis: Generate & Store 10-Min Cryptographic Challenge Token
+    API-->>UI: Return Challenge Token + Warning Summary
+    UI->>User: Display Step 2: "Type DELETE MY ACCOUNT"
+    User->>UI: Inputs exact phrase "DELETE MY ACCOUNT"
+    UI->>API: POST /api/account/deletion/confirm
+    API->>Redis: Atomically Verify & Invalidate Challenge Token
+    API->>DB: BEGIN Transaction: Anonymize PII, Reassign Open Jobs, Invalidate Tokens
+    API->>DB: Record Entry in account_deletion_audit
+    API->>DB: COMMIT Transaction
+    API->>Redis: Purge User Session & Notification Channels
+    API-->>UI: Return Success + Clear Auth Cookies
+    UI->>User: Sign Out & Redirect to Login
+```
+
+#### Key Components:
+
+1. **Database Migration 024** ([`migrations/024_secure_account_deletion.sql`](file:///c:/Users/mrpre/Desktop/SMARTERP/SmartERP-Backend/migrations/024_secure_account_deletion.sql)):
+   - Added `is_deleted`, `deleted_at`, and `deletion_reason` to `users` and `customers`.
+   - Created `account_deletion_audit` table recording `original_user_id`, `company_id`, `role`, `ip_address`, `user_agent`, `reason`, and `retained_records_summary` (JSONB).
+2. **Backend Service** ([`services/accountDeletionService.js`](file:///c:/Users/mrpre/Desktop/SMARTERP/SmartERP-Backend/services/accountDeletionService.js)):
+   - **Sole Owner Guard**: Blocks an Owner from deleting their account if active employees or active operations exist in their company unless ownership is transferred.
+   - **One-Time Challenge Token**: Cryptographic 32-byte hex token stored in Redis/memory with a 10-minute TTL. Consumed immediately on verification to prevent token replay attacks.
+   - **Transactional Data Erasure (`BEGIN ... COMMIT`)**:
+     - Personal PII anonymized: `name = 'Former User [Deleted]'`, `email = 'deleted_user_<uuid>@anonymized.invalid'`, `phone = NULL`, `password_hash = NULL`, `google_id = NULL`, `is_active = FALSE`, `is_deleted = TRUE`.
+     - Statutory record preservation: Financial and operational records (completed jobs, tax invoices, GST runs, payroll logs) are retained under **GST Act Section 36** (72-month retention) and **Companies Act Section 128** (8-year retention).
+     - Active operational continuity: Open in-progress jobs assigned to the deleted technician are set to `assigned_employee_id = NULL` (`status = 'pending_reassignment'`).
+     - Real-time token & session invalidation: Clears DB refresh tokens, purges Redis keys (`user_rt:*`, `employee_notifications:*`, `ai_agent:*`), and invalidates HTTP cookies.
+3. **Ownership Transfer Endpoint** ([`routes/account.js`](file:///c:/Users/mrpre/Desktop/SMARTERP/SmartERP-Backend/routes/account.js)):
+   - `POST /api/account/transfer-ownership`: Enables Sole Owners to designate an active team member as the new `Owner`, automatically demoting themselves to `employee` before proceeding with personal deletion.
+4. **Unified Frontend Danger Zone Component** ([`components/danger-zone-account-deletion.tsx`](file:///c:/Users/mrpre/Desktop/SMARTERP/SmartERP-Frontend/components/danger-zone-account-deletion.tsx)):
+   - Reusable multi-step modal embedded in Owner Settings, Employee Settings, HR Settings, and Customer Profile pages.
 

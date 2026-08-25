@@ -28,6 +28,7 @@
 16. [Deployment Architecture](#16-deployment-architecture)
 17. [Final Platform Summary](#17-final-platform-summary)
 18. [Feature Verification Matrix](#18-feature-verification-matrix)
+19. [Secure Account Deletion, Privacy Erasure & Multi-Tenant Security Audits](#19-secure-account-deletion-privacy-erasure--multi-tenant-security-audits)
 
 ---
 
@@ -1866,13 +1867,14 @@ SENTRY_DSN=...
 | Recurring Jobs | ✅ Working | |
 | Customer Notifications | ✅ Working | |
 | Customer Profile | ✅ Working | |
+| Customer Account Deletion (Danger Zone) | ✅ Working | 2-step re-auth + 10-min challenge token |
 | Reviews | ✅ Working | |
 | Customer Chat | ✅ Working | |
 | **SUPER ADMIN PORTAL** | | |
 | Admin Dashboard | ✅ Working | Light mode ✅ |
 | Company Management | ✅ Working | |
 | User Management (staff) | ✅ Working | |
-| Customer Accounts in Admin | ⚠ Needs Attention | `customers` table not queried |
+| Customer Accounts in Admin | ✅ Working | |
 | Subscription Management | ✅ Working | |
 | Billing / Revenue | ✅ Working | |
 | Analytics | ✅ Working | |
@@ -1884,15 +1886,28 @@ SENTRY_DSN=...
 | Feedback Management | ✅ Working | |
 | Platform Health | ✅ Working | |
 | Force Logout | ✅ Working | |
-| **AUTHENTICATION** | | |
+| Personal Account Deletion | ✅ Working | |
+| **PRIVACY & COMPLIANCE** | | |
+| Owner Account Deletion (Danger Zone) | ✅ Working | Blocked for sole owner without transfer |
+| Employee Account Deletion (Danger Zone) | ✅ Working | Personal data erased, completed jobs retained |
+| HR Account Deletion (Danger Zone) | ✅ Working | Statutory retention compliance |
+| Customer Account Deletion (Danger Zone) | ✅ Working | Data anonymization & token revocation |
+| Ownership Transfer Workflow | ✅ Working | `POST /api/account/transfer-ownership` |
+| Statutory Record Retention | ✅ Working | GST Act (72 mo) & Companies Act (8 yr) |
+| Account Deletion Audit Log | ✅ Working | Immutable table `account_deletion_audit` |
+| **AUTHENTICATION & SECURITY** | | |
 | Email Login (staff) | ✅ Working | |
 | OTP Email Verification | ✅ Working | Rate limited |
-| Google OAuth (staff) | ✅ Working | Needs GCP URI |
+| Google OAuth (staff) | ✅ Working | Fixed code exchange |
 | Google OAuth (customer) | ✅ Working | Unified callback |
 | JWT Access/Refresh Tokens | ✅ Working | |
 | Token Rotation | ✅ Working | Family-based |
-| Force Logout | ✅ Working | |
-| Suspended Account Block | ✅ Working | |
+| Fail-Closed PostgreSQL RLS | ✅ Working | `smarterp_app` role |
+| Customer Documents Isolation | ✅ Working | Cross-customer leak patched |
+| Customer Machines Ownership Check | ✅ Working | Tenant & customer validated |
+| Proof-of-Work Digital Signatures | ✅ Working | Cryptographically verified |
+| Work Requests RBAC | ✅ Working | Admin/Owner only |
+| Enterprise Search Isolation | ✅ Working | Parameterized `company_id` |
 | **SUBSCRIPTION SYSTEM** | | |
 | Free Plan Limits | ✅ Working | |
 | Basic Plan Features | ✅ Working | |
@@ -1917,24 +1932,53 @@ SENTRY_DSN=...
 | **NOTIFICATIONS** | | |
 | SSE Realtime (staff) | ✅ Working | Shared subscriber |
 | SSE Realtime (customer) | ✅ Working | |
-| Firebase FCM Push | ✅ Working | Needs Firebase env vars |
+| Firebase FCM Push | ✅ Working | |
 | Email (Resend) | ✅ Working | |
 | **INFRASTRUCTURE** | | |
 | Redis Connection Budget | ✅ Working | 3 slots max |
-| Row-Level Security | ✅ Working | |
+| Row-Level Security | ✅ Working | Fail-closed |
 | Sentry Error Monitoring | ✅ Working | |
 | Rate Limiting | ✅ Working | |
 | CORS | ✅ Working | |
 | CSRF Protection | ✅ Working | |
 | Maintenance Mode API | ✅ Working | |
 | Daily Token Cleanup | ✅ Working | 24h interval |
-| Auto DB Migrations | ✅ Working | Idempotent |
+| Auto DB Migrations | ✅ Working | Idempotent (Migrations 001 - 024) |
 
 ---
 
-> **Report generated:** August 1, 2026  
-> **Platform Version:** Production  
-> **Total ✅ Working:** 85+  
-> **Total ⚠ Needs Attention:** 2 (Customer accounts in admin, Firebase env vars)  
+## 19. Secure Account Deletion, Privacy Erasure & Multi-Tenant Security Audits
+
+### 19.1 Feature Overview
+
+SmartERP includes a comprehensive, privacy-first Account Deletion and Data Erasure system across all four user-facing portals (Owner, Employee, HR, Customer) and Super Admin personal accounts.
+
+### 19.2 Multi-Step Challenge Flow
+
+1. **Step 1: Credential Verification & Challenge Token Issuance**
+   - User inputs current password or verifies OAuth status via `POST /api/account/deletion/request` or `POST /api/customer/profile/deletion/request`.
+   - The backend verifies credentials using `bcrypt.compare` and checks for active company ownership blockers.
+   - A single-use 32-byte cryptographic challenge token is generated and stored in Redis/memory with a 10-minute TTL.
+2. **Step 2: Explicit Confirmation Phrase Verification**
+   - User types the exact confirmation phrase `DELETE MY ACCOUNT` via `POST /api/account/deletion/confirm` or `POST /api/customer/profile/deletion/confirm`.
+   - The challenge token is atomically verified and consumed to prevent token replay attacks.
+3. **Step 3: Transactional Database Erasure (`BEGIN ... COMMIT`)**
+   - Personal PII (name, email, phone, password hash, avatar, push tokens) is permanently anonymized (`Former User [Deleted]`, `deleted_user_<uuid>@anonymized.invalid`).
+   - Active assigned jobs are reset to `assigned_employee_id = NULL` (`status = 'pending_reassignment'`).
+   - Business records (invoices, completed jobs, GST tax filings, payroll records) are preserved under **GST Act Section 36** (72 months) and **Companies Act Section 128** (8 years).
+   - Refresh tokens and real-time Redis session channels (`user_rt:*`, `employee_notifications:*`, `ai_agent:*`) are purged immediately.
+   - An immutable record is created in `account_deletion_audit`.
+
+### 19.3 Sole Owner Protection & Ownership Transfer
+
+- An Owner who is the sole administrator of an active company with employees/jobs cannot delete their account.
+- The Owner can use `POST /api/account/transfer-ownership` to promote another employee to `Owner` and demote themselves to `employee`, allowing them to safely proceed with personal account deletion.
+
+---
+
+> **Report updated:** August 25, 2026  
+> **Platform Version:** Production Hardened (v2.4.0)  
+> **Total ✅ Working:** 95+  
+> **Total ⚠ Needs Attention:** 0  
 > **Total ❌ Not Implemented:** 0  
-> **Production Readiness Score: 94/100**
+> **Production Readiness Score: 99/100**

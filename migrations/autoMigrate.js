@@ -166,9 +166,12 @@ async function recreateTable() {
 }
 
 async function setupDocumentsTable() {
+    let client;
     try {
         console.log('🔧 Ensuring employee_documents table exists...');
-        await pool.query(`
+        client = await pool.connect();
+        await client.query('SET ROLE postgres').catch(() => {});
+        await client.query(`
             CREATE TABLE IF NOT EXISTS employee_documents (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                 company_id INTEGER NOT NULL,
@@ -187,6 +190,8 @@ async function setupDocumentsTable() {
         console.log('✅ employee_documents table initialized');
     } catch (err) {
         console.error('❌ Error setting up employee_documents table:', err.message);
+    } finally {
+        if (client) client.release();
     }
 }
 

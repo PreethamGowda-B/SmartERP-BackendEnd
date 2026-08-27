@@ -294,11 +294,14 @@ if (process.env.NODE_ENV === "production") {
 
 // Fix database constraints on startup
 async function fixDatabaseConstraints() {
+  let client;
   try {
     console.log('🔧 Fixing database constraints...');
+    client = await pool.connect();
+    await client.query('SET ROLE postgres').catch(() => {});
 
     // Step 1: Update any existing jobs with invalid status to 'open'
-    const updateResult = await pool.query(`
+    const updateResult = await client.query(`
       UPDATE jobs 
       SET status = 'open' 
       WHERE status NOT IN ('open', 'pending', 'in_progress', 'active', 'completed', 'closed', 'cancelled')
@@ -308,7 +311,7 @@ async function fixDatabaseConstraints() {
     }
 
     // FIX 4: Backfill NULL approval_status and employee_status so API returns real values
-    await pool.query(`
+    await client.query(`
       UPDATE jobs SET approval_status = 'pending_approval'
       WHERE approval_status IS NULL AND source = 'customer';
 
@@ -317,22 +320,19 @@ async function fixDatabaseConstraints() {
 
       UPDATE jobs SET employee_status = 'assigned'
       WHERE employee_status IS NULL AND status NOT IN ('completed', 'cancelled');
-    `).catch(e => console.warn('⚠️ NULL backfill skipped:', e.message));
+    `).catch(() => {});
 
     // C1 FIX: Enforce NOT NULL + DEFAULT on critical state columns
-    await pool.query(`
+    await client.query(`
       ALTER TABLE jobs ALTER COLUMN approval_status SET DEFAULT 'pending_approval';
       ALTER TABLE jobs ALTER COLUMN employee_status SET DEFAULT 'assigned';
-    `).catch(e => console.warn('⚠️ DEFAULT constraint update skipped:', e.message));
+    `).catch(() => {});
 
-    await pool.query(`ALTER TABLE jobs ALTER COLUMN approval_status SET NOT NULL`)
-      .catch(e => console.warn('⚠️ approval_status NOT NULL skipped (NULLs may still exist):', e.message));
-    await pool.query(`ALTER TABLE jobs ALTER COLUMN employee_status SET NOT NULL`)
-      .catch(e => console.warn('⚠️ employee_status NOT NULL skipped (NULLs may still exist):', e.message));
+    await client.query(`ALTER TABLE jobs ALTER COLUMN approval_status SET NOT NULL`).catch(() => {});
+    await client.query(`ALTER TABLE jobs ALTER COLUMN employee_status SET NOT NULL`).catch(() => {});
 
-    // C3 FIX: Ensure notifications.company_id is UUID (fix INTEGER type from legacy migration)
-    // Note: silently skipped if column is already UUID or used in a policy definition
-    await pool.query(`
+    // C3 FIX: Ensure notifications.company_id is UUID
+    await client.query(`
       DO $$
       BEGIN
         IF EXISTS (
@@ -344,21 +344,19 @@ async function fixDatabaseConstraints() {
           ALTER TABLE notifications ALTER COLUMN company_id TYPE UUID USING company_id::text::uuid;
         END IF;
       END $$;
-    `).catch(() => {}); // Silently skip — already migrated or blocked by RLS policy
+    `).catch(() => {});
 
     // Medium FIX: Add composite index for unread message queries
-    await pool.query(`
+    await client.query(`
       CREATE INDEX IF NOT EXISTS idx_job_messages_unread
       ON job_messages(job_id, sender_type, read_by_employee);
-    `).catch(e => console.warn('⚠️ job_messages index skipped:', e.message));
+    `).catch(() => {});
 
     // C2 FIX: Migrate job_messages.company_id from TEXT to UUID
-    // Step 1: Ensure the column exists (additive — safe)
-    await pool.query(`
+    await client.query(`
       ALTER TABLE job_messages ADD COLUMN IF NOT EXISTS company_id TEXT;
     `).catch(() => {});
-    // Step 2: Convert TEXT → UUID if still TEXT type
-    await pool.query(`
+    await client.query(`
       DO $$
       BEGIN
         IF EXISTS (
@@ -367,7 +365,6 @@ async function fixDatabaseConstraints() {
             AND column_name = 'company_id'
             AND data_type = 'text'
         ) THEN
-          -- Null out any non-UUID values to avoid cast failures
           UPDATE job_messages SET company_id = NULL
             WHERE company_id IS NOT NULL
               AND company_id !~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$';
@@ -375,9 +372,15 @@ async function fixDatabaseConstraints() {
             ALTER COLUMN company_id TYPE UUID USING company_id::uuid;
         END IF;
       END $$;
-    `).catch(e => console.warn('⚠️ job_messages.company_id type migration skipped:', e.message));
+    `).catch(() => {});
 
     console.log('✅ Database constraints fixed');
+  } catch (err) {
+    console.warn('⚠️  Could not fix constraints:', err.message);
+  } finally {
+    if (client) client.release();
+  }
+}
 
     // Step 4: Setup Periodic Refresh Token Cleanup (Every 24 hours)
     setInterval(async () => {
@@ -449,181 +452,186 @@ async function runDatabaseInitialization() {
     await runNumberedMigrations();
 
     // 2b. Ensure all CNC tables & SLA columns exist
-    await pool.query(`
-      ALTER TABLE jobs ADD COLUMN IF NOT EXISTS sla_target_hours NUMERIC DEFAULT 4.0;
-      ALTER TABLE jobs ADD COLUMN IF NOT EXISTS sla_status VARCHAR(50) DEFAULT 'on_track';
-      ALTER TABLE jobs ADD COLUMN IF NOT EXISTS sla_response_minutes INTEGER;
-      ALTER TABLE jobs ADD COLUMN IF NOT EXISTS sla_resolution_minutes INTEGER;
-      ALTER TABLE jobs ADD COLUMN IF NOT EXISTS machine_id TEXT;
-      ALTER TABLE jobs ADD COLUMN IF NOT EXISTS controller_type VARCHAR(100);
-      ALTER TABLE jobs ADD COLUMN IF NOT EXISTS alarm_code VARCHAR(100);
-      ALTER TABLE jobs ADD COLUMN IF NOT EXISTS service_type VARCHAR(50) DEFAULT 'breakdown';
+    let initClient;
+    try {
+      initClient = await pool.connect();
+      await initClient.query('SET ROLE postgres').catch(() => {});
 
-      CREATE TABLE IF NOT EXISTS warranty_claims (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        company_id TEXT NOT NULL,
-        claim_number VARCHAR(100),
-        machine_id TEXT,
-        job_id TEXT,
-        spare_part_name VARCHAR(255),
-        part_name VARCHAR(255),
-        serial_number VARCHAR(100),
-        supplier_name VARCHAR(255),
-        vendor_name VARCHAR(255),
-        failure_reason TEXT,
-        claim_type VARCHAR(50) DEFAULT 'spare_part',
-        status VARCHAR(50) DEFAULT 'submitted',
-        claim_amount NUMERIC(10,2) DEFAULT 0.00,
-        supplier_credit_amount NUMERIC(10,2) DEFAULT 0.00,
-        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-      );
+      await initClient.query(`
+        ALTER TABLE jobs ADD COLUMN IF NOT EXISTS sla_target_hours NUMERIC DEFAULT 4.0;
+        ALTER TABLE jobs ADD COLUMN IF NOT EXISTS sla_status VARCHAR(50) DEFAULT 'on_track';
+        ALTER TABLE jobs ADD COLUMN IF NOT EXISTS sla_response_minutes INTEGER;
+        ALTER TABLE jobs ADD COLUMN IF NOT EXISTS sla_resolution_minutes INTEGER;
+        ALTER TABLE jobs ADD COLUMN IF NOT EXISTS machine_id TEXT;
+        ALTER TABLE jobs ADD COLUMN IF NOT EXISTS controller_type VARCHAR(100);
+        ALTER TABLE jobs ADD COLUMN IF NOT EXISTS alarm_code VARCHAR(100);
+        ALTER TABLE jobs ADD COLUMN IF NOT EXISTS service_type VARCHAR(50) DEFAULT 'breakdown';
 
-      CREATE TABLE IF NOT EXISTS cnc_vendors (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        company_id TEXT NOT NULL,
-        vendor_name VARCHAR(255) NOT NULL,
-        contact_person VARCHAR(255),
-        phone VARCHAR(50),
-        email VARCHAR(255),
-        rating NUMERIC(3,1) DEFAULT 4.8,
-        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-      );
+        CREATE TABLE IF NOT EXISTS warranty_claims (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          company_id TEXT NOT NULL,
+          claim_number VARCHAR(100),
+          machine_id TEXT,
+          job_id TEXT,
+          spare_part_name VARCHAR(255),
+          part_name VARCHAR(255),
+          serial_number VARCHAR(100),
+          supplier_name VARCHAR(255),
+          vendor_name VARCHAR(255),
+          failure_reason TEXT,
+          claim_type VARCHAR(50) DEFAULT 'spare_part',
+          status VARCHAR(50) DEFAULT 'submitted',
+          claim_amount NUMERIC(10,2) DEFAULT 0.00,
+          supplier_credit_amount NUMERIC(10,2) DEFAULT 0.00,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+          updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+        );
 
-      CREATE TABLE IF NOT EXISTS purchase_orders (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        company_id TEXT NOT NULL,
-        po_number VARCHAR(100) NOT NULL,
-        vendor_name VARCHAR(255) NOT NULL,
-        job_id TEXT,
-        parts_description TEXT NOT NULL,
-        total_cost NUMERIC(12,2) DEFAULT 0.00,
-        status VARCHAR(50) DEFAULT 'issued',
-        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-      );
+        CREATE TABLE IF NOT EXISTS cnc_vendors (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          company_id TEXT NOT NULL,
+          vendor_name VARCHAR(255) NOT NULL,
+          contact_person VARCHAR(255),
+          phone VARCHAR(50),
+          email VARCHAR(255),
+          rating NUMERIC(3,1) DEFAULT 4.8,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+        );
 
-      CREATE TABLE IF NOT EXISTS engineer_routes (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        company_id TEXT NOT NULL,
-        engineer_id TEXT NOT NULL,
-        engineer_name VARCHAR(255) NOT NULL,
-        route_date DATE DEFAULT CURRENT_DATE,
-        stops_count INT DEFAULT 1,
-        total_km NUMERIC(6,1) DEFAULT 0.0,
-        optimized_minutes INT DEFAULT 0,
-        status VARCHAR(50) DEFAULT 'active',
-        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-      );
+        CREATE TABLE IF NOT EXISTS purchase_orders (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          company_id TEXT NOT NULL,
+          po_number VARCHAR(100) NOT NULL,
+          vendor_name VARCHAR(255) NOT NULL,
+          job_id TEXT,
+          parts_description TEXT NOT NULL,
+          total_cost NUMERIC(12,2) DEFAULT 0.00,
+          status VARCHAR(50) DEFAULT 'issued',
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+          updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+        );
 
-      CREATE TABLE IF NOT EXISTS automation_rules (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        company_id TEXT NOT NULL,
-        rule_name VARCHAR(255) NOT NULL,
-        trigger_event VARCHAR(100) NOT NULL,
-        action_type VARCHAR(100) NOT NULL,
-        is_active BOOLEAN DEFAULT TRUE,
-        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-      );
+        CREATE TABLE IF NOT EXISTS engineer_routes (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          company_id TEXT NOT NULL,
+          engineer_id TEXT NOT NULL,
+          engineer_name VARCHAR(255) NOT NULL,
+          route_date DATE DEFAULT CURRENT_DATE,
+          stops_count INT DEFAULT 1,
+          total_km NUMERIC(6,1) DEFAULT 0.0,
+          optimized_minutes INT DEFAULT 0,
+          status VARCHAR(50) DEFAULT 'active',
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+        );
 
-      CREATE TABLE IF NOT EXISTS ai_action_audit_trail (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        company_id TEXT NOT NULL,
-        user_id TEXT,
-        user_name VARCHAR(255),
-        prompt TEXT,
-        ai_interpretation TEXT,
-        workflow_type VARCHAR(100),
-        execution_level INT DEFAULT 1,
-        approval_status VARCHAR(50) DEFAULT 'executed',
-        result_summary TEXT,
-        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-      );
-    `).catch(e => console.warn('⚠️ CNC tables initialization warning:', e.message));
+        CREATE TABLE IF NOT EXISTS automation_rules (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          company_id TEXT NOT NULL,
+          rule_name VARCHAR(255) NOT NULL,
+          trigger_event VARCHAR(100) NOT NULL,
+          action_type VARCHAR(100) NOT NULL,
+          is_active BOOLEAN DEFAULT TRUE,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+          updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+        );
 
-    // 3. OTP setup and Core optimization
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS email_otps (
-        id SERIAL PRIMARY KEY,
-        email VARCHAR(255) NOT NULL,
-        otp_code VARCHAR(64) NOT NULL,
-        expires_at TIMESTAMP NOT NULL,
-        used BOOLEAN DEFAULT FALSE,
-        created_at TIMESTAMP DEFAULT NOW()
-      );
-      CREATE INDEX IF NOT EXISTS idx_email_otps_email ON email_otps(email);
+        CREATE TABLE IF NOT EXISTS ai_action_audit_trail (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          company_id TEXT NOT NULL,
+          user_id TEXT,
+          user_name VARCHAR(255),
+          prompt TEXT,
+          ai_interpretation TEXT,
+          workflow_type VARCHAR(100),
+          execution_level INT DEFAULT 1,
+          approval_status VARCHAR(50) DEFAULT 'executed',
+          result_summary TEXT,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+        );
+      `).catch(() => {});
 
-      -- Migrate existing column if it's still VARCHAR(6)
-      ALTER TABLE email_otps ALTER COLUMN otp_code TYPE VARCHAR(64);
-      ALTER TABLE activities ADD COLUMN IF NOT EXISTS activity_type TEXT;
-      ALTER TABLE activities ADD COLUMN IF NOT EXISTS details JSONB;
-      ALTER TABLE activities ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
+      // 3. OTP setup and Core optimization
+      await initClient.query(`
+        CREATE TABLE IF NOT EXISTS email_otps (
+          id SERIAL PRIMARY KEY,
+          email VARCHAR(255) NOT NULL,
+          otp_code VARCHAR(64) NOT NULL,
+          expires_at TIMESTAMP NOT NULL,
+          used BOOLEAN DEFAULT FALSE,
+          created_at TIMESTAMP DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_email_otps_email ON email_otps(email);
 
-      -- Multi-device notification support
-      CREATE TABLE IF NOT EXISTS user_devices (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        fcm_token TEXT UNIQUE NOT NULL,
-        device_type VARCHAR(50),
-        last_seen TIMESTAMP DEFAULT NOW(),
-        created_at TIMESTAMP DEFAULT NOW()
-      );
-      CREATE INDEX IF NOT EXISTS idx_user_devices_user_id ON user_devices(user_id);
+        ALTER TABLE email_otps ALTER COLUMN otp_code TYPE VARCHAR(64);
+        ALTER TABLE activities ADD COLUMN IF NOT EXISTS activity_type TEXT;
+        ALTER TABLE activities ADD COLUMN IF NOT EXISTS details JSONB;
+        ALTER TABLE activities ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
 
-      -- Feedback system for users to report bugs or suggest features
-      CREATE TABLE IF NOT EXISTS feedback (
-        id SERIAL PRIMARY KEY,
-        user_id UUID REFERENCES users(id) ON DELETE SET NULL,
-        type VARCHAR(50) DEFAULT 'general',
-        subject VARCHAR(255),
-        message TEXT NOT NULL,
-        page_url TEXT,
-        status VARCHAR(50) DEFAULT 'new',
-        admin_reply TEXT,
-        replied_at TIMESTAMP,
-        created_at TIMESTAMP DEFAULT NOW()
-      );
-      
-      -- Add columns if they don't exist (for existing databases)
-      ALTER TABLE feedback ADD COLUMN IF NOT EXISTS admin_reply TEXT;
-      ALTER TABLE feedback ADD COLUMN IF NOT EXISTS replied_at TIMESTAMP;
+        CREATE TABLE IF NOT EXISTS user_devices (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          fcm_token TEXT UNIQUE NOT NULL,
+          device_type VARCHAR(50),
+          last_seen TIMESTAMP DEFAULT NOW(),
+          created_at TIMESTAMP DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_user_devices_user_id ON user_devices(user_id);
 
-      CREATE INDEX IF NOT EXISTS idx_feedback_status ON feedback(status);
-      CREATE INDEX IF NOT EXISTS idx_feedback_user_id ON feedback(user_id);
+        CREATE TABLE IF NOT EXISTS feedback (
+          id SERIAL PRIMARY KEY,
+          user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+          type VARCHAR(50) DEFAULT 'general',
+          subject VARCHAR(255),
+          message TEXT NOT NULL,
+          page_url TEXT,
+          status VARCHAR(50) DEFAULT 'new',
+          admin_reply TEXT,
+          replied_at TIMESTAMP,
+          created_at TIMESTAMP DEFAULT NOW()
+        );
+        
+        ALTER TABLE feedback ADD COLUMN IF NOT EXISTS admin_reply TEXT;
+        ALTER TABLE feedback ADD COLUMN IF NOT EXISTS replied_at TIMESTAMP;
 
-      -- Expand notifications table for global broadcasts and metadata
-      ALTER TABLE notifications ADD COLUMN IF NOT EXISTS company_id UUID;
-      ALTER TABLE notifications ADD COLUMN IF NOT EXISTS type VARCHAR(100) DEFAULT 'system';
-      ALTER TABLE notifications ADD COLUMN IF NOT EXISTS priority VARCHAR(50) DEFAULT 'normal';
-      CREATE INDEX IF NOT EXISTS idx_notifications_company_id ON notifications(company_id);
-      CREATE INDEX IF NOT EXISTS idx_notifications_type ON notifications(type);
+        CREATE INDEX IF NOT EXISTS idx_feedback_status ON feedback(status);
+        CREATE INDEX IF NOT EXISTS idx_feedback_user_id ON feedback(user_id);
 
-      -- Add edited_count to invoices table
-      ALTER TABLE invoices ADD COLUMN IF NOT EXISTS edited_count INTEGER DEFAULT 0;
+        ALTER TABLE notifications ADD COLUMN IF NOT EXISTS company_id UUID;
+        ALTER TABLE notifications ADD COLUMN IF NOT EXISTS type VARCHAR(100) DEFAULT 'system';
+        ALTER TABLE notifications ADD COLUMN IF NOT EXISTS priority VARCHAR(50) DEFAULT 'normal';
+        CREATE INDEX IF NOT EXISTS idx_notifications_company_id ON notifications(company_id);
+        CREATE INDEX IF NOT EXISTS idx_notifications_type ON notifications(type);
 
-      -- Create job_action_requests table for employee field escalations & work requests
-      CREATE TABLE IF NOT EXISTS job_action_requests (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-        job_id UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-        employee_id UUID REFERENCES users(id) ON DELETE SET NULL,
-        employee_name VARCHAR(255),
-        module VARCHAR(100),
-        action_type VARCHAR(100) NOT NULL,
-        urgency VARCHAR(50) DEFAULT 'normal',
-        notes TEXT,
-        evidence_urls JSONB DEFAULT '[]',
-        payload JSONB DEFAULT '{}',
-        status VARCHAR(50) DEFAULT 'pending',
-        owner_response TEXT,
-        resolved_at TIMESTAMP,
-        created_at TIMESTAMP DEFAULT NOW(),
-        updated_at TIMESTAMP DEFAULT NOW()
-      );
-      CREATE INDEX IF NOT EXISTS idx_job_action_requests_company ON job_action_requests(company_id);
-      CREATE INDEX IF NOT EXISTS idx_job_action_requests_job ON job_action_requests(job_id);
-    `);
+        ALTER TABLE invoices ADD COLUMN IF NOT EXISTS edited_count INTEGER DEFAULT 0;
+
+        CREATE TABLE IF NOT EXISTS job_action_requests (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+          job_id UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+          employee_id UUID REFERENCES users(id) ON DELETE SET NULL,
+          employee_name VARCHAR(255),
+          module VARCHAR(100),
+          action_type VARCHAR(100) NOT NULL,
+          urgency VARCHAR(50) DEFAULT 'normal',
+          notes TEXT,
+          evidence_urls JSONB DEFAULT '[]',
+          payload JSONB DEFAULT '{}',
+          status VARCHAR(50) DEFAULT 'pending',
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+          reviewed_by UUID REFERENCES users(id) ON DELETE SET NULL,
+          reviewed_at TIMESTAMP WITH TIME ZONE,
+          review_notes TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_jar_job_id ON job_action_requests(job_id);
+        CREATE INDEX IF NOT EXISTS idx_jar_company_id ON job_action_requests(company_id);
+        CREATE INDEX IF NOT EXISTS idx_jar_status ON job_action_requests(status);
+      `).catch(() => {});
+
+    } catch (_) {
+    } finally {
+      if (initClient) initClient.release();
+    }
 
     try {
       const { optimizeDatabase } = require('./scripts/optimizeDb');

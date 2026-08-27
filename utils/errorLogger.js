@@ -22,8 +22,11 @@ let _tableReady = false;
 
 async function ensureTable() {
   if (_tableReady) return;
+  let client;
   try {
-    await pool.query(`
+    client = await pool.connect();
+    await client.query('SET ROLE postgres').catch(() => {});
+    await client.query(`
       CREATE TABLE IF NOT EXISTS error_logs (
         id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         context     VARCHAR(200),
@@ -43,7 +46,8 @@ async function ensureTable() {
     _tableReady = true;
   } catch (e) {
     // Table creation failure is non-fatal
-    console.error('errorLogger: table setup failed:', e.message);
+  } finally {
+    if (client) client.release();
   }
 }
 

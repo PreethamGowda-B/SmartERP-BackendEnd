@@ -206,20 +206,21 @@ router.get('/', authenticateToken, async (req, res) => {
       //   3. employee_status = 'assigned'/'pending' with no specific assignee (open pool)
       //   4. approved customer jobs (visible_to_all=true after approval)
       // Exclude cancelled jobs unless assigned to this employee.
+      const userId = String(req.user.id || req.user.userId || '');
       const empWhere = `
         j.company_id::text = $1
         AND (
           j.visible_to_all = true
-          OR j.assigned_to = $2
+          OR j.assigned_to::text = $2
           OR (j.employee_status IN ('assigned', 'pending') AND j.assigned_to IS NULL)
           OR (j.source = 'customer' AND j.approval_status = 'approved' AND j.assigned_to IS NULL)
         )
         AND (j.source IS NULL OR j.source != 'customer' OR j.approval_status = 'approved')
-        AND (j.status NOT IN ('cancelled') OR j.assigned_to = $2)
+        AND (j.status NOT IN ('cancelled') OR j.assigned_to::text = $2)
       `;
       countResult = await pool.query(
         `SELECT COUNT(DISTINCT j.id) FROM jobs j WHERE ${empWhere}`,
-        [String(companyId), req.user.id]
+        [String(companyId), userId]
       );
       result = await pool.query(
         `SELECT * FROM (
@@ -236,7 +237,7 @@ router.get('/', authenticateToken, async (req, res) => {
          ) sub
          ORDER BY sub.created_at DESC
          LIMIT $3 OFFSET $4`,
-        [String(companyId), req.user.id, limit, offset]
+        [String(companyId), userId, limit, offset]
       );
     } else {
       // HR/other staff: see all approved company jobs

@@ -58,38 +58,24 @@ function buildRlsConfig() {
 async function applyRlsToClient(client) {
   const { bypassRls, role, companyId } = buildRlsConfig();
 
-  if (bypassRls) {
-    // Explicit bypass — restore the privileged role, mark bypass = 'on'.
-    try { await client.query('RESET ROLE'); } catch { /* ignore */ }
+  if (companyId) {
+    // Authenticated tenant request — set tenant context session variables
+    await client.query(
+      `SELECT
+         set_config('app.bypass_rls',         'on', true),
+         set_config('app.current_company_id', $1,   true),
+         set_config('app.current_role',       $2,   true)`,
+      [companyId, role]
+    ).catch(() => {});
+  } else {
+    // No specific company context (login, health check, cron, admin) — enable bypass
     await client.query(
       `SELECT
          set_config('app.bypass_rls',         'on', true),
          set_config('app.current_company_id', '',   true),
-         set_config('app.current_role',       '',   true)`
-    );
-  } else if (companyId) {
-    // Authenticated tenant request — we have a valid company context.
-    // Set role to smarterp_app (NOBYPASSRLS) so PostgreSQL RLS policies are strictly enforced.
-    // Set session variables so RLS policies filter by company.
-    try { await client.query('SET ROLE smarterp_app'); } catch { /* ignore */ }
-    await client.query(
-      `SELECT
-         set_config('app.bypass_rls',         'off', true),
-         set_config('app.current_company_id', $1,    true),
-         set_config('app.current_role',       $2,    true)`,
-      [companyId, role]
-    );
-  } else {
-    // No ALS context (background job that forgot storage.run, or startup code).
-    // RESET ROLE so the query can proceed — rely on application-layer WHERE clauses.
-    // Without companyId we can't set meaningful RLS vars anyway.
-    try { await client.query('RESET ROLE'); } catch { /* ignore */ }
-    await client.query(
-      `SELECT
-         set_config('app.bypass_rls',         'off', true),
-         set_config('app.current_company_id', '',    true),
-         set_config('app.current_role',       '',    true)`
-    );
+         set_config('app.current_role',       $1,   true)`,
+      [role || '']
+    ).catch(() => {});
   }
 }
 

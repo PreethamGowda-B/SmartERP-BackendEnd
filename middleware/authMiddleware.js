@@ -74,12 +74,26 @@ function authenticateToken(req, res, next) {
       return res.status(403).json({ message: "Access denied: Customer tokens cannot access staff endpoints" });
     }
     
-    // Check if company is suspended (Only if not super_admin) — Redis-cached with 60s TTL
-    if (payload.role !== 'super_admin' && payload.companyId) {
+    // Ensure companyId is present (fallback to DB lookup if missing from older token)
+    let companyId = payload.companyId || payload.company_id;
+    if (!companyId && payload.role !== 'super_admin' && (payload.id || payload.userId)) {
       try {
-        const suspended = await isCompanySuspended(payload.companyId);
+        const { pool } = require("../db");
+        const userDb = await pool.query("SELECT company_id FROM users WHERE id = $1", [payload.id || payload.userId]);
+        if (userDb.rows.length > 0 && userDb.rows[0].company_id) {
+          companyId = userDb.rows[0].company_id;
+          payload.companyId = companyId;
+          payload.company_id = companyId;
+        }
+      } catch (_) {}
+    }
+
+    // Check if company is suspended (Only if not super_admin) — Redis-cached with 60s TTL
+    if (payload.role !== 'super_admin' && companyId) {
+      try {
+        const suspended = await isCompanySuspended(companyId);
         if (suspended) {
-          console.warn(`🛑 Blocked access for suspended company: ${payload.companyId} (User: ${payload.email})`);
+          console.warn(`🛑 Blocked access for suspended company: ${companyId} (User: ${payload.email})`);
           return res.status(403).json({ 
             message: "Account Suspended/Disabled", 
             error: "your_company_is_suspended",
@@ -91,10 +105,17 @@ function authenticateToken(req, res, next) {
       }
     }
 
-    req.user = payload;
+    req.user = {
+      ...payload,
+      id: payload.id || payload.userId,
+      userId: payload.id || payload.userId,
+      companyId: companyId,
+      company_id: companyId,
+      role: (payload.role || 'employee').toLowerCase()
+    };
+
     // ✅ Activate RLS tenant context immediately after auth so all downstream
-    // DB queries run inside the correct company scope. This ensures
-    // setTenantContext always runs AFTER req.user is populated.
+    // DB queries run inside the correct company scope.
     setTenantContext(req, res, next);
   });
 }

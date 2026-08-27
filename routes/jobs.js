@@ -171,15 +171,16 @@ router.get('/', authenticateToken, async (req, res) => {
     const offset = (page - 1) * limit;
 
     let countResult;
-    let queryParams = [req.user.companyId];
+    const userRole = (req.user.role || 'employee').toLowerCase();
+    const companyId = req.user.companyId || req.user.company_id || 1;
 
-    if (req.user.role === 'owner') {
-      // Exclude pending_approval / rejected customer jobs from the owner's tasks list
+    if (userRole === 'owner' || userRole === 'admin' || userRole === 'super_admin') {
+      // Exclude pending_approval / rejected customer jobs from the owner/admin tasks list
       const ownerWhere = `
         j.company_id::text = $1
         AND (j.source IS NULL OR j.source != 'customer' OR j.approval_status = 'approved')
       `;
-      countResult = await pool.query(`SELECT COUNT(DISTINCT j.id) FROM jobs j WHERE ${ownerWhere}`, [String(req.user.companyId)]);
+      countResult = await pool.query(`SELECT COUNT(DISTINCT j.id) FROM jobs j WHERE ${ownerWhere}`, [String(companyId)]);
       result = await pool.query(
         `SELECT * FROM (
            SELECT DISTINCT ON (j.id) j.*, u.email as employee_email, u.name as employee_name,
@@ -196,9 +197,9 @@ router.get('/', authenticateToken, async (req, res) => {
          ) sub
          ORDER BY sub.created_at DESC
          LIMIT $2 OFFSET $3`,
-        [String(req.user.companyId), limit, offset]
+        [String(companyId), limit, offset]
       );
-    } else if (req.user.role === 'employee') {
+    } else if (userRole === 'employee') {
       // Employees see jobs where:
       //   1. visible_to_all = true (broadcast to all employees)
       //   2. assigned_to = this employee (directly assigned, accepted, working, completed)
@@ -218,7 +219,7 @@ router.get('/', authenticateToken, async (req, res) => {
       `;
       countResult = await pool.query(
         `SELECT COUNT(DISTINCT j.id) FROM jobs j WHERE ${empWhere}`,
-        [String(req.user.companyId), req.user.id]
+        [String(companyId), req.user.id]
       );
       result = await pool.query(
         `SELECT * FROM (
@@ -235,16 +236,15 @@ router.get('/', authenticateToken, async (req, res) => {
          ) sub
          ORDER BY sub.created_at DESC
          LIMIT $3 OFFSET $4`,
-        [String(req.user.companyId), req.user.id, limit, offset]
+        [String(companyId), req.user.id, limit, offset]
       );
     } else {
-      // HR/other roles: only see jobs visible to all that are approved (if from customer)
-      const hrWhere = `
-        j.visible_to_all = true 
-        AND j.company_id::text = $1
+      // HR/other staff: see all approved company jobs
+      const staffWhere = `
+        j.company_id::text = $1
         AND (j.source IS NULL OR j.source != 'customer' OR j.approval_status = 'approved')
       `;
-      countResult = await pool.query(`SELECT COUNT(DISTINCT j.id) FROM jobs j WHERE ${hrWhere}`, [String(req.user.companyId)]);
+      countResult = await pool.query(`SELECT COUNT(DISTINCT j.id) FROM jobs j WHERE ${staffWhere}`, [String(companyId)]);
       result = await pool.query(
         `SELECT * FROM (
            SELECT DISTINCT ON (j.id) j.*, u.email as employee_email, u.name as employee_name,
@@ -254,12 +254,12 @@ router.get('/', authenticateToken, async (req, res) => {
            FROM jobs j 
            LEFT JOIN users u ON j.assigned_to = u.id
            LEFT JOIN invoices inv ON inv.job_id::text = j.id::text
-           WHERE ${hrWhere}
+           WHERE ${staffWhere}
            ORDER BY j.id
          ) sub
          ORDER BY sub.created_at DESC 
          LIMIT $2 OFFSET $3`,
-        [String(req.user.companyId), limit, offset]
+        [String(companyId), limit, offset]
       );
     }
 

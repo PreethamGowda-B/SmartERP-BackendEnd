@@ -433,6 +433,20 @@ router.put('/settings', authenticateToken, async (req, res) => {
     const updates = [];
     if (typeof auto_approve_customer_jobs === 'boolean') {
       updates.push(upsertSetting(companyId, 'auto_approve_customer_jobs', String(auto_approve_customer_jobs), req.user.id));
+      if (auto_approve_customer_jobs) {
+        updates.push(pool.query(
+          `UPDATE jobs
+           SET approval_status = 'approved',
+               approved_at = NOW(),
+               status = 'open',
+               employee_status = 'assigned',
+               visible_to_all = TRUE
+           WHERE (company_id::text = $1::text OR company_id IN (SELECT id FROM companies WHERE id::text = $1::text))
+             AND source = 'customer'
+             AND approval_status = 'pending_approval'`,
+          [String(companyId)]
+        ).catch(() => {}));
+      }
     }
     if (typeof hourly_rate === 'number' && hourly_rate >= 0) {
       updates.push(upsertSetting(companyId, 'hourly_rate', String(hourly_rate), req.user.id));

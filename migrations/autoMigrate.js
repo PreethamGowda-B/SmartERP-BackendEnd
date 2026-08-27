@@ -220,13 +220,22 @@ const NUMBERED_MIGRATIONS = [
 async function runNumberedMigrations() {
     for (const filename of NUMBERED_MIGRATIONS) {
         const filePath = path.join(__dirname, filename);
+        let client;
         try {
             const sql = fs.readFileSync(filePath, 'utf8');
-            await pool.query(sql);
+            client = await pool.connect();
+            await client.query('BEGIN');
+            await client.query(sql);
+            await client.query('COMMIT');
             console.log(`✅ Migration applied: ${filename}`);
         } catch (err) {
+            if (client) {
+                try { await client.query('ROLLBACK'); } catch (_) {}
+            }
             // Log but don't crash the server — each migration is independently guarded
             console.error(`⚠️  Migration failed (${filename}):`, err.message);
+        } finally {
+            if (client) client.release();
         }
     }
 }

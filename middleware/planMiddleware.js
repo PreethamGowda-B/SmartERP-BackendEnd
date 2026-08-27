@@ -101,6 +101,12 @@ async function loadPlan(req, res, next) {
         trial_ends_at: data.trial_ends_at
       };
     } else {
+      let daysRemaining = 0;
+      if (subscriptionExpires) {
+        daysRemaining = Math.max(0, Math.ceil((subscriptionExpires - now) / (1000 * 60 * 60 * 24)));
+      } else if (data.plan_db_id >= 2) {
+        daysRemaining = 365;
+      }
       planObj = {
         id: data.plan_db_id,
         name: data.name,
@@ -110,7 +116,7 @@ async function loadPlan(req, res, next) {
         messages_history_days: data.messages_history_days,
         features: data.features,
         is_trial: false,
-        days_remaining: 0,
+        days_remaining: daysRemaining,
         trial_ends_at: data.trial_ends_at
       };
     }

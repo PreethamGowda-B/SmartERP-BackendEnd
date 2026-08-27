@@ -88,6 +88,8 @@ router.get('/status', loadPlan, async (req, res) => {
       const expiry = new Date(company.subscription_expires_at);
       const diffMs = expiry.getTime() - now.getTime();
       daysRemaining = Math.max(0, Math.ceil(diffMs / (1000 * 60 * 60 * 24)));
+    } else if (!plan.is_trial && (company.subscription_status === 'active' || plan.id >= 2)) {
+      daysRemaining = 365;
     }
 
     res.json({

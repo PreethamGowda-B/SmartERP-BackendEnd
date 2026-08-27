@@ -119,7 +119,7 @@ router.post('/clock-in', authenticateToken, async (req, res) => {
     // Shift over: at or after 7:00 PM IST
     if (clockHour >= 19) {
       return res.status(400).json({
-        message: 'you cannot clock in after 7:00pm come tomorrow and clockin fast clockin will open at 8:00am come fast now go and sleep',
+        message: 'Clock-in is unavailable after shift hours (7:00 PM IST). Shift clock-in will resume tomorrow at 8:00 AM. Please contact HR or submit a regularization request if you require manual attendance approval.',
         code: 'SHIFT_OVER',
         current_time: istClockIn.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true })
       });

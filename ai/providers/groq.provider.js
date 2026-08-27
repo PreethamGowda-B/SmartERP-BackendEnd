@@ -47,13 +47,20 @@ function parsePseudoToolCalls(str) {
   return toolCalls;
 }
 
+const FALLBACK_MODELS = [
+  "openai/gpt-oss-120b",
+  "openai/gpt-oss-20b",
+  "qwen/qwen3.8-27b",
+  "groq/compound",
+];
+
 class GroqProvider extends BaseAIProvider {
   constructor() {
     super("Groq");
     this.client = new Groq({
       apiKey: process.env.GROQ_API_KEY,
     });
-    this.defaultModel = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
+    this.defaultModel = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
   }
 
   async generateCompletion({ messages, tools = [], temperature = 0.2 }) {
@@ -67,24 +74,28 @@ class GroqProvider extends BaseAIProvider {
         return m;
       });
 
-      const payload = {
-        model: this.defaultModel,
-        messages: sanitizedMessages,
-        temperature,
-      };
+      const candidateModels = [this.defaultModel, ...FALLBACK_MODELS.filter(m => m !== this.defaultModel)];
+      let lastError = null;
 
-      if (tools && tools.length > 0) {
-        payload.tools = tools;
-        payload.tool_choice = "auto";
-      }
+      for (const modelToTry of candidateModels) {
+        const payload = {
+          model: modelToTry,
+          messages: sanitizedMessages,
+          temperature,
+        };
 
-      try {
-        const response = await this.client.chat.completions.create(payload);
-        const choice = response.choices[0];
-        const message = choice.message;
+        if (tools && tools.length > 0) {
+          payload.tools = tools;
+          payload.tool_choice = "auto";
+        }
 
-        let content = message.content || "";
-        let toolCalls = message.tool_calls || [];
+        try {
+          const response = await this.client.chat.completions.create(payload);
+          const choice = response.choices[0];
+          const message = choice.message;
+
+          let content = message.content || "";
+          let toolCalls = message.tool_calls || [];
 
         // Sanitize any tool call arguments returned directly by Groq
         if (toolCalls && toolCalls.length > 0) {
@@ -118,25 +129,44 @@ class GroqProvider extends BaseAIProvider {
           model: response.model,
         };
       } catch (err) {
+        lastError = err;
         const errStr = JSON.stringify(err || {});
         const errMsg = err?.message || String(err || "");
 
-        // Intercept Llama 3.3 failed_generation 400 errors containing tool call pseudo-XML
-        if (errStr.includes("failed_generation") || errStr.includes("tool_<function") || errMsg.includes("<function=") || errStr.includes("tool call validation failed")) {
-          const parsedCalls = parsePseudoToolCalls(errStr + " " + errMsg);
+        // Intercept failed_generation 400 errors containing tool call pseudo-XML or JSON output
+        if (err?.error?.error?.failed_generation || errStr.includes("failed_generation") || errStr.includes("tool_<function") || errMsg.includes("<function=") || errStr.includes("tool call validation failed")) {
+          const rawGen = err?.error?.error?.failed_generation || "";
+          if (rawGen) {
+            try {
+              const parsedGen = JSON.parse(rawGen);
+              const extractedText = parsedGen?.arguments?.text || parsedGen?.text;
+              if (extractedText) {
+                return {
+                  content: extractedText,
+                  toolCalls: [],
+                  usage: {},
+                  model: modelToTry,
+                };
+              }
+            } catch (_) {}
+          }
+
+          const parsedCalls = parsePseudoToolCalls(errStr + " " + errMsg + " " + rawGen);
           if (parsedCalls.length > 0) {
             return {
               content: "",
               toolCalls: parsedCalls,
               usage: {},
-              model: this.defaultModel,
+              model: modelToTry,
             };
           }
         }
-        throw err;
+        console.warn(`⚠️ Groq model '${modelToTry}' failed (${errMsg}) — trying next candidate...`);
       }
-    });
-  }
+    }
+    throw lastError || new Error("All AI models failed to respond.");
+  });
+}
 }
 
 module.exports = GroqProvider;

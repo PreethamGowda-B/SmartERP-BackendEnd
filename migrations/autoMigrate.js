@@ -218,12 +218,23 @@ const NUMBERED_MIGRATIONS = [
 ];
 
 async function runNumberedMigrations() {
+    let setupClient;
+    try {
+        setupClient = await pool.connect();
+        await setupClient.query('SET ROLE postgres').catch(() => {});
+        await setupClient.query('GRANT ALL ON SCHEMA public TO PUBLIC').catch(() => {});
+        await setupClient.query('GRANT ALL ON SCHEMA public TO postgres').catch(() => {});
+    } catch (_) {} finally {
+        if (setupClient) setupClient.release();
+    }
+
     for (const filename of NUMBERED_MIGRATIONS) {
         const filePath = path.join(__dirname, filename);
         let client;
         try {
             const sql = fs.readFileSync(filePath, 'utf8');
             client = await pool.connect();
+            await client.query('SET ROLE postgres').catch(() => {});
             await client.query('BEGIN');
             await client.query(sql);
             await client.query('COMMIT');

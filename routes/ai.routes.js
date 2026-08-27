@@ -9,6 +9,7 @@ const SecurityShield = require("../ai/gateway/security.shield");
 const ReActEngine = require("../ai/planner/ReAct.engine");
 const pluginRegistry = require("../ai/plugins");
 const MetricsService = require("../ai/telemetry/metrics.service");
+const { pool } = require("../db");
 
 const AIDataService = require("../services/aiDataService");
 
@@ -322,6 +323,16 @@ router.post(
         blocked: false,
         promptPreview: cleanMessage,
       });
+
+      // Persist to CNC Enterprise AI Action Audit Trail
+      const companyId = req.user.companyId || req.user.company_id || 1;
+      const userId = req.user.userId || req.user.id || '00000000-0000-0000-0000-000000000000';
+      const userName = req.user.name || 'Owner';
+      await pool.query(
+        `INSERT INTO ai_action_audit_trail (company_id, user_id, user_name, prompt, ai_interpretation, workflow_type, execution_level, approval_status, result_summary, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, 1, 'executed', $7, NOW())`,
+        [String(companyId), String(userId), userName, cleanMessage, finalResult.text?.substring(0, 500) || 'Query Analyzed', finalResult.activeModelScope || 'general', finalResult.text?.substring(0, 500) || 'Completed']
+      ).catch(() => {});
 
       finalResult.telemetry = {
         ...(finalResult.telemetry || {}),

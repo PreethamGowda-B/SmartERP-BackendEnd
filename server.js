@@ -375,12 +375,6 @@ async function fixDatabaseConstraints() {
     `).catch(() => {});
 
     console.log('✅ Database constraints fixed');
-  } catch (err) {
-    console.warn('⚠️  Could not fix constraints:', err.message);
-  } finally {
-    if (client) client.release();
-  }
-}
 
     // Step 4: Setup Periodic Refresh Token Cleanup (Every 24 hours)
     setInterval(async () => {
@@ -410,6 +404,8 @@ async function fixDatabaseConstraints() {
 
   } catch (err) {
     console.warn('⚠️  Could not fix constraints:', err.message);
+  } finally {
+    if (client) client.release();
   }
 }
 /**

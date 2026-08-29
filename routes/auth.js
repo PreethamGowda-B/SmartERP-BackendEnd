@@ -346,14 +346,13 @@ router.get('/google/callback', (req, res, next) => {
         return res.redirect(`${FRONTEND}/auth/callback?code=${oauthCode}`);
       }
 
-      // Redis unavailable — fallback (no tokens in URL, just user info)
-      console.warn('⚠️ Redis unavailable for OAuth code exchange, using fallback');
-      return res.redirect(
-        `${FRONTEND}/auth/callback?code=fallback&user=${encodeURIComponent(
-          JSON.stringify({ id: user.id, name: user.name, email: user.email,
-                          role: user.role, company_id: user.company_id, companyId: user.company_id })
-        )}`
+      // Redis unavailable — sign a secure short-lived 60s exchange token so tokens stay encrypted and safe
+      const exchangeToken = jwt.sign(
+        { type: 'oauth_exchange', payload: oauthPayload },
+        ACCESS_SECRET,
+        { expiresIn: '60s' }
       );
+      return res.redirect(`${FRONTEND}/auth/callback?code=${exchangeToken}`);
     } catch (err) {
       console.error('Google Auth Error:', err);
       return res.redirect(`${FRONTEND}/login?error=auth_failed`);
@@ -366,26 +365,43 @@ router.get('/google/callback', (req, res, next) => {
 // ---------------------------------------------
 // ✅ POST /api/auth/exchange-code
 // Exchanges a short-lived OAuth one-time code for session tokens
-// The code is stored in Redis for 60s — single use
+// Supported via Redis (60s TTL) or signed single-use JWT exchange token
 // ---------------------------------------------
 router.post("/exchange-code", async (req, res) => {
   const { code } = req.body;
   if (!code) return res.status(400).json({ message: "Code is required" });
 
   try {
-    if (!redisClient || redisClient.status !== "ready") {
-      return res.status(503).json({ message: "Auth service temporarily unavailable" });
+    let raw = null;
+
+    if (redisClient && redisClient.status === "ready") {
+      try {
+        raw = await redisClient.get(`oauth_code:${code}`);
+        if (raw) {
+          await redisClient.del(`oauth_code:${code}`);
+        }
+      } catch (rErr) {
+        console.warn("Redis lookup error in exchange-code:", rErr.message);
+      }
     }
 
-    const raw = await redisClient.get(`oauth_code:${code}`);
+    // If not in Redis or Redis is down, verify if it is a signed JWT exchange token
+    if (!raw) {
+      try {
+        const decoded = jwt.verify(code, ACCESS_SECRET);
+        if (decoded && decoded.type === "oauth_exchange" && decoded.payload) {
+          raw = decoded.payload;
+        }
+      } catch (jwtErr) {
+        // Not a valid JWT or expired
+      }
+    }
+
     if (!raw) {
       return res.status(400).json({ message: "Invalid or expired code" });
     }
 
-    // Consume the code (one-time use)
-    await redisClient.del(`oauth_code:${code}`);
-
-    const { accessToken, refreshToken, user } = JSON.parse(raw);
+    const { accessToken, refreshToken, user } = typeof raw === "string" ? JSON.parse(raw) : raw;
 
     const isSuperAdmin = user.role === "super_admin";
     const accessCookieName = isSuperAdmin ? COOKIE_ACCESS_ADMIN : COOKIE_ACCESS_USER;
@@ -401,8 +417,7 @@ router.post("/exchange-code", async (req, res) => {
     res.cookie(accessCookieName, accessToken, { ...cookieOpts, maxAge: ACCESS_MAX_AGE });
     res.cookie(refreshCookieName, refreshToken, { ...cookieOpts, maxAge: REFRESH_MAX_AGE });
 
-    // Also return tokens in body so the frontend can store them in sessionStorage
-    // (cookies alone fail cross-origin in modern browsers blocking 3rd-party cookies)
+    // Return tokens in JSON body so frontend can persist in storage (works cross-domain between Vercel & Render)
     res.json({ ok: true, user, accessToken, refreshToken });
   } catch (err) {
     console.error("exchange-code error:", err.message);

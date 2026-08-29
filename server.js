@@ -907,6 +907,9 @@ app.use((err, req, res, next) => {
     'http://localhost:3001'
   ];
   const allowedPatterns = [
+    /^https:\/\/smart-erp-front(-[a-z0-9]+)?(-[a-z0-9-]+)?\.vercel\.app$/,
+    /^https:\/\/smart-erp-front-[a-z0-9]+-thepreethu01-9119s-projects\.vercel\.app$/,
+  ];
   const cleanOrigin = origin ? origin.toLowerCase().trim() : '';
   const isAllowedOrigin = cleanOrigin && (
     allowedOrigins.includes(cleanOrigin) ||

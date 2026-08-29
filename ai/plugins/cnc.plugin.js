@@ -1,175 +1,262 @@
 const BasePlugin = require("./base.plugin");
 const { pool } = require("../../db");
 
-// ─── Verified CNC Controller Alarm & Troubleshooting Knowledge Base ──────────
+// ─── Machine Classification & Architecture Registry ──────────────────────────
+const MACHINE_CLASSIFICATIONS = {
+  // Haas Machining Centers
+  "VF-1": { type: "Vertical Machining Center (VMC)", category: "Milling", axes: "3-Axis (X, Y, Z)" },
+  "VF-2": { type: "Vertical Machining Center (VMC)", category: "Milling", axes: "3-Axis (X, Y, Z)" },
+  "VF-3": { type: "Vertical Machining Center (VMC)", category: "Milling", axes: "3-Axis (X, Y, Z)" },
+  "VF-4": { type: "Vertical Machining Center (VMC)", category: "Milling", axes: "3-Axis (X, Y, Z)" },
+  "VF-5": { type: "Vertical Machining Center (VMC)", category: "Milling", axes: "3-Axis (X, Y, Z)" },
+  "MINI MILL": { type: "Compact Vertical Machining Center", category: "Milling", axes: "3-Axis (X, Y, Z)" },
+  "UMC-500": { type: "Universal 5-Axis Machining Center", category: "Milling", axes: "5-Axis" },
+  "UMC-750": { type: "Universal 5-Axis Machining Center", category: "Milling", axes: "5-Axis" },
+  "EC-400": { type: "Horizontal Machining Center (HMC)", category: "Milling", axes: "4-Axis" },
+  // Haas Turning Centers (Lathes)
+  "ST-10": { type: "CNC Turning Center (Lathe)", category: "Turning", axes: "2-Axis (X, Z)" },
+  "ST-20": { type: "CNC Turning Center (Lathe)", category: "Turning", axes: "2-Axis (X, Z)" },
+  "ST-30": { type: "CNC Turning Center (Lathe)", category: "Turning", axes: "2-Axis (X, Z)" },
+  "TL-1": { type: "CNC Toolroom Lathe", category: "Turning", axes: "2-Axis (X, Z)" },
+  "TL-2": { type: "CNC Toolroom Lathe", category: "Turning", axes: "2-Axis (X, Z)" }
+};
+
+// ─── Authoritative Verified CNC Alarm Knowledge Base ─────────────────────────
 const VERIFIED_CNC_KNOWLEDGE = {
-  // Haas NGC / Classic
-  "HAAS_401": {
-    controller: "Haas NGC / Classic",
-    alarmCode: "401",
-    title: "Servo Off / Drive Fault",
+  // ── Haas Controller Alarms (Numeric 3/4 digits) ───────────────────────────
+  "HAAS_163": {
+    controller: "Haas Next Generation Control (NGC) / Classic Haas Control (CHC)",
+    alarmCode: "163",
+    title: "Z-Axis Drive Fault / Servo Overcurrent",
     severity: "critical",
-    category: "Servo System",
-    description: "Main vector drive or axis amplifier status line indicated a fault, turning all axis servos off.",
+    category: "Axis Drive System",
+    description: "Z-axis amplifier reported a drive fault or instantaneous overcurrent condition to the Main Processor PCB.",
     causes: [
-      "Low DC bus voltage (< 310V DC) from incoming power dip or regenerative discharge load.",
-      "High voltage spike or shorted motor power cable / brake winding.",
-      "Vector drive fault or fault signal cable loose at Main PCB (Connector P1-P4).",
-      "Overheated amplifier or failed cooling fan."
+      "Z-axis holding brake not releasing (defective brake solenoid or lack of 24V DC brake release signal).",
+      "Short circuit or insulation degradation in Z-axis servo motor power cable or motor stator winding.",
+      "Mechanical binding in Z-axis ball screw nut, linear guide trucks, or counterbalance cylinder.",
+      "Defective Haas Smart Amplifier or Vector Drive module."
     ],
-    safetyWarning: "HIGH VOLTAGE HAZARD: DC bus capacitors retain >320V DC charge for up to 10 minutes after main power off. Measure DC bus voltage with a calibrated CAT-III/IV multimeter before touching terminals.",
+    safetyWarning: "HIGH VOLTAGE & SUSPENDED LOAD HAZARD: Z-axis headstock is heavy and may drop if the brake is disengaged. Ensure headstock is mechanically blocked with wooden/aluminum cribbing before servicing Z-axis brake or drive. Only qualified service personnel should service high-voltage cabinet components under strict Lockout/Tagout (LOTO).",
     diagnosticSteps: [
-      "Record any secondary alarms displayed simultaneously (e.g. Alarm 161 Drive Fault, 162 X-Axis Short).",
-      "Power off machine and wait 10 minutes for DC bus discharge.",
-      "Inspect Vector Drive status LEDs (Fault, Overvoltage, Regen) on the drive faceplate.",
-      "Disconnect motor leads from amplifier and measure phase-to-phase resistance (~1.2Ω) and phase-to-ground (> 100MΩ).",
-      "Check incoming 3-phase line balance (all 3 phases within 2% voltage balance)."
+      "Record all secondary alarms displayed on screen (e.g. Alarm 161, 162, 401).",
+      "Inspect way lube level and verify lubrication pressure gauge reads 25–45 PSI during lube cycle.",
+      "Perform a visual inspection of Z-axis way covers and guideways for chip jamming or lack of oil film.",
+      "Check Z-axis brake release: Listen for the mechanical click of the solenoid when E-stop is reset and servos are commanded.",
+      "If qualified: Measure motor lead resistance with power locked out. Winding resistance should be balanced across all 3 phases.",
+      "If fault persists, isolate whether the drive amplifier or the motor/cable is faulted by testing motor leads at amplifier terminals."
     ],
-    verifiedCitations: ["📘 Haas NGC Service Manual — Section 4 (Vector Drive)", "📘 SmartERP CNC Knowledge Base (Ref: CNC-HAA-401)"]
+    verifiedCitations: [
+      "[Manufacturer Documentation] Haas NGC Service Manual — Axis Drive & Motor Troubleshooting (96-0258)",
+      "[SmartERP Verified Service History] SmartERP Standard CNC Diagnostics (Ref: HAA-NGC-163)"
+    ]
   },
+
+  "HAAS_401": {
+    controller: "Haas Next Generation Control (NGC) / Classic Haas Control (CHC)",
+    alarmCode: "401",
+    title: "Servo Off / Drive Fault (All Axes Disabled)",
+    severity: "critical",
+    category: "Servo & Vector Drive System",
+    description: "The CNC controller detected a fault status line from the Vector Drive or axis amplifiers, disabling power to all axis servo motors.",
+    causes: [
+      "Low DC bus voltage (< 310V DC) caused by incoming 3-phase line voltage drop or blown line fuses.",
+      "Vector Drive fault or regenerative load dump resistor over-temperature.",
+      "Loose fault communication cable between Vector Drive and MOCON / Main PCB (Connector P1–P4).",
+      "Amplifier over-temperature trip or cooling fan failure in electrical cabinet."
+    ],
+    safetyWarning: "HIGH VOLTAGE HAZARD: The DC bus retains dangerous voltage (>320V DC) after power-down. Wait for the high-voltage discharge indicator LED on the Vector Drive faceplate to fully extinguish and verify with a calibrated meter before touching any electrical terminals. Follow OSHA/ISO Lockout/Tagout (LOTO) protocols.",
+    diagnosticSteps: [
+      "Check for accompanying axis-specific alarms (e.g., Alarm 161 X Drive Fault, 163 Z Drive Fault).",
+      "Inspect incoming 3-phase AC voltage at main breaker (verify phase-to-phase balance within 2%).",
+      "Inspect Vector Drive status LEDs on the drive module (check Fault, Overvolt, Regen indicators).",
+      "Ensure electrical cabinet cooling fans are running and air filters are free of oil mist and dust.",
+      "Verify wiring connections on fault bus ribbon cables between amplifiers and main processor."
+    ],
+    verifiedCitations: [
+      "[Manufacturer Documentation] Haas Vector Drive Troubleshooting Guide (Haas Automation Manual 96-0258)",
+      "[SmartERP Verified Service History] SmartERP CNC Knowledge Base (Ref: CNC-HAA-401)"
+    ]
+  },
+
+  "HAAS_992": {
+    controller: "Haas Next Generation Control (NGC)",
+    alarmCode: "992",
+    title: "Spindle Orientation Fault / Orient Failed",
+    severity: "critical",
+    category: "Spindle & Tool Change System",
+    description: "The spindle was commanded to orient (e.g. M19 or prior to tool change) but failed to lock into the commanded angular position within the parameter time limit.",
+    causes: [
+      "Spindle encoder belt loose, damaged, or slipped on spindle shaft pulley.",
+      "Spindle orient shot pin / mechanical locking ring binding or solenoid not engaging.",
+      "Spindle vector drive orientation gain parameter out of tune or motor braking delay.",
+      "Encoder feedback cable loose or optical encoder ring contaminated with coolant/oil."
+    ],
+    safetyWarning: "SPINDLE & TOOL CHANGER PINCH HAZARD: Never reach into spindle nose or tool changer carousel area while servos/spindle are powered. Engage Emergency Stop before inspecting spindle belts or shot pins.",
+    diagnosticSteps: [
+      "Check spindle drive belt tension and inspect encoder timing belt for missing teeth or wear.",
+      "Command M19 in MDI mode at low RPM and observe if spindle oscillates or overshoots position.",
+      "Inspect spindle orientation shot pin assembly (if equipped on mechanical orient models) for proper pneumatic actuation.",
+      "Clean optical encoder / magnetic pickup ring from cutting fluid condensation.",
+      "Check Diagnostics screen for spindle speed/position feedback stability during manual spindle rotation."
+    ],
+    verifiedCitations: [
+      "[Manufacturer Documentation] Haas NGC Mill Operator & Service Manual — Section: Spindle Orientation (Alarm 992)",
+      "[SmartERP Verified Service History] SmartERP Tooling Maintenance SOP #992"
+    ]
+  },
+
   "HAAS_104": {
-    controller: "Haas NGC",
+    controller: "Haas Next Generation Control (NGC)",
     alarmCode: "104",
     title: "Y-Axis Following Error / Position Lag",
     severity: "warning",
-    category: "Axis Drive",
-    description: "Difference between commanded axis coordinate and actual encoder position exceeded Parameter 26 error limit.",
+    category: "Axis Drive System",
+    description: "The difference between commanded coordinate position and actual encoder feedback exceeded the maximum allowable error threshold.",
     causes: [
-      "Way lube pump failure or blocked lube metering valve causing high friction on linear guide ways.",
-      "Loose motor-to-ballscrew coupling or gib misalignment.",
+      "Way lube pump failure or blocked metering valve causing high friction on linear guide ways.",
+      "Loose motor-to-ballscrew mechanical coupling or ball screw bearing preload failure.",
       "Encoder cable shielding degradation or optical scale contamination."
     ],
-    safetyWarning: "Ensure emergency stop is engaged before working inside machine enclosure near axis travel paths.",
+    safetyWarning: "Ensure Emergency Stop is engaged before inspecting linear ways and ball screw areas inside the machining enclosure.",
     diagnosticSteps: [
-      "Check way lube pressure gauge during manual pump cycle (nominal 25-45 PSI).",
+      "Check way lube pressure gauge during manual pump cycle (nominal 25–45 PSI).",
       "Inspect Y-axis way covers for chip compaction or mechanical binding.",
       "Jog axis slowly in JOG mode while monitoring motor load percentage on the Diagnostics screen.",
-      "Inspect coupling clamping bolt torque (25 Nm) between servo motor and ball screw."
+      "Inspect coupling clamping bolt torque between servo motor and ball screw."
     ],
-    verifiedCitations: ["📘 Haas Mill Service Manual", "📘 SmartERP Machine Maintenance SOP #104"]
+    verifiedCitations: [
+      "[Manufacturer Documentation] Haas Mill Service Manual — Axis Motion Diagnostics (96-0258)",
+      "[SmartERP Verified Service History] SmartERP Machine Maintenance SOP #104"
+    ]
   },
+
   "HAAS_991": {
-    controller: "Haas NGC",
+    controller: "Haas Next Generation Control (NGC)",
     alarmCode: "991",
     title: "Door Interlock Safety Violation",
     severity: "warning",
     category: "Safety Interlock",
-    description: "Enclosure safety switch opened while spindle was commanded or axis motion was active.",
-    causes: ["Safety door mechanical switch misaligned or dirty.", "Safety interlock key damaged or bypassed."],
-    safetyWarning: "NEVER bypass door interlocks. Industrial safety regulations (ISO 13849-1) require active safety circuits.",
-    diagnosticSteps: [
-      "Clean safety switch optical/magnetic head from metal chips.",
-      "Inspect wiring harness at door switch terminal.",
-      "Verify door switch bit in Diagnostics > I/O state changes when door is latched."
+    description: "Enclosure safety door switch opened while spindle rotation was commanded or axis rapid traverse was active.",
+    causes: [
+      "Safety door mechanical switch misaligned, loose, or contaminated with chips.",
+      "Safety interlock actuator key damaged or bent.",
+      "Door switch circuit wiring harness loose at I/O PCB."
     ],
-    verifiedCitations: ["📘 Haas Safety Manual", "📘 ISO 13849-1 Machine Safety Guidelines"]
+    safetyWarning: "NEVER bypass door interlocks. Industrial safety regulations (ISO 13849-1 / ANSI B11.54) require functional safety interlocks to prevent operator injury.",
+    diagnosticSteps: [
+      "Clean safety switch optical/magnetic head and remove trapped metal chips.",
+      "Inspect wiring harness at door switch terminal block.",
+      "Verify door switch bit in Diagnostics > I/O state transitions from 0 to 1 when door is latched."
+    ],
+    verifiedCitations: [
+      "[Manufacturer Documentation] Haas NGC Safety & Compliance Manual",
+      "[Manufacturer Documentation] ISO 13849-1 Machine Safety Guidelines"
+    ]
   },
 
-  // Fanuc 0i-MF / 31i
+  // ── Fanuc CNC Alarms ──────────────────────────────────────────────────────
   "FANUC_401": {
-    controller: "Fanuc 0i-MF / 31i",
+    controller: "Fanuc Series 0i-MF / 0i-TF / 30i / 31i",
     alarmCode: "401",
-    title: "V-READY OFF (Servo Amplifier Not Ready)",
+    title: "V-READY OFF (VRDY Off / Servo Amplifier Not Ready)",
     severity: "critical",
     category: "Servo System",
-    description: "The servo amplifier ready signal (VRDY) dropped LOW even though the CNC controller commanded PRDY (Power Ready).",
+    description: "The servo amplifier ready signal (VRDY) went LOW while the CNC controller commanded PRDY (Power Ready).",
     causes: [
-      "Emergency Stop contact open or 24V DC I/O supply dropped.",
-      "Servo amplifier optical cable (FSSB) disconnected or damaged.",
+      "Emergency Stop contact open or 24V DC I/O power supply drop.",
+      "Servo amplifier optical communication cable (FSSB) disconnected or damaged.",
       "Main magnetic contactor (MCC) trip or phase loss on 200V AC servo transformer."
     ],
-    safetyWarning: "Isolate 415V/200V transformer power and lockout before inspecting MCC contactor coils.",
+    safetyWarning: "HIGH VOLTAGE: Isolate 415V/200V transformer power and lockout main switch before inspecting MCC contactor coils or power terminals.",
     diagnosticSteps: [
-      "Inspect LED display on Fanuc Servo Amplifier module (e.g. display '--' = normal standby, '01'/'02' = IPM overcurrent, 'b0' = FSSB comms error).",
+      "Inspect 7-segment LED display on Fanuc Servo Amplifier module ('--' = normal standby, '01'/'02' = IPM overcurrent, 'b0' = FSSB comms error).",
       "Check 24V DC power supply voltage on amplifier connector CXA2A (must be 24V ± 10%).",
-      "Inspect FSSB optical cable links between CNC main CPU and servo amplifiers for red laser light transmission.",
+      "Inspect FSSB optical cable links between CNC main CPU and servo amplifiers for red light transmission.",
       "Verify MCC contactor auxiliary contacts for carbon pitting or weld failure."
     ],
-    verifiedCitations: ["📘 Fanuc Series 0i-MODEL F Maintenance Manual (B-64605EN)", "📘 SmartERP Servo Diagnostic Guide"]
+    verifiedCitations: [
+      "[Manufacturer Documentation] Fanuc Series 0i-MODEL F Maintenance Manual (B-64605EN)",
+      "[SmartERP Verified Service History] SmartERP Servo Diagnostic Guide"
+    ]
   },
+
   "FANUC_EX1001": {
-    controller: "Fanuc 0i-MF / 31i",
+    controller: "Fanuc Series 0i-MF / 31i",
     alarmCode: "EX1001",
     title: "Spindle Drive / Chiller Temperature Overheat",
     severity: "critical",
-    category: "Spindle & Chiller",
+    category: "Spindle & Thermal Protection",
     description: "Spindle motor thermistor or spindle drive heat sink temperature exceeded safety trip threshold (110°C).",
     causes: [
-      "Spindle oil chiller circulation pump failure or coolant flow rate below 8 L/min.",
-      "Cabinet heat exchanger air filters clogged with cutting oil vapor/dust.",
+      "Spindle oil chiller circulation pump failure or coolant flow rate below specification.",
+      "Cabinet heat exchanger air filters clogged with cutting oil vapor or dust.",
       "Spindle motor cooling fan defective or thermistor circuit wire broken."
     ],
     safetyWarning: "Allow spindle motor to cool for at least 30 minutes before opening motor junction box.",
     diagnosticSteps: [
-      "Check chiller flow switch LED indicator and chiller oil temperature gauge.",
+      "Check chiller flow switch indicator and chiller oil temperature gauge.",
       "Clean cabinet intake wire mesh filters using compressed air (max 3 bar).",
       "Measure thermistor resistance at amplifier connector JYA3 (standard 10kΩ NTC at 25°C).",
-      "Check Fanuc Diagnosis Parameter #400-405 for recorded spindle thermal load %."
+      "Check Fanuc Diagnosis Parameter #400–405 for recorded spindle thermal load %."
     ],
-    verifiedCitations: ["📘 Fanuc Spindle Amplifier Maintenance Guide", "📘 SmartERP Preventive Maintenance SOP-01"]
-  },
-  "FANUC_OT0500": {
-    controller: "Fanuc 0i / 31i",
-    alarmCode: "OT0500",
-    title: "+X Axis Over Travel (Soft Limit 1)",
-    severity: "info",
-    category: "Axis Overtravel",
-    description: "The commanded move in +X axis exceeded positive software stroke limit set in CNC Parameter 1320.",
-    causes: ["Program coordinate offset (G54-G59) shifted or tool length compensation error.", "Workpiece or fixture placed outside physical machining envelope."],
-    safetyWarning: "Use lowest JOG feedrate when backing off overtravel limit to prevent hard mechanical stop collision.",
-    diagnosticSteps: [
-      "Switch CNC mode selector to JOG or MANUAL.",
-      "Press and hold the 'Overtravel Release' or 'OT Release' push button on machine operator panel.",
-      "Jog X-axis in negative (-) direction until clear of software boundary.",
-      "Check active G54 workpiece zero and verify CNC program coordinates."
-    ],
-    verifiedCitations: ["📘 Fanuc Operator Manual", "📘 SmartERP CNC Basics Guide"]
+    verifiedCitations: [
+      "[Manufacturer Documentation] Fanuc Spindle Amplifier Maintenance Guide (B-65285EN)",
+      "[SmartERP Verified Service History] SmartERP Preventive Maintenance SOP-01"
+    ]
   },
 
-  // Siemens 840D / 828D
+  // ── Mitsubishi Electric Alarms ────────────────────────────────────────────
+  "MITSUBISHI_AL04": {
+    controller: "Mitsubishi Electric M80 / M70 (MDS-D / MDS-DH Drive Series)",
+    alarmCode: "AL-04",
+    title: "Servo Amplifier Overcurrent / IPM Fault (Drive LED: 04)",
+    severity: "critical",
+    category: "Servo Drive System",
+    description: "MDS-D/DH servo drive detected excessive instantaneous current flowing through the output Intelligent Power Module (IPM) inverter bridge.",
+    causes: [
+      "Motor power cable harness insulation breakdown or pinched wire in flexible cable track.",
+      "Motor stator winding short circuit due to cutting fluid ingress through conduit gland.",
+      "Mechanical axis collision or jammed ball screw nut preventing motor rotation.",
+      "Damaged IPM transistor inside the MDS servo amplifier."
+    ],
+    safetyWarning: "HIGH VOLTAGE: Disconnect main 3-phase circuit breaker and wait for CHARGE LED on drive unit to fully extinguish before opening servo drive cover or touching terminals. Always verify zero voltage with a calibrated meter.",
+    diagnosticSteps: [
+      "Disconnect motor power cable (U, V, W) from drive bottom terminals.",
+      "Perform Insulation Resistance (Megger) test on motor leads to earth (minimum 10 MΩ per manufacturer spec).",
+      "Measure motor phase-to-phase resistance with a digital milliohmmeter (must be balanced across U-V, V-W, W-U).",
+      "Inspect flexible cable energy chain for wear, bend fatigue, or cutting fluid accumulation."
+    ],
+    verifiedCitations: [
+      "[Manufacturer Documentation] Mitsubishi Electric MDS-D-SVJ3 / MDS-DH Series Maintenance Manual (IB-1500158)",
+      "[SmartERP Verified Service History] SmartERP Servo Diagnostic SOP #04"
+    ]
+  },
+
+  // ── Siemens Sinumerik Alarms ──────────────────────────────────────────────
   "SIEMENS_2001": {
-    controller: "Siemens Sinumerik 840D / 828D",
+    controller: "Siemens Sinumerik 840D sl / 828D",
     alarmCode: "2001",
     title: "PLC Axis Interlock Not Released",
     severity: "warning",
     category: "PLC Interlock",
     description: "Axis motion enable signal (DB31-48.DBX21.7) not enabled by PLC logic program.",
     causes: [
-      "Hydraulic system pressure below minimum threshold (35 bar).",
+      "Hydraulic system pressure below minimum threshold.",
       "Lubrication pressure switch not confirming pressure pulse within cycle timer.",
-      "Tool clamp confirmation proximity switch (DB380x.DBX2001.0) inactive."
+      "Tool clamp confirmation proximity switch inactive."
     ],
     safetyWarning: "Do not attempt manual tool unclamp while spindle motor is in motion.",
     diagnosticSteps: [
-      "Check hydraulic pressure gauge on main power pack (nominal 45 bar).",
+      "Check hydraulic pressure gauge on main power pack.",
       "Navigate to Diagnostics > PLC Status and check DB31.DBX21.7 bit state.",
       "Verify tool unclamp sensor LED on spindle cylinder top cap.",
       "Inspect way lube reservoir fluid level."
     ],
-    verifiedCitations: ["📘 Siemens Sinumerik 840D sl Diagnostics Manual", "📘 SmartERP Interlock Guide"]
-  },
-
-  // Mitsubishi M80 / M70
-  "MITSUBISHI_AL04": {
-    controller: "Mitsubishi M80 / M70",
-    alarmCode: "AL-04",
-    title: "Servo Amplifier Overcurrent / Short Circuit",
-    severity: "critical",
-    category: "Servo System",
-    description: "MDS-D/DH servo drive detected excessive instantaneous current flowing through the output IGBT inverter bridge.",
-    causes: [
-      "Motor power cable harness insulation breakdown or pinched wire in cable track.",
-      "Motor internal winding burnt due to coolant ingress through conduit seal.",
-      "Mechanical axis collision or jammed ball screw."
-    ],
-    safetyWarning: "Disconnect main 3-phase circuit breaker and wait for CHARGE LED to extinguish completely before opening servo drive cover.",
-    diagnosticSteps: [
-      "Disconnect motor power cable (U, V, W) from drive bottom terminals.",
-      "Perform Insulation Resistance (Megger) test at 500V DC on motor leads (must exceed 50 MΩ to earth).",
-      "Check resistance between U-V, V-W, W-U with milliohmmeter (must be balanced within 0.05Ω).",
-      "Inspect flexible cable energy chain for wear, bend fatigue, or cutting fluid accumulation."
-    ],
-    verifiedCitations: ["📘 Mitsubishi Electric MDS-D-SVJ3 Maintenance Manual", "📘 SmartERP Servo Diagnostic SOP #04"]
+    verifiedCitations: [
+      "[Manufacturer Documentation] Siemens Sinumerik 840D sl Diagnostics Manual",
+      "[SmartERP Verified Service History] SmartERP Interlock Guide"
+    ]
   }
 };
 
@@ -280,9 +367,22 @@ class CncPlugin extends BasePlugin {
           return { success: false, message: "Machine not found or not registered under your company." };
         }
 
+        const machine = res.rows[0];
+        const modelUpper = String(machine.model || machine.machine_name || "").toUpperCase();
+        let classification = "CNC Machining Center";
+        for (const [key, val] of Object.entries(MACHINE_CLASSIFICATIONS)) {
+          if (modelUpper.includes(key)) {
+            classification = val.type;
+            break;
+          }
+        }
+
         return {
           success: true,
-          machine: res.rows[0]
+          machine: {
+            ...machine,
+            machine_classification: classification
+          }
         };
       }
     };
@@ -307,10 +407,9 @@ class CncPlugin extends BasePlugin {
         }
 
         const limit = params.limit || 10;
-        // Search in jobs / service tickets
         const query = `
           SELECT j.id, j.title, j.description, j.status, j.priority, j.created_at, j.updated_at,
-                 j.assigned_to_name, j.location, j.progress
+                 j.assigned_to, j.location, j.progress
           FROM jobs j
           WHERE j.company_id::text = $1::text
             AND (j.description ILIKE '%' || $2 || '%' OR j.title ILIKE '%' || $2 || '%' OR j.machine_id::text = $2::text)
@@ -320,7 +419,6 @@ class CncPlugin extends BasePlugin {
 
         const machineIdentifier = String(params.machineId || "");
         const res = await pool.query(query, [String(companyId), machineIdentifier, limit]).catch(async () => {
-          // Fallback simple query
           return pool.query(
             `SELECT id, title, description, status, priority, created_at FROM jobs
              WHERE company_id::text = $1::text ORDER BY created_at DESC LIMIT $2`,
@@ -339,14 +437,14 @@ class CncPlugin extends BasePlugin {
     // ── Tool 4: decode_cnc_alarm ──────────────────────────────────────────────
     this.tools["decode_cnc_alarm"] = {
       name: "decode_cnc_alarm",
-      description: "Decodes a CNC alarm or error code against verified controller manuals (Fanuc, Siemens, Haas, Mitsubishi) and provides root cause and diagnostic procedures.",
+      description: "Decodes a CNC alarm or error code against verified manufacturer manuals (Haas, Fanuc, Siemens, Mitsubishi) and provides authoritative root causes and diagnostic procedures.",
       allowedRoles: ["owner", "admin", "hr", "employee", "super_admin"],
       isDestructive: false,
       parameters: {
         type: "object",
         properties: {
-          alarmCode: { type: "string", description: "The alarm code number or text (e.g. '401', 'EX1001', 'AL-04', '2001', '104')" },
-          controllerType: { type: "string", description: "Controller family: 'Haas', 'Fanuc', 'Siemens', 'Mitsubishi', 'Heidenhain', or 'Universal'" }
+          alarmCode: { type: "string", description: "The alarm code number or text (e.g. '163', '401', '992', '104', 'EX1001', 'AL-04')" },
+          controllerType: { type: "string", description: "Controller family: 'Haas', 'Fanuc', 'Siemens', 'Mitsubishi', or 'Universal'" }
         },
         required: ["alarmCode"]
       },
@@ -354,11 +452,47 @@ class CncPlugin extends BasePlugin {
         const rawCode = String(params.alarmCode || "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
         const controller = String(params.controllerType || "").toLowerCase();
 
-        // Match against verified knowledge base
+        // 1. Special Case: Haas AL-04 check
+        // AL-04 is NOT a Haas native CNC alarm code. On Haas controls, alarm numbers are numeric (e.g. 104, 163, 401).
+        if (controller.includes("haas") && (rawCode === "AL04" || rawCode === "04" || rawCode === "AL4")) {
+          return {
+            success: true,
+            isVerified: false,
+            confidenceLevel: "LOW",
+            notice: "AL-04 is NOT an official Haas CNC controller screen alarm code. Haas NGC/CHC controls use 3 or 4-digit numeric alarm codes (e.g. Alarm 104, 163, 401, 992). AL-04 is typically a 7-segment LED display error code on Mitsubishi/Fanuc/Yaskawa servo drive amplifiers.",
+            recommendation: "Please check the Haas control screen (press [ALARM / MESGS]) and provide the exact numeric alarm number and message text displayed on screen.",
+            data: {
+              alarmCode: params.alarmCode,
+              controller: "Haas (Unverified Alarm Code Format)",
+              title: "Unverified Alarm Code on Haas Controller",
+              severity: "warning",
+              category: "Format Ambiguity",
+              description: "The code 'AL-04' does not correspond to a documented Haas screen alarm. If the Z-axis stopped moving, common Haas Z-axis alarms include: Alarm 163 (Z-Axis Drive Fault / Overcurrent), Alarm 104 (Following Error), or Alarm 401 (Servo Off).",
+              causes: [
+                "Alarm code was read from a third-party servo drive LED rather than the Haas operator display.",
+                "Z-axis holding brake is locked or 24V DC brake solenoid is not engaging.",
+                "Mechanical obstruction, chip jam, or way cover binding on Z-axis column.",
+                "Motor power cable or drive amplifier overcurrent condition."
+              ],
+              safetyWarning: "SUSPENDED LOAD HAZARD: Do not attempt to force or jog the Z-axis with power on. Block the headstock before servicing brake or drive components.",
+              diagnosticSteps: [
+                "Press [ALARM / MESGS] on the Haas control panel to read the authoritative numeric alarm code and description.",
+                "Verify whether the Z-axis is in E-Stop or Servo Off state (Alarm 401).",
+                "Check way lube oil level and air supply pressure gauge (nominal 85 PSI).",
+                "Inspect the Z-axis column and way covers for physical chip compaction."
+              ],
+              verifiedCitations: [
+                "[AI Diagnostic Inference] Haas Controller Alarm Code Architecture (Haas Automation)"
+              ]
+            }
+          };
+        }
+
+        // 2. Match against verified knowledge base
         let matchKey = null;
         if (controller.includes("haas") && VERIFIED_CNC_KNOWLEDGE[`HAAS_${rawCode}`]) {
           matchKey = `HAAS_${rawCode}`;
-        } else if ((controller.includes("fanuc") || !controller) && VERIFIED_CNC_KNOWLEDGE[`FANUC_${rawCode}`]) {
+        } else if (controller.includes("fanuc") && VERIFIED_CNC_KNOWLEDGE[`FANUC_${rawCode}`]) {
           matchKey = `FANUC_${rawCode}`;
         } else if (controller.includes("siemens") && VERIFIED_CNC_KNOWLEDGE[`SIEMENS_${rawCode}`]) {
           matchKey = `SIEMENS_${rawCode}`;
@@ -379,37 +513,40 @@ class CncPlugin extends BasePlugin {
           return {
             success: true,
             isVerified: true,
-            confidenceLevel: "HIGH (Verified Manufacturer Manual)",
+            confidenceLevel: "HIGH",
             data: entry
           };
         }
 
-        // Unverified / Generic fallback with honest confidence rating
+        // 3. Unverified / Unknown Alarm Code
         return {
           success: true,
           isVerified: false,
-          confidenceLevel: "MEDIUM (AI Diagnostic Inference)",
-          notice: "Exact alarm code not present in offline cached standard manual. Providing standard electro-mechanical diagnostic workflow.",
+          confidenceLevel: "LOW",
+          notice: `Alarm code '${params.alarmCode}' was not found in the verified manufacturer documentation cache.`,
+          recommendation: "Please provide the exact controller model (e.g. Haas NGC, Fanuc 0i-MF, Siemens 840D) and the exact text description displayed on the control screen.",
           data: {
             alarmCode: params.alarmCode,
-            controller: params.controllerType || "Generic CNC",
-            title: `Diagnostic Protocol for Alarm ${params.alarmCode}`,
+            controller: params.controllerType || "Unspecified Controller",
+            title: `Unverified Alarm: ${params.alarmCode}`,
             severity: "warning",
-            category: "General Diagnostic",
-            description: `Tripped sensor, drive interlock, or parameter condition under code ${params.alarmCode}.`,
+            category: "General Troubleshooting",
+            description: `No authoritative manufacturer documentation found for code '${params.alarmCode}' under controller '${params.controllerType || "Generic"}'.`,
             causes: [
-              "Sensor contact open, dirty optical scale, or 24V DC I/O signal rail voltage drop.",
-              "Axis limit travel trip or mechanical binding on guide ways.",
-              "Motor thermal switch or drive ready interlock open."
+              "Controller-specific manufacturer alarm (OEM custom M-code or ladder alarm).",
+              "External interlock condition (air pressure, lube pressure, chiller flow, door safety).",
+              "Sensor contact bounce or 24V DC I/O power supply fluctuation."
             ],
-            safetyWarning: "CAUTION: De-energize 415V/3-phase power and lockout before working inside high voltage electrical cabinets.",
+            safetyWarning: "ELECTRICAL & MECHANICAL SAFETY: Always disconnect and lockout main power before opening electrical cabinets. Service must be performed by qualified personnel.",
             diagnosticSteps: [
-              "Verify the exact controller model (e.g. Fanuc 0i-MF, Haas NGC, Siemens 840D).",
-              "Check active I/O status bits in controller Diagnostics / PLC screen.",
-              "Inspect 24V DC power supply rails and safety circuit relays.",
-              "Refer to the specific machine builder electrical schematic manual."
+              "Record the full error message and any accompanying secondary alarms displayed on the screen.",
+              "Check non-invasive external conditions: Air pressure (85 PSI), Way lube reservoir level, Chiller status, Door interlock.",
+              "Consult the specific machine builder electrical schematic and parameter manual.",
+              "If the issue persists, escalate for certified field service."
             ],
-            verifiedCitations: ["📘 SmartERP Universal CNC Diagnostic Framework"]
+            verifiedCitations: [
+              "[AI Diagnostic Inference] SmartERP Universal CNC Diagnostic Guidelines"
+            ]
           }
         };
       }
@@ -490,7 +627,7 @@ class CncPlugin extends BasePlugin {
       }
     };
 
-    // ── Tool 7: prepare_service_escalation (Consequential Action requiring confirmation) ─
+    // ── Tool 7: prepare_service_escalation ────────────────────────────────────
     this.tools["prepare_service_escalation"] = {
       name: "prepare_service_escalation",
       description: "Prepares a high-priority service ticket escalation for a critical machine breakdown. Returns a structured confirmation widget for user approval.",

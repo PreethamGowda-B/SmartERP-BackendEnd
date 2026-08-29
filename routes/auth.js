@@ -597,7 +597,7 @@ router.post("/verify-otp", otpVerifyLimiter, async (req, res) => {
 // ---------------------------------------------
 // ✅ Reset Password via Email OTP (For all users including Google OAuth accounts)
 // ---------------------------------------------
-router.post("/reset-password", otpVerifyLimiter, [
+router.post("/reset-password", [
   body("email").isEmail().withMessage("Valid email is required").normalizeEmail(),
   body("otp").trim().notEmpty().withMessage("OTP is required"),
   body("new_password")
@@ -609,13 +609,21 @@ router.post("/reset-password", otpVerifyLimiter, [
   }
 
   const { email, otp, new_password } = req.body;
+  const normalizedEmail = String(email || "").toLowerCase().trim();
 
   try {
-    // 1. Verify OTP Hash
-    const submittedHash = crypto.createHash("sha256").update(otp.toString().trim() + email.toLowerCase()).digest("hex");
+    // 1. Verify OTP Hash (supporting salted SHA-256 and fallback direct hash)
+    const hashWithEmail = crypto.createHash("sha256").update(otp.toString().trim() + normalizedEmail).digest("hex");
+    const plainOtp = otp.toString().trim();
+
     const otpResult = await pool.query(
-      "SELECT * FROM email_otps WHERE email = $1 AND otp_code = $2 AND used = FALSE AND expires_at > NOW() ORDER BY created_at DESC LIMIT 1",
-      [email.toLowerCase(), submittedHash]
+      `SELECT * FROM email_otps 
+       WHERE LOWER(email) = $1 
+         AND (otp_code = $2 OR otp_code = $3) 
+         AND used = FALSE 
+         AND expires_at > NOW() 
+       ORDER BY created_at DESC LIMIT 1`,
+      [normalizedEmail, hashWithEmail, plainOtp]
     );
 
     if (otpResult.rows.length === 0) {
@@ -623,7 +631,7 @@ router.post("/reset-password", otpVerifyLimiter, [
     }
 
     // 2. Fetch User
-    const userResult = await pool.query("SELECT id, name, email, role, company_id FROM users WHERE email = $1", [email.toLowerCase()]);
+    const userResult = await pool.query("SELECT id, name, email, role, company_id FROM users WHERE LOWER(email) = $1", [normalizedEmail]);
     if (userResult.rows.length === 0) {
       return res.status(404).json({ message: "Account not found for this email address." });
     }
@@ -643,11 +651,16 @@ router.post("/reset-password", otpVerifyLimiter, [
 
     // 6. Clear Redis attempt counter if active
     if (redisClient && redisClient.status === "ready") {
-      await redisClient.del(`otp_verify_attempts:${email.toLowerCase()}`).catch(() => {});
+      await redisClient.del(`otp_attempts:${normalizedEmail}`).catch(() => {});
+      await redisClient.del(`otp_verify_attempts:${normalizedEmail}`).catch(() => {});
     }
 
     // 7. Track password changes in backend audit logs
-    await logActivity(user.id, "password_reset", req);
+    try {
+      await logActivity(user.id, "password_reset", req);
+    } catch (actErr) {
+      console.warn("⚠️ logActivity warning in reset-password:", actErr.message);
+    }
 
     console.log(`✅ Password successfully reset for user ${user.email} (ID: ${user.id})`);
 

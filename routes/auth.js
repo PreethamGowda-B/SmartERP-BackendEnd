@@ -1112,6 +1112,121 @@ router.post("/validate-company", async (req, res) => {
 });
 
 // ---------------------------------------------
+// ✅ Complete Employee Onboarding & Link Company
+// ---------------------------------------------
+router.post("/employee/onboarding", authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId || req.user.id;
+    const { name, phone, position, department, company_code } = req.body;
+
+    if (!company_code) {
+      return res.status(400).json({ message: "Company code is required to complete onboarding" });
+    }
+
+    // 1. Validate Company Code
+    const { validateCompanyCode } = require("../utils/companyIdGenerator");
+    const validation = await validateCompanyCode(company_code);
+
+    if (!validation.valid) {
+      return res.status(400).json({ message: "Invalid or inactive company code. Please check with your employer." });
+    }
+
+    const targetCompanyId = validation.company.id;
+    const targetCompanyCode = validation.company.company_id;
+    const targetCompanyName = validation.company.company_name;
+
+    // Check if company is suspended
+    if (validation.company.status === "suspended") {
+      return res.status(403).json({ message: "This company account is currently suspended. Please contact your employer." });
+    }
+
+    // 2. Update Users table
+    const updateResult = await pool.query(
+      `UPDATE users 
+       SET name = COALESCE(NULLIF($1, ''), name), 
+           company_id = $2, 
+           company_code = $3,
+           updated_at = NOW()
+       WHERE id = $4
+       RETURNING id, name, email, role, company_id, company_code`,
+      [name?.trim() || null, targetCompanyId, targetCompanyCode, userId]
+    );
+
+    if (updateResult.rows.length === 0) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const updatedUser = updateResult.rows[0];
+
+    // 3. Upsert into employee_profiles if available
+    try {
+      await pool.query(
+        `INSERT INTO employee_profiles (user_id, phone, position, department, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, NOW(), NOW())
+         ON CONFLICT (user_id) 
+         DO UPDATE SET 
+           phone = COALESCE(EXCLUDED.phone, employee_profiles.phone),
+           position = COALESCE(EXCLUDED.position, employee_profiles.position),
+           department = COALESCE(EXCLUDED.department, employee_profiles.department),
+           updated_at = NOW()`,
+        [userId, phone?.trim() || null, position?.trim() || null, department?.trim() || null]
+      );
+    } catch (epErr) {
+      console.warn("⚠️ Note: employee_profiles table update non-critical:", epErr.message);
+    }
+
+    // 4. Issue Fresh JWT Tokens with the new companyId
+    const newAccessToken = jwt.sign(
+      { id: updatedUser.id, userId: updatedUser.id, role: updatedUser.role, email: updatedUser.email, companyId: updatedUser.company_id },
+      ACCESS_SECRET,
+      { expiresIn: ACCESS_EXPIRY }
+    );
+    const newRefreshToken = jwt.sign({ id: updatedUser.id, userId: updatedUser.id }, REFRESH_SECRET, { expiresIn: REFRESH_EXPIRY });
+
+    // Store rotated refresh token
+    const tokenFamily = crypto.randomUUID();
+    await pool.query(
+      `INSERT INTO refresh_tokens (user_id, token, token_family, expires_at, created_at, user_agent, ip_address)
+       VALUES ($1::uuid, $2, $3::uuid, NOW() + INTERVAL '30 days', NOW(), $4, $5)`,
+      [updatedUser.id, newRefreshToken, tokenFamily, req.headers["user-agent"] || null, req.ip || null]
+    );
+
+    const cookieOpts = {
+      httpOnly: true,
+      sameSite: "none",
+      secure: true,
+      path: "/",
+    };
+
+    res.cookie(COOKIE_ACCESS_USER, newAccessToken, { ...cookieOpts, maxAge: ACCESS_MAX_AGE });
+    res.cookie(COOKIE_REFRESH_USER, newRefreshToken, { ...cookieOpts, maxAge: REFRESH_MAX_AGE });
+
+    console.log(`✅ Employee ${updatedUser.email} successfully onboarded and linked to company ${targetCompanyCode} (${targetCompanyName})`);
+
+    return res.json({
+      ok: true,
+      user: {
+        ...updatedUser,
+        company_name: targetCompanyName,
+        phone: phone?.trim() || undefined,
+        position: position?.trim() || undefined,
+        department: department?.trim() || undefined
+      },
+      accessToken: newAccessToken,
+      refreshToken: newRefreshToken,
+      company: {
+        id: targetCompanyId,
+        company_id: targetCompanyCode,
+        company_name: targetCompanyName
+      }
+    });
+  } catch (err) {
+    console.error("Employee onboarding error:", err.message);
+    res.status(500).json({ message: "Server error during onboarding. Please try again." });
+  }
+});
+
+// ---------------------------------------------
 // ✅ Get Company Settings (Authenticated)
 // ---------------------------------------------
 router.get("/company/settings", authenticateToken, async (req, res) => {

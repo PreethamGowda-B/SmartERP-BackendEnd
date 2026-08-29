@@ -74,10 +74,10 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Wait for Render deploy (90s)
-        run: sleep 90
+      - name: Wait for initial deploy buffer (30s)
+        run: sleep 30
 
       - name: Run smoke tests
         run: node scripts/smoke-test.js
         env:
-          API_URL: https://smarterp-backendend.onrender.com
+          API_URL: https://api.prozync.in

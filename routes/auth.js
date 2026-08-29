@@ -658,12 +658,12 @@ router.post("/reset-password", [
 
     // 4. Update Password Hash in Database
     await pool.query(
-      "UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2",
+      "UPDATE users SET password_hash = $1 WHERE id = $2",
       [newHash, user.id]
     );
 
     // 5. Invalidate OTP (single-use enforcement)
-    await pool.query("UPDATE email_otps SET used = TRUE WHERE id = $1", [otpResult.rows[0].id]);
+    await pool.query("UPDATE email_otps SET used = TRUE WHERE id = $1", [otpResult.rows[0].id]).catch(() => {});
 
     // 6. Clear Redis attempt counter if active
     if (redisClient && redisClient.status === "ready") {
@@ -686,8 +686,8 @@ router.post("/reset-password", [
       message: "Password reset successfully! You can now use your new password to sign in or confirm sensitive actions."
     });
   } catch (err) {
-    console.error("Reset password error:", err.message);
-    res.status(500).json({ message: "Failed to reset password. Please try again." });
+    console.error("❌ Reset password error:", err.stack || err.message);
+    res.status(500).json({ message: err.message || "Failed to reset password. Please try again." });
   }
 });
 

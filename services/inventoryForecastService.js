@@ -38,7 +38,7 @@ class InventoryForecastService {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      await client.query(`SET LOCAL app.current_company_id = '${companyId}'`);
+      await client.query(`SELECT set_config('app.current_company_id', $1::text, true)`, [String(companyId)]);
 
       // 1. Fetch inventory items with current quantities
       const itemsRes = await client.query(
@@ -97,7 +97,7 @@ class InventoryForecastService {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      await client.query(`SET LOCAL app.current_company_id = '${companyId}'`);
+      await client.query(`SELECT set_config('app.current_company_id', $1::text, true)`, [String(companyId)]);
 
       const poNumber = `PO-${Date.now().toString().slice(-6)}`;
 

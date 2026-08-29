@@ -8,7 +8,7 @@ class ArCollectionsService {
   static async getAgingSummary(companyId) {
     const client = await pool.connect();
     try {
-      await client.query(`SET LOCAL app.current_company_id = '${companyId}'`);
+      await client.query(`SELECT set_config('app.current_company_id', $1::text, true)`, [String(companyId)]);
 
       const res = await client.query(
         `SELECT 
@@ -36,7 +36,7 @@ class ArCollectionsService {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      await client.query(`SET LOCAL app.current_company_id = '${companyId}'`);
+      await client.query(`SELECT set_config('app.current_company_id', $1::text, true)`, [String(companyId)]);
 
       // Fetch unpaid invoices
       const invoicesRes = await client.query(
@@ -112,7 +112,7 @@ Suggest 50% payment today with a 2% early settlement discount and 50% in 14 days
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      await client.query(`SET LOCAL app.current_company_id = '${companyId}'`);
+      await client.query(`SELECT set_config('app.current_company_id', $1::text, true)`, [String(companyId)]);
 
       const schedRes = await client.query(
         `SELECT * FROM ar_collection_schedules WHERE id = $1 AND company_id = $2`,

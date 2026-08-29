@@ -150,7 +150,7 @@ Mathematical Score: ${scoreResult.score}%, Status: ${scoreResult.matchStatus}, V
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      await client.query(`SET LOCAL app.current_company_id = '${companyId}'`);
+      await client.query(`SELECT set_config('app.current_company_id', $1::text, true)`, [String(companyId)]);
 
       // 1. Mark previous runs for this period and type as not latest
       await client.query(
@@ -197,7 +197,7 @@ Mathematical Score: ${scoreResult.score}%, Status: ${scoreResult.matchStatus}, V
 
     try {
       await client.query('BEGIN');
-      await client.query(`SET LOCAL app.current_company_id = '${companyId}'`);
+      await client.query(`SELECT set_config('app.current_company_id', $1::text, true)`, [String(companyId)]);
 
       // Fetch Company Tolerance Settings
       const settingsRes = await client.query(

@@ -9,7 +9,7 @@ class PayrollValidationService {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      await client.query(`SET LOCAL app.current_company_id = '${companyId}'`);
+      await client.query(`SELECT set_config('app.current_company_id', $1::text, true)`, [String(companyId)]);
 
       // 1. Create Validation Run Header
       const runRes = await client.query(
@@ -231,7 +231,7 @@ class PayrollValidationService {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      await client.query(`SET LOCAL app.current_company_id = '${companyId}'`);
+      await client.query(`SELECT set_config('app.current_company_id', $1::text, true)`, [String(companyId)]);
 
       const res = await client.query(
         `UPDATE payroll_validation_flags
@@ -258,7 +258,7 @@ class PayrollValidationService {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      await client.query(`SET LOCAL app.current_company_id = '${companyId}'`);
+      await client.query(`SELECT set_config('app.current_company_id', $1::text, true)`, [String(companyId)]);
 
       // Check if there are unresolved critical flags
       const criticalRes = await client.query(

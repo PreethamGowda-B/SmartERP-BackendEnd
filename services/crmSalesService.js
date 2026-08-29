@@ -33,7 +33,7 @@ class CrmSalesService {
   static async getPipelineSummary(companyId) {
     const client = await pool.connect();
     try {
-      await client.query(`SET LOCAL app.current_company_id = '${companyId}'`);
+      await client.query(`SELECT set_config('app.current_company_id', $1::text, true)`, [String(companyId)]);
 
       const res = await client.query(
         `SELECT l.*, u.name as assigned_user_name
@@ -73,7 +73,7 @@ class CrmSalesService {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      await client.query(`SET LOCAL app.current_company_id = '${companyId}'`);
+      await client.query(`SELECT set_config('app.current_company_id', $1::text, true)`, [String(companyId)]);
 
       const { score, priority } = this.calculateLeadScore({ dealValue, companyName, email, phone });
 
@@ -111,7 +111,7 @@ class CrmSalesService {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      await client.query(`SET LOCAL app.current_company_id = '${companyId}'`);
+      await client.query(`SELECT set_config('app.current_company_id', $1::text, true)`, [String(companyId)]);
 
       const leadRes = await client.query(
         `UPDATE crm_leads_enhanced
@@ -148,7 +148,7 @@ class CrmSalesService {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      await client.query(`SET LOCAL app.current_company_id = '${companyId}'`);
+      await client.query(`SELECT set_config('app.current_company_id', $1::text, true)`, [String(companyId)]);
 
       const leadRes = await client.query(
         `SELECT * FROM crm_leads_enhanced WHERE id = $1 AND company_id = $2`,

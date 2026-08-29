@@ -547,7 +547,7 @@ router.post('/:id/send-whatsapp', authenticate, async (req, res) => {
     ).catch((wErr) => ({ success: false, error: wErr.message }));
 
     // Update status to sent
-    await pool.query(`UPDATE invoices SET status = 'sent', updated_at = NOW() WHERE id = $1`, [id]);
+    await pool.query(`UPDATE invoices SET status = 'sent', updated_at = NOW() WHERE id = $1 AND company_id = $2`, [id, companyId]);
 
     // Log Activity (Issue 7 Requirement)
     await invoiceService.logActivity({
@@ -616,7 +616,7 @@ router.post('/:id/send-email', authenticate, async (req, res) => {
     }
 
     // Update status to sent
-    await pool.query(`UPDATE invoices SET status = 'sent', updated_at = NOW() WHERE id = $1`, [id]);
+    await pool.query(`UPDATE invoices SET status = 'sent', updated_at = NOW() WHERE id = $1 AND company_id = $2`, [id, companyId]);
 
     // Log Activity (Issue 8 Requirement)
     await invoiceService.logActivity({

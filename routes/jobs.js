@@ -200,7 +200,7 @@ router.get('/', authenticateToken, async (req, res) => {
                   inv.version_number AS invoice_version_number,
                   inv.edited_count AS invoice_edited_count
            FROM jobs j
-           LEFT JOIN users u ON j.assigned_to = u.id
+           LEFT JOIN users u ON COALESCE(j.assigned_to, j.assigned_employee_id, j.accepted_by)::text = u.id::text
            LEFT JOIN invoices inv ON inv.job_id::text = j.id::text
            WHERE ${ownerWhere}
            ORDER BY j.id
@@ -299,10 +299,10 @@ router.get('/', authenticateToken, async (req, res) => {
         declined_at: r.declined_at,
         completed_at: r.completed_at,
         employee_email: r.employee_email,
-        employee_name: r.employee_name ?? null,
-        // These fields must also come from DB, not the blob
-        // Low FIX: use ?? (nullish coalescing) — || would coerce '' or 0 to null
-        source: r.source ?? (r.created_by_role === 'customer' || r.customer_id ? 'customer' : null),
+        employee_name: r.employee_name ?? r.assigned_employee_name ?? null,
+        accepted_by_name: r.accepted_by_name ?? r.employee_name ?? r.assigned_employee_name ?? null,
+        assigned_employee_name: r.assigned_employee_name ?? r.employee_name ?? null,
+        accepted_by: r.accepted_by ?? r.assigned_to ?? null,
         is_customer_job: r.source === 'customer' || r.source === 'customer_portal' || r.created_by_role === 'customer' || Boolean(r.customer_id),
         approval_status: r.approval_status ?? null,
         customer_id: r.customer_id ?? null,

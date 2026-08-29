@@ -40,6 +40,22 @@ Always retrieve actual data across modules through tools before responding.`,
 You are an expert in lead management, sales pipeline tracking, customer analytics, deal conversion, and CRM strategy.
 Always retrieve actual CRM and customer data through tools before responding.`,
 
+  cnc: `You are the SmartERP CNC Service AI — a senior industrial CNC field service & machine diagnostics specialist.
+Your purpose is to assist CNC technicians, service engineers, and plant operators with troubleshooting machine faults, alarm codes, spindle/servo issues, hydraulics, pneumatics, ATC tool changers, preventive maintenance, and service history.
+
+MANDATORY TROUBLESHOOTING ARCHITECTURE:
+1. CONTROLLER AWARENESS: CNC alarms differ across manufacturers (Haas, Fanuc, Siemens, Mitsubishi, Heidenhain). If the user provides an alarm without controller or machine context, ALWAYS ask for the controller or encourage selecting the machine.
+2. SAFETY FIRST: Never instruct users to bypass safety interlocks, defeat E-STOPs, or perform live high-voltage work without qualification. Always state the mandatory safety caution (LOTO, DC bus discharge time, CAT-IV multimeter).
+3. STRUCTURED SENIOR ENGINEER FORMAT:
+   - 🔴 PROBLEM IDENTIFIED: Machine model, controller, symptom, confirmed alarm.
+   - 🔍 LIKELY CAUSES: 3-5 prioritized root causes.
+   - ⚠️ SAFETY WARNING: Specific electrical or mechanical safety precautions.
+   - 🛠️ STEP-BY-STEP DIAGNOSTIC PROCEDURE: Clear, numbered diagnostic checks.
+   - 📜 PREVIOUS SMARTERP HISTORY: Any matching service incidents or past resolutions.
+   - 📊 CONFIDENCE & GROUNDING: Distinguish verified manual documentation from AI inference.
+4. ZERO HALLUCINATIONS: Never fabricate alarm definitions, part numbers, or voltage specifications. If uncertain, state: "Insufficient verified documentation to confidently identify this alarm."
+Always query live machine registry and service history tools where available.`,
+
   general: `You are the SmartERP Enterprise AI Agent — the intelligent operating system layer of SmartERP.
 You act like an experienced ERP Consultant and Business Analyst who can answer questions across all modules.`,
 };
@@ -54,6 +70,7 @@ const FOLLOW_UP_SUGGESTIONS = {
   gst: ["GST reconciliation report", "Vendor compliance status", "GSTR summary", "Tax filing due dates", "Input tax credit"],
   executive: ["Company performance summary", "Revenue forecast", "Department comparison", "KPI dashboard", "Growth trends"],
   crm: ["Sales pipeline status", "Lead conversion rate", "Customer analytics", "Top customers", "Deal forecast"],
+  cnc: ["Decode CNC alarm code", "Diagnose spindle fault", "Check machine service history", "Find spare parts in stock", "Check machine warranty"],
   general: ["Attendance overview", "Payroll summary", "Inventory status", "GST report", "Executive report"],
 };
 
@@ -181,6 +198,12 @@ If no rich widget is needed, set "widget" to null.
     const lower = prompt.toLowerCase();
 
     const SCOPE_KEYWORDS = {
+      cnc: [
+        "cnc", "spindle", "servo", "controller", "alarm", "fanuc", "siemens", "haas", "mitsubishi",
+        "heidenhain", "atc", "tool changer", "chiller", "axis", "backlash", "encoder", "hydraulic",
+        "pneumatic", "overtravel", "overheat", "vibration", "ballscrew", "ball screw", "machine breakdown",
+        "lube", "lubrication", "g-code", "m-code", "feedrate", "machine registry", "interlock", "way lube"
+      ],
       gst: ["gst", "tax reconciliation", "gstr", "hsn", "igst", "cgst", "sgst", "input tax credit", "tax filing"],
       payroll: ["payroll", "salary", "pay slip", "payslip", "wages", "overtime pay", "deduction", "pay period"],
       finance: ["revenue", "cash flow", "profit", "expense", "invoice", "billing", "financial", "balance sheet", "p&l", "income"],

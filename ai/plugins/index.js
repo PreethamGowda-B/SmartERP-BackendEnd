@@ -10,6 +10,7 @@ const OCRPlugin = require("./ocr.plugin");
 const GSTReconciliationPlugin = require("./gstReconciliation.plugin");
 const CrmPlugin = require("./crm.plugin");
 const LiveSummaryPlugin = require("./liveSummary.plugin");
+const CncPlugin = require("./cnc.plugin");
 
 // Pro-only plugin list
 const PRO_ONLY_PLUGINS = [
@@ -28,6 +29,7 @@ const BASIC_ALLOWED_PLUGINS = [
   "InventoryPlugin",
   "CustomerPlugin",
   "OCRPlugin",
+  "CncPlugin",
 ];
 
 class PluginRegistry {
@@ -45,6 +47,7 @@ class PluginRegistry {
       new OCRPlugin(),
       new GSTReconciliationPlugin(),
       new CrmPlugin(),
+      new CncPlugin(),
     ];
   }
 

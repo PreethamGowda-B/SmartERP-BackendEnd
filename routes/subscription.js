@@ -58,7 +58,7 @@ router.get('/status', loadPlan, async (req, res) => {
     }
 
     // Live usage counts
-    const [empResult, invResult, companyResult] = await Promise.all([
+    const [empResult, invResult, companyResult, subEventResult] = await Promise.all([
       pool.query(
         `SELECT COUNT(*) AS count FROM users WHERE company_id = $1 AND role = 'employee'`,
         [companyId]
@@ -68,10 +68,21 @@ router.get('/status', loadPlan, async (req, res) => {
         [companyId]
       ),
       pool.query(
-        `SELECT is_on_trial, trial_ends_at, trial_started_at, subscription_expires_at, is_first_login
+        `SELECT is_on_trial, trial_ends_at, trial_started_at, subscription_expires_at, is_first_login, billing_cycle, subscription_status
          FROM companies WHERE id = $1`,
         [companyId]
-      )
+      ).catch(async () => {
+        // Fallback if billing_cycle column doesn't exist yet on companies
+        return pool.query(
+          `SELECT is_on_trial, trial_ends_at, trial_started_at, subscription_expires_at, is_first_login
+           FROM companies WHERE id = $1`,
+          [companyId]
+        );
+      }),
+      pool.query(
+        `SELECT metadata FROM subscription_events WHERE company_id = $1 ORDER BY created_at DESC LIMIT 1`,
+        [companyId]
+      ).catch(() => ({ rows: [] }))
     ]);
 
     const employeeCount = parseInt(empResult.rows[0]?.count || 0, 10);
@@ -90,6 +101,16 @@ router.get('/status', loadPlan, async (req, res) => {
       daysRemaining = Math.max(0, Math.ceil(diffMs / (1000 * 60 * 60 * 24)));
     } else if (!plan.is_trial && (company.subscription_status === 'active' || plan.id >= 2)) {
       daysRemaining = 365;
+    }
+
+    // Determine accurate billing cycle (yearly vs monthly)
+    let effectiveBillingCycle = company.billing_cycle;
+    if (!effectiveBillingCycle && subEventResult.rows.length > 0) {
+      const meta = subEventResult.rows[0]?.metadata || {};
+      effectiveBillingCycle = meta.billingCycle || meta.billing_cycle;
+    }
+    if (!effectiveBillingCycle) {
+      effectiveBillingCycle = daysRemaining > 45 ? 'yearly' : 'monthly';
     }
 
     res.json({
@@ -112,6 +133,7 @@ router.get('/status', loadPlan, async (req, res) => {
         employees_remaining: employeeLimit === null ? null : Math.max(0, employeeLimit - employeeCount),
         inventory_remaining: inventoryLimit === null ? null : Math.max(0, inventoryLimit - inventoryCount)
       },
+      billing_cycle: effectiveBillingCycle,
       trial_started_at: company.trial_started_at || null,
       subscription_expires_at: company.subscription_expires_at || null,
       is_first_login: company.is_first_login

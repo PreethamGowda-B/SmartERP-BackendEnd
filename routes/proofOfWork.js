@@ -38,7 +38,7 @@ async function ensureDbInitialized() {
       CREATE TABLE IF NOT EXISTS job_proof_of_work (
         id SERIAL PRIMARY KEY,
         job_id TEXT NOT NULL,
-        company_id INT,
+        company_id TEXT,
         uploaded_by_id TEXT,
         uploaded_by_name TEXT,
         photo_url TEXT,
@@ -51,6 +51,9 @@ async function ensureDbInitialized() {
         created_at TIMESTAMP DEFAULT NOW()
       );
     `);
+    await client.query(`
+      ALTER TABLE job_proof_of_work ALTER COLUMN company_id TYPE TEXT USING company_id::text;
+    `).catch(() => {});
     isInitialized = true;
   } catch (err) {
     // Fail open if table already exists
@@ -165,6 +168,7 @@ router.post("/:id/proof-of-work", authenticateToken, requireClockIn, async (req,
 // Fetch complete audit trail of site proof photos, GPS, & signatures
 router.get("/:id/proof-of-work", async (req, res) => {
   try {
+    await ensureDbInitialized();
     const caller = resolveCaller(req);
     if (!caller) {
       return res.status(401).json({ message: "Authentication required." });
@@ -196,15 +200,15 @@ router.get("/:id/proof-of-work", async (req, res) => {
     const result = await pool.query(
       `SELECT * FROM job_proof_of_work WHERE job_id::text = $1::text ORDER BY created_at ASC`,
       [jobId]
-    );
+    ).catch(() => ({ rows: [] }));
 
     return res.json({
       success: true,
-      proofs: result.rows,
+      proofs: result.rows || [],
     });
   } catch (err) {
     console.error("❌ Error fetching proof of work:", err);
-    return res.status(500).json({ message: "Failed to fetch proof of work." });
+    return res.status(500).json({ message: "Failed to fetch proof of work.", proofs: [] });
   }
 });
 

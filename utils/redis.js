@@ -66,9 +66,11 @@ function getSharedSubscriber() {
   try {
     subscriberClient = new Redis(REDIS_URL, {
       ...BASE_OPTS,
-      // Subscriber connections should retry a bit longer
+      enableOfflineQueue: true, // Allow subscribe commands to buffer until TCP connection opens
+      maxRetriesPerRequest: null,
+      // Subscriber connections should retry longer to stay alive
       retryStrategy(times) {
-        if (times > 5) return null;
+        if (times > 10) return null;
         return Math.min(times * 1000, 5000);
       },
     });

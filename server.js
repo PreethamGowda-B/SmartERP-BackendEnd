@@ -907,16 +907,18 @@ app.use((err, req, res, next) => {
     'http://localhost:3001'
   ];
   const allowedPatterns = [
-    /^https:\/\/smart-erp-front(-[a-z0-9]+)?(-[a-z0-9-]+)?\.vercel\.app$/,
-    /^https:\/\/smart-erp-front-[a-z0-9]+-thepreethu01-9119s-projects\.vercel\.app$/,
-  ];
-  const isAllowedOrigin = origin && (
-    allowedOrigins.includes(origin) ||
-    allowedPatterns.some(p => p.test(origin))
+  const cleanOrigin = origin ? origin.toLowerCase().trim() : '';
+  const isAllowedOrigin = cleanOrigin && (
+    allowedOrigins.includes(cleanOrigin) ||
+    cleanOrigin.endsWith('.prozync.in') ||
+    cleanOrigin.endsWith('.vercel.app') ||
+    allowedPatterns.some(p => p.test(cleanOrigin))
   );
   if (isAllowedOrigin) {
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-CSRF-Token,X-Requested-With,Accept');
   }
 
   // Handle CSRF errors specifically

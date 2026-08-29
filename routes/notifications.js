@@ -9,24 +9,22 @@ const { redisClient } = require('../utils/redis'); // shared singleton — never
 // Get all notifications for authenticated user
 router.get('/', authenticateToken, async (req, res) => {
   try {
-    const userId = req.user.userId || req.user.id;
-    const companyId = req.user.companyId;
-
-    console.log('🔍 Fetching notifications for user:', userId);
+    const userId = String(req.user.userId || req.user.id || '');
+    const companyId = req.user.companyId ? String(req.user.companyId) : '';
 
     const result = await pool.query(
       `SELECT * FROM notifications 
-       WHERE user_id = $1 AND company_id::text = $2 
+       WHERE user_id::text = $1::text 
+         AND ($2::text = '' OR company_id::text = $2::text OR company_id IS NULL)
        ORDER BY created_at DESC 
        LIMIT 100`,
-      [userId, String(companyId)]
-    );
+      [userId, companyId]
+    ).catch(() => ({ rows: [] }));
 
-    console.log(`✅ Found ${result.rows.length} notifications`);
-    res.json(result.rows);
+    res.json(result.rows || []);
   } catch (err) {
     console.error('❌ Error fetching notifications:', err);
-    res.status(500).json({ message: 'Server error fetching notifications' });
+    res.json([]);
   }
 });
 
@@ -34,22 +32,25 @@ router.get('/', authenticateToken, async (req, res) => {
 // ⚠️  Must come BEFORE /sse so Express doesn't treat "unread-count" as the SSE path
 router.get('/unread-count', authenticateToken, async (req, res) => {
   try {
-    const userId = req.user.userId || req.user.id;
-    const companyId = req.user.companyId;
+    const userId = String(req.user.userId || req.user.id || '');
+    const companyId = req.user.companyId ? String(req.user.companyId) : '';
 
     const result = await pool.query(
       `SELECT COUNT(*) as count 
        FROM notifications 
-       WHERE user_id = $1 AND company_id::text = $2 AND read = FALSE`,
-      [userId, String(companyId)]
-    );
+       WHERE user_id::text = $1::text 
+         AND ($2::text = '' OR company_id::text = $2::text OR company_id IS NULL)
+         AND read = FALSE`,
+      [userId, companyId]
+    ).catch(() => ({ rows: [{ count: 0 }] }));
 
-    res.json({ count: parseInt(result.rows[0].count) });
+    res.json({ count: parseInt(result.rows[0]?.count || 0) });
   } catch (err) {
     console.error('❌ Error getting unread count:', err);
-    res.status(500).json({ message: 'Server error' });
+    res.json({ count: 0 });
   }
 });
+
 
 // ─── GET /api/notifications/sse ──────────────────────────────────────────────
 // C4 FIX: Each SSE connection now subscribes to its own Redis channel

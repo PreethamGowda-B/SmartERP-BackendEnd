@@ -8,11 +8,14 @@ const { emitSystemEvent } = require('../helpers/eventBus');
 // ─── GET /api/automation-center (Fetch Active Zero-Code Rules) ─────────────
 router.get('/', authenticateToken, async (req, res) => {
   try {
-    const companyId = req.user.companyId || req.user.company_id || 1;
+    const companyId = req.user.companyId || req.user.company_id;
+    if (!companyId && req.user.role !== 'super_admin') {
+      return res.json({ success: true, rules: [] });
+    }
 
     const result = await pool.query(
-      `SELECT * FROM automation_rules WHERE company_id::text = $1::text OR company_id = $2 ORDER BY created_at DESC`,
-      [companyId.toString(), parseInt(companyId, 10) || 1]
+      `SELECT * FROM automation_rules WHERE company_id::text = $1::text ORDER BY created_at DESC`,
+      [companyId.toString()]
     ).catch(() => ({ rows: [] }));
 
     res.json({ success: true, rules: result.rows });
@@ -25,7 +28,8 @@ router.get('/', authenticateToken, async (req, res) => {
 // ─── POST /api/automation-center (Create Zero-Code Automation Rule) ───────
 router.post('/', authenticateToken, async (req, res) => {
   try {
-    const companyId = req.user.companyId || req.user.company_id || 1;
+    const companyId = req.user.companyId || req.user.company_id;
+    if (!companyId) return res.status(403).json({ message: 'No company associated with this account' });
     const { rule_name, trigger_event, action_type } = req.body;
 
     if (!rule_name || !trigger_event || !action_type) {
@@ -58,7 +62,8 @@ router.post('/', authenticateToken, async (req, res) => {
 // ─── POST /api/automation-center/evaluate (Trigger Rule Evaluation Manually) ─
 router.post('/evaluate', authenticateToken, async (req, res) => {
   try {
-    const companyId = req.user.companyId || req.user.company_id || 1;
+    const companyId = req.user.companyId || req.user.company_id;
+    if (!companyId) return res.status(403).json({ message: 'No company associated with this account' });
     const { trigger_event, jobId, machineId, itemId, details } = req.body;
 
     if (!trigger_event) {

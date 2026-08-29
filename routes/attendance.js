@@ -302,7 +302,7 @@ router.post('/clock-out', authenticateToken, async (req, res) => {
 router.get('/me', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId || req.user.id;
-    const companyId = req.user.companyId || req.user.company_id || 1;
+    const companyId = req.user.companyId || req.user.company_id;
     const today = new Date().toISOString().split('T')[0];
 
     // Fetch today's record

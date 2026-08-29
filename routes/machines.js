@@ -6,7 +6,10 @@ const { authenticateToken } = require('../middleware/authMiddleware');
 // ─── GET /api/machines (List machines) ──────────────────────────────────────
 router.get('/', authenticateToken, async (req, res) => {
   try {
-    const companyId = req.user.companyId || req.user.company_id || 1;
+    const companyId = req.user.companyId || req.user.company_id;
+    if (!companyId && req.user.role !== 'super_admin') {
+      return res.json({ success: true, machines: [] });
+    }
     const { customer_id, plant_id, status, search } = req.query;
 
     let query = `
@@ -54,7 +57,8 @@ router.get('/', authenticateToken, async (req, res) => {
 // ─── POST /api/machines (Register new CNC machine) ──────────────────────────
 router.post('/', authenticateToken, async (req, res) => {
   try {
-    const companyId = req.user.companyId || req.user.company_id || 1;
+    const companyId = req.user.companyId || req.user.company_id;
+    if (!companyId) return res.status(403).json({ message: 'No company associated with this account' });
     const {
       customer_id,
       plant_id,
@@ -68,50 +72,40 @@ router.post('/', authenticateToken, async (req, res) => {
       year_of_manufacture,
       spindle_hours = 0,
       installation_date,
-      warranty_start_date,
-      warranty_end_date,
+      warranty_expiry,
+      ip_address,
+      iot_device_id,
+      status = 'operational',
+      health_score = 100,
+      critical_level = 'medium',
+      amc_contract_number
     } = req.body;
 
-    const effectiveCustomerId = customer_id || req.user.customerId || req.user.userId || req.user.id || '00000000-0000-0000-0000-000000000000';
-
-    if (!machine_name || !serial_number || !controller_type) {
-      return res.status(400).json({ message: 'machine_name, serial_number, and controller_type are required' });
+    if (!customer_id || !machine_name || !serial_number) {
+      return res.status(400).json({ message: 'customer_id, machine_name, and serial_number are required' });
     }
 
     const result = await pool.query(
-      `INSERT INTO customer_machines
-         (company_id, customer_id, plant_id, production_line, area_location, machine_name, make, model, serial_number, controller_type, year_of_manufacture, spindle_hours, installation_date, warranty_start_date, warranty_end_date, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NOW(), NOW())
-       RETURNING *`,
+      `INSERT INTO customer_machines (
+        company_id, customer_id, plant_id, production_line, area_location,
+        machine_name, make, model, serial_number, controller_type,
+        year_of_manufacture, spindle_hours, installation_date, warranty_expiry,
+        ip_address, iot_device_id, status, health_score, critical_level, amc_contract_number
+      ) VALUES (
+        $1, $2, $3, $4, $5,
+        $6, $7, $8, $9, $10,
+        $11, $12, $13, $14,
+        $15, $16, $17, $18, $19, $20
+      ) RETURNING *`,
       [
-        companyId,
-        effectiveCustomerId,
-        plant_id || null,
-        production_line || null,
-        area_location || null,
-        machine_name,
-        make || 'Generic',
-        model || 'VMC',
-        serial_number,
-        controller_type,
-        year_of_manufacture || null,
-        spindle_hours || 0,
-        installation_date || new Date().toISOString().split('T')[0],
-        warranty_start_date || new Date().toISOString().split('T')[0],
-        warranty_end_date || null,
+        companyId, customer_id, plant_id || null, production_line || null, area_location || null,
+        machine_name, make || null, model || null, serial_number, controller_type || null,
+        year_of_manufacture || null, spindle_hours, installation_date || null, warranty_expiry || null,
+        ip_address || null, iot_device_id || null, status, health_score, critical_level, amc_contract_number || null
       ]
     );
 
-    const machine = result.rows[0];
-
-    // Log Feature #17 Initial Installation event on Machine Timeline
-    await pool.query(
-      `INSERT INTO machine_timeline_events (company_id, machine_id, event_type, title, description, created_at)
-       VALUES ($1, $2, 'installation', 'Machine Installed & Commissioned', $3, NOW())`,
-      [companyId, machine.id, `Machine ${machine_name} (${serial_number}) registered & commissioned under controller ${controller_type}`]
-    ).catch(() => {});
-
-    res.status(201).json({ success: true, machine });
+    res.status(201).json({ success: true, machine: result.rows[0] });
   } catch (err) {
     console.error('❌ Error creating machine:', err.message);
     res.status(500).json({ message: err.message || 'Server error' });
@@ -121,7 +115,8 @@ router.post('/', authenticateToken, async (req, res) => {
 // ─── GET /api/machines/:id (Fetch machine profile & dashboard details) ──────
 router.get('/:id', authenticateToken, async (req, res) => {
   try {
-    const companyId = req.user.companyId || req.user.company_id || 1;
+    const companyId = req.user.companyId || req.user.company_id;
+    if (!companyId) return res.status(403).json({ message: 'No company associated with this account' });
     const { id } = req.params;
 
     const machineRes = await pool.query(
@@ -212,7 +207,8 @@ router.get('/:id/timeline', authenticateToken, async (req, res) => {
 // ─── POST /api/machines/:id/subcomponents (Add subcomponent) ─────────────────
 router.post('/:id/subcomponents', authenticateToken, async (req, res) => {
   try {
-    const companyId = req.user.companyId || req.user.company_id || 1;
+    const companyId = req.user.companyId || req.user.company_id;
+    if (!companyId) return res.status(403).json({ message: 'No company associated with this account' });
     const { id } = req.params;
     const { component_type, name, make_model, serial_number, specs } = req.body;
 

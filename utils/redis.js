@@ -38,7 +38,8 @@ function attachListeners(client, label) {
     } else if (
       !err.message?.includes('Connection is closed') &&
       !err.message?.includes('connect ECONNREFUSED') &&
-      !err.message?.includes('Stream isn\'t writeable')
+      !err.message?.includes('Stream isn\'t writeable') &&
+      !err.message?.includes("Can't execute 'info'")
     ) {
       console.warn(`⚠️ Redis [${label}] error:`, err.message);
     }

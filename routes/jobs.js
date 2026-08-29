@@ -172,7 +172,17 @@ router.get('/', authenticateToken, async (req, res) => {
 
     let countResult;
     const userRole = (req.user.role || 'employee').toLowerCase();
-    const companyId = req.user.companyId || req.user.company_id || 1;
+    const companyId = req.user.companyId || req.user.company_id;
+
+    if (!companyId && userRole !== 'super_admin') {
+      return res.json({
+        jobs: [],
+        total: 0,
+        page,
+        limit,
+        pages: 0
+      });
+    }
 
     if (userRole === 'owner' || userRole === 'admin' || userRole === 'super_admin') {
       // Exclude pending_approval / rejected customer jobs from the owner/admin tasks list

@@ -6,7 +6,10 @@ const { authenticateToken } = require('../middleware/authMiddleware');
 // ─── POST /api/ai/copilot (Enterprise AI Operations Copilot & Multi-Step Workflows) ───
 router.post('/', authenticateToken, async (req, res) => {
   try {
-    const companyId = req.user.companyId || req.user.company_id || 1;
+    const companyId = req.user.companyId || req.user.company_id;
+    if (!companyId && req.user.role !== 'super_admin') {
+      return res.status(403).json({ message: 'No company associated with this account' });
+    }
     const userId = req.user.userId || req.user.id;
     const userName = req.user.name || 'User';
     const role = req.user.role || 'owner';
@@ -145,11 +148,14 @@ router.post('/', authenticateToken, async (req, res) => {
 // ─── GET /api/ai/copilot/activity (AI Activity Center Log) ─────────────────
 router.get('/activity', authenticateToken, async (req, res) => {
   try {
-    const companyId = req.user.companyId || req.user.company_id || 1;
+    const companyId = req.user.companyId || req.user.company_id;
+    if (!companyId && req.user.role !== 'super_admin') {
+      return res.json({ success: true, activities: [] });
+    }
 
     const result = await pool.query(
-      `SELECT * FROM ai_action_audit_trail WHERE company_id::text = $1::text OR company_id = $2 ORDER BY created_at DESC LIMIT 30`,
-      [companyId.toString(), parseInt(companyId, 10) || 1]
+      `SELECT * FROM ai_action_audit_trail WHERE company_id::text = $1::text ORDER BY created_at DESC LIMIT 30`,
+      [companyId.toString()]
     ).catch(() => ({ rows: [] }));
 
     res.json({ success: true, activities: result.rows });

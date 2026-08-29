@@ -428,21 +428,24 @@ router.post("/exchange-code", async (req, res) => {
 
 
 // ---------------------------------------------
-// ✅ Send OTP for email verification (signup only)
+// ✅ Send OTP for email verification / password reset / security actions
 // ---------------------------------------------
 router.post("/send-otp", async (req, res) => {
-  const { email } = req.body;
+  const { email, type, purpose } = req.body;
   if (!email) return res.status(400).json({ message: "Email is required" });
 
+  const normalizedEmail = String(email).toLowerCase().trim();
+  const actionType = String(type || purpose || "").toLowerCase().trim();
+
   // 🛡️ OTP Rate Limiting (5 requests per 10 minutes)
-  const otpLimitKey = `otp_attempts:${email}`;
+  const otpLimitKey = `otp_attempts:${normalizedEmail}`;
   if (redisClient && redisClient.status === 'ready') {
     try {
       const attempts = await redisClient.get(otpLimitKey);
       if (attempts && parseInt(attempts, 10) >= 5) {
         const ttl = await redisClient.ttl(otpLimitKey);
         const minutesLeft = Math.ceil(ttl / 60);
-        console.warn(`🛡️  OTP Blocked for ${email}. Too many requests.`);
+        console.warn(`🛡️  OTP Blocked for ${normalizedEmail}. Too many requests.`);
         return res.status(429).json({
           message: `You have reached the OTP request limit. Please try again after ${minutesLeft} minutes.`,
           retryAfter: ttl
@@ -475,38 +478,52 @@ router.post("/send-otp", async (req, res) => {
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
 
-    // Old OTP cleanup and storage (Table is now ensured on server startup)
-    await pool.query("DELETE FROM email_otps WHERE email = $1", [email]);
+    // Old OTP cleanup and storage
+    await pool.query("DELETE FROM email_otps WHERE LOWER(email) = $1", [normalizedEmail]);
 
     // Hash OTP before storage — plaintext OTPs in DB are a breach risk
-    const otpHash = crypto.createHash("sha256").update(otp + email).digest("hex");
+    const otpHash = crypto.createHash("sha256").update(otp + normalizedEmail).digest("hex");
     await pool.query(
       "INSERT INTO email_otps (email, otp_code, expires_at) VALUES ($1, $2, $3)",
-      [email, otpHash, expiresAt]
+      [normalizedEmail, otpHash, expiresAt]
     );
+
+    // Determine custom email copy based on request type
+    let emailSubject = `SmartERP Verification Code: ${otp}`;
+    let emailTitle = "Email Verification";
+    let emailDescription = "Use the verification code below to verify your email address and access your SmartERP workspace.";
+
+    if (actionType.includes("password") || actionType.includes("reset")) {
+      emailSubject = `SmartERP Password Reset Code: ${otp}`;
+      emailTitle = "Password Reset Request";
+      emailDescription = "We received a request to reset your password. Use the verification code below to set a new password for your SmartERP account.";
+    } else if (actionType.includes("delete") || actionType.includes("security")) {
+      emailSubject = `SmartERP Security Action Code: ${otp}`;
+      emailTitle = "Security Action Authorization";
+      emailDescription = "Use the verification code below to authorize this critical account action.";
+    }
 
     // Send email via Resend with a 10s timeout safety
     const resend = new Resend(process.env.RESEND_API_KEY);
 
-    // We race the email send with a timeout to avoid hanging the UI
     const sendPromise = resend.emails.send({
       from: "SmartERP <noreply@prozync.in>",
-      to: email,
-      subject: "Your SmartERP Verification Code",
+      to: normalizedEmail,
+      subject: emailSubject,
       html: `
-        <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 32px; background: #f8fafc; border-radius: 12px;">
+        <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 32px; background: #f8fafc; border-radius: 12px; border: 1px solid #e2e8f0;">
           <div style="text-align: center; margin-bottom: 24px;">
-            <div style="background: #4F46E5; display: inline-block; padding: 12px 20px; border-radius: 8px;">
-              <span style="color: white; font-size: 20px; font-weight: bold;">SmartERP</span>
+            <div style="background: #4F46E5; display: inline-block; padding: 10px 22px; border-radius: 8px;">
+              <span style="color: white; font-size: 20px; font-weight: 800; letter-spacing: 0.5px;">SmartERP</span>
             </div>
           </div>
-          <h2 style="color: #1e293b; text-align: center; margin-bottom: 8px;">Email Verification</h2>
-          <p style="color: #64748b; text-align: center; margin-bottom: 32px;">Use the code below to verify your email and create your account.</p>
-          <div style="background: white; border: 2px solid #e2e8f0; border-radius: 12px; padding: 24px; text-align: center; margin-bottom: 24px;">
-            <div style="font-size: 42px; font-weight: bold; letter-spacing: 10px; color: #4F46E5; font-family: monospace;">${otp}</div>
+          <h2 style="color: #0f172a; text-align: center; margin-bottom: 8px; font-size: 22px; font-weight: 700;">${emailTitle}</h2>
+          <p style="color: #475569; text-align: center; margin-bottom: 28px; font-size: 14px; line-height: 1.5;">${emailDescription}</p>
+          <div style="background: #ffffff; border: 2px solid #cbd5e1; border-radius: 12px; padding: 20px; text-align: center; margin-bottom: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.05);">
+            <div style="font-size: 38px; font-weight: 800; letter-spacing: 8px; color: #4F46E5; font-family: 'Courier New', Courier, monospace;">${otp}</div>
           </div>
-          <p style="color: #94a3b8; text-align: center; font-size: 13px;">This code expires in <strong>10 minutes</strong>. Do not share it with anyone.</p>
-          <p style="color: #cbd5e1; text-align: center; font-size: 12px; margin-top: 24px;">If you didn't request this, you can safely ignore this email.</p>
+          <p style="color: #64748b; text-align: center; font-size: 13px; margin-bottom: 8px;">This code expires in <strong>10 minutes</strong>. Do not share it with anyone.</p>
+          <p style="color: #94a3b8; text-align: center; font-size: 12px; margin-top: 20px; border-top: 1px solid #e2e8f0; pt-3;">If you didn't request this action, you can safely ignore this email.</p>
         </div>
       `,
     });
@@ -515,14 +532,13 @@ router.post("/send-otp", async (req, res) => {
 
     const sendResult = await Promise.race([sendPromise, timeoutPromise]);
 
-
     if (sendResult.error) {
       console.error("Resend error:", sendResult.error);
       return res.status(500).json({ message: "Failed to send OTP: " + sendResult.error.message });
     }
 
-    console.log(`✅ OTP sent to ${email}`, sendResult.data?.id);
-    res.json({ ok: true, message: "OTP sent to your email" });
+    console.log(`✅ OTP (${actionType || "general"}) sent to ${normalizedEmail}`, sendResult.data?.id);
+    res.json({ ok: true, message: "Verification code sent to your email." });
   } catch (err) {
     console.error("Send OTP error:", err.message);
     res.status(500).json({ message: "Failed to send OTP. Please try again." });

@@ -99,11 +99,18 @@ router.post("/:id/proof-of-work", authenticateToken, requireClockIn, async (req,
       [jobId, effectiveCompanyId, userId, userName, photo_url || null, notes || null, gps_latitude || null, gps_longitude || null, stage]
     );
 
-    // Update job stage if provided
-    await pool.query(
-      `UPDATE jobs SET stage = $1, updated_at = NOW() WHERE id::text = $2::text`,
-      [stage, jobId]
-    );
+    // Optionally update job status if stage indicates completion or in-progress
+    if (stage === 'completed') {
+      await pool.query(
+        `UPDATE jobs SET status = 'completed', progress = 100, updated_at = NOW() WHERE id::text = $1::text`,
+        [jobId]
+      ).catch(() => {});
+    } else if (stage === 'in_progress') {
+      await pool.query(
+        `UPDATE jobs SET status = 'in_progress', updated_at = NOW() WHERE id::text = $1::text AND status = 'open'`,
+        [jobId]
+      ).catch(() => {});
+    }
 
     // Notify Owner
     try {
@@ -253,9 +260,9 @@ router.post("/:id/customer-signoff", async (req, res) => {
 
     // Auto-complete job & update status
     await pool.query(
-      `UPDATE jobs SET status = 'completed', stage = 'Completed', progress = 100, updated_at = NOW() WHERE id::text = $1::text`,
+      `UPDATE jobs SET status = 'completed', progress = 100, updated_at = NOW() WHERE id::text = $1::text`,
       [jobId]
-    );
+    ).catch(() => {});
 
     // Check if invoice exists; if not, create draft invoice automatically with verified job.company_id
     try {

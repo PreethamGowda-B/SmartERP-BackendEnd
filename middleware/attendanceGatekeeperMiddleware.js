@@ -21,17 +21,26 @@ async function requireClockIn(req, res, next) {
       return res.status(401).json({ success: false, message: 'Authentication required' });
     }
 
+    const today = new Date().toISOString().split('T')[0];
+
     // Check if employee has an active clock-in record for TODAY
     const shiftRes = await pool.query(
-      `SELECT id, check_in_time, clock_out_time FROM attendance
+      `SELECT id, check_in_time, check_out_time FROM attendance
        WHERE user_id::text = $1::text 
-         AND (company_id::text = $2::text OR company_id IS NULL OR $2::text = '1' OR company_id::text IN (SELECT id::text FROM companies WHERE id::text = $2::text))
-         AND (date = CURRENT_DATE OR (check_in_time IS NOT NULL AND check_in_time >= CURRENT_DATE))
-         AND (check_in_time IS NOT NULL OR clock_in_time IS NOT NULL OR clock_in IS NOT NULL)
-         AND (clock_out_time IS NULL AND clock_out IS NULL)
+         AND (date = $2 OR (check_in_time IS NOT NULL AND check_in_time::date = $2::date))
+         AND check_in_time IS NOT NULL
+         AND check_out_time IS NULL
        ORDER BY created_at DESC LIMIT 1`,
-      [String(userId), String(companyId)]
-    );
+      [String(userId), today]
+    ).catch(async (dbErr) => {
+      console.warn('⚠️ Primary attendance query fallback:', dbErr.message);
+      return pool.query(
+        `SELECT id, check_in_time, check_out_time FROM attendance
+         WHERE user_id::text = $1::text AND check_in_time IS NOT NULL AND check_out_time IS NULL
+         ORDER BY created_at DESC LIMIT 1`,
+        [String(userId)]
+      ).catch(() => ({ rows: [] }));
+    });
 
     if (shiftRes.rows.length > 0) {
       // Employee is clocked in with active shift — allow operation
@@ -67,7 +76,6 @@ async function requireClockIn(req, res, next) {
 
   } catch (err) {
     console.error('❌ Attendance Gatekeeper Middleware Error:', err.message);
-    // On unexpected DB error, fail-safe block to preserve shift integrity
     return res.status(403).json({
       success: false,
       code: 'SHIFT_NOT_STARTED',

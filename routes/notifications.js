@@ -3,7 +3,7 @@ const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 const { registerSSEConnection, unregisterSSEConnection, broadcastToUser } = require('../utils/notificationHelpers');
-const redisShared = require('../utils/redis'); // shared singleton — never create extra connections for non-pubsub ops
+const { redisClient } = require('../utils/redis'); // shared singleton — never create extra connections for non-pubsub ops
 
 // ─── GET /api/notifications ──────────────────────────────────────────────────
 // Get all notifications for authenticated user
@@ -155,9 +155,9 @@ router.get('/sse', authenticateToken, async (req, res) => {
 
       // Mark user as offline in Redis — reuse shared singleton
       const companyId = String(req.user.companyId || '');
-      if (redisShared && companyId) {
+      if (redisClient && companyId) {
         try {
-          await redisShared.hdel(`online_users:${companyId}`, userId);
+          await redisClient.hdel(`online_users:${companyId}`, userId);
         } catch (e) {
           console.warn('⚠️ Could not clear online status:', e.message);
         }

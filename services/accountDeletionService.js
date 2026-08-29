@@ -96,8 +96,19 @@ class AccountDeletionService {
         if (!match) {
           throw { status: 401, message: 'Invalid password confirmation. Account deletion rejected.' };
         }
+      } else if (otp) {
+        // Support direct OTP verification for Google OAuth users
+        const submittedHash = crypto.createHash("sha256").update(otp.toString().trim() + user.email.toLowerCase()).digest("hex");
+        const otpResult = await pool.query(
+          "SELECT * FROM email_otps WHERE email = $1 AND otp_code = $2 AND used = FALSE AND expires_at > NOW() ORDER BY created_at DESC LIMIT 1",
+          [user.email.toLowerCase(), submittedHash]
+        );
+        if (otpResult.rows.length === 0) {
+          throw { status: 400, message: 'Invalid or expired OTP code. Please request a new verification code.' };
+        }
+        await pool.query("UPDATE email_otps SET used = TRUE WHERE id = $1", [otpResult.rows[0].id]);
       } else if (user.google_id && !isOAuth) {
-        throw { status: 400, message: 'Please re-authenticate with Google before deleting your account.' };
+        throw { status: 400, message: 'Your account was created via Google without a password. Please reset your password via Email OTP or verify with OTP to proceed.' };
       }
 
       // 3. Special Owner Protection Rules

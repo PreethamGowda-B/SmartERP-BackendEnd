@@ -16,13 +16,14 @@ router.post('/deletion/request', authenticateToken, async (req, res) => {
     const userId = req.user.userId || req.user.id;
     const companyId = req.user.companyId || req.user.company_id;
     const role = req.user.role;
-    const { password, is_oauth } = req.body;
+    const { password, otp, is_oauth } = req.body;
 
     const result = await AccountDeletionService.requestStaffDeletion({
       userId,
       companyId,
       role,
       password,
+      otp,
       isOAuth: is_oauth || false,
       ipAddress: req.ip || req.headers['x-forwarded-for'],
       userAgent: req.headers['user-agent']

@@ -595,6 +595,74 @@ router.post("/verify-otp", otpVerifyLimiter, async (req, res) => {
 });
 
 // ---------------------------------------------
+// ✅ Reset Password via Email OTP (For all users including Google OAuth accounts)
+// ---------------------------------------------
+router.post("/reset-password", otpVerifyLimiter, [
+  body("email").isEmail().withMessage("Valid email is required").normalizeEmail(),
+  body("otp").trim().notEmpty().withMessage("OTP is required"),
+  body("new_password")
+    .isLength({ min: 6 }).withMessage("Password must be at least 6 characters long"),
+], async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ message: errors.array()[0].msg, errors: errors.array() });
+  }
+
+  const { email, otp, new_password } = req.body;
+
+  try {
+    // 1. Verify OTP Hash
+    const submittedHash = crypto.createHash("sha256").update(otp.toString().trim() + email.toLowerCase()).digest("hex");
+    const otpResult = await pool.query(
+      "SELECT * FROM email_otps WHERE email = $1 AND otp_code = $2 AND used = FALSE AND expires_at > NOW() ORDER BY created_at DESC LIMIT 1",
+      [email.toLowerCase(), submittedHash]
+    );
+
+    if (otpResult.rows.length === 0) {
+      return res.status(400).json({ message: "Invalid or expired OTP. Please request a new code." });
+    }
+
+    // 2. Fetch User
+    const userResult = await pool.query("SELECT id, name, email, role, company_id FROM users WHERE email = $1", [email.toLowerCase()]);
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ message: "Account not found for this email address." });
+    }
+    const user = userResult.rows[0];
+
+    // 3. Hash New Password
+    const newHash = await bcrypt.hash(new_password, 10);
+
+    // 4. Update Password Hash in Database
+    await pool.query(
+      "UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2",
+      [newHash, user.id]
+    );
+
+    // 5. Invalidate OTP (single-use enforcement)
+    await pool.query("UPDATE email_otps SET used = TRUE WHERE id = $1", [otpResult.rows[0].id]);
+
+    // 6. Clear Redis attempt counter if active
+    if (redisClient && redisClient.status === "ready") {
+      await redisClient.del(`otp_verify_attempts:${email.toLowerCase()}`).catch(() => {});
+    }
+
+    // 7. Track password changes in backend audit logs
+    await logActivity(user.id, "password_reset", req);
+
+    console.log(`✅ Password successfully reset for user ${user.email} (ID: ${user.id})`);
+
+    return res.json({
+      ok: true,
+      success: true,
+      message: "Password reset successfully! You can now use your new password to sign in or confirm sensitive actions."
+    });
+  } catch (err) {
+    console.error("Reset password error:", err.message);
+    res.status(500).json({ message: "Failed to reset password. Please try again." });
+  }
+});
+
+// ---------------------------------------------
 // ✅ Signup (Register New Users)
 // ---------------------------------------------
 router.post("/signup", [

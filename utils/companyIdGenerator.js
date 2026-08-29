@@ -34,14 +34,18 @@ async function generateCompanyId() {
     }
 }
 
-/**
- * Validate if a company code exists
- */
 async function validateCompanyCode(companyCode) {
     try {
+        if (!companyCode) return { valid: false, company: null };
+        const cleanCode = String(companyCode).trim();
         const result = await pool.query(
-            'SELECT id, company_id, company_name FROM companies WHERE company_id = $1',
-            [companyCode]
+            `SELECT id, company_id, company_name, status FROM companies 
+             WHERE UPPER(company_id) = UPPER($1) 
+                OR id::text = $1 
+                OR UPPER(REPLACE(company_id, '-', '')) = UPPER(REPLACE($1, '-', ''))
+                OR UPPER(REPLACE(company_id, ' ', '')) = UPPER(REPLACE($1, ' ', ''))
+             LIMIT 1`,
+            [cleanCode]
         );
 
         if (result.rows.length > 0) {

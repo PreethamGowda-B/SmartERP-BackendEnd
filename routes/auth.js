@@ -1195,8 +1195,8 @@ router.post("/employee/onboarding", authenticateToken, async (req, res) => {
     const { validateCompanyCode } = require("../utils/companyIdGenerator");
     const validation = await validateCompanyCode(company_code);
 
-    if (!validation.valid) {
-      return res.status(400).json({ message: "Invalid or inactive company code. Please check with your employer." });
+    if (!validation.valid || !validation.company) {
+      return res.status(400).json({ message: "Invalid company code. Please check the code with your employer." });
     }
 
     const targetCompanyId = validation.company.id;
@@ -1209,41 +1209,66 @@ router.post("/employee/onboarding", authenticateToken, async (req, res) => {
     }
 
     // 2. Update Users table
-    const updateResult = await pool.query(
-      `UPDATE users 
-       SET name = COALESCE(NULLIF($1, ''), name), 
-           company_id = $2, 
-           company_code = $3,
-           updated_at = NOW()
-       WHERE id = $4
-       RETURNING id, name, email, role, company_id, company_code`,
-      [name?.trim() || null, targetCompanyId, targetCompanyCode, userId]
-    );
-
-    if (updateResult.rows.length === 0) {
-      return res.status(404).json({ message: "User not found" });
+    let updatedUser = null;
+    try {
+      const updateResult = await pool.query(
+        `UPDATE users 
+         SET name = COALESCE(NULLIF($1, ''), name), 
+             phone = COALESCE(NULLIF($2, ''), phone),
+             position = COALESCE(NULLIF($3, ''), position),
+             department = COALESCE(NULLIF($4, ''), department),
+             company_id = $5, 
+             company_code = $6,
+             updated_at = NOW()
+         WHERE id::text = $7::text
+         RETURNING id, name, email, role, company_id, company_code, phone, position, department`,
+        [
+          name?.trim() || null,
+          phone?.trim() || null,
+          position?.trim() || null,
+          department?.trim() || null,
+          targetCompanyId,
+          targetCompanyCode,
+          String(userId)
+        ]
+      );
+      updatedUser = updateResult.rows[0];
+    } catch (dbErr) {
+      console.warn("⚠️ Full update users failed, executing lightweight fallback:", dbErr.message);
+      const fallbackResult = await pool.query(
+        `UPDATE users 
+         SET name = COALESCE(NULLIF($1, ''), name), 
+             company_id = $2, 
+             company_code = $3
+         WHERE id::text = $4::text
+         RETURNING id, name, email, role, company_id, company_code`,
+        [name?.trim() || null, targetCompanyId, targetCompanyCode, String(userId)]
+      );
+      updatedUser = fallbackResult.rows[0];
     }
 
-    const updatedUser = updateResult.rows[0];
+    if (!updatedUser) {
+      return res.status(404).json({ message: "User account not found. Please log in again." });
+    }
 
-    // 3. Upsert into employee_profiles if available
+    // 3. Upsert into employee_profiles if table exists
     try {
       await pool.query(
         `INSERT INTO employee_profiles (user_id, phone, position, department, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, NOW(), NOW())
+         VALUES ($1::uuid, $2, $3, $4, NOW(), NOW())
          ON CONFLICT (user_id) 
          DO UPDATE SET 
            phone = COALESCE(EXCLUDED.phone, employee_profiles.phone),
            position = COALESCE(EXCLUDED.position, employee_profiles.position),
            department = COALESCE(EXCLUDED.department, employee_profiles.department),
            updated_at = NOW()`,
-        [userId, phone?.trim() || null, position?.trim() || null, department?.trim() || null]
+        [updatedUser.id, phone?.trim() || null, position?.trim() || null, department?.trim() || null]
       );
     } catch (epErr) {
-      console.warn("⚠️ Note: employee_profiles table update non-critical:", epErr.message);
+      console.warn("⚠️ Note: employee_profiles update non-critical:", epErr.message);
     }
 
-    // 4. Issue Fresh JWT Tokens with the new companyId
+    // 4. Issue Fresh JWT Tokens with the linked companyId
     const newAccessToken = jwt.sign(
       { id: updatedUser.id, userId: updatedUser.id, role: updatedUser.role, email: updatedUser.email, companyId: updatedUser.company_id },
       ACCESS_SECRET,
@@ -1251,13 +1276,17 @@ router.post("/employee/onboarding", authenticateToken, async (req, res) => {
     );
     const newRefreshToken = jwt.sign({ id: updatedUser.id, userId: updatedUser.id }, REFRESH_SECRET, { expiresIn: REFRESH_EXPIRY });
 
-    // Store rotated refresh token
-    const tokenFamily = crypto.randomUUID();
-    await pool.query(
-      `INSERT INTO refresh_tokens (user_id, token, token_family, expires_at, created_at, user_agent, ip_address)
-       VALUES ($1::uuid, $2, $3::uuid, NOW() + INTERVAL '30 days', NOW(), $4, $5)`,
-      [updatedUser.id, newRefreshToken, tokenFamily, req.headers["user-agent"] || null, req.ip || null]
-    );
+    // 5. Store rotated refresh token safely
+    try {
+      const tokenFamily = crypto.randomUUID();
+      await pool.query(
+        `INSERT INTO refresh_tokens (user_id, token, token_family, expires_at, created_at, user_agent, ip_address)
+         VALUES ($1::uuid, $2, $3::uuid, NOW() + INTERVAL '30 days', NOW(), $4, $5)`,
+        [updatedUser.id, newRefreshToken, tokenFamily, req.headers["user-agent"] || null, req.ip || null]
+      );
+    } catch (rtErr) {
+      console.warn("⚠️ Note: refresh_tokens storage non-critical:", rtErr.message);
+    }
 
     const cookieOpts = {
       httpOnly: true,
@@ -1276,9 +1305,9 @@ router.post("/employee/onboarding", authenticateToken, async (req, res) => {
       user: {
         ...updatedUser,
         company_name: targetCompanyName,
-        phone: phone?.trim() || undefined,
-        position: position?.trim() || undefined,
-        department: department?.trim() || undefined
+        phone: phone?.trim() || updatedUser.phone || undefined,
+        position: position?.trim() || updatedUser.position || undefined,
+        department: department?.trim() || updatedUser.department || undefined
       },
       accessToken: newAccessToken,
       refreshToken: newRefreshToken,
@@ -1289,8 +1318,8 @@ router.post("/employee/onboarding", authenticateToken, async (req, res) => {
       }
     });
   } catch (err) {
-    console.error("Employee onboarding error:", err.message);
-    res.status(500).json({ message: "Server error during onboarding. Please try again." });
+    console.error("Employee onboarding error:", err);
+    res.status(500).json({ message: err.message || "Server error during onboarding. Please try again." });
   }
 });
 

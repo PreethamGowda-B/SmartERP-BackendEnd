@@ -70,14 +70,14 @@ router.get('/sse', authenticateToken, async (req, res) => {
 
   // Mark user as online in Redis — reuse shared singleton, no new connection needed
   const companyId = String(req.user.companyId || '');
-  if (redisShared && companyId) {
+  if (redisClient && companyId) {
     try {
-      const hsetFn = redisShared.hset || redisShared.hSet;
+      const hsetFn = redisClient.hset || redisClient.hSet;
       if (typeof hsetFn === 'function') {
-        await hsetFn.call(redisShared, `online_users:${companyId}`, userId, '1');
+        await hsetFn.call(redisClient, `online_users:${companyId}`, userId, '1');
       }
-      if (typeof redisShared.expire === 'function') {
-        await redisShared.expire(`online_users:${companyId}`, 300); // 5 min TTL
+      if (typeof redisClient.expire === 'function') {
+        await redisClient.expire(`online_users:${companyId}`, 300); // 5 min TTL
       }
     } catch (e) {
       console.warn('⚠️ Could not set online status:', e.message);

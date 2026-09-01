@@ -49,7 +49,7 @@ async function runPhase3Tests() {
   }
 
   // ── Test 2: Live Database Event Aggregation & Incident Creation ─────────────
-  const testIp1 = `198.51.200.${Math.floor(Math.random() * 200) + 10}`;
+  const testIp1 = `198.51.${Math.floor(Math.random() * 200) + 10}.${Math.floor(Math.random() * 200) + 10}`;
   {
     // Insert 5 raw telemetry events for testIp1
     for (let i = 1; i <= 5; i++) {
@@ -93,7 +93,7 @@ async function runPhase3Tests() {
   }
 
   // ── Test 4: Super Admin Unauthorized Probing Incident ───────────────────────
-  const testIp2 = `198.51.200.${Math.floor(Math.random() * 200) + 10}`;
+  const testIp2 = `198.51.${Math.floor(Math.random() * 200) + 10}.${Math.floor(Math.random() * 200) + 10}`;
   {
     await pool.query(
       `INSERT INTO security_events (company_id, user_id, event_type, severity, ip_address, endpoint, http_method, status_code, metadata, created_at)
@@ -108,7 +108,7 @@ async function runPhase3Tests() {
   }
 
   // ── Test 5: Multi-Vector Anomaly Correlation ────────────────────────────────
-  const testIp3 = `198.51.200.${Math.floor(Math.random() * 200) + 10}`;
+  const testIp3 = `198.51.${Math.floor(Math.random() * 200) + 10}.${Math.floor(Math.random() * 200) + 10}`;
   {
     // Insert 1 route scan + 1 failed auth
     await pool.query(

@@ -1,6 +1,8 @@
 const express = require('express');
 const router = express.Router();
 const multer = require('multer');
+const fs = require('fs');
+const path = require('path');
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 const { cloudinary, hasCloudinaryConfig } = require('../config/cloudinary');
@@ -52,31 +54,43 @@ router.post('/', authenticateToken, upload.single('file'), async (req, res) => {
             return res.status(404).json({ message: 'Employee not found in your company' });
         }
 
-        // Upload buffer to Cloudinary under smarterp/documents
+        // Upload buffer to Cloudinary or fallback to local disk
         const isImage = req.file.mimetype.startsWith('image/');
         let fileUrl = null;
-        try {
-            const uploadResult = await new Promise((resolve, reject) => {
-                const stream = cloudinary.uploader.upload_stream(
-                    {
-                        folder: `smarterp/documents/${companyId}`,
-                        resource_type: isImage ? 'image' : 'raw',
-                        public_id: `doc_${Date.now()}`,
-                        ...(isImage && { transformation: [{ width: 1600, crop: 'limit' }] })
-                    },
-                    (error, result) => {
-                        if (error) reject(error);
-                        else resolve(result);
-                    }
-                );
-                stream.end(req.file.buffer);
-            });
-            fileUrl = uploadResult.secure_url;
-        } catch (cloudErr) {
-            console.warn('⚠️ Cloudinary API upload warning:', cloudErr.message);
-            const cloudName = process.env.CLOUDINARY_CLOUD_NAME || 'dvqnrmdbo';
-            const ext = isImage ? 'png' : 'pdf';
-            fileUrl = `https://res.cloudinary.com/${cloudName}/${isImage ? 'image' : 'raw'}/upload/v${Date.now()}/smarterp/documents/${companyId}/doc_${Date.now()}.${ext}`;
+
+        if (hasCloudinaryConfig) {
+            try {
+                const uploadResult = await new Promise((resolve, reject) => {
+                    const stream = cloudinary.uploader.upload_stream(
+                        {
+                            folder: `smarterp/documents/${companyId}`,
+                            resource_type: isImage ? 'image' : 'raw',
+                            public_id: `doc_${Date.now()}`,
+                            ...(isImage && { transformation: [{ width: 1600, crop: 'limit' }] })
+                        },
+                        (error, result) => {
+                            if (error) reject(error);
+                            else resolve(result);
+                        }
+                    );
+                    stream.end(req.file.buffer);
+                });
+                fileUrl = uploadResult.secure_url;
+            } catch (cloudErr) {
+                console.warn('⚠️ Cloudinary upload failed, falling back to local storage:', cloudErr.message);
+            }
+        }
+
+        // If Cloudinary wasn't configured or failed, store securely on local disk
+        if (!fileUrl) {
+            const ext = req.file.originalname.split('.').pop() || (isImage ? 'png' : 'pdf');
+            const filename = `doc-${Date.now()}-${Math.round(Math.random() * 1e9)}.${ext}`;
+            const uploadsDir = path.join(__dirname, '..', 'uploads', 'documents');
+            if (!fs.existsSync(uploadsDir)) {
+                fs.mkdirSync(uploadsDir, { recursive: true });
+            }
+            fs.writeFileSync(path.join(uploadsDir, filename), req.file.buffer);
+            fileUrl = `/uploads/documents/${filename}`;
         }
 
         const result = await pool.query(

@@ -58,6 +58,23 @@ function checkPermission(requiredPermission) {
       return next();
     }
 
+    const { emitSecurityEvent, SECURITY_EVENT_TYPES } = require('../utils/securityEmitter');
+    emitSecurityEvent({
+      companyId: req.user?.companyId || req.user?.company_id,
+      userId: req.user?.id || req.user?.userId,
+      eventType: SECURITY_EVENT_TYPES.RBAC_DENIED,
+      severity: 'low',
+      ipAddress: req.ip || req.headers['x-forwarded-for'],
+      userAgent: req.headers['user-agent'],
+      endpoint: req.originalUrl || req.path,
+      httpMethod: req.method,
+      statusCode: 403,
+      metadata: {
+        userRole,
+        requiredPermission,
+      }
+    });
+
     return res.status(403).json({
       message: `Access denied. You do not have permission to ${requiredPermission.replace(':', ' ')}.`,
       required: requiredPermission

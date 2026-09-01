@@ -65,12 +65,39 @@ function authenticateToken(req, res, next) {
     return res.status(401).json({ message: "Not authenticated" });
   }
 
+  const { emitSecurityEvent, SECURITY_EVENT_TYPES } = require("../utils/securityEmitter");
+
   jwt.verify(token, process.env.JWT_SECRET, async (err, payload) => {
     if (err) {
+      emitSecurityEvent({
+        eventType: SECURITY_EVENT_TYPES.AUTH_TOKEN_INVALID,
+        severity: 'low',
+        ipAddress: req.ip || req.headers['x-forwarded-for'],
+        userAgent: req.headers['user-agent'],
+        endpoint: req.originalUrl || req.path,
+        httpMethod: req.method,
+        statusCode: 401,
+        metadata: {
+          errorName: err.name,
+        }
+      });
       return res.status(401).json({ message: "Invalid or expired token" });
     }
 
     if (payload.role === 'customer') {
+      emitSecurityEvent({
+        userId: payload.id || payload.userId,
+        eventType: SECURITY_EVENT_TYPES.RBAC_DENIED,
+        severity: 'medium',
+        ipAddress: req.ip || req.headers['x-forwarded-for'],
+        userAgent: req.headers['user-agent'],
+        endpoint: req.originalUrl || req.path,
+        httpMethod: req.method,
+        statusCode: 403,
+        metadata: {
+          reason: 'Customer token attempted access to staff endpoint',
+        }
+      });
       return res.status(403).json({ message: "Access denied: Customer tokens cannot access staff endpoints" });
     }
     
@@ -94,6 +121,20 @@ function authenticateToken(req, res, next) {
         const suspended = await isCompanySuspended(companyId);
         if (suspended) {
           console.warn(`🛑 Blocked access for suspended company: ${companyId} (User: ${payload.email})`);
+          emitSecurityEvent({
+            companyId: String(companyId),
+            userId: payload.id || payload.userId,
+            eventType: SECURITY_EVENT_TYPES.AUTH_COMPANY_SUSPENDED,
+            severity: 'medium',
+            ipAddress: req.ip || req.headers['x-forwarded-for'],
+            userAgent: req.headers['user-agent'],
+            endpoint: req.originalUrl || req.path,
+            httpMethod: req.method,
+            statusCode: 403,
+            metadata: {
+              email: payload.email,
+            }
+          });
           return res.status(403).json({ 
             message: "Account Suspended/Disabled", 
             error: "your_company_is_suspended",

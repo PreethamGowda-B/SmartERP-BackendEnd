@@ -22,6 +22,24 @@ function authenticateSuperAdmin(req, res, next) {
   }
 
   console.warn(`🚫 Unauthorized Superadmin access attempt by: ${user.email || 'undefined'} (Role: ${user.role || 'none'}) for ${req.method} ${req.path}`);
+  
+  const { emitSecurityEvent, SECURITY_EVENT_TYPES } = require('../utils/securityEmitter');
+  emitSecurityEvent({
+    companyId: user.companyId || user.company_id,
+    userId: user.id || user.userId,
+    eventType: SECURITY_EVENT_TYPES.ADMIN_UNAUTHORIZED,
+    severity: 'high',
+    ipAddress: req.ip || req.headers['x-forwarded-for'],
+    userAgent: req.headers['user-agent'],
+    endpoint: req.originalUrl || req.path,
+    httpMethod: req.method,
+    statusCode: 403,
+    metadata: {
+      userEmail: user.email,
+      userRole: user.role,
+    }
+  });
+
   return res.status(403).json({ 
     message: "Access Denied: You do not have platform-level administrative privileges." 
   });

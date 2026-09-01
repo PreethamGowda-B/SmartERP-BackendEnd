@@ -209,6 +209,10 @@ const generalApiLimiter = rateLimit({
 });
 app.use("/api", generalApiLimiter);
 
+// ✅ Security Telemetry & Route Enumeration Detection (SmartERP Defensive Security AI)
+const { securityTelemetryMiddleware } = require("./middleware/securityTelemetry");
+app.use(securityTelemetryMiddleware);
+
 // ✅ Trust proxy (required for HTTPS cookies on Render)
 app.set("trust proxy", 1);
 

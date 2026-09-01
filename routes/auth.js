@@ -592,6 +592,20 @@ router.post("/verify-otp", otpVerifyLimiter, async (req, res) => {
     );
 
     if (result.rows.length === 0) {
+      const { emitSecurityEvent, SECURITY_EVENT_TYPES } = require("../utils/securityEmitter");
+      emitSecurityEvent({
+        eventType: SECURITY_EVENT_TYPES.AUTH_FAILED,
+        severity: 'low',
+        ipAddress: req.ip || req.headers['x-forwarded-for'],
+        userAgent: req.headers['user-agent'],
+        endpoint: '/api/auth/verify-otp',
+        httpMethod: 'POST',
+        statusCode: 400,
+        metadata: {
+          reason: 'invalid_or_expired_otp',
+          email: email.toLowerCase(),
+        }
+      });
       return res.status(400).json({ message: "Invalid or expired OTP. Please request a new one." });
     }
 
@@ -878,12 +892,27 @@ router.post("/login", async (req, res) => {
 
   const identifier = rawIdentifier.toLowerCase();
 
+  const { emitSecurityEvent, SECURITY_EVENT_TYPES } = require("../utils/securityEmitter");
+
   try {
     const result = await pool.query(
       "SELECT * FROM users WHERE LOWER(email) = $1 OR LOWER(name) = $1",
       [identifier]
     );
     if (result.rows.length === 0) {
+      emitSecurityEvent({
+        eventType: SECURITY_EVENT_TYPES.AUTH_FAILED,
+        severity: 'low',
+        ipAddress: req.ip || req.headers['x-forwarded-for'],
+        userAgent: req.headers['user-agent'],
+        endpoint: '/api/auth/login',
+        httpMethod: 'POST',
+        statusCode: 401,
+        metadata: {
+          reason: 'user_not_found',
+          identifier: identifier.slice(0, 100),
+        }
+      });
       return res.status(401).json({ message: "Invalid email or password" });
     }
 
@@ -893,7 +922,21 @@ router.post("/login", async (req, res) => {
     if (user.role !== 'super_admin' && user.company_id) {
       const companyRes = await pool.query("SELECT status FROM companies WHERE id = $1", [user.company_id]);
       if (companyRes.rows.length > 0 && companyRes.rows[0].status === 'suspended') {
-        console.warn(`🛑 Login blocked for suspended company user: ${email}`);
+        console.warn(`🛑 Login blocked for suspended company user: ${identifier}`);
+        emitSecurityEvent({
+          companyId: String(user.company_id),
+          userId: String(user.id),
+          eventType: SECURITY_EVENT_TYPES.AUTH_COMPANY_SUSPENDED,
+          severity: 'medium',
+          ipAddress: req.ip || req.headers['x-forwarded-for'],
+          userAgent: req.headers['user-agent'],
+          endpoint: '/api/auth/login',
+          httpMethod: 'POST',
+          statusCode: 403,
+          metadata: {
+            reason: 'company_suspended',
+          }
+        });
         return res.status(403).json({
           message: "Account Suspended/Disabled",
           error: "company_suspended",
@@ -909,6 +952,21 @@ router.post("/login", async (req, res) => {
 
     const valid = await bcrypt.compare(password, user.password_hash);
     if (!valid) {
+      emitSecurityEvent({
+        companyId: String(user.company_id),
+        userId: String(user.id),
+        eventType: SECURITY_EVENT_TYPES.AUTH_FAILED,
+        severity: 'medium',
+        ipAddress: req.ip || req.headers['x-forwarded-for'],
+        userAgent: req.headers['user-agent'],
+        endpoint: '/api/auth/login',
+        httpMethod: 'POST',
+        statusCode: 401,
+        metadata: {
+          reason: 'invalid_password',
+          identifier: identifier.slice(0, 100),
+        }
+      });
       return res.status(401).json({ message: "Invalid email or password" });
     }
 

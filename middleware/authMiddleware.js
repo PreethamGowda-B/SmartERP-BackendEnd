@@ -40,10 +40,22 @@ async function isCompanySuspended(companyId) {
 function authenticateToken(req, res, next) {
   let token = null;
 
-  // Try Authorization header first
-  const authHeader = req.headers["authorization"];
-  if (authHeader && authHeader.startsWith("Bearer ")) {
-    token = authHeader.split(" ")[1];
+  const isAdminRoute = req.originalUrl?.startsWith('/api/admin') || 
+                       req.originalUrl?.startsWith('/api/superadmin') || 
+                       req.originalUrl?.startsWith('/api/v1/superadmin') ||
+                       req.originalUrl?.startsWith('/api/ai');
+
+  // If visiting an admin route, prioritize superadmin cookie if present
+  if (isAdminRoute && req.cookies?.superadmin_access_token) {
+    token = req.cookies.superadmin_access_token;
+  }
+
+  // Try Authorization header
+  if (!token) {
+    const authHeader = req.headers["authorization"];
+    if (authHeader && authHeader.startsWith("Bearer ")) {
+      token = authHeader.split(" ")[1];
+    }
   }
 
   // Try query parameter (for SSE connections)

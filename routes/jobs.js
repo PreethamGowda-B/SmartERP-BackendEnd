@@ -330,6 +330,100 @@ router.get('/', authenticateToken, async (req, res) => {
   }
 });
 
+// ── GET /api/jobs/:id ────────────────────────────────────────────────────────
+// Retrieve details for a specific single job by ID
+router.get('/:id', authenticateToken, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+
+    // Skip if it's a known sub-route (e.g. actions, approvals, invoices, etc.)
+    const staticRoutes = ['chat-unread-count', 'invoices', 'approvals', 'action-requests'];
+    if (staticRoutes.includes(id)) {
+      return next();
+    }
+
+    const userRole = (req.user.role || 'employee').toLowerCase();
+    const companyId = req.user.companyId || req.user.company_id;
+    const userId = String(req.user.id || req.user.userId || '');
+
+    const result = await pool.query(
+      `SELECT j.*, u.email as employee_email, u.name as employee_name,
+              inv.id AS invoice_id, inv.invoice_number, inv.status AS invoice_status,
+              inv.viewed_at AS invoice_viewed_at, inv.downloaded_at AS invoice_downloaded_at,
+              inv.total_amount AS invoice_total_amount,
+              inv.version_number AS invoice_version_number,
+              inv.edited_count AS invoice_edited_count
+       FROM jobs j
+       LEFT JOIN users u ON COALESCE(j.assigned_to, j.assigned_employee_id, j.accepted_by)::text = u.id::text
+       LEFT JOIN invoices inv ON inv.job_id::text = j.id::text
+       WHERE j.id::text = $1
+       LIMIT 1`,
+      [String(id)]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Job not found' });
+    }
+
+    const r = result.rows[0];
+
+    // Verify tenant isolation (super_admin can view all)
+    if (userRole !== 'super_admin' && String(r.company_id) !== String(companyId)) {
+      return res.status(403).json({ message: 'Access denied: Job belongs to another company' });
+    }
+
+    // Verify employee RBAC permissions
+    if (userRole === 'employee') {
+      const isVisible = r.visible_to_all === true ||
+                        String(r.assigned_to) === userId ||
+                        String(r.created_by) === userId;
+      if (!isVisible) {
+        return res.status(403).json({ message: 'Access denied: You are not assigned to this job' });
+      }
+    }
+
+    const job = r.data && typeof r.data === 'object' ? r.data : {};
+    const formattedJob = {
+      ...job,
+      id: r.id,
+      title: r.title,
+      description: r.description,
+      priority: r.priority,
+      status: r.status,
+      visible_to_all: r.visible_to_all,
+      created_by: r.created_by,
+      assigned_to: r.assigned_to,
+      created_at: r.created_at,
+      employee_status: r.employee_status,
+      progress: r.progress || 0,
+      accepted_at: r.accepted_at,
+      declined_at: r.declined_at,
+      completed_at: r.completed_at,
+      employee_email: r.employee_email,
+      employee_name: r.employee_name ?? r.assigned_employee_name ?? null,
+      accepted_by_name: r.accepted_by_name ?? r.employee_name ?? r.assigned_employee_name ?? null,
+      assigned_employee_name: r.assigned_employee_name ?? r.employee_name ?? null,
+      accepted_by: r.accepted_by ?? r.assigned_to ?? null,
+      is_customer_job: r.source === 'customer' || r.source === 'customer_portal' || r.created_by_role === 'customer' || Boolean(r.customer_id),
+      approval_status: r.approval_status ?? null,
+      customer_id: r.customer_id ?? null,
+      company_id: r.company_id ?? null,
+      started_at: r.started_at ?? null,
+      invoice_id: r.invoice_id ?? null,
+      invoice_number: r.invoice_number ?? null,
+      invoice_status: r.invoice_status ?? null,
+      invoice_viewed_at: r.invoice_viewed_at ?? null,
+      invoice_downloaded_at: r.invoice_downloaded_at ?? null,
+      invoice_total_amount: r.invoice_total_amount ?? null,
+    };
+
+    res.json({ ok: true, job: formattedJob, ...formattedJob });
+  } catch (err) {
+    console.error('GET /api/jobs/:id error:', err);
+    res.status(500).json({ message: 'Server error retrieving job details' });
+  }
+});
+
 /**
  * Accept a job (Employee only)
  * Section 1: wrapped in DB transaction — accept + started_at + active_job_count are atomic

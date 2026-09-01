@@ -115,11 +115,15 @@ if (redisConnection) {
     console.log(`✅ Audit job ${job.id} finished`);
   });
 
-  webhookWorker.on('completed', (job) => {
-    console.log(`✅ Webhook retry job ${job.id} finished successfully`);
-  });
+  // Security Worker (SmartERP Defensive Security AI)
+  const { securityWorker } = require('./securityWorker');
+  if (securityWorker) {
+    securityWorker.on('completed', (job) => {
+      console.log(`✅ Security analysis job ${job.id} finished`);
+    });
+  }
 
-  console.log('🚀 Redis Workers Initialized (Notifications, Audit, & Webhook Retry)');
+  console.log('🚀 Redis Workers Initialized (Notifications, Audit, Webhook Retry, & Security AI)');
 } else {
   console.warn('⚠️ No Redis connection - Background Workers NOT started.');
 }

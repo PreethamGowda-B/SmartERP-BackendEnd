@@ -1,18 +1,18 @@
-/**
+﻿/**
  * routes/customer/auth.js
  *
  * Customer Portal authentication routes:
- *   GET  /csrf              — issue CSRF token
- *   POST /send-otp          — send OTP to email
- *   POST /verify-otp        — verify OTP
- *   POST /signup            — register new customer
- *   POST /login             — authenticate customer
- *   POST /refresh           — rotate refresh token
- *   POST /logout            — revoke refresh token + clear cookies
- *   GET  /google            — initiate Google OAuth (customer-specific strategy)
- *   GET  /google/callback   — handle Google OAuth callback
- *   POST /onboarding        — complete onboarding (set company_id + phone)
- *   GET  /validate-company  — check if a company code is valid
+ *   GET  /csrf              â€” issue CSRF token
+ *   POST /send-otp          â€” send OTP to email
+ *   POST /verify-otp        â€” verify OTP
+ *   POST /signup            â€” register new customer
+ *   POST /login             â€” authenticate customer
+ *   POST /refresh           â€” rotate refresh token
+ *   POST /logout            â€” revoke refresh token + clear cookies
+ *   GET  /google            â€” initiate Google OAuth (customer-specific strategy)
+ *   GET  /google/callback   â€” handle Google OAuth callback
+ *   POST /onboarding        â€” complete onboarding (set company_id + phone)
+ *   GET  /validate-company  â€” check if a company code is valid
  */
 
 const express = require('express');
@@ -30,12 +30,12 @@ const redisClient = require('../../utils/redis');
 const { validateCompanyCode } = require('../../utils/companyIdGenerator');
 const { storage } = require('../../middleware/als');
 
-// ✅ RLS bypass — customer auth routes look up customers/companies by email before
+// âœ… RLS bypass â€” customer auth routes look up customers/companies by email before
 // any company context is known. Explicitly opt-in to cross-tenant access.
 router.use((req, res, next) => storage.run({ isWebRequest: true, bypassRls: true }, next));
 
 
-// ─── Constants ────────────────────────────────────────────────────────────────
+// â”€â”€â”€ Constants â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const CUSTOMER_PORTAL_ORIGIN = process.env.CUSTOMER_PORTAL_ORIGIN || 'http://localhost:3001';
 const JWT_SECRET = process.env.JWT_SECRET;
 const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || process.env.JWT_SECRET;
@@ -44,10 +44,10 @@ const cookieOpts = { httpOnly: true, sameSite: 'none', secure: true, path: '/' }
 const ACCESS_MAX_AGE = 60 * 60 * 1000;        // 1 hour
 const REFRESH_MAX_AGE = 30 * 24 * 60 * 60 * 1000; // 30 days
 
-// ─── Resend client ────────────────────────────────────────────────────────────
+// â”€â”€â”€ Resend client â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const resend = new Resend(process.env.RESEND_API_KEY);
 
-// ─── Audit log helper (non-blocking) ─────────────────────────────────────────
+// â”€â”€â”€ Audit log helper (non-blocking) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 function auditLog(req, customerId, action, details, companyId) {
   pool.query(
     `INSERT INTO activities (user_id, action, activity_type, details, ip_address, user_agent, company_id, created_at)
@@ -64,7 +64,7 @@ function auditLog(req, customerId, action, details, companyId) {
   ).catch(e => console.error('Audit log error:', e.message));
 }
 
-// ─── Issue full JWT cookies helper ───────────────────────────────────────────
+// â”€â”€â”€ Issue full JWT cookies helper â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 async function issueTokens(res, req, customer) {
   const accessToken = jwt.sign(
     { id: customer.id, role: 'customer', companyId: customer.company_id, email: customer.email },
@@ -115,7 +115,7 @@ async function issueTokens(res, req, customer) {
   return { accessToken, refreshToken };
 }
 
-// ─── CSRF validation middleware ───────────────────────────────────────────────
+// â”€â”€â”€ CSRF validation middleware â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Applied to all non-GET routes in this router.
 // Skipped for: /csrf endpoint, SSE routes, requests with Authorization: Bearer header.
 router.use((req, res, next) => {
@@ -138,7 +138,7 @@ router.use((req, res, next) => {
   const csrfHeader = req.headers['x-csrf-token'];
   const csrfCookie = req.cookies && req.cookies['csrf_token'];
 
-  // If no cookie yet (first request), allow through — client must call /csrf first
+  // If no cookie yet (first request), allow through â€” client must call /csrf first
   if (!csrfCookie) {
     return next();
   }
@@ -164,7 +164,7 @@ router.use((req, res, next) => {
   next();
 });
 
-// ─── GET /csrf ────────────────────────────────────────────────────────────────
+// â”€â”€â”€ GET /csrf â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 router.get('/csrf', (req, res) => {
   const csrfToken = crypto.randomBytes(32).toString('hex');
   res.cookie('csrf_token', csrfToken, {
@@ -177,7 +177,7 @@ router.get('/csrf', (req, res) => {
   return res.json({ csrfToken });
 });
 
-// ─── POST /send-otp ───────────────────────────────────────────────────────────
+// â”€â”€â”€ POST /send-otp â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 router.post('/send-otp', [
   body('email').isEmail().normalizeEmail().withMessage('Valid email required'),
 ], async (req, res) => {
@@ -189,7 +189,7 @@ router.post('/send-otp', [
   const { email } = req.body;
 
   try {
-    // Email conflict check — block if email already exists in users table (owner/employee)
+    // Email conflict check â€” block if email already exists in users table (owner/employee)
     const userConflict = await pool.query(
       'SELECT id FROM users WHERE email = $1 LIMIT 1',
       [email]
@@ -286,7 +286,7 @@ router.post('/send-otp', [
   }
 });
 
-// ─── POST /verify-otp ─────────────────────────────────────────────────────────
+// â”€â”€â”€ POST /verify-otp â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 router.post('/verify-otp', [
   body('email').isEmail().normalizeEmail().withMessage('Valid email required'),
   body('otp').isLength({ min: 6, max: 6 }).withMessage('OTP must be 6 digits'),
@@ -329,7 +329,7 @@ router.post('/verify-otp', [
   }
 });
 
-// ─── POST /signup ─────────────────────────────────────────────────────────────
+// â”€â”€â”€ POST /signup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 router.post('/signup', [
   body('name').trim().notEmpty().withMessage('Name is required'),
   body('email').isEmail().normalizeEmail().withMessage('Valid email required'),
@@ -411,7 +411,7 @@ router.post('/signup', [
   }
 });
 
-// ─── POST /login ──────────────────────────────────────────────────────────────
+// â”€â”€â”€ POST /login â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 router.post('/login', [
   body('email').isEmail().normalizeEmail().withMessage('Valid email required'),
   body('password').notEmpty().withMessage('Password is required'),
@@ -514,7 +514,7 @@ router.post('/login', [
       return res.status(403).json({ message: 'Please verify your email before logging in.' });
     }
 
-    // Check company status — suspended OR inactive subscription
+    // Check company status â€” suspended OR inactive subscription
     if (customer.company_id) {
       const companyCheck = await pool.query(
         "SELECT status, subscription_status FROM companies WHERE id = $1",
@@ -565,7 +565,7 @@ router.post('/login', [
   }
 });
 
-// ─── POST /refresh ────────────────────────────────────────────────────────────
+// â”€â”€â”€ POST /refresh â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 router.post('/refresh', async (req, res) => {
   const refreshToken = req.cookies && req.cookies['customer_refresh_token'];
 
@@ -637,7 +637,7 @@ router.post('/refresh', async (req, res) => {
   }
 });
 
-// ─── POST /logout ─────────────────────────────────────────────────────────────
+// â”€â”€â”€ POST /logout â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 router.post('/logout', async (req, res) => {
   const refreshToken = req.cookies && req.cookies['customer_refresh_token'];
 
@@ -659,15 +659,15 @@ router.post('/logout', async (req, res) => {
   return res.json({ ok: true });
 });
 
-// ─── Google OAuth ─────────────────────────────────────────────────────────────
+// â”€â”€â”€ Google OAuth â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // The unified Google OAuth strategy now lives in routes/auth.js.
 // Customer portal Google sign-in is initiated via:
 //   GET /api/v1/auth/google?type=customer
 // The single callback URL is: /api/v1/auth/google/callback
-// No routes needed here — keeping this comment so it's clear the removal was intentional.
+// No routes needed here â€” keeping this comment so it's clear the removal was intentional.
 
 
-// ─── POST /onboarding ─────────────────────────────────────────────────────────
+// â”€â”€â”€ POST /onboarding â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 router.post('/onboarding', [
   body('company_code').trim().notEmpty().withMessage('Company code is required'),
   body('phone').optional().trim(),
@@ -751,7 +751,7 @@ router.post('/onboarding', [
   }
 });
 
-// ─── GET /validate-company ────────────────────────────────────────────────────
+// â”€â”€â”€ GET /validate-company â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 router.get('/validate-company', async (req, res) => {
   const { code } = req.query;
 
@@ -769,10 +769,295 @@ router.get('/validate-company', async (req, res) => {
       return res.json({ valid: false });
     }
 
-    return res.json({ valid: true, companyName: result.rows[0].company_name });
+    return res.json({ valid: true, company_name: result.rows[0].company_name });
   } catch (err) {
     console.error('validate-company error:', err.message);
-    return res.json({ valid: false });
+    return res.status(500).json({ valid: false });
+  }
+});
+
+// â”€â”€â”€ Password Recovery Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+function computeCustomerHmac(data, secretSalt = process.env.JWT_SECRET || 'smarterp_default_sec_salt') {
+  return crypto.createHmac('sha256', secretSalt).update(String(data)).digest('hex');
+}
+
+const CUSTOMER_GENERIC_RESPONSE = "If an account exists for this email, we've sent verification instructions.";
+
+// â”€â”€â”€ POST /forgot-password â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Anti-enumeration forgot password scoped strictly to customer accounts
+router.post('/forgot-password', async (req, res) => {
+  const { email } = req.body;
+  const normalizedEmail = String(email || '').toLowerCase().trim();
+
+  if (!normalizedEmail || !normalizedEmail.includes('@')) {
+    return res.status(200).json({ ok: true, message: CUSTOMER_GENERIC_RESPONSE });
+  }
+
+  // Rate Limiting
+  const rateLimitKey = `customer_forgot_pw_limit:${normalizedEmail}`;
+  if (redisClient && redisClient.status === 'ready') {
+    try {
+      const count = await redisClient.incr(rateLimitKey);
+      if (count === 1) await redisClient.expire(rateLimitKey, 900);
+      if (count > 5) {
+        return res.status(429).json({ message: 'Too many password reset requests. Please try again later.' });
+      }
+    } catch (_) {}
+  }
+
+  try {
+    const custRes = await pool.query(
+      'SELECT id, name, email FROM customers WHERE LOWER(email) = $1 AND is_deleted = FALSE',
+      [normalizedEmail]
+    );
+
+    if (custRes.rows.length > 0) {
+      const customer = custRes.rows[0];
+      const otp = crypto.randomInt(100000, 999999).toString();
+      const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 min
+
+      await pool.query("DELETE FROM email_otps WHERE LOWER(email) = $1 AND account_type = 'customer'", [normalizedEmail]);
+
+      const otpHash = computeCustomerHmac(otp + normalizedEmail);
+      await pool.query(
+        "INSERT INTO email_otps (email, otp_code, account_type, expires_at) VALUES ($1, $2, 'customer', $3)",
+        [normalizedEmail, otpHash, expiresAt]
+      );
+
+      if (process.env.RESEND_API_KEY) {
+        const resendClient = new Resend(process.env.RESEND_API_KEY);
+        await resendClient.emails.send({
+          from: process.env.RESEND_FROM_EMAIL || 'SmartERP Customer Portal <noreply@prozync.in>',
+          to: normalizedEmail,
+          subject: `SmartERP Customer Portal Password Reset Code: ${otp}`,
+          html: `
+            <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 32px; background: #f8fafc; border-radius: 12px; border: 1px solid #e2e8f0;">
+              <div style="text-align: center; margin-bottom: 24px;">
+                <div style="background: #2563EB; display: inline-block; padding: 10px 22px; border-radius: 8px;">
+                  <span style="color: white; font-size: 20px; font-weight: 800; letter-spacing: 0.5px;">SmartERP Customer Portal</span>
+                </div>
+              </div>
+              <h2 style="color: #0f172a; text-align: center; margin-bottom: 8px; font-size: 22px; font-weight: 700;">Password Reset Request</h2>
+              <p style="color: #475569; text-align: center; margin-bottom: 28px; font-size: 14px; line-height: 1.5;">We received a request to reset your customer account password. Use the verification code below to set a new password.</p>
+              <div style="background: #ffffff; border: 2px solid #cbd5e1; border-radius: 12px; padding: 20px; text-align: center; margin-bottom: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.05);">
+                <div style="font-size: 38px; font-weight: 800; letter-spacing: 8px; color: #2563EB; font-family: 'Courier New', Courier, monospace;">${otp}</div>
+              </div>
+              <p style="color: #64748b; text-align: center; font-size: 13px; margin-bottom: 8px;">This code expires in <strong>10 minutes</strong>. Single-use only.</p>
+              <p style="color: #ef4444; text-align: center; font-size: 12px; margin-top: 12px; font-weight: 600;">Security Warning: Never share this code with anyone.</p>
+              <p style="color: #94a3b8; text-align: center; font-size: 12px; margin-top: 20px; border-top: 1px solid #e2e8f0; padding-top: 16px;">If you didn't request a password reset, you can safely ignore this email.</p>
+            </div>
+          `,
+        }).catch(err => console.error('Resend customer reset email failed:', err.message));
+      }
+
+      auditLog(req, customer.id, 'customer_password_reset_requested', { email: normalizedEmail });
+    }
+
+    return res.status(200).json({ ok: true, message: CUSTOMER_GENERIC_RESPONSE });
+  } catch (err) {
+    console.error('Customer forgot-password error:', err.message);
+    return res.status(200).json({ ok: true, message: CUSTOMER_GENERIC_RESPONSE });
+  }
+});
+
+// â”€â”€â”€ POST /verify-reset-otp â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Verify Customer OTP and Issue Single-Use Reset Token
+router.post('/verify-reset-otp', async (req, res) => {
+  const { email, otp } = req.body;
+  const normalizedEmail = String(email || '').toLowerCase().trim();
+  const plainOtp = String(otp || '').trim();
+
+  if (!normalizedEmail || !plainOtp) {
+    return res.status(400).json({ message: 'Email and verification code are required.' });
+  }
+
+  const attemptKey = `cust_pw_reset_attempts:${normalizedEmail}`;
+  if (redisClient && redisClient.status === 'ready') {
+    try {
+      const attempts = await redisClient.incr(attemptKey);
+      if (attempts === 1) await redisClient.expire(attemptKey, 900);
+      if (attempts > 5) {
+        return res.status(429).json({ message: 'Too many verification attempts. Please request a new code.' });
+      }
+    } catch (_) {}
+  }
+
+  try {
+    const submittedHmac = computeCustomerHmac(plainOtp + normalizedEmail);
+    const fallbackSha = crypto.createHash('sha256').update(plainOtp + normalizedEmail).digest('hex');
+
+    const otpRes = await pool.query(
+      `SELECT id, otp_code, attempts, expires_at 
+       FROM email_otps 
+       WHERE LOWER(email) = $1 
+         AND account_type = 'customer' 
+         AND used = FALSE 
+         AND expires_at > NOW() 
+       ORDER BY created_at DESC LIMIT 1`,
+      [normalizedEmail]
+    );
+
+    if (otpRes.rows.length === 0) {
+      return res.status(400).json({ message: 'Invalid or expired verification code. Please request a new code.' });
+    }
+
+    const record = otpRes.rows[0];
+    const currentAttempts = (record.attempts || 0) + 1;
+
+    let isMatch = false;
+    try {
+      const expectedBuffer = Buffer.from(record.otp_code);
+      const hmacBuffer = Buffer.from(submittedHmac);
+      const shaBuffer = Buffer.from(fallbackSha);
+      if (expectedBuffer.length === hmacBuffer.length && crypto.timingSafeEqual(expectedBuffer, hmacBuffer)) {
+        isMatch = true;
+      } else if (expectedBuffer.length === shaBuffer.length && crypto.timingSafeEqual(expectedBuffer, shaBuffer)) {
+        isMatch = true;
+      }
+    } catch (_) {
+      isMatch = false;
+    }
+
+    if (!isMatch) {
+      await pool.query('UPDATE email_otps SET attempts = $1 WHERE id = $2', [currentAttempts, record.id]);
+      if (currentAttempts >= 5) {
+        await pool.query('UPDATE email_otps SET used = TRUE WHERE id = $1', [record.id]);
+      }
+      return res.status(400).json({ message: 'Invalid verification code. Please check and try again.' });
+    }
+
+    await pool.query('UPDATE email_otps SET used = TRUE WHERE id = $1', [record.id]);
+
+    const custRes = await pool.query(
+      'SELECT id, email FROM customers WHERE LOWER(email) = $1 AND is_deleted = FALSE',
+      [normalizedEmail]
+    );
+
+    if (custRes.rows.length === 0) {
+      return res.status(400).json({ message: 'Invalid reset session. Please try again.' });
+    }
+
+    const customer = custRes.rows[0];
+
+    const rawResetToken = crypto.randomBytes(32).toString('hex');
+    const tokenHash = computeCustomerHmac(rawResetToken);
+    const tokenExpiresAt = new Date(Date.now() + 15 * 60 * 1000);
+
+    await pool.query(
+      `INSERT INTO password_reset_tokens 
+       (account_type, user_id, email, token_hash, expires_at, ip_address, user_agent)
+       VALUES ('customer', $1, $2, $3, $4, $5, $6)`,
+      [customer.id, normalizedEmail, tokenHash, tokenExpiresAt, req.ip || null, req.headers['user-agent'] || null]
+    );
+
+    res.cookie('customer_reset_session_token', rawResetToken, {
+      ...cookieOpts,
+      maxAge: 15 * 60 * 1000,
+    });
+
+    if (redisClient && redisClient.status === 'ready') {
+      await redisClient.del(attemptKey).catch(() => {});
+    }
+
+    return res.json({
+      ok: true,
+      verified: true,
+      reset_token: rawResetToken,
+      message: 'Verification successful. You can now set your new password.'
+    });
+  } catch (err) {
+    console.error('Customer verify-reset-otp error:', err.message);
+    return res.status(500).json({ message: 'Verification failed. Please try again.' });
+  }
+});
+
+// â”€â”€â”€ POST /reset-password â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Reset Customer Password with Token Verification and Session Revocation
+router.post('/reset-password', async (req, res) => {
+  const { email, reset_token, new_password } = req.body;
+  const rawToken = reset_token || req.cookies?.customer_reset_session_token;
+  const normalizedEmail = String(email || '').toLowerCase().trim();
+  const rawPassword = String(new_password || '');
+
+  if (!rawToken) {
+    return res.status(400).json({ message: 'Reset authorization token is missing or expired. Please verify your email again.' });
+  }
+
+  // Password Policy
+  if (rawPassword.length < 8) {
+    return res.status(400).json({ message: 'Password must be at least 8 characters long.' });
+  }
+  if (!/[A-Z]/.test(rawPassword)) {
+    return res.status(400).json({ message: 'Password must contain at least one uppercase letter.' });
+  }
+  if (!/[a-z]/.test(rawPassword)) {
+    return res.status(400).json({ message: 'Password must contain at least one lowercase letter.' });
+  }
+  if (!/[0-9]/.test(rawPassword)) {
+    return res.status(400).json({ message: 'Password must contain at least one number.' });
+  }
+  if (!/[^A-Za-z0-9]/.test(rawPassword)) {
+    return res.status(400).json({ message: 'Password must contain at least one special character.' });
+  }
+
+  try {
+    const tokenHash = computeCustomerHmac(rawToken);
+
+    let tokenQuery = `
+      SELECT id, user_id, email, expires_at, used 
+      FROM password_reset_tokens 
+      WHERE token_hash = $1 
+        AND account_type = 'customer' 
+        AND used = FALSE 
+        AND expires_at > NOW()
+    `;
+    const params = [tokenHash];
+
+    if (normalizedEmail) {
+      tokenQuery += ' AND LOWER(email) = $2';
+      params.push(normalizedEmail);
+    }
+    tokenQuery += ' ORDER BY created_at DESC LIMIT 1';
+
+    const tokenRes = await pool.query(tokenQuery, params);
+
+    if (tokenRes.rows.length === 0) {
+      return res.status(400).json({ message: 'Invalid or already-used reset authorization token. Please request a new verification code.' });
+    }
+
+    const tokenRecord = tokenRes.rows[0];
+    const customerId = tokenRecord.user_id;
+
+    // 1. Mark token used
+    await pool.query('UPDATE password_reset_tokens SET used = TRUE WHERE id = $1', [tokenRecord.id]);
+
+    // 2. Hash new password
+    const newHash = await bcrypt.hash(rawPassword, 10);
+
+    // 3. Update customer password
+    await pool.query(
+      'UPDATE customers SET password_hash = $1 WHERE id = $2',
+      [newHash, customerId]
+    );
+
+    // 4. Invalidate all active customer refresh tokens
+    await pool.query('DELETE FROM customer_refresh_tokens WHERE customer_id = $1', [customerId]).catch(() => {});
+
+    // 5. Clear reset cookie
+    res.clearCookie('customer_reset_session_token', { path: '/' });
+
+    auditLog(req, customerId, 'customer_password_reset_success', { email: tokenRecord.email });
+
+    console.log(`Customer password successfully reset and sessions revoked for customer ID: ${customerId}`);
+
+    return res.json({
+      ok: true,
+      success: true,
+      message: 'Password reset successful! You can now sign in with your new password.'
+    });
+  } catch (err) {
+    console.error('Customer reset-password error:', err.message);
+    return res.status(500).json({ message: 'Failed to reset password. Please try again.' });
   }
 });
 

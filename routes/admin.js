@@ -253,6 +253,13 @@ router.post('/announcements', async (req, res) => {
           [userIds, companyIds, 'system_broadcast', noteTitle, message, notePriority]
         );
 
+        // Also persist in announcements history table
+        await pool.query(
+          `INSERT INTO announcements (title, content, priority, created_by)
+           VALUES ($1, $2, $3, $4)`,
+          [noteTitle, message, notePriority, req.user?.id || userIds[0]]
+        ).catch((err) => console.warn('⚠️ Could not save to announcements table:', err.message));
+
         res.json({ message: `Broadcast sent to ${owners.rows.length} company owners`, sent: owners.rows.length });
     } catch (err) {
         console.error('❌ Announcement broadcast error:', err);

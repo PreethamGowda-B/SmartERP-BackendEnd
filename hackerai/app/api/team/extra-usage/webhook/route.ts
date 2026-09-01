@@ -1,0 +1,164 @@
+import { after, NextRequest, NextResponse } from "next/server";
+import { stripe } from "@/app/api/stripe";
+import { getConvexClient } from "@/lib/db/convex-client";
+import { api } from "@/convex/_generated/api";
+import Stripe from "stripe";
+import { phLogger } from "@/lib/posthog/server";
+import {
+  PAID_FUNNEL_EVENTS,
+  paidFunnelProperties,
+} from "@/lib/analytics/paid-funnel";
+import {
+  logStripeWebhookMissingSignature,
+  logStripeWebhookSignatureVerificationFailed,
+} from "@/lib/billing/stripe-webhook-logging";
+
+const WEBHOOK_LOG_PREFIX = "[Team Extra Usage Webhook]";
+const WEBHOOK_LOG_CONTEXT = {
+  webhook: "team_extra_usage",
+  route: "/api/team/extra-usage/webhook",
+};
+
+/**
+ * POST /api/team/extra-usage/webhook
+ * Handles Stripe webhook events for team extra usage purchases.
+ *
+ * Configure this webhook in Stripe Dashboard:
+ * - Endpoint URL: https://your-domain.com/api/team/extra-usage/webhook
+ * - Events to listen: checkout.session.completed
+ */
+export async function POST(req: NextRequest) {
+  const body = await req.text();
+  const signature = req.headers.get("stripe-signature");
+
+  if (!signature) {
+    logStripeWebhookMissingSignature({
+      logPrefix: WEBHOOK_LOG_PREFIX,
+      ...WEBHOOK_LOG_CONTEXT,
+      requestHeaders: req.headers,
+      body,
+      signature,
+    });
+    return NextResponse.json(
+      { error: "Missing stripe-signature header" },
+      { status: 400 },
+    );
+  }
+
+  const webhookSecret =
+    process.env.STRIPE_TEAM_EXTRA_USAGE_WEBHOOK_SECRET ??
+    process.env.STRIPE_EXTRA_USAGE_WEBHOOK_SECRET;
+  if (!webhookSecret) {
+    console.error(
+      "[Team Extra Usage Webhook] No webhook secret configured (STRIPE_TEAM_EXTRA_USAGE_WEBHOOK_SECRET or STRIPE_EXTRA_USAGE_WEBHOOK_SECRET)",
+    );
+    return NextResponse.json(
+      { error: "Webhook secret not configured" },
+      { status: 500 },
+    );
+  }
+
+  let event: Stripe.Event;
+  try {
+    event = stripe.webhooks.constructEvent(body, signature, webhookSecret);
+  } catch (err) {
+    logStripeWebhookSignatureVerificationFailed({
+      logPrefix: WEBHOOK_LOG_PREFIX,
+      ...WEBHOOK_LOG_CONTEXT,
+      requestHeaders: req.headers,
+      body,
+      signature,
+      error: err,
+    });
+    return NextResponse.json(
+      { error: "Webhook signature verification failed" },
+      { status: 400 },
+    );
+  }
+
+  switch (event.type) {
+    case "checkout.session.completed": {
+      const session = event.data.object as Stripe.Checkout.Session;
+      if (session.metadata?.type !== "team_extra_usage_purchase") {
+        return NextResponse.json({ received: true });
+      }
+
+      const organizationId = session.metadata.organizationId;
+      const amountDollars = session.metadata.amountDollars
+        ? parseFloat(session.metadata.amountDollars)
+        : NaN;
+
+      if (!organizationId || isNaN(amountDollars)) {
+        console.error(
+          "[Team Extra Usage Webhook] Invalid metadata in checkout session:",
+          session.id,
+        );
+        // Ack receipt — malformed metadata won't heal on retry, and 4xx would
+        // cause Stripe to redeliver for ~3 days.
+        return NextResponse.json({ received: true });
+      }
+
+      try {
+        const result = await getConvexClient().mutation(
+          api.teamExtraUsage.addTeamCredits,
+          {
+            serviceKey: process.env.CONVEX_SERVICE_ROLE_KEY!,
+            organizationId,
+            amountDollars,
+            idempotencyKey: `cs_${session.id}`,
+            revenueSource: "team_extra_usage_purchase",
+            stripeCustomerId:
+              typeof session.customer === "string"
+                ? session.customer
+                : session.customer?.id,
+            stripeCheckoutSessionId: session.id,
+            stripePaymentIntentId:
+              typeof session.payment_intent === "string"
+                ? session.payment_intent
+                : session.payment_intent?.id,
+          },
+        );
+
+        if (result.alreadyProcessed) {
+          console.log(
+            `[Team Extra Usage Webhook] Checkout session ${session.id} already processed, skipping`,
+          );
+        }
+        phLogger.event(
+          PAID_FUNNEL_EVENTS.addCreditCheckoutSucceeded,
+          paidFunnelProperties({
+            org_id: organizationId,
+            checkout_attempt_id: session.metadata.checkoutAttemptId,
+            checkout_type: "team_extra_usage_purchase",
+            amount_dollars: amountDollars,
+            stripe_customer_id:
+              typeof session.customer === "string"
+                ? session.customer
+                : session.customer?.id,
+            stripe_checkout_session_id: session.id,
+            stripe_payment_intent_id:
+              typeof session.payment_intent === "string"
+                ? session.payment_intent
+                : session.payment_intent?.id,
+            payment_status: session.payment_status,
+            $insert_id: `${PAID_FUNNEL_EVENTS.addCreditCheckoutSucceeded}:${session.id}`,
+          }),
+        );
+        after(() => phLogger.flush());
+      } catch (error) {
+        console.error(
+          "[Team Extra Usage Webhook] FAILED to add credits:",
+          error,
+        );
+        return NextResponse.json(
+          { error: "Failed to add credits" },
+          { status: 500 },
+        );
+      }
+
+      break;
+    }
+  }
+
+  return NextResponse.json({ received: true });
+}

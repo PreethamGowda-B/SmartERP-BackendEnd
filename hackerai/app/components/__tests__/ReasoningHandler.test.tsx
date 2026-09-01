@@ -1,0 +1,428 @@
+import "@testing-library/jest-dom";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import type { UIMessage } from "@ai-sdk/react";
+import { ReasoningHandler } from "../ReasoningHandler";
+
+const StreamingReasoningParts = ({ message }: { message: UIMessage }) => (
+  <>
+    {message.parts.map((part, partIndex) =>
+      part.type === "reasoning" ? (
+        <ReasoningHandler
+          key={partIndex}
+          message={message}
+          partIndex={partIndex}
+          status="streaming"
+          isLastMessage
+          keepLatestOpenDuringStreaming
+        />
+      ) : null,
+    )}
+  </>
+);
+
+describe("ReasoningHandler", () => {
+  const longReasoningPrefix = `Unique early reasoning marker.\n${"Filler reasoning line.\n".repeat(
+    800,
+  )}`;
+  const longReasoningEnd = "Latest reasoning remains visible.";
+  const longReasoning = `${longReasoningPrefix}${longReasoningEnd}`;
+  const longReasoningCutoff = longReasoning.slice(-6_000);
+  const firstCutoffNewline = longReasoningCutoff.indexOf("\n");
+  const expectedLongReasoningTail = longReasoningCutoff.slice(
+    firstCutoffNewline + 1,
+  );
+
+  it("opens when the first reasoning delta replaces an empty streaming part", async () => {
+    const emptyMessage = {
+      id: "assistant-first-delta",
+      role: "assistant",
+      parts: [{ type: "reasoning", state: "streaming", text: "" }],
+    } as unknown as UIMessage;
+    const { rerender } = render(
+      <ReasoningHandler
+        message={emptyMessage}
+        partIndex={0}
+        status="streaming"
+        isLastMessage
+      />,
+    );
+
+    expect(
+      screen.queryByRole("button", { name: "Thinking..." }),
+    ).not.toBeInTheDocument();
+
+    const firstDeltaMessage = {
+      ...emptyMessage,
+      parts: [
+        {
+          type: "reasoning",
+          state: "streaming",
+          text: "First reasoning delta",
+        },
+      ],
+    } as unknown as UIMessage;
+    rerender(
+      <ReasoningHandler
+        message={firstDeltaMessage}
+        partIndex={0}
+        status="streaming"
+        isLastMessage
+      />,
+    );
+
+    const trigger = screen.getByRole("button", { name: "Thinking..." });
+    await waitFor(() =>
+      expect(trigger).toHaveAttribute("aria-expanded", "true"),
+    );
+    expect(screen.getByText("First reasoning delta")).toBeVisible();
+  });
+
+  it("renders OpenRouter reasoning parts with reasoning_details metadata", () => {
+    const message = {
+      id: "assistant-1",
+      role: "assistant",
+      parts: [
+        {
+          type: "reasoning",
+          state: "done",
+          text: "Visible reasoning text",
+          providerMetadata: {
+            openrouter: {
+              reasoning_details: [
+                { type: "reasoning.text", text: "Visible reasoning text" },
+              ],
+            },
+          },
+        },
+      ],
+    } as unknown as UIMessage;
+
+    render(
+      <ReasoningHandler
+        message={message}
+        partIndex={0}
+        status="streaming"
+        isLastMessage
+      />,
+    );
+
+    expect(screen.getByText("Thinking...")).toBeInTheDocument();
+    expect(screen.getByText("Thinking...")).toHaveClass("animate-text-shimmer");
+    expect(screen.getByText("Visible reasoning text")).toBeInTheDocument();
+  });
+
+  it("keeps the latest reasoning open without shimmer while its tool is running", async () => {
+    const message = {
+      id: "assistant-1",
+      role: "assistant",
+      parts: [
+        { type: "step-start" },
+        { type: "reasoning", state: "done", text: "Planning the tool" },
+        {
+          type: "tool-run_terminal_cmd",
+          state: "input-available",
+          toolCallId: "tool-1",
+          input: { command: "printf test" },
+        },
+      ],
+    } as unknown as UIMessage;
+
+    render(
+      <ReasoningHandler
+        message={message}
+        partIndex={1}
+        status="streaming"
+        isLastMessage
+        keepLatestOpenDuringStreaming
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("Planning the tool")).toBeVisible();
+    });
+    expect(screen.getByText("Reasoning")).not.toHaveClass(
+      "animate-text-shimmer",
+    );
+    expect(screen.queryByText("Thinking...")).not.toBeInTheDocument();
+    expect(
+      screen.queryByTestId("reasoning-streaming-indicator"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps restored streaming reasoning collapsed", async () => {
+    const message = {
+      id: "assistant-restored",
+      role: "assistant",
+      parts: [
+        {
+          type: "reasoning",
+          state: "streaming",
+          text: "Replayed reasoning",
+        },
+      ],
+    } as unknown as UIMessage;
+
+    render(
+      <ReasoningHandler
+        message={message}
+        partIndex={0}
+        status="streaming"
+        isLastMessage
+        keepLatestOpenDuringStreaming
+        suppressAutoOpenDuringStreaming
+      />,
+    );
+
+    const trigger = screen.getByRole("button", { name: "Thinking..." });
+    await waitFor(() => {
+      expect(trigger).toHaveAttribute("aria-expanded", "false");
+    });
+    expect(screen.queryByText("Replayed reasoning")).not.toBeInTheDocument();
+  });
+
+  it("preserves last-part auto-collapse outside the Agent work panel", async () => {
+    const message = {
+      id: "assistant-1",
+      role: "assistant",
+      parts: [
+        { type: "reasoning", state: "done", text: "Finished reasoning" },
+        { type: "text", state: "streaming", text: "Answering" },
+      ],
+    } as unknown as UIMessage;
+
+    render(
+      <ReasoningHandler
+        message={message}
+        partIndex={0}
+        status="streaming"
+        isLastMessage
+      />,
+    );
+
+    expect(screen.getByText("Reasoning")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.queryByText("Finished reasoning")).not.toBeInTheDocument();
+    });
+  });
+
+  it("collapses the previous reasoning only when a newer block appears", async () => {
+    const initialMessage = {
+      id: "assistant-1",
+      role: "assistant",
+      parts: [
+        { type: "step-start" },
+        { type: "reasoning", state: "done", text: "Planning the tool" },
+        {
+          type: "tool-run_terminal_cmd",
+          state: "output-available",
+          toolCallId: "tool-1",
+          input: { command: "printf test" },
+          output: "test",
+        },
+      ],
+    } as unknown as UIMessage;
+
+    const { rerender } = render(
+      <StreamingReasoningParts message={initialMessage} />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("Planning the tool")).toBeVisible();
+    });
+
+    const emptyNextReasoning = {
+      ...initialMessage,
+      parts: [
+        ...initialMessage.parts,
+        { type: "step-start" },
+        { type: "reasoning", state: "streaming", text: "" },
+      ],
+    } as unknown as UIMessage;
+    rerender(<StreamingReasoningParts message={emptyNextReasoning} />);
+
+    expect(screen.getByText("Planning the tool")).toBeVisible();
+
+    const visibleNextReasoning = {
+      ...emptyNextReasoning,
+      parts: emptyNextReasoning.parts.map((part, index) =>
+        index === 4 ? { ...part, text: "Reviewing output" } : part,
+      ),
+    } as unknown as UIMessage;
+    rerender(<StreamingReasoningParts message={visibleNextReasoning} />);
+
+    await waitFor(() => {
+      expect(screen.queryByText("Planning the tool")).not.toBeInTheDocument();
+    });
+    expect(screen.getByText("Reviewing output")).toBeVisible();
+    expect(screen.getByText("Thinking...")).toBeInTheDocument();
+  });
+
+  it("leaves the latest reasoning open for the parent completion collapse", async () => {
+    const message = {
+      id: "assistant-1",
+      role: "assistant",
+      parts: [
+        { type: "step-start" },
+        { type: "reasoning", state: "done", text: "Reviewing output" },
+        { type: "text", state: "done", text: "Done" },
+      ],
+    } as unknown as UIMessage;
+
+    const { rerender } = render(
+      <ReasoningHandler
+        message={message}
+        partIndex={1}
+        status="streaming"
+        isLastMessage
+        keepLatestOpenDuringStreaming
+        deferCollapseUntilParent
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("Reviewing output")).toBeVisible();
+    });
+
+    rerender(
+      <ReasoningHandler
+        message={message}
+        partIndex={1}
+        status="ready"
+        isLastMessage
+        keepLatestOpenDuringStreaming
+        deferCollapseUntilParent
+      />,
+    );
+
+    expect(screen.getByText("Reasoning")).toBeInTheDocument();
+    expect(screen.getByText("Reviewing output")).toBeVisible();
+  });
+
+  it("bounds long reasoning while it is streaming", async () => {
+    const message = {
+      id: "assistant-long-stream",
+      role: "assistant",
+      parts: [{ type: "reasoning", state: "streaming", text: longReasoning }],
+    } as unknown as UIMessage;
+
+    render(
+      <ReasoningHandler
+        message={message}
+        partIndex={0}
+        status="streaming"
+        isLastMessage
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("long-reasoning-preview")).toBeVisible();
+    });
+    expect(screen.getByTestId("long-reasoning-preview-body").textContent).toBe(
+      expectedLongReasoningTail,
+    );
+    expect(
+      screen.queryByRole("button", { name: "Show full reasoning" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps a completed long stream bounded until full reasoning is requested", async () => {
+    const streamingMessage = {
+      id: "assistant-long-complete",
+      role: "assistant",
+      parts: [{ type: "reasoning", state: "streaming", text: longReasoning }],
+    } as unknown as UIMessage;
+    const { rerender } = render(
+      <ReasoningHandler
+        message={streamingMessage}
+        partIndex={0}
+        status="streaming"
+        isLastMessage
+        deferCollapseUntilParent
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("long-reasoning-preview")).toBeVisible();
+    });
+
+    const completedMessage = {
+      ...streamingMessage,
+      parts: [
+        { type: "reasoning", state: "done", text: longReasoning },
+        { type: "text", state: "done", text: "Done" },
+      ],
+    } as unknown as UIMessage;
+    rerender(
+      <ReasoningHandler
+        message={completedMessage}
+        partIndex={0}
+        status="ready"
+        isLastMessage
+        deferCollapseUntilParent
+      />,
+    );
+
+    const showFullButton = screen.getByRole("button", {
+      name: "Show full reasoning",
+    });
+    expect(screen.getByTestId("long-reasoning-preview")).toBeVisible();
+
+    fireEvent.click(showFullButton);
+
+    expect(
+      screen.queryByTestId("long-reasoning-preview"),
+    ).not.toBeInTheDocument();
+    expect(screen.getByTestId("streamdown")).toHaveTextContent(
+      "Unique early reasoning marker.",
+    );
+    expect(screen.getByTestId("streamdown")).toHaveTextContent(
+      longReasoningEnd,
+    );
+  });
+
+  it("bounds complete historical long reasoning until full content is requested", async () => {
+    const message = {
+      id: "assistant-long-history",
+      role: "assistant",
+      parts: [{ type: "reasoning", state: "done", text: longReasoning }],
+    } as unknown as UIMessage;
+
+    const { rerender } = render(
+      <ReasoningHandler
+        message={message}
+        partIndex={0}
+        status="ready"
+        isLastMessage
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Reasoning" }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("long-reasoning-preview")).toHaveTextContent(
+        longReasoningEnd,
+      );
+    });
+    expect(screen.queryByTestId("streamdown")).not.toBeInTheDocument();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Show full reasoning" }),
+    );
+
+    expect(screen.getByTestId("streamdown")).toHaveTextContent(
+      "Unique early reasoning marker.",
+    );
+
+    rerender(
+      <ReasoningHandler
+        message={message}
+        partIndex={0}
+        status="streaming"
+        isLastMessage
+      />,
+    );
+
+    expect(screen.getByTestId("long-reasoning-preview")).toBeVisible();
+    expect(screen.queryByTestId("streamdown")).not.toBeInTheDocument();
+  });
+});

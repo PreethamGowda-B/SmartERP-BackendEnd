@@ -1,0 +1,879 @@
+import {
+  SidebarContent,
+  SidebarFile,
+  SidebarNote,
+  SidebarNotes,
+  WebSearchResult,
+} from "@/types/chat";
+import {
+  formatSendInput,
+  getTerminalExecutionPhase,
+  isInteractiveShellAction,
+  stripAgentOnlyTerminalGuidance,
+} from "@/app/components/tools/shell-tool-utils";
+import { parseAgentAutoReviewLifecycle } from "@/types";
+
+interface MessagePart {
+  type: string;
+  toolCallId?: string;
+  input?: any;
+  output?: any;
+  state?: string;
+  [key: string]: any;
+}
+
+export interface Message {
+  role: string;
+  parts?: MessagePart[];
+  [key: string]: any;
+}
+
+// Tool types that intentionally render during input-streaming for progressive UI
+// (e.g. file write/append showing content as the LLM generates it). All other
+// tool types are held back until input-available — see the gate inside the
+// per-part forEach below.
+const STREAMS_DURING_INPUT = new Set<string>(["tool-file"]);
+
+const getWebSearchQuery = (input: unknown): string => {
+  if (!input || typeof input !== "object") return "";
+  const { queries, query } = input as {
+    queries?: unknown;
+    query?: unknown;
+  };
+  if (Array.isArray(queries)) return queries.join(", ");
+  if (typeof queries === "string") return queries;
+  return typeof query === "string" ? query : "";
+};
+
+/**
+ * Extract sidebar content from a single message. Exported for incremental processing
+ * (e.g. only reprocess the last message during streaming).
+ */
+export function extractSidebarContentFromMessage(
+  message: Message,
+): SidebarContent[] {
+  const contentList: SidebarContent[] = [];
+  if (message.role !== "assistant" || !message.parts) return contentList;
+
+  // Collect terminal output from data-terminal parts (for streaming)
+  const terminalDataMap = new Map<string, string>();
+  const autoReviewStatusByToolCallId = new Map<
+    string,
+    NonNullable<ReturnType<typeof parseAgentAutoReviewLifecycle>>["status"]
+  >();
+  // Collect diff data from data-diff parts (for search_replace UI-only diff display)
+  const diffDataMap = new Map<
+    string,
+    { originalContent: string; modifiedContent: string }
+  >();
+
+  message.parts.forEach((part) => {
+    if (part.type === "data-terminal" && part.data?.toolCallId) {
+      const toolCallId = part.data.toolCallId;
+      const terminalOutput = part.data?.terminal || "";
+      const existing = terminalDataMap.get(toolCallId) || "";
+      terminalDataMap.set(toolCallId, existing + terminalOutput);
+    }
+    if (part.type === "data-agent-auto-review-lifecycle") {
+      const lifecycle = parseAgentAutoReviewLifecycle(part.data);
+      if (lifecycle) {
+        autoReviewStatusByToolCallId.set(
+          lifecycle.toolCallId,
+          lifecycle.status,
+        );
+      }
+    }
+    if (part.type === "data-diff" && part.data?.toolCallId) {
+      const toolCallId = part.data.toolCallId;
+      diffDataMap.set(toolCallId, {
+        originalContent: part.data.originalContent || "",
+        modifiedContent: part.data.modifiedContent || "",
+      });
+    }
+  });
+
+  message.parts.forEach((part) => {
+    // Hold tool entries back until the LLM finishes generating tool input.
+    // The AI SDK populates `part.input` from partial JSON during input-streaming,
+    // which would otherwise push entries into contentList and trigger sidebar
+    // auto-follow mid-stream. Tools listed in STREAMS_DURING_INPUT opt out for
+    // progressive UI (e.g. file write/append showing content as it's generated).
+    if (
+      part.state === "input-streaming" &&
+      typeof part.type === "string" &&
+      part.type.startsWith("tool-") &&
+      !STREAMS_DURING_INPUT.has(part.type)
+    ) {
+      return;
+    }
+
+    if (
+      (part.type === "tool-delegate_task" ||
+        part.type === "tool-create_agent" ||
+        part.type === "tool-continue_agent" ||
+        part.type === "tool-send_message_to_agent" ||
+        part.type === "tool-wait_for_agents") &&
+      part.toolCallId &&
+      typeof message.id === "string"
+    ) {
+      const lifecycle = message.parts?.find(
+        (candidate: any) =>
+          candidate?.type === "data-subagent-lifecycle" &&
+          candidate?.data?.parent_tool_call_id === part.toolCallId,
+      ) as any;
+      const selectedSubagentId =
+        lifecycle?.data?.subagent_id ??
+        part.output?.agent_id ??
+        part.output?.target_agent_id ??
+        part.input?.target_agent_id;
+      contentList.push({
+        kind: "subagents",
+        parentMessageId: lifecycle?.data?.parent_message_id ?? message.id,
+        toolCallId: part.toolCallId,
+        ...(part.type !== "tool-create_agent" &&
+        part.type !== "tool-delegate_task" &&
+        selectedSubagentId
+          ? { selectedSubagentId }
+          : {}),
+      });
+      return;
+    }
+
+    // Terminal
+    if (
+      (part.type === "tool-run_terminal_cmd" ||
+        part.type === "tool-interact_terminal_session") &&
+      part.input
+    ) {
+      const action = part.input.action || "exec";
+      const executionPhase = getTerminalExecutionPhase({
+        toolState: part.state,
+        autoReviewStatus: autoReviewStatusByToolCallId.get(
+          part.toolCallId || "",
+        ),
+      });
+      const isInteractive =
+        isInteractiveShellAction(action) || !!part.input.interactive;
+      // For action=send, format each token through formatSendInput (same
+      // helper the main UI uses) so raw control bytes / escape sequences
+      // render as readable tmux names and trailing newlines collapse to
+      // "Enter", never landing verbatim in the sidebar label.
+      const sendInput = part.input.input;
+      const sendDisplay =
+        action === "send" && sendInput
+          ? Array.isArray(sendInput)
+            ? sendInput.map((t) => formatSendInput(t)).join(" ")
+            : formatSendInput(sendInput)
+          : "";
+      const command =
+        part.input.command || part.input.brief || sendDisplay || action;
+
+      // Get streaming output from data-terminal parts
+      const streamingOutput = terminalDataMap.get(part.toolCallId || "") || "";
+
+      // Extract output from result object (handles both new and legacy formats)
+      const result = part.output?.result;
+      let output = "";
+
+      if (result) {
+        // New format: result.output
+        if (typeof result.output === "string") {
+          output = result.output;
+        }
+        // Legacy format: result.stdout + result.stderr
+        else if (result.stdout !== undefined || result.stderr !== undefined) {
+          output = (result.stdout || "") + (result.stderr || "");
+        }
+        // If result is a string directly (fallback)
+        else if (typeof result === "string") {
+          output = result;
+        }
+      }
+
+      // sessionSnapshot is cleaned via xterm headless - prefer it when available.
+      // For streaming, show live output for responsiveness.
+      const sessionSnapshot = result?.sessionSnapshot || "";
+      // Surface tool-level errors as the displayed output so e.g. action=view
+      // on a killed session shows "Session ... not found." in the sidebar
+      // instead of an empty panel — same pattern as `getShellOutput`.
+      const resultError = typeof result?.error === "string" ? result.error : "";
+      const finalOutput =
+        // Prefer cleaned sessionSnapshot when available (works for all action types)
+        sessionSnapshot ||
+        // For interactive actions, prefer live streaming output
+        (isInteractive ? streamingOutput : null) ||
+        // Fallback chain
+        output ||
+        streamingOutput ||
+        part.output?.output ||
+        resultError ||
+        "";
+
+      // Only feed rawBytes (→ xterm renderer) for interactive PTY contexts.
+      // Plain non-interactive exec output is line-oriented; the shiki ANSI
+      // renderer handles it without dragging in xterm.js.
+      const rawSnapshot = result?.rawSnapshot || "";
+      const isComplete = part.state === "output-available";
+      const effectiveRawBytes = isInteractive
+        ? isComplete && rawSnapshot
+          ? rawSnapshot
+          : streamingOutput || rawSnapshot || undefined
+        : undefined;
+
+      contentList.push({
+        command,
+        output: stripAgentOnlyTerminalGuidance(finalOutput),
+        isExecuting: executionPhase === "executing",
+        executionPhase,
+        isBackground: part.input.is_background,
+        toolCallId: part.toolCallId || "",
+        rawBytes: effectiveRawBytes,
+        ...(isInteractive
+          ? {
+              shellAction: action,
+              pid: part.input.pid ?? part.output?.result?.pid,
+              session: part.input.session ?? part.output?.result?.session,
+              input: part.input.input,
+            }
+          : {}),
+      });
+    }
+
+    // Shell tool (new interactive PTY-based shell)
+    if (part.type === "tool-shell" && part.input) {
+      const command = part.input.command || part.input.brief || "";
+      const executionPhase = getTerminalExecutionPhase({
+        toolState: part.state,
+        autoReviewStatus: autoReviewStatusByToolCallId.get(
+          part.toolCallId || "",
+        ),
+      });
+
+      // Skip if no command/brief available yet
+      if (!command) return;
+
+      // Get streaming output from data-terminal parts
+      const streamingOutput = terminalDataMap.get(part.toolCallId || "") || "";
+
+      // Shell tool returns { output: string } directly (not nested in result)
+      const directOutput =
+        typeof part.output?.output === "string" ? part.output.output : "";
+
+      const finalOutput = directOutput || streamingOutput || "";
+
+      // Only feed rawBytes (→ xterm renderer) for interactive PTY actions.
+      // Plain `exec` output is line-oriented and renders fine via shiki.
+      const isInteractiveShellPart = isInteractiveShellAction(
+        part.input.action,
+      );
+      const rawSnapshot = part.output?.rawSnapshot || "";
+      const isComplete = part.state === "output-available";
+      const effectiveRawBytes = isInteractiveShellPart
+        ? isComplete && rawSnapshot
+          ? rawSnapshot
+          : streamingOutput || rawSnapshot || undefined
+        : undefined;
+
+      contentList.push({
+        command,
+        output: stripAgentOnlyTerminalGuidance(finalOutput),
+        isExecuting: executionPhase === "executing",
+        executionPhase,
+        isBackground: false,
+        toolCallId: part.toolCallId || "",
+        shellAction: part.input.action,
+        pid: part.input.pid ?? part.output?.pid,
+        session: part.input.session ?? part.output?.session,
+        input: part.input.input,
+        rawBytes: effectiveRawBytes,
+      });
+    }
+
+    // HTTP Request
+    if (part.type === "tool-http_request" && part.input?.url) {
+      const method = part.input.method || "GET";
+      const url = part.input.url;
+      const command = `${method} ${url}`;
+
+      // Get streaming output from data-terminal parts (HTTP uses same streaming mechanism)
+      const streamingOutput = terminalDataMap.get(part.toolCallId || "") || "";
+
+      // Extract output from result
+      let output = "";
+      if (part.output) {
+        output = part.output.output || part.output.error || "";
+      }
+
+      const finalOutput = output || streamingOutput || "";
+      const executionPhase = getTerminalExecutionPhase({
+        toolState: part.state,
+        autoReviewStatus: autoReviewStatusByToolCallId.get(
+          part.toolCallId || "",
+        ),
+      });
+
+      contentList.push({
+        command,
+        output: finalOutput,
+        isExecuting: executionPhase === "executing",
+        executionPhase,
+        isBackground: false,
+        toolCallId: part.toolCallId || "",
+      });
+    }
+
+    // Web Search - extract at input-available for auto-follow, and output-available for results
+    if (part.type === "tool-web_search" && part.state === "input-available") {
+      const query = getWebSearchQuery(part.input);
+      if (query) {
+        contentList.push({
+          query,
+          results: [],
+          isSearching: true,
+          toolCallId: part.toolCallId || "",
+        });
+      }
+    }
+
+    if (part.type === "tool-web_search" && part.state === "output-available") {
+      const query = getWebSearchQuery(part.input);
+
+      let results: WebSearchResult[] = [];
+      if (part.output) {
+        // Handle both formats: output as array directly, or output.result as array
+        const rawResults = Array.isArray(part.output)
+          ? part.output
+          : part.output.result;
+        if (Array.isArray(rawResults)) {
+          results = rawResults.map((r: WebSearchResult) => ({
+            title: r.title || "",
+            url: r.url || "",
+            content: r.content || "",
+            date: r.date || null,
+            lastUpdated: r.lastUpdated || null,
+          }));
+        }
+      }
+
+      contentList.push({
+        query,
+        results,
+        isSearching: false,
+        toolCallId: part.toolCallId || "",
+      });
+    }
+
+    // File tool streaming - extract during input-streaming/input-available
+    // so sidebar auto-follow works for file operations (like terminals)
+    if (
+      part.type === "tool-file" &&
+      (part.state === "input-streaming" || part.state === "input-available")
+    ) {
+      const fileInput = part.input;
+      if (fileInput?.path) {
+        const fileAction = fileInput.action as string;
+        if (fileAction === "write" || fileAction === "append") {
+          contentList.push({
+            path: fileInput.path,
+            content: fileInput.text || "",
+            action: fileAction === "write" ? "creating" : "appending",
+            toolCallId: part.toolCallId || "",
+            isExecuting: true,
+          });
+        } else if (
+          part.state === "input-available" &&
+          (fileAction === "view" ||
+            fileAction === "read" ||
+            fileAction === "edit")
+        ) {
+          const range =
+            fileAction === "read" && fileInput.range
+              ? {
+                  start: fileInput.range[0],
+                  end:
+                    fileInput.range[1] === -1 ? undefined : fileInput.range[1],
+                }
+              : undefined;
+          contentList.push({
+            path: fileInput.path,
+            content: "",
+            range,
+            action:
+              fileAction === "view"
+                ? "viewing"
+                : fileAction === "read"
+                  ? "reading"
+                  : "editing",
+            toolCallId: part.toolCallId || "",
+            isExecuting: true,
+          });
+        }
+      }
+    }
+
+    // File Operations - extract at input-available for early auto-follow
+    if (
+      (part.type === "tool-read_file" ||
+        part.type === "tool-search_replace" ||
+        part.type === "tool-multi_edit") &&
+      part.state === "input-available"
+    ) {
+      const fileInput = part.input;
+      const filePath =
+        fileInput?.file_path || fileInput?.path || fileInput?.target_file || "";
+      if (filePath) {
+        const action: SidebarFile["action"] =
+          part.type === "tool-read_file" ? "reading" : "editing";
+        let range = undefined;
+        if (
+          part.type === "tool-read_file" &&
+          fileInput.offset &&
+          fileInput.limit
+        ) {
+          range = {
+            start: fileInput.offset,
+            end: fileInput.offset + fileInput.limit - 1,
+          };
+        }
+        contentList.push({
+          path: filePath,
+          content: "",
+          range,
+          action,
+          toolCallId: part.toolCallId || "",
+          isExecuting: true,
+        });
+      }
+    }
+
+    // File Operations - extract when output is available with full content
+    if (
+      (part.type === "tool-read_file" ||
+        part.type === "tool-write_file" ||
+        part.type === "tool-search_replace" ||
+        part.type === "tool-multi_edit" ||
+        part.type === "tool-file") &&
+      part.state === "output-available"
+    ) {
+      const fileInput = part.input;
+      if (!fileInput) return;
+
+      const filePath =
+        fileInput.file_path || fileInput.path || fileInput.target_file || "";
+      if (!filePath) return;
+
+      let action: SidebarFile["action"] = "reading";
+      let content = "";
+      let range = undefined;
+      let originalContent: string | undefined;
+      let modifiedContent: string | undefined;
+
+      if (part.type === "tool-file") {
+        // New unified file tool
+        const fileAction = fileInput.action as string;
+        const actionMap: Record<string, SidebarFile["action"]> = {
+          view: "viewing",
+          read: "reading",
+          write: "writing",
+          append: "appending",
+          edit: "editing",
+        };
+        action = actionMap[fileAction] || "reading";
+
+        if (fileAction === "view") {
+          const output = part.output;
+          if (typeof output === "object" && output !== null) {
+            content =
+              typeof output.content === "string"
+                ? output.content
+                : "Viewed multimodal file.";
+          }
+        } else if (fileAction === "read") {
+          // Output is an object with originalContent (raw content without line numbers)
+          const output = part.output;
+          if (
+            typeof output === "object" &&
+            output !== null &&
+            "originalContent" in output
+          ) {
+            content = (output.originalContent as string) || "";
+          }
+
+          if (fileInput.range) {
+            const [start, end] = fileInput.range;
+            range = {
+              start,
+              end: end === -1 ? undefined : end,
+            };
+          }
+        } else if (fileAction === "write") {
+          content = fileInput.text || "";
+        } else if (fileAction === "append") {
+          // Output is now an object with originalContent (modifiedContent computed from input.text)
+          const output = part.output;
+          const appendedText = fileInput.text || "";
+
+          if (
+            typeof output === "object" &&
+            output !== null &&
+            "originalContent" in output
+          ) {
+            // New format: object with originalContent, compute modifiedContent (no auto newline)
+            originalContent = output.originalContent as string;
+            const computedModified = originalContent + appendedText;
+            modifiedContent = computedModified;
+            content = computedModified;
+          } else {
+            // Fallback: no original content, just show appended text
+            originalContent = "";
+            modifiedContent = appendedText;
+            content = appendedText;
+          }
+        } else if (fileAction === "edit") {
+          // Output is now an object with originalContent and modifiedContent
+          const output = part.output;
+
+          if (
+            typeof output === "object" &&
+            output !== null &&
+            "originalContent" in output &&
+            "modifiedContent" in output
+          ) {
+            // New format: object with diff data
+            originalContent = output.originalContent as string;
+            modifiedContent = output.modifiedContent as string;
+            content = modifiedContent || "";
+          } else if (typeof output === "string") {
+            // Fallback: old string format
+            const lines = output.split("\n");
+            const contentLines = lines
+              .slice(2)
+              .map((line: string) => line.replace(/^\d+\t/, ""));
+            content = contentLines.join("\n");
+          }
+        }
+      } else if (part.type === "tool-read_file") {
+        action = "reading";
+        // Extract result - handle both string and object formats
+        const result = part.output?.result;
+        let rawContent = "";
+
+        if (typeof result === "string") {
+          rawContent = result;
+        } else if (result && typeof result === "object") {
+          // If result is an object, try to extract content
+          rawContent = result.content || result.text || result.result || "";
+        }
+
+        // Clean line numbers from read output (only if we have content)
+        if (rawContent) {
+          content = rawContent.replace(/^\s*\d+\|/gm, "");
+        }
+
+        if (fileInput.offset && fileInput.limit) {
+          range = {
+            start: fileInput.offset,
+            end: fileInput.offset + fileInput.limit - 1,
+          };
+        }
+      } else if (part.type === "tool-write_file") {
+        action = "writing";
+        content = fileInput.contents || fileInput.content || "";
+      } else if (
+        part.type === "tool-search_replace" ||
+        part.type === "tool-multi_edit"
+      ) {
+        action = "editing";
+        // Extract result - handle both string and object formats
+        const result = part.output?.result;
+        if (typeof result === "string") {
+          content = result;
+        } else if (result && typeof result === "object") {
+          content = result.content || result.text || result.result || "";
+        } else {
+          content = "";
+        }
+      }
+
+      // For search_replace, try to get diff data from data-diff parts (not persisted across reloads)
+      if (part.type === "tool-search_replace" && part.toolCallId) {
+        const streamedDiff = diffDataMap.get(part.toolCallId);
+        if (streamedDiff) {
+          originalContent = streamedDiff.originalContent;
+          modifiedContent = streamedDiff.modifiedContent;
+        }
+      }
+
+      contentList.push({
+        path: filePath,
+        content: modifiedContent || content,
+        range,
+        action,
+        toolCallId: part.toolCallId || "",
+        originalContent,
+        modifiedContent,
+        mediaType:
+          part.type === "tool-file" &&
+          typeof part.output === "object" &&
+          part.output !== null &&
+          typeof part.output.mediaType === "string"
+            ? part.output.mediaType
+            : undefined,
+        sizeBytes:
+          part.type === "tool-file" &&
+          typeof part.output === "object" &&
+          part.output !== null &&
+          typeof part.output.sizeBytes === "number"
+            ? part.output.sizeBytes
+            : undefined,
+        kind:
+          part.type === "tool-file" &&
+          typeof part.output === "object" &&
+          part.output !== null &&
+          (part.output.kind === "image" || part.output.kind === "pdf")
+            ? part.output.kind
+            : undefined,
+        filename:
+          part.type === "tool-file" &&
+          typeof part.output === "object" &&
+          part.output !== null &&
+          typeof part.output.filename === "string"
+            ? part.output.filename
+            : undefined,
+        previewFiles:
+          part.type === "tool-file" &&
+          typeof part.output === "object" &&
+          part.output !== null &&
+          Array.isArray(part.output.previewFiles)
+            ? part.output.previewFiles
+            : undefined,
+        renderedPages:
+          part.type === "tool-file" &&
+          typeof part.output === "object" &&
+          part.output !== null &&
+          Array.isArray(part.output.renderedPages)
+            ? part.output.renderedPages
+            : undefined,
+        renderedPageLimit:
+          part.type === "tool-file" &&
+          typeof part.output === "object" &&
+          part.output !== null &&
+          typeof part.output.renderedPageLimit === "number"
+            ? part.output.renderedPageLimit
+            : undefined,
+        truncatedPages:
+          part.type === "tool-file" &&
+          typeof part.output === "object" &&
+          part.output !== null &&
+          typeof part.output.truncatedPages === "boolean"
+            ? part.output.truncatedPages
+            : undefined,
+        pageCount:
+          part.type === "tool-file" &&
+          typeof part.output === "object" &&
+          part.output !== null &&
+          typeof part.output.pageCount === "number"
+            ? part.output.pageCount
+            : undefined,
+        previewError:
+          part.type === "tool-file" &&
+          typeof part.output === "object" &&
+          part.output !== null &&
+          typeof part.output.previewError === "string"
+            ? part.output.previewError
+            : undefined,
+        isExecuting: false,
+      });
+    }
+
+    // Shared files (get_terminal_files)
+    if (part.type === "tool-get_terminal_files") {
+      const requestedPaths: string[] = part.input?.files || [];
+
+      // Seed from persisted message.fileDetails so sidebar shows files after reload
+      const persistedFiles = (message.fileDetails as any[] | undefined) || [];
+      const files = persistedFiles.map((f: any) => ({
+        name: f.name || "",
+        mediaType: f.mediaType,
+        fileId: f.fileId,
+        s3Key: f.s3Key,
+        sizeBytes: typeof f.sizeBytes === "number" ? f.sizeBytes : undefined,
+      }));
+
+      contentList.push({
+        files,
+        requestedPaths,
+        isExecuting:
+          part.state === "input-available" || part.state === "input-streaming",
+        toolCallId: part.toolCallId || "",
+      });
+    }
+
+    // Proxy tools
+    const proxyToolTypes = [
+      "tool-list_requests",
+      "tool-view_request",
+      "tool-send_request",
+      "tool-scope_rules",
+      "tool-list_sitemap",
+      "tool-view_sitemap_entry",
+    ];
+
+    if (proxyToolTypes.includes(part.type)) {
+      const toolName = part.type.replace("tool-", "");
+      const proxyInput = part.input || {};
+      const cmdParts: string[] = [toolName];
+      if (proxyInput.request_id) cmdParts.push(`id:${proxyInput.request_id}`);
+      if (proxyInput.method && proxyInput.url)
+        cmdParts.push(`${proxyInput.method} ${proxyInput.url}`);
+      if (proxyInput.httpql_filter)
+        cmdParts.push(`filter:"${proxyInput.httpql_filter}"`);
+      if (proxyInput.action) cmdParts.push(proxyInput.action);
+      if (proxyInput.entry_id) cmdParts.push(`entry:${proxyInput.entry_id}`);
+      const command = cmdParts.join(" ");
+
+      let output = "";
+      if (part.errorText) {
+        output = `Error: ${part.errorText}`;
+      } else if (part.output?.result?.error) {
+        output = `Error: ${part.output.result.error}`;
+      } else if (part.output?.result) {
+        try {
+          output = JSON.stringify(part.output.result, null, 2);
+        } catch {
+          output = String(part.output.result);
+        }
+      }
+
+      contentList.push({
+        proxyAction: toolName,
+        command,
+        output,
+        isExecuting:
+          part.state === "input-available" || part.state === "running",
+        toolCallId: part.toolCallId || "",
+      });
+    }
+
+    // Notes tools
+    const notesToolTypes = [
+      "tool-create_note",
+      "tool-list_notes",
+      "tool-update_note",
+      "tool-delete_note",
+    ];
+
+    if (notesToolTypes.includes(part.type)) {
+      const toolName = part.type.replace("tool-", "") as
+        "create_note" | "list_notes" | "update_note" | "delete_note";
+
+      const actionMap: Record<string, SidebarNotes["action"]> = {
+        create_note: "create",
+        list_notes: "list",
+        update_note: "update",
+        delete_note: "delete",
+      };
+
+      const action = actionMap[toolName] || "list";
+      const input = part.input || {};
+      const result = part.output?.result || part.output || {};
+
+      let notes: SidebarNote[] = [];
+      let totalCount = 0;
+      let affectedTitle: string | undefined;
+      let newNoteId: string | undefined;
+      let original: SidebarNotes["original"];
+      let modified: SidebarNotes["modified"];
+
+      if (action === "list" && result?.notes) {
+        notes = result.notes;
+        totalCount = result.total_count || notes.length;
+      } else if (action === "create" && input) {
+        notes = [
+          {
+            note_id: result?.note_id || "pending",
+            title: input.title || "",
+            content: input.content || "",
+            category: input.category || "general",
+            tags: input.tags || [],
+            updated_at: Date.now(),
+          },
+        ];
+        totalCount = 1;
+        affectedTitle = input.title;
+        newNoteId = result?.note_id;
+      } else if (action === "update") {
+        // For update, use original/modified for before/after comparison
+        original = result?.original;
+        modified = result?.modified;
+        affectedTitle = modified?.title || input?.title || input?.note_id;
+        totalCount = 1;
+      } else if (action === "delete") {
+        affectedTitle = result?.deleted_title || input?.note_id;
+        totalCount = 0;
+      }
+
+      contentList.push({
+        action,
+        notes,
+        totalCount,
+        isExecuting: part.state !== "output-available",
+        toolCallId: part.toolCallId || "",
+        affectedTitle,
+        newNoteId,
+        original,
+        modified,
+      });
+    }
+  });
+
+  return contentList;
+}
+
+export function extractAllSidebarContent(
+  messages: Message[],
+): SidebarContent[] {
+  return messages.flatMap(extractSidebarContentFromMessage);
+}
+
+const getToolCallId = (content: SidebarContent): string | undefined =>
+  "toolCallId" in content && content.toolCallId
+    ? content.toolCallId
+    : undefined;
+
+const isSameSidebarContent = (
+  left: SidebarContent,
+  right: SidebarContent,
+): boolean => {
+  const leftToolCallId = getToolCallId(left);
+  const rightToolCallId = getToolCallId(right);
+
+  if (leftToolCallId || rightToolCallId) {
+    return leftToolCallId === rightToolCallId;
+  }
+
+  return (
+    "path" in left &&
+    "path" in right &&
+    left.path === right.path &&
+    left.action === right.action
+  );
+};
+
+/**
+ * Keeps an open tool sidebar aligned with the messages left after regeneration.
+ * If the selected tool was removed, the latest surviving tool is the closest
+ * previous execution in the transcript.
+ */
+export function reconcileSidebarContentAfterRegeneration(
+  messages: Message[],
+  sidebarContent: SidebarContent,
+): SidebarContent | null {
+  const remainingContent = extractAllSidebarContent(messages);
+  const selectionStillExists = remainingContent.some((content) =>
+    isSameSidebarContent(content, sidebarContent),
+  );
+
+  if (selectionStillExists) return sidebarContent;
+  return remainingContent[remainingContent.length - 1] ?? null;
+}

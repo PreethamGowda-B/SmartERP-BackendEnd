@@ -1,0 +1,514 @@
+import { logUsageRecord } from "@/lib/db/actions";
+import {
+  getProviderUsageRawModelCost,
+  isPositiveFiniteNumber,
+} from "@/lib/provider-usage-cost";
+import { calculateRawModelUsageCostDollars } from "@/lib/rate-limit";
+import type { UsageDeductionFailureReason } from "@/lib/rate-limit";
+import type { ChatApiEndpoint } from "@/lib/api/agent-endpoints";
+import type { ChatMode, RateLimitInfo, SubscriptionTier } from "@/types";
+import { v4 as uuidv4 } from "uuid";
+
+interface StepUsage {
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  inputTokenDetails?: {
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
+  };
+  raw?: {
+    cost?: number;
+    cost_details?: {
+      upstream_inference_cost?: number;
+      upstreamInferenceCost?: number;
+    };
+    costDetails?: {
+      upstream_inference_cost?: number;
+      upstreamInferenceCost?: number;
+    };
+  };
+}
+
+type ModelStepCost = {
+  rawCost: number;
+  authoritativeCost?: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  modelName?: string;
+};
+
+export type UsageBillingType = "included" | "extra" | "mixed";
+export type UsageCostSource =
+  "provider" | "hybrid" | "token_estimate" | "raw_token_estimate";
+
+export interface UsageBillingBreakdown {
+  includedPointsDeducted: number;
+  extraUsagePointsDeducted: number;
+  uncoveredPoints?: number;
+  usageDeductionFailed?: boolean;
+  usageDeductionFailureReason?: UsageDeductionFailureReason;
+}
+
+interface ResolvedUsageBillingBreakdown extends UsageBillingBreakdown {
+  includedPointsDeducted: number;
+  extraUsagePointsDeducted: number;
+  uncoveredPoints: number;
+  usageDeductionFailed: boolean;
+  usageDeductionFailureReason?: UsageDeductionFailureReason;
+}
+
+export interface UsageCostRecord {
+  model: string;
+  type: UsageBillingType;
+  includedCostDollars: number;
+  extraUsageCostDollars: number;
+  uncoveredCostDollars: number;
+  includedPointsDeducted: number;
+  extraUsagePointsDeducted: number;
+  uncoveredPoints: number;
+  usageDeductionFailed: boolean;
+  usageDeductionFailureReason?: UsageDeductionFailureReason;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  costDollars: number;
+  modelCostDollars: number;
+  nonModelCostDollars: number;
+  costSource: UsageCostSource;
+}
+
+/**
+ * Tracks accumulated token usage across stream steps and handles logging.
+ * Shared between chat-handler.ts and agent-task.ts to avoid duplication.
+ */
+export class UsageTracker {
+  /** Correlates this run's usage record with downstream settlement logs. */
+  readonly usageSettlementId = uuidv4();
+  inputTokens = 0;
+  outputTokens = 0;
+  totalTokens = 0;
+  cacheReadTokens = 0;
+  cacheWriteTokens = 0;
+  providerCost = 0;
+  /**
+   * Provider cost for the streamed model leg only. Summarization is tracked
+   * separately because it survives resetModelLeg() during a fallback retry.
+   */
+  modelProviderCost = 0;
+  private modelStepCosts: ModelStepCost[] = [];
+  private summarizationStepCosts: ModelStepCost[] = [];
+  /** Costs from sandbox sessions and tool usage (always accurate, even on non-clean streams) */
+  nonModelCost = 0;
+  lastStepInputTokens = 0;
+  /** Input tokens from summarization requests, preserved across model fallback. */
+  summarizationInputTokens = 0;
+  /** Output tokens from summarization (not from assistant responses) */
+  summarizationOutputTokens = 0;
+  /** Cache tokens from summarization requests, preserved across model fallback. */
+  summarizationCacheReadTokens = 0;
+  summarizationCacheWriteTokens = 0;
+
+  /**
+   * Discard the model leg's accumulated usage before a fallback retry runs.
+   * Keeps nonModelCost (sandbox/tool spend already incurred) and all
+   * summarization usage, so the final deduction only replaces the streamed
+   * model leg with the fallback model.
+   */
+  resetModelLeg() {
+    this.providerCost -= this.modelProviderCost;
+    this.modelProviderCost = 0;
+    this.inputTokens = this.summarizationInputTokens;
+    this.outputTokens = this.summarizationOutputTokens;
+    this.totalTokens = this.inputTokens + this.outputTokens;
+    this.lastStepInputTokens = 0;
+    this.cacheReadTokens = this.summarizationCacheReadTokens;
+    this.cacheWriteTokens = this.summarizationCacheWriteTokens;
+    this.modelStepCosts = [];
+  }
+
+  accumulateStep(usage: StepUsage, modelName?: string): number {
+    this.inputTokens += usage.inputTokens || 0;
+    this.outputTokens += usage.outputTokens || 0;
+    this.totalTokens += usage.totalTokens || 0;
+    this.lastStepInputTokens = usage.inputTokens || 0;
+    this.cacheReadTokens += usage.inputTokenDetails?.cacheReadTokens || 0;
+    this.cacheWriteTokens += usage.inputTokenDetails?.cacheWriteTokens || 0;
+    const stepCost = getProviderUsageRawModelCost(usage.raw);
+    const rawCost = isPositiveFiniteNumber(stepCost) ? stepCost : 0;
+    const stepCostIndex =
+      this.modelStepCosts.push({
+        rawCost,
+        inputTokens: usage.inputTokens || 0,
+        outputTokens: usage.outputTokens || 0,
+        cacheReadTokens: usage.inputTokenDetails?.cacheReadTokens || 0,
+        cacheWriteTokens: usage.inputTokenDetails?.cacheWriteTokens || 0,
+        modelName,
+      }) - 1;
+    if (isPositiveFiniteNumber(stepCost)) {
+      this.providerCost += stepCost;
+      this.modelProviderCost += stepCost;
+    }
+    return stepCostIndex;
+  }
+
+  accumulateSummarization(usage: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
+    cost?: number;
+    model?: string;
+  }): void {
+    const inputTokens = usage.inputTokens || 0;
+    const outputTokens = usage.outputTokens || 0;
+    const cacheReadTokens = usage.cacheReadTokens || 0;
+    const cacheWriteTokens = usage.cacheWriteTokens || 0;
+    const rawCost = isPositiveFiniteNumber(usage.cost) ? usage.cost : 0;
+
+    this.inputTokens += inputTokens;
+    this.summarizationInputTokens += inputTokens;
+    this.outputTokens += outputTokens;
+    this.summarizationOutputTokens += outputTokens;
+    this.totalTokens += inputTokens + outputTokens;
+    this.cacheReadTokens += cacheReadTokens;
+    this.summarizationCacheReadTokens += cacheReadTokens;
+    this.cacheWriteTokens += cacheWriteTokens;
+    this.summarizationCacheWriteTokens += cacheWriteTokens;
+    this.summarizationStepCosts.push({
+      rawCost,
+      inputTokens,
+      outputTokens,
+      cacheReadTokens,
+      cacheWriteTokens,
+      modelName: usage.model,
+    });
+    if (rawCost > 0) {
+      // Summarization survives resetModelLeg(), so do not include it in
+      // modelProviderCost (the amount removed for a streamed-model retry).
+      this.providerCost += rawCost;
+    }
+  }
+
+  setAuthoritativeModelCostForStep(
+    stepCostIndex: number | undefined,
+    costDollars: number | undefined,
+  ) {
+    if (!isPositiveFiniteNumber(costDollars) || stepCostIndex === undefined) {
+      return;
+    }
+
+    const stepCost = this.modelStepCosts[stepCostIndex];
+    if (!stepCost) return;
+
+    const previousCost = stepCost.authoritativeCost ?? stepCost.rawCost;
+    stepCost.authoritativeCost = costDollars;
+    this.providerCost += costDollars - previousCost;
+    this.modelProviderCost += costDollars - previousCost;
+  }
+
+  private get allModelSteps(): ModelStepCost[] {
+    return [...this.modelStepCosts, ...this.summarizationStepCosts];
+  }
+
+  get hasAuthoritativeModelCost(): boolean {
+    const modelSteps = this.allModelSteps;
+    return (
+      modelSteps.length > 0 &&
+      modelSteps.every((stepCost) =>
+        isPositiveFiniteNumber(stepCost.authoritativeCost ?? stepCost.rawCost),
+      )
+    );
+  }
+
+  get hasAnyAuthoritativeModelCost(): boolean {
+    return this.allModelSteps.some((stepCost) =>
+      isPositiveFiniteNumber(stepCost.authoritativeCost ?? stepCost.rawCost),
+    );
+  }
+
+  /** Output tokens from the streamed response only (excludes summarization) */
+  get streamOutputTokens(): number {
+    return this.outputTokens - this.summarizationOutputTokens;
+  }
+
+  /** Whether any cache token data was reported by the provider */
+  get hasCacheData(): boolean {
+    return this.cacheReadTokens > 0 || this.cacheWriteTokens > 0;
+  }
+
+  /** Cache hit rate: proportion of cached input tokens that were reads (0–1), or null if no cache data */
+  get cacheHitRate(): number | null {
+    const total = this.cacheReadTokens + this.cacheWriteTokens;
+    if (total === 0) return null;
+    return this.cacheReadTokens / total;
+  }
+
+  get hasUsage(): boolean {
+    return (
+      this.inputTokens > 0 || this.outputTokens > 0 || this.providerCost > 0
+    );
+  }
+
+  computeModelCostDollars(
+    selectedModel: string,
+    accountingModel?: string,
+  ): number {
+    const modelSteps = this.allModelSteps;
+    if (modelSteps.length === 0) {
+      return calculateRawModelUsageCostDollars({
+        inputTokens: this.inputTokens,
+        outputTokens: this.outputTokens,
+        cacheReadTokens: this.cacheReadTokens,
+        cacheWriteTokens: this.cacheWriteTokens,
+        modelName: accountingModel ?? selectedModel,
+      });
+    }
+
+    return modelSteps.reduce((totalCost, stepCost) => {
+      const authoritativeCost = stepCost.authoritativeCost ?? stepCost.rawCost;
+      if (isPositiveFiniteNumber(authoritativeCost)) {
+        return totalCost + authoritativeCost;
+      }
+      return (
+        totalCost +
+        calculateRawModelUsageCostDollars({
+          inputTokens: stepCost.inputTokens,
+          outputTokens: stepCost.outputTokens,
+          cacheReadTokens: stepCost.cacheReadTokens,
+          cacheWriteTokens: stepCost.cacheWriteTokens,
+          modelName: stepCost.modelName ?? accountingModel ?? selectedModel,
+        })
+      );
+    }, 0);
+  }
+
+  computeCostDollars(selectedModel: string, accountingModel?: string): number {
+    return (
+      this.computeModelCostDollars(selectedModel, accountingModel) +
+      this.nonModelCost
+    );
+  }
+
+  getBillingBreakdown(
+    rateLimitInfo: RateLimitInfo,
+    billingBreakdown?: UsageBillingBreakdown,
+  ): ResolvedUsageBillingBreakdown {
+    return {
+      includedPointsDeducted: Math.max(
+        0,
+        billingBreakdown?.includedPointsDeducted ??
+          rateLimitInfo.pointsDeducted ??
+          0,
+      ),
+      extraUsagePointsDeducted: Math.max(
+        0,
+        billingBreakdown?.extraUsagePointsDeducted ??
+          rateLimitInfo.extraUsagePointsDeducted ??
+          0,
+      ),
+      uncoveredPoints: Math.max(0, billingBreakdown?.uncoveredPoints ?? 0),
+      usageDeductionFailed:
+        billingBreakdown?.usageDeductionFailed === true ||
+        (billingBreakdown?.uncoveredPoints ?? 0) > 0,
+      usageDeductionFailureReason:
+        billingBreakdown?.usageDeductionFailureReason,
+    };
+  }
+
+  resolveUsageType(
+    rateLimitInfo: RateLimitInfo,
+    billingBreakdown?: UsageBillingBreakdown,
+  ): UsageBillingType {
+    const {
+      includedPointsDeducted,
+      extraUsagePointsDeducted,
+      uncoveredPoints,
+    } = this.getBillingBreakdown(rateLimitInfo, billingBreakdown);
+    if (includedPointsDeducted > 0 && extraUsagePointsDeducted > 0) {
+      return "mixed";
+    }
+    if (includedPointsDeducted > 0 && uncoveredPoints > 0) {
+      return "mixed";
+    }
+    return extraUsagePointsDeducted > 0 || uncoveredPoints > 0
+      ? "extra"
+      : "included";
+  }
+
+  resolveCostBreakdown(
+    costDollars: number,
+    rateLimitInfo: RateLimitInfo,
+    billingBreakdown?: UsageBillingBreakdown,
+  ): Pick<
+    UsageCostRecord,
+    | "includedCostDollars"
+    | "extraUsageCostDollars"
+    | "uncoveredCostDollars"
+    | "includedPointsDeducted"
+    | "extraUsagePointsDeducted"
+    | "uncoveredPoints"
+    | "usageDeductionFailed"
+    | "usageDeductionFailureReason"
+  > {
+    const {
+      includedPointsDeducted,
+      extraUsagePointsDeducted,
+      uncoveredPoints,
+      usageDeductionFailed,
+      usageDeductionFailureReason,
+    } = this.getBillingBreakdown(rateLimitInfo, billingBreakdown);
+    const totalPoints =
+      includedPointsDeducted + extraUsagePointsDeducted + uncoveredPoints;
+
+    if (totalPoints <= 0) {
+      return {
+        includedCostDollars: costDollars,
+        extraUsageCostDollars: 0,
+        uncoveredCostDollars: 0,
+        includedPointsDeducted,
+        extraUsagePointsDeducted,
+        uncoveredPoints,
+        usageDeductionFailed,
+        usageDeductionFailureReason,
+      };
+    }
+
+    const includedCostDollars =
+      costDollars * (includedPointsDeducted / totalPoints);
+    const extraUsageCostDollars =
+      costDollars * (extraUsagePointsDeducted / totalPoints);
+    const uncoveredCostDollars =
+      costDollars - includedCostDollars - extraUsageCostDollars;
+    return {
+      includedCostDollars,
+      extraUsageCostDollars,
+      uncoveredCostDollars,
+      includedPointsDeducted,
+      extraUsagePointsDeducted,
+      uncoveredPoints,
+      usageDeductionFailed,
+      usageDeductionFailureReason,
+    };
+  }
+
+  resolveModelName({
+    selectedModelOverride,
+    responseModel,
+    configuredModelId,
+    selectedModel,
+  }: {
+    selectedModelOverride?: string | null;
+    responseModel?: string;
+    configuredModelId: string;
+    selectedModel: string;
+  }): string {
+    if (!selectedModelOverride || selectedModelOverride === "auto") {
+      return "auto";
+    }
+    return responseModel || configuredModelId || selectedModel;
+  }
+
+  createUsageCostRecord({
+    selectedModel,
+    selectedModelOverride,
+    responseModel,
+    configuredModelId,
+    accountingModel,
+    rateLimitInfo,
+    billingBreakdown,
+  }: {
+    selectedModel: string;
+    selectedModelOverride?: string | null;
+    responseModel?: string;
+    configuredModelId: string;
+    accountingModel?: string;
+    rateLimitInfo: RateLimitInfo;
+    billingBreakdown?: UsageBillingBreakdown;
+  }): UsageCostRecord {
+    const model = this.resolveModelName({
+      selectedModelOverride,
+      responseModel,
+      configuredModelId,
+      selectedModel,
+    });
+    const modelCostDollars = this.computeModelCostDollars(
+      selectedModel,
+      accountingModel,
+    );
+    const costDollars = modelCostDollars + this.nonModelCost;
+    const costBreakdown = this.resolveCostBreakdown(
+      costDollars,
+      rateLimitInfo,
+      billingBreakdown,
+    );
+    return {
+      model,
+      type: this.resolveUsageType(rateLimitInfo, billingBreakdown),
+      ...costBreakdown,
+      inputTokens: this.inputTokens,
+      outputTokens: this.outputTokens,
+      totalTokens: this.totalTokens || this.inputTokens + this.outputTokens,
+      cacheReadTokens: this.cacheReadTokens || undefined,
+      cacheWriteTokens: this.cacheWriteTokens || undefined,
+      costDollars,
+      modelCostDollars,
+      nonModelCostDollars: this.nonModelCost,
+      costSource: this.hasAuthoritativeModelCost
+        ? "provider"
+        : this.hasAnyAuthoritativeModelCost
+          ? "hybrid"
+          : "raw_token_estimate",
+    };
+  }
+
+  log(args: {
+    userId: string;
+    organizationId?: string;
+    chatId?: string;
+    assistantMessageId?: string;
+    endpoint?: ChatApiEndpoint;
+    mode?: ChatMode;
+    subscription?: SubscriptionTier;
+    selectedModel: string;
+    selectedModelOverride?: string | null;
+    responseModel?: string;
+    configuredModelId: string;
+    accountingModel?: string;
+    rateLimitInfo: RateLimitInfo;
+    billingBreakdown?: UsageBillingBreakdown;
+  }) {
+    const usage = this.createUsageCostRecord(args);
+    logUsageRecord({
+      usageSettlementId: this.usageSettlementId,
+      userId: args.userId,
+      organizationId: args.organizationId,
+      chatId: args.chatId,
+      assistantMessageId: args.assistantMessageId,
+      endpoint: args.endpoint,
+      mode: args.mode,
+      subscription: args.subscription,
+      model: usage.model,
+      type: usage.type,
+      includedCostDollars: usage.includedCostDollars,
+      extraUsageCostDollars: usage.extraUsageCostDollars,
+      includedPointsDeducted: usage.includedPointsDeducted,
+      extraUsagePointsDeducted: usage.extraUsagePointsDeducted,
+      uncoveredCostDollars: usage.uncoveredCostDollars,
+      uncoveredPoints: usage.uncoveredPoints,
+      usageDeductionFailureReason: usage.usageDeductionFailureReason,
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
+      cacheReadTokens: usage.cacheReadTokens,
+      cacheWriteTokens: usage.cacheWriteTokens,
+      costDollars: usage.costDollars,
+      modelCostDollars: usage.modelCostDollars,
+      nonModelCostDollars: usage.nonModelCostDollars,
+      costSource: usage.costSource,
+    });
+  }
+}

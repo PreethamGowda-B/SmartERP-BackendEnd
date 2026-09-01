@@ -1,0 +1,888 @@
+import { describe, it, expect } from "@jest/globals";
+import { UIMessage } from "ai";
+import {
+  limitImageParts,
+  selectModel,
+  getMaxStepsForUser,
+  fixIncompleteMessageParts,
+} from "../chat-processor";
+
+function makeFilePart(id: string, mediaType = "image/png") {
+  return { type: "file", fileId: id, mediaType, name: `${id}.png`, size: 100 };
+}
+
+function makeMessage(
+  id: string,
+  role: "user" | "assistant",
+  parts: any[],
+): UIMessage {
+  return { id, role, parts } as UIMessage;
+}
+
+describe("limitImageParts", () => {
+  it("should return messages unchanged when under the limit", () => {
+    const messages = [
+      makeMessage("m1", "user", [
+        { type: "text", text: "hello" },
+        makeFilePart("f1"),
+      ]),
+    ];
+    const result = limitImageParts(messages);
+    expect(result).toBe(messages); // same reference, no changes
+  });
+
+  it("should return messages unchanged when exactly at the ask limit (10 images)", () => {
+    const parts = Array.from({ length: 10 }, (_, i) => makeFilePart(`f${i}`));
+    const messages = [makeMessage("m1", "user", parts)];
+    const result = limitImageParts(messages, "ask");
+    expect(result).toBe(messages);
+  });
+
+  it("should remove oldest images when over the ask limit", () => {
+    const parts = Array.from({ length: 15 }, (_, i) => makeFilePart(`f${i}`));
+    const messages = [makeMessage("m1", "user", parts)];
+    const result = limitImageParts(messages, "ask");
+
+    const remainingFiles = result[0].parts.filter(
+      (p: any) => p.type === "file",
+    );
+    expect(remainingFiles).toHaveLength(10);
+    // Should keep f5..f14 (the 10 most recent), removing f0..f4
+    expect((remainingFiles[0] as any).fileId).toBe("f5");
+    expect((remainingFiles[9] as any).fileId).toBe("f14");
+  });
+
+  it("should remove oldest images across multiple messages in ask mode", () => {
+    // 3 messages with 5 images each = 15 total, should keep last 10
+    const messages = Array.from({ length: 3 }, (_, msgIdx) => {
+      const parts = Array.from({ length: 5 }, (_, fileIdx) =>
+        makeFilePart(`f${msgIdx * 5 + fileIdx}`),
+      );
+      return makeMessage(`m${msgIdx}`, "user", parts);
+    });
+
+    const result = limitImageParts(messages, "ask");
+
+    const allFiles = result.flatMap((msg) =>
+      msg.parts.filter((p: any) => p.type === "file"),
+    );
+    expect(allFiles).toHaveLength(10);
+    // Oldest 5 images (f0..f4) from first message should be removed
+    expect((allFiles[0] as any).fileId).toBe("f5");
+    expect((allFiles[9] as any).fileId).toBe("f14");
+  });
+
+  it("should preserve non-file parts when removing images", () => {
+    const parts: any[] = [
+      { type: "text", text: "check these images" },
+      ...Array.from({ length: 12 }, (_, i) => makeFilePart(`f${i}`)),
+    ];
+    const messages = [makeMessage("m1", "user", parts)];
+    const result = limitImageParts(messages, "ask");
+
+    const textParts = result[0].parts.filter((p: any) => p.type === "text");
+    const fileParts = result[0].parts.filter((p: any) => p.type === "file");
+
+    expect(textParts).toHaveLength(1);
+    expect((textParts[0] as any).text).toBe("check these images");
+    expect(fileParts).toHaveLength(10);
+  });
+
+  it("should handle messages with no parts", () => {
+    const messages = [
+      { id: "m1", role: "user" } as UIMessage,
+      makeMessage("m2", "user", [makeFilePart("f1")]),
+    ];
+    const result = limitImageParts(messages);
+    expect(result).toBe(messages); // under limit, no changes
+  });
+
+  it("should only limit images, leaving PDFs and other file types untouched", () => {
+    const parts = Array.from({ length: 25 }, (_, i) =>
+      makeFilePart(`f${i}`, i % 2 === 0 ? "image/png" : "application/pdf"),
+    );
+    const messages = [makeMessage("m1", "user", parts)];
+    const result = limitImageParts(messages, "ask");
+
+    const remainingFiles = result[0].parts.filter(
+      (p: any) => p.type === "file",
+    );
+    const images = remainingFiles.filter(
+      (p: any) => p.mediaType === "image/png",
+    );
+    const pdfs = remainingFiles.filter(
+      (p: any) => p.mediaType === "application/pdf",
+    );
+
+    // All 12 PDFs should remain (odd indices: 1,3,5,...,23 = 12 PDFs)
+    expect(pdfs).toHaveLength(12);
+    // Only 10 most recent images should remain (even indices: 0,2,4,...,24 = 13 images, keep last 10)
+    expect(images).toHaveLength(10);
+  });
+
+  it("should not remove any files when all are non-image types", () => {
+    const parts = Array.from({ length: 20 }, (_, i) =>
+      makeFilePart(`f${i}`, "application/pdf"),
+    );
+    const messages = [makeMessage("m1", "user", parts)];
+    const result = limitImageParts(messages);
+    expect(result).toBe(messages); // no images, nothing to limit
+  });
+
+  it("should allow 20 images in agent mode", () => {
+    const parts = Array.from({ length: 20 }, (_, i) => makeFilePart(`f${i}`));
+    const messages = [makeMessage("m1", "user", parts)];
+    const result = limitImageParts(messages, "agent");
+    expect(result).toBe(messages);
+  });
+
+  it("should remove oldest images only after the agent limit", () => {
+    const parts = Array.from({ length: 25 }, (_, i) => makeFilePart(`f${i}`));
+    const messages = [makeMessage("m1", "user", parts)];
+    const result = limitImageParts(messages, "agent");
+
+    const remainingFiles = result[0].parts.filter(
+      (p: any) => p.type === "file",
+    );
+    expect(remainingFiles).toHaveLength(20);
+    expect((remainingFiles[0] as any).fileId).toBe("f5");
+    expect((remainingFiles[19] as any).fileId).toBe("f24");
+  });
+});
+
+// ==========================================================================
+// selectModel - Model selection logic
+// ==========================================================================
+describe("selectModel", () => {
+  it.each([
+    ["ask", "pro-plus"],
+    ["agent", "pro-plus"],
+    ["ask", "ultra"],
+    ["agent", "ultra"],
+  ] as const)(
+    "routes %s %s Auto text to DeepSeek V4 Pro",
+    (mode, subscription) => {
+      expect(selectModel(mode, subscription, "auto", false, false)).toBe(
+        "model-deepseek-v4-pro-0813",
+      );
+    },
+  );
+
+  it.each(["pro-plus", "ultra"] as const)(
+    "routes %s Auto PDFs to DeepSeek V4 Pro",
+    (subscription) => {
+      expect(selectModel("agent", subscription, "auto", false, true)).toBe(
+        "model-deepseek-v4-pro-0813",
+      );
+    },
+  );
+
+  it.each(["pro", "team"] as const)(
+    "keeps %s Auto routing on DeepSeek V4 Flash",
+    (subscription) => {
+      expect(selectModel("agent", subscription, "auto", false, false)).toBe(
+        "model-deepseek-v4-flash-0731",
+      );
+    },
+  );
+
+  it("keeps explicit models and image routes unchanged", () => {
+    const auxiliaryVision = { auxiliaryVisionEnabled: true };
+
+    expect(
+      selectModel(
+        "agent",
+        "pro-plus",
+        "hackerai-standard",
+        false,
+        false,
+        auxiliaryVision,
+      ),
+    ).toBe("model-deepseek-v4-flash-0731");
+    expect(
+      selectModel(
+        "agent",
+        "pro-plus",
+        "hackerai-pro",
+        false,
+        false,
+        auxiliaryVision,
+      ),
+    ).toBe("model-deepseek-v4-pro-0813");
+    expect(
+      selectModel("agent", "ultra", "auto", true, false, auxiliaryVision),
+    ).toBe("model-deepseek-v4-pro-0813");
+  });
+
+  it("routes HackerAI Pro through DeepSeek V4 Pro 0813", () => {
+    expect(selectModel("agent", "pro", "hackerai-pro")).toBe(
+      "model-deepseek-v4-pro-0813",
+    );
+  });
+
+  it.each([
+    ["ask", "hackerai-standard", "model-deepseek-v4-flash-0731"],
+    ["agent", "hackerai-standard", "model-deepseek-v4-flash-0731"],
+    ["ask", "hackerai-pro", "model-deepseek-v4-pro-0813"],
+    ["agent", "hackerai-pro", "model-deepseek-v4-pro-0813"],
+  ] as const)(
+    "keeps %s %s on DeepSeek for images when auxiliary vision is enabled",
+    (mode, selectedModel, expected) => {
+      expect(
+        selectModel(mode, "pro", selectedModel, true, false, {
+          auxiliaryVisionEnabled: true,
+        }),
+      ).toBe(expected);
+    },
+  );
+
+  it("keeps paid Auto image prompts on DeepSeek with auxiliary vision", () => {
+    expect(
+      selectModel("ask", "pro", undefined, true, false, {
+        auxiliaryVisionEnabled: true,
+      }),
+    ).toBe("model-deepseek-v4-flash-0731");
+  });
+
+  it.each(["ask", "agent"] as const)(
+    "routes Standard %s image prompts directly to GLM 5.3 Flash",
+    (mode) => {
+      expect(
+        selectModel(mode, "pro", "hackerai-standard", true, false, {
+          directGlmVisionEnabled: true,
+        }),
+      ).toBe("model-glm-5.3-flash");
+    },
+  );
+
+  it.each(["ask", "agent"] as const)(
+    "routes Pro %s image prompts directly to GLM 5.3 Flash Pro",
+    (mode) => {
+      expect(
+        selectModel(mode, "pro", "hackerai-pro", true, false, {
+          directGlmVisionEnabled: true,
+        }),
+      ).toBe("model-glm-5.3-flash-pro");
+    },
+  );
+
+  it("uses the Pro GLM vision route for Pro Plus Auto images", () => {
+    expect(
+      selectModel("agent", "pro-plus", "auto", true, false, {
+        directGlmVisionEnabled: true,
+      }),
+    ).toBe("model-glm-5.3-flash-pro");
+  });
+
+  it.each(["pro", "pro-plus", "ultra", "team"] as const)(
+    "routes paid %s explicit Standard text to DeepSeek V4 Flash 0731 in both modes",
+    (subscription) => {
+      for (const mode of ["ask", "agent"] as const) {
+        expect(selectModel(mode, subscription, "hackerai-standard")).toBe(
+          "model-deepseek-v4-flash-0731",
+        );
+      }
+    },
+  );
+
+  it.each(["pro", "team"] as const)(
+    "routes paid %s Auto text to DeepSeek V4 Flash 0731 in both modes",
+    (subscription) => {
+      for (const mode of ["ask", "agent"] as const) {
+        expect(selectModel(mode, subscription, "auto")).toBe(
+          "model-deepseek-v4-flash-0731",
+        );
+      }
+    },
+  );
+
+  // Default model selection by mode
+  describe("default models (no override)", () => {
+    it.each(["pro", "team"] as const)(
+      "should return DeepSeek V4 Flash 0731 for paid agent text on %s",
+      (subscription) => {
+        expect(selectModel("agent", subscription)).toBe(
+          "model-deepseek-v4-flash-0731",
+        );
+      },
+    );
+
+    it.each(["pro-plus", "ultra"] as const)(
+      "should return DeepSeek V4 Pro 0813 for paid agent text on %s",
+      (subscription) => {
+        expect(selectModel("agent", subscription)).toBe(
+          "model-deepseek-v4-pro-0813",
+        );
+      },
+    );
+
+    it("should return Grok 4.5 medium for paid Agent Auto with an image", () => {
+      expect(selectModel("agent", "pro", undefined, true, false)).toBe(
+        "model-grok-4.5",
+      );
+    });
+
+    it("should keep paid agent on DeepSeek V4 Flash 0731 when a PDF is attached", () => {
+      expect(selectModel("agent", "pro", undefined, false, true)).toBe(
+        "model-deepseek-v4-flash-0731",
+      );
+    });
+
+    it("should return DeepSeek V4 Flash 0731 for paid ask with no image/PDF", () => {
+      expect(selectModel("ask", "pro")).toBe("model-deepseek-v4-flash-0731");
+    });
+
+    it("should return Grok 4.5 medium for paid Ask Auto with an image", () => {
+      expect(selectModel("ask", "pro", undefined, true, false)).toBe(
+        "model-grok-4.5",
+      );
+    });
+
+    it("should keep paid ask on DeepSeek V4 Flash 0731 when a PDF is attached", () => {
+      expect(selectModel("ask", "pro", undefined, false, true)).toBe(
+        "model-deepseek-v4-flash-0731",
+      );
+    });
+
+    it("should use Grok 4.5 medium when paid Ask Auto has both image and PDF attachments", () => {
+      expect(selectModel("ask", "pro", undefined, true, true)).toBe(
+        "model-grok-4.5",
+      );
+    });
+
+    it("should return ask-model-free for ask mode (free)", () => {
+      expect(selectModel("ask", "free")).toBe("ask-model-free");
+    });
+
+    it("should return DeepSeek V4 Pro 0813 for ultra subscription with no image/PDF", () => {
+      expect(selectModel("ask", "ultra")).toBe("model-deepseek-v4-pro-0813");
+    });
+
+    it("should return DeepSeek V4 Flash 0731 for team subscription with no image/PDF", () => {
+      expect(selectModel("ask", "team")).toBe("model-deepseek-v4-flash-0731");
+    });
+  });
+
+  // Tier override — Standard is content-aware in ask mode; Max maps to Opus in both modes
+  describe("tier override for ask mode (paid users)", () => {
+    it("should map HackerAI Pro to DeepSeek V4 Pro 0813 for text-only ask mode", () => {
+      expect(selectModel("ask", "ultra", "hackerai-pro")).toBe(
+        "model-deepseek-v4-pro-0813",
+      );
+    });
+
+    it("should map HackerAI Pro to DeepSeek V4 Pro 0813 for team users", () => {
+      expect(selectModel("ask", "team", "hackerai-pro")).toBe(
+        "model-deepseek-v4-pro-0813",
+      );
+    });
+
+    it("should route HackerAI Pro vision to Grok 4.5 high", () => {
+      expect(selectModel("ask", "pro", "hackerai-pro", true, false)).toBe(
+        "model-grok-4.5-pro",
+      );
+    });
+
+    it("should keep HackerAI Pro on DeepSeek V4 Pro 0813 when a PDF is attached", () => {
+      expect(selectModel("ask", "pro", "hackerai-pro", false, true)).toBe(
+        "model-deepseek-v4-pro-0813",
+      );
+    });
+
+    it("should map HackerAI Standard to DeepSeek V4 Flash 0731 when no image/PDF", () => {
+      expect(selectModel("ask", "pro", "hackerai-standard")).toBe(
+        "model-deepseek-v4-flash-0731",
+      );
+    });
+
+    it("should promote HackerAI Standard vision to Grok 4.5 medium", () => {
+      expect(selectModel("ask", "pro", "hackerai-standard", true, false)).toBe(
+        "model-grok-4.5",
+      );
+    });
+
+    it("should keep HackerAI Standard on DeepSeek V4 Flash 0731 when a PDF is attached", () => {
+      expect(selectModel("ask", "pro", "hackerai-standard", false, true)).toBe(
+        "model-deepseek-v4-flash-0731",
+      );
+    });
+
+    it("should prefer Grok 4.5 medium for HackerAI Standard when image and PDF are both attached", () => {
+      expect(selectModel("ask", "pro", "hackerai-standard", true, true)).toBe(
+        "model-grok-4.5",
+      );
+    });
+
+    it("should map HackerAI Max to Grok 4.6 for Ultra", () => {
+      expect(selectModel("ask", "ultra", "hackerai-max")).toBe(
+        "model-grok-4.6",
+      );
+    });
+
+    it("should downgrade HackerAI Max to Pro outside Ultra", () => {
+      expect(selectModel("ask", "pro", "hackerai-max")).toBe(
+        "model-deepseek-v4-pro-0813",
+      );
+      expect(selectModel("ask", "pro-plus", "hackerai-max")).toBe(
+        "model-deepseek-v4-pro-0813",
+      );
+      expect(selectModel("ask", "team", "hackerai-max")).toBe(
+        "model-deepseek-v4-pro-0813",
+      );
+    });
+
+    it("should map HackerAI Max to Grok 4.6 for paid users with extra usage", () => {
+      expect(
+        selectModel("ask", "pro", "hackerai-max", false, false, {
+          extraUsageAvailable: true,
+        }),
+      ).toBe("model-grok-4.6");
+    });
+  });
+
+  // Agent mode — Auto/Standard use DeepSeek for text/PDF and media-capable routes for images.
+  describe("tier override in agent mode", () => {
+    it("should map HackerAI Standard to DeepSeek V4 Flash 0731 for text-only agent mode", () => {
+      expect(selectModel("agent", "pro", "hackerai-standard")).toBe(
+        "model-deepseek-v4-flash-0731",
+      );
+    });
+
+    it("should route HackerAI Standard vision to Grok 4.5 medium", () => {
+      expect(
+        selectModel("agent", "pro", "hackerai-standard", true, false),
+      ).toBe("model-grok-4.5");
+    });
+
+    it("should keep HackerAI Standard on DeepSeek V4 Flash 0731 when a PDF is attached", () => {
+      expect(
+        selectModel("agent", "pro", "hackerai-standard", false, true),
+      ).toBe("model-deepseek-v4-flash-0731");
+    });
+
+    it("should map HackerAI Pro to DeepSeek V4 Pro 0813 in text-only agent mode", () => {
+      expect(selectModel("agent", "pro", "hackerai-pro")).toBe(
+        "model-deepseek-v4-pro-0813",
+      );
+    });
+
+    it("should route HackerAI Pro vision to Grok 4.5 high in agent mode", () => {
+      expect(selectModel("agent", "pro", "hackerai-pro", true, false)).toBe(
+        "model-grok-4.5-pro",
+      );
+    });
+
+    it("should keep HackerAI Pro on DeepSeek V4 Pro 0813 when a PDF is attached", () => {
+      expect(selectModel("agent", "pro", "hackerai-pro", false, true)).toBe(
+        "model-deepseek-v4-pro-0813",
+      );
+    });
+
+    it("should map HackerAI Max to Grok 4.6 in agent mode for Ultra", () => {
+      expect(selectModel("agent", "ultra", "hackerai-max")).toBe(
+        "model-grok-4.6",
+      );
+    });
+
+    it("should downgrade HackerAI Max to Pro in agent mode outside Ultra", () => {
+      expect(selectModel("agent", "pro", "hackerai-max")).toBe(
+        "model-deepseek-v4-pro-0813",
+      );
+      expect(selectModel("agent", "pro-plus", "hackerai-max")).toBe(
+        "model-deepseek-v4-pro-0813",
+      );
+      expect(selectModel("agent", "team", "hackerai-max")).toBe(
+        "model-deepseek-v4-pro-0813",
+      );
+    });
+
+    it("should map HackerAI Max to Grok 4.6 in agent mode for paid users with extra usage", () => {
+      expect(
+        selectModel("agent", "pro-plus", "hackerai-max", false, false, {
+          extraUsageAvailable: true,
+        }),
+      ).toBe("model-grok-4.6");
+    });
+
+    it("should default to DeepSeek V4 Flash 0731 when no model is selected", () => {
+      expect(selectModel("agent", "pro")).toBe("model-deepseek-v4-flash-0731");
+      expect(selectModel("agent", "pro", "auto")).toBe(
+        "model-deepseek-v4-flash-0731",
+      );
+    });
+  });
+
+  // Free user guard
+  describe("free user guard", () => {
+    it("should ignore tier override for free users in agent mode", () => {
+      expect(selectModel("agent", "free", "hackerai-pro")).toBe(
+        "agent-model-free",
+      );
+    });
+
+    it("should ignore tier override for free users in ask mode", () => {
+      expect(selectModel("ask", "free", "hackerai-pro")).toBe("ask-model-free");
+    });
+
+    it("should keep free ask Standard on the free GLM Flash route", () => {
+      expect(selectModel("ask", "free", "hackerai-standard")).toBe(
+        "ask-model-free",
+      );
+    });
+  });
+
+  // "auto" override
+  describe("auto override", () => {
+    it("should route paid agent Auto text to DeepSeek V4 Flash 0731", () => {
+      expect(selectModel("agent", "pro", "auto")).toBe(
+        "model-deepseek-v4-flash-0731",
+      );
+    });
+
+    it("should route paid Agent Auto images to Grok and PDFs to DeepSeek", () => {
+      expect(selectModel("agent", "pro", "auto", true, false)).toBe(
+        "model-grok-4.5",
+      );
+      expect(selectModel("agent", "pro", "auto", false, true)).toBe(
+        "model-deepseek-v4-flash-0731",
+      );
+    });
+
+    it("should treat 'auto' as no override in paid ask mode (text-only → DeepSeek Flash)", () => {
+      expect(selectModel("ask", "pro", "auto")).toBe(
+        "model-deepseek-v4-flash-0731",
+      );
+    });
+
+    it("should treat 'auto' as no override in ask mode with image -> Grok", () => {
+      expect(selectModel("ask", "pro", "auto", true, false)).toBe(
+        "model-grok-4.5",
+      );
+    });
+
+    it("should treat 'auto' as no override in ask mode with PDF -> DeepSeek", () => {
+      expect(selectModel("ask", "pro", "auto", false, true)).toBe(
+        "model-deepseek-v4-flash-0731",
+      );
+    });
+  });
+
+  // Undefined override
+  describe("undefined override", () => {
+    it("should use default when override is undefined", () => {
+      expect(selectModel("agent", "pro", undefined)).toBe(
+        "model-deepseek-v4-flash-0731",
+      );
+      expect(selectModel("ask", "pro", undefined)).toBe(
+        "model-deepseek-v4-flash-0731",
+      );
+      expect(selectModel("ask", "pro", undefined, true, false)).toBe(
+        "model-grok-4.5",
+      );
+      expect(selectModel("ask", "pro", undefined, false, true)).toBe(
+        "model-deepseek-v4-flash-0731",
+      );
+    });
+  });
+});
+
+// ==========================================================================
+// getMaxStepsForUser - Step limits by mode
+// ==========================================================================
+describe("getMaxStepsForUser", () => {
+  it("should return 500 steps for agent mode", () => {
+    expect(getMaxStepsForUser("agent")).toBe(500);
+  });
+
+  it("should return 15 steps for ask mode", () => {
+    expect(getMaxStepsForUser("ask")).toBe(15);
+  });
+});
+
+// ==========================================================================
+// fixIncompleteMessageParts - Fixing incomplete tool invocations on abort
+// ==========================================================================
+describe("fixIncompleteMessageParts", () => {
+  it("should not modify already-complete tool parts", () => {
+    const parts = [
+      { type: "step-start" },
+      {
+        type: "tool-create_note",
+        toolCallId: "call_1",
+        state: "output-available",
+        input: { title: "Test" },
+        output: { message: "Created" },
+      },
+    ];
+    const result = fixIncompleteMessageParts(parts);
+    expect(result).toEqual(parts);
+  });
+
+  it("should mark incomplete renderable tool with input as aborted", () => {
+    const parts = [
+      { type: "step-start" },
+      {
+        type: "tool-create_note",
+        toolCallId: "call_1",
+        state: "input-available",
+        input: { title: "Test", content: "Content" },
+      },
+    ];
+    const result = fixIncompleteMessageParts(parts);
+    expect(result).toHaveLength(2);
+    expect(result[0].type).toBe("step-start");
+    expect(result[1]).toMatchObject({
+      type: "tool-create_note",
+      toolCallId: "call_1",
+      state: "output-error",
+      input: { title: "Test", content: "Content" },
+      errorText: "Stopped by user before the tool completed.",
+    });
+  });
+
+  it("should identify output-limited tools without blaming the user", () => {
+    const parts = [
+      { type: "step-start" },
+      {
+        type: "tool-file",
+        toolCallId: "call_1",
+        state: "input-streaming",
+        input: { action: "write", path: "/tmp/result.py" },
+      },
+    ];
+
+    const result = fixIncompleteMessageParts(parts, {
+      logContext: { finishReason: "length" },
+    });
+
+    expect(result[1]).toMatchObject({
+      type: "tool-file",
+      state: "output-error",
+      errorText:
+        "The response reached its output limit before the tool completed.",
+    });
+  });
+
+  it("should remove tool parts with input-streaming and no input", () => {
+    const parts = [
+      { type: "step-start" },
+      {
+        type: "tool-create_note",
+        toolCallId: "call_1",
+        state: "input-streaming",
+      },
+    ];
+    const result = fixIncompleteMessageParts(parts);
+    expect(result).toHaveLength(0);
+  });
+
+  it("should remove tool parts with undefined input", () => {
+    const parts = [
+      { type: "text", text: "Let me help" },
+      { type: "step-start" },
+      {
+        type: "tool-file",
+        toolCallId: "call_2",
+        state: "input-streaming",
+        input: undefined,
+      },
+    ];
+    const result = fixIncompleteMessageParts(parts);
+    // Text should remain, step-start and tool should be removed
+    expect(result).toHaveLength(1);
+    expect(result[0].type).toBe("text");
+  });
+
+  it("should mark incomplete tool with partial meaningful input as aborted", () => {
+    const parts = [
+      { type: "step-start" },
+      {
+        type: "tool-create_note",
+        toolCallId: "call_1",
+        state: "input-streaming",
+        input: { title: "Partial" },
+      },
+    ];
+    const result = fixIncompleteMessageParts(parts);
+    expect(result).toHaveLength(2);
+    expect(result[1]).toMatchObject({
+      type: "tool-create_note",
+      state: "output-error",
+      input: { title: "Partial" },
+      errorText: "Stopped by user before the tool completed.",
+    });
+  });
+
+  it("should mark incomplete file writes with streamed path metadata as aborted", () => {
+    const parts = [
+      { type: "step-start" },
+      {
+        input: {
+          action: "write",
+          brief: "Test with cloudscraper to handle Cloudflare challenge",
+          path: "/home/user/telenet_cloudscraper.py",
+        },
+        state: "input-streaming",
+        toolCallId: "toolu_vrtx_01CY5UvLdoBKwymCRD5TB8r3",
+        type: "tool-file",
+      },
+    ];
+
+    const result = fixIncompleteMessageParts(parts);
+
+    expect(result).toHaveLength(2);
+    expect(result[1]).toMatchObject({
+      type: "tool-file",
+      state: "output-error",
+      toolCallId: "toolu_vrtx_01CY5UvLdoBKwymCRD5TB8r3",
+      input: {
+        action: "write",
+        brief: "Test with cloudscraper to handle Cloudflare challenge",
+        path: "/home/user/telenet_cloudscraper.py",
+      },
+      errorText: "Stopped by user before the tool completed.",
+    });
+  });
+
+  it("should handle mixed complete and incomplete parts", () => {
+    const parts = [
+      { type: "step-start" },
+      { type: "text", text: "I'll create a note" },
+      {
+        type: "tool-create_note",
+        toolCallId: "call_1",
+        state: "output-available",
+        input: { title: "Done" },
+        output: { message: "Created" },
+      },
+      { type: "step-start" },
+      {
+        type: "tool-file",
+        toolCallId: "call_2",
+        state: "input-streaming",
+        // No input - interrupted
+      },
+    ];
+    const result = fixIncompleteMessageParts(parts);
+    // Should keep first step-start, text, and completed tool; remove second step-start and incomplete tool
+    expect(result).toHaveLength(3);
+    expect(result[0].type).toBe("step-start");
+    expect(result[1].type).toBe("text");
+    expect(result[2].type).toBe("tool-create_note");
+    expect(result[2].state).toBe("output-available");
+  });
+
+  it("should preserve existing output on incomplete tool with input", () => {
+    const parts = [
+      {
+        type: "tool-create_note",
+        toolCallId: "call_1",
+        state: "input-available",
+        input: { title: "Test" },
+        output: { message: "Partial result" },
+      },
+    ];
+    const result = fixIncompleteMessageParts(parts);
+    expect(result[0].state).toBe("output-available");
+    expect(result[0].output).toEqual({ message: "Partial result" });
+  });
+
+  it("should preserve error tool parts", () => {
+    const parts = [
+      {
+        type: "tool-create_note",
+        toolCallId: "call_1",
+        state: "output-error",
+        errorText: "Something went wrong",
+      },
+    ];
+    const result = fixIncompleteMessageParts(parts);
+    expect(result).toHaveLength(1);
+    expect(result[0].errorText).toBe("Something went wrong");
+  });
+
+  // Trailing incomplete step trimming ("must include at least one parts field" fix)
+  it("should trim trailing step with only reasoning (no text/tool content)", () => {
+    const parts = [
+      { type: "step-start" },
+      { type: "reasoning", state: "done", text: "Thinking about step 1..." },
+      {
+        type: "tool-create_note",
+        toolCallId: "call_1",
+        state: "output-available",
+        input: { title: "Note" },
+        output: { message: "Created" },
+      },
+      { type: "step-start" },
+      {
+        type: "reasoning",
+        state: "done",
+        text: "Thinking about step 2 but interrupted...",
+      },
+    ];
+    const result = fixIncompleteMessageParts(parts);
+    // Should keep first step with content, remove trailing step-start + reasoning
+    expect(result).toHaveLength(3);
+    expect(result[0].type).toBe("step-start");
+    expect(result[1].type).toBe("reasoning");
+    expect(result[2].type).toBe("tool-create_note");
+  });
+
+  it("should not trim trailing step that has text content", () => {
+    const parts = [
+      { type: "step-start" },
+      {
+        type: "tool-create_note",
+        toolCallId: "call_1",
+        state: "output-available",
+        input: { title: "Note" },
+        output: { message: "Created" },
+      },
+      { type: "step-start" },
+      { type: "reasoning", state: "done", text: "Let me explain..." },
+      { type: "text", text: "Here is the result." },
+    ];
+    const result = fixIncompleteMessageParts(parts);
+    expect(result).toHaveLength(5);
+  });
+
+  it("should not trim trailing step that has tool content", () => {
+    const parts = [
+      { type: "step-start" },
+      { type: "reasoning", state: "done", text: "Thinking..." },
+      {
+        type: "tool-file",
+        toolCallId: "call_1",
+        state: "output-available",
+        input: { action: "read" },
+        output: { content: "file data" },
+      },
+    ];
+    const result = fixIncompleteMessageParts(parts);
+    expect(result).toHaveLength(3);
+  });
+
+  it("should trim single step with only reasoning to empty array", () => {
+    const parts = [
+      { type: "step-start" },
+      { type: "reasoning", state: "done", text: "Just thinking..." },
+    ];
+    const result = fixIncompleteMessageParts(parts);
+    expect(result).toHaveLength(0);
+  });
+
+  it("should trim trailing step with multiple reasoning parts but no content", () => {
+    const parts = [
+      { type: "step-start" },
+      { type: "text", text: "I found the issue." },
+      { type: "step-start" },
+      { type: "reasoning", state: "done", text: "First thought..." },
+      { type: "reasoning", state: "done", text: "Second thought..." },
+    ];
+    const result = fixIncompleteMessageParts(parts);
+    // Should keep first step, remove trailing step-start + both reasoning parts
+    expect(result).toHaveLength(2);
+    expect(result[0].type).toBe("step-start");
+    expect(result[1].type).toBe("text");
+  });
+});

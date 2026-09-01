@@ -1,0 +1,121 @@
+import { useState } from "react";
+import { ChatMode } from "@/types/chat";
+import { useDataStreamState } from "@/app/components/DataStreamProvider";
+import { Button } from "@/components/ui/button";
+import { AGENT_RUN_SPEND_CAP_FINISH_REASON } from "@/lib/chat/agent-run-spend-cap";
+import {
+  BUDGET_EXHAUSTION_FINISH_REASON,
+  OUTPUT_LIMIT_FINISH_REASON,
+  POST_SUMMARIZATION_INCOMPLETE_FINISH_REASON,
+} from "@/lib/chat/stop-conditions";
+import type { SelectedModel } from "@/types/chat";
+
+interface FinishReasonNoticeProps {
+  finishReason?: string;
+  mode?: ChatMode;
+  agentRunSpendCapPremiumContinuationAllowed?: boolean;
+  onContinue?: (selectedModelOverride?: SelectedModel) => void;
+}
+
+export const FinishReasonNotice = ({
+  finishReason,
+  onContinue,
+}: FinishReasonNoticeProps) => {
+  const { isAutoResuming, isAutoContinuing } = useDataStreamState();
+  const [hasContinued, setHasContinued] = useState(false);
+
+  if (!finishReason) return null;
+
+  if (isAutoContinuing) {
+    return (
+      <div className="mt-2 w-full" role="status" aria-live="polite">
+        <div className="bg-muted text-muted-foreground rounded-lg px-3 py-2 border border-border">
+          Continuing automatically…
+        </div>
+      </div>
+    );
+  }
+
+  if (isAutoResuming) return null;
+  if (hasContinued) return null;
+
+  const getNoticeContent = () => {
+    if (finishReason === "tool-calls") {
+      return (
+        <>Reached the step limit for this turn. Completed work was saved.</>
+      );
+    }
+
+    if (finishReason === "timeout" || finishReason === "preemptive-timeout") {
+      return (
+        <>Reached the time limit for this turn. Completed work was saved.</>
+      );
+    }
+
+    if (finishReason === OUTPUT_LIMIT_FINISH_REASON) {
+      return (
+        <>
+          The response reached its output limit before finishing. Continue to
+          resume where it stopped; completed work was saved.
+        </>
+      );
+    }
+
+    if (finishReason === "context-limit") {
+      return (
+        <>
+          Reached the context limit for this conversation. Completed work was
+          saved.
+        </>
+      );
+    }
+
+    if (finishReason === POST_SUMMARIZATION_INCOMPLETE_FINISH_REASON) {
+      return (
+        <>Paused after compacting the conversation. Completed work was saved.</>
+      );
+    }
+
+    if (finishReason === AGENT_RUN_SPEND_CAP_FINISH_REASON) {
+      return <>Paused at a legacy Pro Agent per-run safety cap.</>;
+    }
+
+    if (finishReason === BUDGET_EXHAUSTION_FINISH_REASON) {
+      return <>You&apos;ve reached your usage limit, so this run stopped.</>;
+    }
+
+    return null;
+  };
+
+  const content = getNoticeContent();
+
+  if (!content) return null;
+
+  const showContinue =
+    onContinue &&
+    !hasContinued &&
+    finishReason !== BUDGET_EXHAUSTION_FINISH_REASON;
+  const continuationModel = undefined;
+  const continueButtonLabel = "Continue";
+
+  return (
+    <div className="mt-2 w-full">
+      <div className="bg-muted text-muted-foreground rounded-lg px-3 py-2 border border-border flex items-center justify-between gap-3 flex-wrap">
+        <span>{content}</span>
+        {showContinue && (
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            onClick={() => {
+              setHasContinued(true);
+              onContinue(continuationModel);
+            }}
+          >
+            {continueButtonLabel}
+          </Button>
+        )}
+      </div>
+    </div>
+  );
+};

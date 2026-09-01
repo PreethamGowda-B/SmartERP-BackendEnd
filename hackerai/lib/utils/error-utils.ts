@@ -1,0 +1,787 @@
+import { redactSensitiveErrorMessage } from "@/lib/utils/error-redaction";
+
+/**
+ * Extracts a readable error message from any error type.
+ */
+export const getErrorMessage = (err: unknown): string => {
+  if (err instanceof Error) {
+    return err.message;
+  }
+  if (typeof err === "string") {
+    return err;
+  }
+  if (err && typeof err === "object" && "message" in err) {
+    const msg = (err as { message: unknown }).message;
+    return typeof msg === "string" ? msg : JSON.stringify(msg);
+  }
+  try {
+    return JSON.stringify(err);
+  } catch {
+    return String(err);
+  }
+};
+
+const truncate = (str: string, max: number): string => {
+  return str.length > max ? str.slice(0, max) + "…" : str;
+};
+
+const OPENROUTER_DETAIL_MAX_LENGTH = 500;
+
+const parseJsonObject = (
+  value: string,
+): Record<string, unknown> | undefined => {
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null;
+
+const collectErrorSources = (
+  source: unknown,
+  seen = new WeakSet<object>(),
+  depth = 0,
+): unknown[] => {
+  if (!isRecord(source) || depth > 3 || seen.has(source)) return [source];
+  seen.add(source);
+
+  const sources: unknown[] = [source];
+  for (const key of ["error", "cause"] as const) {
+    const nested = source[key];
+    if (nested !== undefined) {
+      sources.push(...collectErrorSources(nested, seen, depth + 1));
+    }
+  }
+
+  const errors = source.errors;
+  if (Array.isArray(errors)) {
+    for (const nested of errors.slice(0, 5)) {
+      sources.push(...collectErrorSources(nested, seen, depth + 1));
+    }
+  }
+
+  return sources;
+};
+
+const OPENROUTER_REQUEST_SIZE_GUARD_HEADER =
+  "x-hackerai-openrouter-request-size-guard";
+const OPENROUTER_REQUEST_BYTES_BEFORE_HEADER =
+  "x-hackerai-openrouter-request-bytes-before";
+const OPENROUTER_REQUEST_BYTES_AFTER_HEADER =
+  "x-hackerai-openrouter-request-bytes-after";
+const OPENROUTER_REQUEST_LIMIT_BYTES_HEADER =
+  "x-hackerai-openrouter-request-limit-bytes";
+
+export type LocalOpenRouterRequestSizeGuardDetails = {
+  requestId?: string;
+  requestBytesBefore?: number;
+  requestBytesAfter?: number;
+  limitBytes?: number;
+};
+
+const getResponseHeader = (
+  source: Record<string, unknown>,
+  headerName: string,
+): string | undefined => {
+  if (!isRecord(source.responseHeaders)) return undefined;
+  const entry = Object.entries(source.responseHeaders).find(
+    ([name]) => name.toLowerCase() === headerName,
+  );
+  return typeof entry?.[1] === "string" ? entry[1] : undefined;
+};
+
+const parseNonNegativeInteger = (
+  value: string | undefined,
+): number | undefined => {
+  if (value === undefined || !/^\d+$/.test(value)) return undefined;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? parsed : undefined;
+};
+
+export const getLocalOpenRouterRequestSizeGuardDetails = (
+  error: unknown,
+): LocalOpenRouterRequestSizeGuardDetails | undefined => {
+  const guardSource = collectErrorSources(error).find(
+    (source) =>
+      isRecord(source) &&
+      getResponseHeader(source, OPENROUTER_REQUEST_SIZE_GUARD_HEADER) ===
+        "rejected",
+  );
+  if (!isRecord(guardSource)) return undefined;
+
+  return {
+    requestId: getResponseHeader(guardSource, "x-hackerai-request-id"),
+    requestBytesBefore: parseNonNegativeInteger(
+      getResponseHeader(guardSource, OPENROUTER_REQUEST_BYTES_BEFORE_HEADER),
+    ),
+    requestBytesAfter: parseNonNegativeInteger(
+      getResponseHeader(guardSource, OPENROUTER_REQUEST_BYTES_AFTER_HEADER),
+    ),
+    limitBytes: parseNonNegativeInteger(
+      getResponseHeader(guardSource, OPENROUTER_REQUEST_LIMIT_BYTES_HEADER),
+    ),
+  };
+};
+
+export const isLocalOpenRouterRequestSizeGuardError = (
+  error: unknown,
+): boolean => getLocalOpenRouterRequestSizeGuardDetails(error) !== undefined;
+
+const getOpenRouterPayload = (
+  source: unknown,
+): Record<string, unknown> | null => {
+  if (!isRecord(source)) return null;
+  const anySource = source;
+
+  if (anySource.data && typeof anySource.data === "object") {
+    return anySource.data as Record<string, unknown>;
+  }
+
+  if (
+    isRecord(anySource.error) &&
+    ("code" in anySource.error || "metadata" in anySource.error)
+  ) {
+    return anySource;
+  }
+
+  if (typeof anySource.responseBody === "string") {
+    return parseJsonObject(anySource.responseBody) ?? null;
+  }
+
+  return null;
+};
+
+const getOpenRouterProviderInfo = (
+  source: unknown,
+): Record<string, unknown> => {
+  const payloads = collectErrorSources(source)
+    .map(getOpenRouterPayload)
+    .filter((payload): payload is Record<string, unknown> => payload !== null);
+  if (payloads.length === 0) return {};
+
+  const details: Record<string, unknown> = {};
+  for (const payload of payloads) {
+    const id = pickBodyId(payload);
+    if (id && details.openrouterGenerationId === undefined) {
+      details.openrouterGenerationId = id;
+    }
+
+    const nested = isRecord(payload.error) ? payload.error : undefined;
+    if (!nested) continue;
+
+    if (
+      details.providerErrorCode === undefined &&
+      (typeof nested.code === "number" || typeof nested.code === "string")
+    ) {
+      details.providerErrorCode = nested.code;
+    }
+    if (
+      details.providerErrorMessage === undefined &&
+      typeof nested.message === "string" &&
+      nested.message.length > 0
+    ) {
+      details.providerErrorMessage = truncate(
+        redactSensitiveErrorMessage(nested.message),
+        OPENROUTER_DETAIL_MAX_LENGTH,
+      );
+    }
+
+    const metadata = isRecord(nested.metadata) ? nested.metadata : undefined;
+    if (!metadata) continue;
+
+    if (
+      details.providerName === undefined &&
+      typeof metadata.provider_name === "string"
+    ) {
+      details.providerName = metadata.provider_name;
+    }
+    if (
+      details.providerRawError === undefined &&
+      typeof metadata.raw === "string" &&
+      metadata.raw.length > 0
+    ) {
+      details.providerRawError = truncate(
+        redactSensitiveErrorMessage(metadata.raw),
+        OPENROUTER_DETAIL_MAX_LENGTH,
+      );
+    }
+  }
+
+  return details;
+};
+
+const PROVIDER_CONTEXT_OVERFLOW_PATTERNS = [
+  /context[_\s-]?length[_\s-]?exceeded/i,
+  /context window/i,
+  /context limit/i,
+  /maximum context/i,
+  /max(?:imum)? token/i,
+  /input(?: is)? too long/i,
+  /prompt(?: is)? too long/i,
+  /request(?: entity)? too large/i,
+  /payload too large/i,
+  /too many tokens/i,
+  /reduce (?:the )?(?:length|size)/i,
+  /exceeds? (?:the )?(?:model|provider).*(?:limit|maximum)/i,
+] as const;
+
+const PROVIDER_MEDIA_OVERFLOW_PATTERNS = [
+  /downloaded image content cannot exceed/i,
+  /image content cannot exceed/i,
+  /image(?: file)? too large/i,
+  /media(?: file)? too large/i,
+  /attachment(?: file)? too large/i,
+  /base64.*too large/i,
+] as const;
+
+const sourceToSearchableStrings = (source: unknown): string[] => {
+  if (typeof source === "string") return [source];
+  if (!isRecord(source)) return [];
+
+  const result: string[] = [];
+  for (const key of [
+    "name",
+    "message",
+    "code",
+    "statusText",
+    "responseBody",
+  ] as const) {
+    const value = source[key];
+    if (typeof value === "string") result.push(value);
+  }
+
+  const providerInfo = getOpenRouterProviderInfo(source);
+  for (const value of Object.values(providerInfo)) {
+    if (typeof value === "string") result.push(value);
+  }
+
+  return result;
+};
+
+export const classifyProviderOverflowError = (
+  error: unknown,
+): "context" | "media" | null => {
+  const searchable = collectErrorSources(error).flatMap(
+    sourceToSearchableStrings,
+  );
+  if (
+    searchable.some((text) =>
+      PROVIDER_MEDIA_OVERFLOW_PATTERNS.some((pattern) => pattern.test(text)),
+    )
+  ) {
+    return "media";
+  }
+  if (
+    searchable.some((text) =>
+      PROVIDER_CONTEXT_OVERFLOW_PATTERNS.some((pattern) => pattern.test(text)),
+    )
+  ) {
+    return "context";
+  }
+  return null;
+};
+
+export const isProviderContextOrMediaOverflowError = (
+  error: unknown,
+): boolean => classifyProviderOverflowError(error) !== null;
+
+/**
+ * Extracts structured error details for logging to PostHog or other services.
+ * Handles both standard Error objects and provider-specific error formats (AI SDK, etc.)
+ * Sensitive user data (prompts, messages) is removed from the output.
+ */
+export const extractErrorDetails = (
+  error: unknown,
+): Record<string, unknown> => {
+  const sources = collectErrorSources(error);
+  const err = sources.find((source) => source instanceof Error) as
+    Error | undefined;
+  const records = sources.filter(isRecord);
+  const primaryRecord = records[0];
+
+  const details: Record<string, unknown> = {
+    errorName:
+      err?.name ||
+      (typeof primaryRecord?.name === "string"
+        ? primaryRecord.name
+        : "UnknownError"),
+    errorMessage: redactSensitiveErrorMessage(getErrorMessage(error)),
+  };
+
+  // Add stack trace if available
+  if (err?.stack) {
+    details.errorStack = redactSensitiveErrorMessage(err.stack);
+  }
+
+  // Extract provider-specific error details (AI SDK format). Walk common
+  // wrapper fields so stream/UI wrappers do not hide APICallError diagnostics.
+  for (const source of records) {
+    if (details.statusCode === undefined && "statusCode" in source) {
+      details.statusCode = source.statusCode;
+    }
+    if (details.providerUrl === undefined && "url" in source) {
+      details.providerUrl =
+        typeof source.url === "string"
+          ? redactSensitiveErrorMessage(source.url)
+          : source.url;
+    }
+    if (details.responseBodyPresent === undefined && "responseBody" in source) {
+      // Provider response bodies can contain parsed attachments, file
+      // annotations, inline images, or user text under provider-specific keys.
+      // Keep only presence/size diagnostics; getOpenRouterProviderInfo below
+      // extracts the bounded status, provider, request ID, and reason fields.
+      details.responseBodyPresent = source.responseBody !== undefined;
+      if (typeof source.responseBody === "string") {
+        details.responseBodyLength = source.responseBody.length;
+      }
+    }
+    if (details.isRetryable === undefined && "isRetryable" in source) {
+      details.isRetryable = source.isRetryable;
+    }
+    if (details.providerDataPresent === undefined && "data" in source) {
+      // `data` is an opaque provider payload with the same privacy risks as a
+      // response body. Never copy it into telemetry.
+      details.providerDataPresent = source.data !== undefined;
+    }
+    if (details.cause === undefined && "cause" in source && source.cause) {
+      details.cause = redactSensitiveErrorMessage(
+        getErrorMessage(source.cause),
+      );
+    }
+    if (details.errorCode === undefined && "code" in source) {
+      details.errorCode = source.code;
+    }
+  }
+
+  Object.assign(details, getOpenRouterProviderInfo(error));
+
+  return details;
+};
+
+export type ProviderErrorCategory =
+  | "rate_limited"
+  | "content_blocked"
+  | "provider_5xx"
+  | "provider_4xx"
+  | "stream_terminated"
+  | "timeout"
+  | "unknown";
+
+const PROVIDER_STREAM_TERMINATION_PATTERN =
+  /terminated|aborted|abort|network connection lost|connection (?:reset|closed|lost)|socket hang up|unexpected eof/i;
+const PROVIDER_STREAM_DISCONNECT_PATTERN =
+  /terminated|network connection lost|connection (?:reset|closed|lost)|socket hang up|unexpected eof/i;
+
+const parseHttpStatus = (value: unknown): number | undefined => {
+  const code =
+    typeof value === "number"
+      ? value
+      : typeof value === "string"
+        ? Number(value)
+        : undefined;
+
+  return code != null && Number.isInteger(code) && code >= 400 && code <= 599
+    ? code
+    : undefined;
+};
+
+const getProviderMessageText = (details: Record<string, unknown>): string => {
+  return [
+    details.errorMessage,
+    details.providerErrorMessage,
+    details.providerRawError,
+    details.cause,
+    details.responseBody,
+  ]
+    .filter((value): value is string => typeof value === "string")
+    .join(" ");
+};
+
+const INVALID_IMAGE_INPUT_PATTERN =
+  /failed to download the provided image[\s\S]{0,500}(?:image host returned )?HTTP status (?:404|410)\b/i;
+
+export const isInvalidImageInputError = (error: unknown): boolean =>
+  INVALID_IMAGE_INPUT_PATTERN.test(
+    getProviderMessageText(extractErrorDetails(error)),
+  );
+
+const PROVIDER_CONTENT_BLOCK_PATTERN =
+  /\bPROHIBITED_CONTENT\b|\b(?:content[_ -]?(?:filter(?:ing)?|policy)|safety policy|moderation policy|safety system|moderation system)\b.{0,80}\b(?:block(?:ed)?|flag(?:ged)?|reject(?:ed)?|prohibit(?:ed)?|violate(?:s|d|ion)?|unsafe|harmful)\b|\b(?:block(?:ed)?|flag(?:ged)?|reject(?:ed)?|prohibit(?:ed)?|violate(?:s|d|ion)?|unsafe|harmful)\b.{0,80}\b(?:content[_ -]?(?:filter(?:ing)?|policy)|safety policy|moderation policy|safety system|moderation system)\b|\bblocked by (?:the )?(?:provider )?(?:safety|moderation)(?: system| filter)?\b|\b(?:unsafe|harmful) content\b/i;
+
+export const PROVIDER_CONTENT_BLOCKED_USER_MESSAGE =
+  "The model provider blocked this request because the conversation content was flagged by its safety system. Edit your last message or remove sensitive or raw tool output, then try again.";
+
+export const isProviderContentFilterFinishReason = (
+  finishReason: unknown,
+): finishReason is "content-filter" => finishReason === "content-filter";
+
+export const createProviderContentBlockedFinishReasonError = (): Error & {
+  statusCode: 403;
+  finishReason: "content-filter";
+} =>
+  Object.assign(
+    new Error(
+      "PROHIBITED_CONTENT: provider returned content-filter finish reason",
+    ),
+    {
+      name: "ProviderContentBlockedFinishReasonError",
+      statusCode: 403 as const,
+      finishReason: "content-filter" as const,
+    },
+  );
+
+export const isProviderContentBlockedFinishReasonError = (
+  error: unknown,
+): boolean =>
+  Boolean(
+    error &&
+    typeof error === "object" &&
+    ((error as { finishReason?: unknown }).finishReason === "content-filter" ||
+      (error as { name?: unknown }).name ===
+        "ProviderContentBlockedFinishReasonError"),
+  );
+
+export const isProviderContentBlockedDetails = (
+  details: Record<string, unknown>,
+): boolean => {
+  const message = getProviderMessageText(details);
+  return PROVIDER_CONTENT_BLOCK_PATTERN.test(message);
+};
+
+export const isProviderContentBlockedError = (error: unknown): boolean =>
+  isProviderContentBlockedDetails(extractErrorDetails(error));
+
+export const getProviderStatusCode = (
+  details: Record<string, unknown>,
+): number | undefined => {
+  const statusCode = parseHttpStatus(details.statusCode);
+  if (statusCode != null) return statusCode;
+
+  for (const key of ["providerErrorCode", "errorCode"] as const) {
+    const code = parseHttpStatus(details[key]);
+    if (code != null) return code;
+  }
+
+  return undefined;
+};
+
+export const getProviderErrorCategory = (
+  details: Record<string, unknown>,
+): ProviderErrorCategory => {
+  const statusCode =
+    parseHttpStatus(details.statusCode) ??
+    parseHttpStatus(details.providerErrorCode);
+  if (statusCode === 429) return "rate_limited";
+  if (isProviderContentBlockedDetails(details)) return "content_blocked";
+  if (statusCode != null && statusCode >= 500) return "provider_5xx";
+  if (statusCode != null && statusCode >= 400) return "provider_4xx";
+
+  const message = getProviderMessageText(details);
+  if (PROVIDER_STREAM_TERMINATION_PATTERN.test(message)) {
+    return "stream_terminated";
+  }
+  if (/timeout|timed out/i.test(message)) return "timeout";
+
+  const fallbackStatusCode = parseHttpStatus(details.errorCode);
+  if (fallbackStatusCode === 429) return "rate_limited";
+  if (fallbackStatusCode != null && fallbackStatusCode >= 500)
+    return "provider_5xx";
+  if (fallbackStatusCode != null && fallbackStatusCode >= 400)
+    return "provider_4xx";
+
+  return "unknown";
+};
+
+export const isProviderStreamTerminatedError = (error: unknown): boolean =>
+  getProviderErrorCategory(extractErrorDetails(error)) === "stream_terminated";
+
+/** Allow one replay-safe continuation for provider disconnects and transient failures. */
+export const isRetriableProviderStreamDisconnectError = (
+  error: unknown,
+): boolean => {
+  const details = extractErrorDetails(error);
+  const category = getProviderErrorCategory(details);
+  if (category === "timeout" || category === "provider_5xx") return true;
+  return (
+    category === "stream_terminated" &&
+    PROVIDER_STREAM_DISCONNECT_PATTERN.test(getProviderMessageText(details))
+  );
+};
+
+export interface ProviderAttempt {
+  status_code?: number;
+  message: string;
+  error_name?: string;
+  request_id?: string;
+  provider_name?: string;
+}
+
+const REQUEST_ID_HEADERS = [
+  // OpenRouter exposes its generation id as `X-Generation-Id` on every
+  // response where a generation was attempted (CORS-exposed). Prefer it
+  // over cf-ray so we get a queryable id even when the error body isn't
+  // parsed into `data` / `responseBody`.
+  "x-generation-id",
+  "request-id",
+  "x-request-id",
+  "cf-ray",
+  "x-amzn-requestid",
+];
+
+const pickBodyId = (body: unknown): string | undefined => {
+  if (!body || typeof body !== "object") return undefined;
+  const b = body as { id?: unknown; request_id?: unknown };
+  // Accept any non-empty string from `id` — OpenRouter uses `gen-…` today,
+  // but locking to that prefix would silently drop a `req-…` id and fall
+  // back to cf-ray, which is the opposite of what this function is for.
+  if (typeof b.id === "string" && b.id.length > 0) return b.id;
+  if (typeof b.request_id === "string" && b.request_id.length > 0)
+    return b.request_id;
+  return undefined;
+};
+
+const extractRequestId = (error: unknown): string | undefined => {
+  if (!isRecord(error)) return undefined;
+  const e = error as {
+    responseHeaders?: Record<string, unknown>;
+    data?: unknown;
+    responseBody?: unknown;
+  };
+
+  const fromData = pickBodyId(e.data);
+  if (fromData) return fromData;
+
+  if (typeof e.responseBody === "string") {
+    try {
+      const fromBody = pickBodyId(JSON.parse(e.responseBody));
+      if (fromBody) return fromBody;
+    } catch {
+      // responseBody isn't JSON; fall through to headers
+    }
+  }
+
+  const headers = e.responseHeaders;
+  if (!headers || typeof headers !== "object") return undefined;
+  const lower: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(headers)) {
+    lower[k.toLowerCase()] = v;
+  }
+  for (const key of REQUEST_ID_HEADERS) {
+    const value = lower[key];
+    if (typeof value === "string" && value.length > 0) return value;
+  }
+  return undefined;
+};
+
+const toAttempt = (error: unknown): ProviderAttempt => {
+  const anyError = isRecord(error) ? error : {};
+  const providerInfo = getOpenRouterProviderInfo(error);
+  const statusCode =
+    typeof anyError.statusCode === "number"
+      ? anyError.statusCode
+      : typeof anyError.status === "number"
+        ? anyError.status
+        : undefined;
+  const errorName =
+    error instanceof Error
+      ? error.name
+      : typeof anyError.name === "string"
+        ? (anyError.name as string)
+        : undefined;
+  return {
+    status_code: statusCode,
+    message: redactSensitiveErrorMessage(getErrorMessage(error)),
+    error_name: errorName,
+    request_id: extractRequestId(error),
+    provider_name:
+      typeof providerInfo.providerName === "string"
+        ? providerInfo.providerName
+        : undefined,
+  };
+};
+
+/**
+ * Decompose an AI SDK `RetryError` (or anything with an `errors[]` array of
+ * attempt errors) into per-attempt records. Returns undefined when the error
+ * does not carry attempt history, so callers can fall back to single-error
+ * logging.
+ */
+export const extractRetryAttempts = (
+  error: unknown,
+): ProviderAttempt[] | undefined => {
+  if (!error || typeof error !== "object") return undefined;
+  const errors = (error as { errors?: unknown }).errors;
+  if (!Array.isArray(errors) || errors.length === 0) return undefined;
+  return errors.map(toAttempt);
+};
+
+/**
+ * Converts a provider error into a user-friendly message.
+ *
+ * Extracts details from the AI SDK `APICallError` shape:
+ *   - `statusCode`          — HTTP status (e.g. 429)
+ *   - `data.error.message`  — OpenRouter's provider error message
+ *   - `data.error.metadata.provider_name` — e.g. "Google", "Anthropic"
+ *   - `data.error.metadata.raw` — raw detail from the underlying provider
+ *   - `responseBody`        — fallback when `data` isn't parsed
+ *
+ * Output format:
+ *   "<friendly explanation>\n\nDetails: <provider_name> returned <status>: <detail>"
+ */
+export const getUserFriendlyProviderError = (error: unknown): string => {
+  const statusCode = extractStatusCode(error);
+  const { providerName, detail } = extractProviderDetails(error);
+  const overflowKind = classifyProviderOverflowError(error);
+
+  if (isInvalidImageInputError(error)) {
+    return "An attached image is no longer available at its source URL. Reattach the image and try again.";
+  }
+
+  if (isProviderContentBlockedError(error)) {
+    return PROVIDER_CONTENT_BLOCKED_USER_MESSAGE;
+  }
+
+  if (overflowKind === "media") {
+    return "The model provider rejected this request because attached media or file payloads were too large. Remove or shrink the attachments, then try again.";
+  }
+
+  if (overflowKind === "context") {
+    return "The model provider rejected this request because the conversation exceeded its context limit. The conversation may need another compaction pass, or you can retry after removing large tool output or attachments.";
+  }
+
+  // Friendly summary based on status code
+  const summary = getStatusSummary(statusCode);
+
+  // Build "Details: …" line from whatever specifics we have
+  const detailParts: string[] = [];
+  if (providerName) detailParts.push(providerName);
+  if (statusCode) detailParts.push(`HTTP ${statusCode}`);
+  if (detail) detailParts.push(detail);
+
+  if (detailParts.length > 0) {
+    return `${summary}\n\nDetails: ${detailParts.join(" — ")}`;
+  }
+  return summary;
+};
+
+function getStatusSummary(statusCode: number | undefined): string {
+  switch (statusCode) {
+    case 429:
+      return "The model is temporarily rate limited. Please wait a moment and try again.";
+    case 403:
+      return "Access to this model was denied by the provider. Please try a different model.";
+    case 400:
+      return "The model could not process this request. Please try again or use a different model.";
+    case 408:
+    case 504:
+      return "The model took too long to respond. Please try again.";
+    case 500:
+    case 502:
+    case 503:
+      return "The model provider encountered a server error. Please try again or switch to a different model.";
+    default:
+      return "An error occurred while generating a response. Please try again.";
+  }
+}
+
+/**
+ * Pulls the most specific error detail from the AI SDK / OpenRouter error,
+ * preferring `metadata.raw` > `data.error.message` > `responseBody` snippet.
+ */
+function extractProviderDetails(error: unknown): {
+  providerName?: string;
+  detail?: string;
+} {
+  if (!error || typeof error !== "object") return {};
+
+  const anyError = error as Record<string, unknown>;
+  let providerName: string | undefined;
+  let detail: string | undefined;
+
+  // OpenRouter nested format: data.error { message, metadata { provider_name, raw } }
+  if (anyError.data && typeof anyError.data === "object") {
+    const data = anyError.data as Record<string, unknown>;
+    if (data.error && typeof data.error === "object") {
+      const nested = data.error as Record<string, unknown>;
+
+      if (nested.metadata && typeof nested.metadata === "object") {
+        const meta = nested.metadata as Record<string, unknown>;
+        if (typeof meta.provider_name === "string") {
+          providerName = meta.provider_name;
+        }
+        // metadata.raw has the most specific upstream error
+        if (typeof meta.raw === "string" && meta.raw.length > 0) {
+          detail = truncate(redactSensitiveErrorMessage(meta.raw), 300);
+        }
+      }
+
+      // Fall back to data.error.message
+      if (!detail && typeof nested.message === "string") {
+        detail = truncate(redactSensitiveErrorMessage(nested.message), 300);
+      }
+    }
+  }
+
+  // Last resort: try to extract a message from the raw responseBody string
+  if (!detail && typeof anyError.responseBody === "string") {
+    detail = extractMessageFromResponseBody(anyError.responseBody);
+  }
+
+  return { providerName, detail };
+}
+
+/** Extract HTTP status code from AI SDK error objects. */
+function extractStatusCode(error: unknown): number | undefined {
+  if (!error || typeof error !== "object") return undefined;
+
+  const anyError = error as Record<string, unknown>;
+
+  // Direct statusCode property (AI SDK APICallError)
+  if (typeof anyError.statusCode === "number") {
+    return anyError.statusCode;
+  }
+
+  // Nested in data.error.code (OpenRouter format)
+  if (
+    anyError.data &&
+    typeof anyError.data === "object" &&
+    "error" in anyError.data
+  ) {
+    const nested = (anyError.data as Record<string, unknown>).error as
+      Record<string, unknown> | undefined;
+    if (nested && typeof nested.code === "number") {
+      return nested.code;
+    }
+  }
+
+  // HTTP status property
+  if (typeof anyError.status === "number") {
+    return anyError.status;
+  }
+
+  return undefined;
+}
+
+/** Try to pull an error message from a JSON response body string. */
+function extractMessageFromResponseBody(body: string): string | undefined {
+  try {
+    const parsed = JSON.parse(body);
+    const msg = parsed?.error?.message ?? parsed?.message;
+    if (typeof msg === "string" && msg.length > 0) {
+      return truncate(redactSensitiveErrorMessage(msg), 300);
+    }
+  } catch {
+    // Not JSON — return a trimmed snippet if it's short enough to be useful
+    const trimmed = body.trim();
+    if (trimmed.length > 0 && trimmed.length <= 300) {
+      return redactSensitiveErrorMessage(trimmed);
+    }
+  }
+  return undefined;
+}

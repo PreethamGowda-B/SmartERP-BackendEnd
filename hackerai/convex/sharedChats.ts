@@ -1,0 +1,452 @@
+import { query, mutation } from "./_generated/server";
+import { v } from "convex/values";
+import { convexLogger } from "./lib/logger";
+import {
+  assertUserCanAccessChatHistory,
+  isUserBlockedFromChatHistory,
+} from "./lib/suspensionGuards";
+import { stripOpenRouterReasoningMetadataFromParts } from "../lib/chat/provider-metadata-sanitizer";
+import {
+  getVisibleSharedChatByShareId,
+  listVisibleSharedMessages,
+  serializeSharedChat,
+  sharedChatValidator,
+  sharedMessageValidator,
+  type VisibleSharedChat,
+} from "./lib/sharedChatSnapshot";
+
+/**
+ * Share a chat by creating a public share link.
+ * If the chat is already shared, returns the existing share_id.
+ *
+ * @param chatId - The ID of the chat to share
+ * @returns Share metadata (shareId and shareDate)
+ * @throws {Error} If chat not found or user not authorized
+ */
+export const shareChat = mutation({
+  args: { chatId: v.string() },
+  returns: v.object({
+    shareId: v.string(),
+    shareDate: v.number(),
+  }),
+  handler: async (ctx, args) => {
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity) {
+      throw new Error("Unauthorized: User not authenticated");
+    }
+    await assertUserCanAccessChatHistory(ctx, identity.subject);
+
+    const chat = await ctx.db
+      .query("chats")
+      .withIndex("by_chat_id", (q) => q.eq("id", args.chatId))
+      .first();
+
+    if (!chat) {
+      convexLogger.warn("share_chat_missing", {
+        user_id: identity.subject,
+        chat_id: args.chatId,
+      });
+      throw new Error("Chat not found");
+    }
+
+    if (chat.user_id !== identity.subject) {
+      convexLogger.warn("share_chat_access_denied", {
+        user_id: identity.subject,
+        chat_id: args.chatId,
+        owner_user_id: chat.user_id,
+      });
+      throw new Error("Unauthorized: Chat does not belong to user");
+    }
+
+    // If already shared, return existing share_id
+    if (chat.share_id && chat.share_date) {
+      return {
+        shareId: chat.share_id,
+        shareDate: chat.share_date,
+      };
+    }
+
+    // Generate new share_id using crypto.randomUUID() for security
+    const shareId = crypto.randomUUID();
+    const shareDate = Date.now();
+
+    await ctx.db.patch(chat._id, {
+      share_id: shareId,
+      share_date: shareDate,
+      update_time: Date.now(),
+    });
+
+    // Re-fetch to ensure we return the persisted value, handling potential race conditions
+    const persisted = await ctx.db.get(chat._id);
+    if (!persisted?.share_id || !persisted.share_date) {
+      throw new Error("Failed to persist share metadata");
+    }
+
+    return {
+      shareId: persisted.share_id,
+      shareDate: persisted.share_date,
+    };
+  },
+});
+
+/**
+ * Update an existing share by refreshing the share_date.
+ * This allows the shared link to include new messages added after the original share.
+ *
+ * FROZEN SHARE CONCEPT:
+ * - Original share shows messages up to original share_date
+ * - After updating, shared link shows messages up to new share_date
+ * - This gives users control over what content is publicly visible
+ *
+ * @param chatId - The ID of the chat to update
+ * @returns Updated share metadata (same shareId, new shareDate)
+ * @throws {Error} If chat not found, not shared, or user not authorized
+ */
+export const updateShareDate = mutation({
+  args: { chatId: v.string() },
+  returns: v.object({
+    shareId: v.string(),
+    shareDate: v.number(),
+  }),
+  handler: async (ctx, args) => {
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity) {
+      throw new Error("Unauthorized: User not authenticated");
+    }
+    await assertUserCanAccessChatHistory(ctx, identity.subject);
+
+    const chat = await ctx.db
+      .query("chats")
+      .withIndex("by_chat_id", (q) => q.eq("id", args.chatId))
+      .first();
+
+    if (!chat) {
+      convexLogger.warn("share_update_chat_missing", {
+        user_id: identity.subject,
+        chat_id: args.chatId,
+      });
+      throw new Error("Chat not found");
+    }
+
+    if (chat.user_id !== identity.subject) {
+      convexLogger.warn("share_update_access_denied", {
+        user_id: identity.subject,
+        chat_id: args.chatId,
+        owner_user_id: chat.user_id,
+      });
+      throw new Error("Unauthorized: Chat does not belong to user");
+    }
+
+    // Can only update if chat is already shared
+    if (!chat.share_id || !chat.share_date) {
+      convexLogger.warn("share_update_not_shared", {
+        user_id: identity.subject,
+        chat_id: args.chatId,
+      });
+      throw new Error(
+        "Chat is not shared - use shareChat to create a share first",
+      );
+    }
+
+    // Update share_date to now, keeping same share_id
+    const newShareDate = Date.now();
+
+    await ctx.db.patch(chat._id, {
+      share_date: newShareDate,
+      update_time: Date.now(),
+    });
+
+    return {
+      shareId: chat.share_id,
+      shareDate: newShareDate,
+    };
+  },
+});
+
+/**
+ * Unshare a chat by removing public access.
+ *
+ * @param chatId - The ID of the chat to unshare
+ * @throws {Error} If chat not found or user not authorized
+ */
+export const unshareChat = mutation({
+  args: { chatId: v.string() },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity) {
+      throw new Error("Unauthorized: User not authenticated");
+    }
+    await assertUserCanAccessChatHistory(ctx, identity.subject);
+
+    const chat = await ctx.db
+      .query("chats")
+      .withIndex("by_chat_id", (q) => q.eq("id", args.chatId))
+      .first();
+
+    if (!chat) {
+      convexLogger.warn("share_unshare_chat_missing", {
+        user_id: identity.subject,
+        chat_id: args.chatId,
+      });
+      throw new Error("Chat not found");
+    }
+
+    if (chat.user_id !== identity.subject) {
+      convexLogger.warn("share_unshare_access_denied", {
+        user_id: identity.subject,
+        chat_id: args.chatId,
+        owner_user_id: chat.user_id,
+      });
+      throw new Error("Unauthorized: Chat does not belong to user");
+    }
+
+    await ctx.db.patch(chat._id, {
+      share_id: undefined,
+      share_date: undefined,
+      update_time: Date.now(),
+    });
+
+    return null;
+  },
+});
+
+/**
+ * Get shared chat by share_id (PUBLIC - no auth required).
+ * Returns chat without user_id to maintain anonymity.
+ *
+ * @param shareId - The public share ID
+ * @returns Chat data without sensitive user information, or null if not found
+ */
+export const getSharedChat = query({
+  args: { shareId: v.string() },
+  returns: v.union(sharedChatValidator, v.null()),
+  handler: async (ctx, args) => {
+    const chat = await getVisibleSharedChatByShareId(ctx, args.shareId);
+    return chat ? serializeSharedChat(chat) : null;
+  },
+});
+
+/**
+ * Get a complete public shared-chat snapshot in one client round trip.
+ * Returns the same anonymous chat metadata and frozen messages as the legacy
+ * getSharedChat + getSharedMessages sequence.
+ */
+export const getSharedSnapshot = query({
+  args: { shareId: v.string() },
+  returns: v.union(
+    v.object({
+      chat: sharedChatValidator,
+      messages: v.array(sharedMessageValidator),
+    }),
+    v.null(),
+  ),
+  handler: async (ctx, args) => {
+    let chat: VisibleSharedChat | null;
+    try {
+      chat = await getVisibleSharedChatByShareId(ctx, args.shareId);
+    } catch (error) {
+      console.error("Failed to get shared snapshot:", error);
+      return null;
+    }
+
+    if (!chat) {
+      return null;
+    }
+
+    let messages: Awaited<ReturnType<typeof listVisibleSharedMessages>>;
+    try {
+      messages = await listVisibleSharedMessages(ctx, chat);
+    } catch (error) {
+      console.error("Failed to get shared messages:", error);
+      messages = [];
+    }
+
+    return {
+      chat: serializeSharedChat(chat),
+      messages,
+    };
+  },
+});
+
+/**
+ * Get all shared chats for the authenticated user.
+ *
+ * @returns Array of shared chats with share metadata
+ */
+export const getUserSharedChats = query({
+  args: {},
+  returns: v.array(
+    v.object({
+      _id: v.id("chats"),
+      id: v.string(),
+      title: v.string(),
+      share_id: v.string(),
+      share_date: v.number(),
+      update_time: v.number(),
+    }),
+  ),
+  handler: async (ctx) => {
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity) {
+      return [];
+    }
+    await assertUserCanAccessChatHistory(ctx, identity.subject);
+
+    const chats = await ctx.db
+      .query("chats")
+      .withIndex("by_user_and_updated", (q) =>
+        q.eq("user_id", identity.subject),
+      )
+      .order("desc")
+      .collect();
+
+    return chats
+      .filter((chat) => chat.share_id && chat.share_date)
+      .sort((a, b) => b.share_date! - a.share_date!)
+      .map((chat) => ({
+        _id: chat._id,
+        id: chat.id,
+        title: chat.title,
+        share_id: chat.share_id!,
+        share_date: chat.share_date!,
+        update_time: chat.update_time,
+      }));
+  },
+});
+
+/**
+ * Fork a shared chat into the authenticated user's own chat.
+ * Copies all visible messages (up to share_date) into a new chat
+ * owned by the current user, so they can continue the conversation.
+ *
+ * @param shareId - The public share ID of the chat to fork
+ * @returns The new chat ID
+ * @throws {Error} If chat not found, not shared, or user not authenticated
+ */
+export const forkSharedChat = mutation({
+  args: { shareId: v.string() },
+  returns: v.string(),
+  handler: async (ctx, args) => {
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity) {
+      throw new Error("Unauthorized: User not authenticated");
+    }
+    await assertUserCanAccessChatHistory(ctx, identity.subject);
+
+    // Validate UUID format
+    const UUID_REGEX =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!UUID_REGEX.test(args.shareId)) {
+      throw new Error("Invalid share link");
+    }
+
+    const chat = await ctx.db
+      .query("chats")
+      .withIndex("by_share_id", (q) => q.eq("share_id", args.shareId))
+      .first();
+
+    if (!chat || !chat.share_id || !chat.share_date) {
+      throw new Error("Shared chat not found");
+    }
+    if (await isUserBlockedFromChatHistory(ctx, chat.user_id)) {
+      throw new Error("Shared chat not found");
+    }
+
+    // Read this chat's messages via the existing per-chat index, then apply the
+    // frozen-share cutoff locally to avoid a production-wide compound index.
+    const messages = await ctx.db
+      .query("messages")
+      .withIndex("by_chat_id", (q) => q.eq("chat_id", chat.id))
+      .order("asc")
+      .collect();
+
+    const frozenMessages = messages
+      .filter(
+        (msg) => msg.update_time <= chat.share_date! && msg.is_hidden !== true,
+      )
+      .sort(
+        (a, b) =>
+          a.update_time - b.update_time || a._creationTime - b._creationTime,
+      );
+
+    // Create new chat owned by the current user
+    const newChatId = crypto.randomUUID();
+
+    await ctx.db.insert("chats", {
+      id: newChatId,
+      title: chat.title,
+      user_id: identity.subject,
+      branched_from_chat_id: chat.id,
+      branched_from_title: chat.title,
+      update_time: Date.now(),
+    });
+
+    // Copy messages to new chat
+    for (const msg of frozenMessages) {
+      const newMessageId = crypto.randomUUID();
+      // Remove file/image parts entirely — the forking user doesn't own the
+      // original files, signed URLs will expire, and placeholder parts render
+      // as broken "Unknown file" cards in the regular chat view.
+      const sanitizedParts = stripOpenRouterReasoningMetadataFromParts(
+        msg.parts,
+      ).filter((part: any) => part.type !== "file");
+      await ctx.db.insert("messages", {
+        id: newMessageId,
+        chat_id: newChatId,
+        user_id: identity.subject,
+        role: msg.role,
+        parts: sanitizedParts,
+        content: msg.content,
+        source_message_id: msg.id,
+        update_time: Date.now(),
+        model: msg.model,
+        mode: msg.mode,
+        generation_started_at: msg.generation_started_at,
+        generation_time_ms: msg.generation_time_ms,
+        finish_reason: msg.finish_reason,
+        usage: msg.usage,
+      });
+    }
+
+    return newChatId;
+  },
+});
+
+/**
+ * Unshare all chats for the authenticated user.
+ *
+ * @throws {Error} If user not authenticated
+ */
+export const unshareAllChats = mutation({
+  args: {},
+  returns: v.null(),
+  handler: async (ctx) => {
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity) {
+      throw new Error("Unauthorized: User not authenticated");
+    }
+    await assertUserCanAccessChatHistory(ctx, identity.subject);
+
+    const sharedChats = await ctx.db
+      .query("chats")
+      .withIndex("by_user_and_updated", (q) =>
+        q.eq("user_id", identity.subject),
+      )
+      .collect();
+
+    const updates = sharedChats
+      .filter((chat) => chat.share_id)
+      .map((chat) =>
+        ctx.db.patch(chat._id, {
+          share_id: undefined,
+          share_date: undefined,
+          update_time: Date.now(),
+        }),
+      );
+
+    await Promise.all(updates);
+
+    return null;
+  },
+});

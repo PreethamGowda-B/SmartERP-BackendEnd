@@ -1,0 +1,578 @@
+import readline from "node:readline";
+import { exec } from "node:child_process";
+import { promises as fs } from "node:fs";
+import { promisify } from "node:util";
+import crypto from "node:crypto";
+import path from "node:path";
+import chalk from "chalk";
+
+const execAsync = promisify(exec);
+
+function question(query: string): Promise<string> {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+
+  return new Promise((resolve) =>
+    rl.question(query, (ans) => {
+      rl.close();
+      resolve(ans);
+    }),
+  );
+}
+
+async function getOpenRouterApiKey(): Promise<string> {
+  console.log(`\n${chalk.bold("Getting OpenRouter API Key")}`);
+  console.log(
+    "You can find your OpenRouter API Key at: https://openrouter.ai/keys",
+  );
+  const key = await question("Enter your OpenRouter API Key: ");
+
+  if (key.startsWith("sk-")) {
+    return key;
+  }
+
+  console.log(chalk.red("Please enter a valid OpenRouter API Key"));
+  console.log('OpenRouter keys should start with "sk-"');
+
+  return await getOpenRouterApiKey();
+}
+
+async function getOpenAiApiKey(): Promise<string> {
+  console.log(`\n${chalk.bold("Getting OpenAI API Key")}`);
+  console.log(
+    "You can find your OpenAI API Key at: https://platform.openai.com/api-keys",
+  );
+  const key = await question("Enter your OpenAI API Key: ");
+
+  if (key.startsWith("sk-")) {
+    return key;
+  }
+
+  console.log(chalk.red("Invalid OpenAI API Key format"));
+  console.log('OpenAI keys should start with "sk-"');
+
+  return await getOpenAiApiKey();
+}
+
+async function getXaiApiKey(): Promise<string> {
+  console.log(`\n${chalk.bold("Getting XAI API Key for Agent mode")}`);
+  console.log("You can find your XAI API Key at: https://xai.com/api-keys");
+  const key = await question("Enter your XAI API Key: ");
+
+  if (key.startsWith("xai-")) {
+    return key;
+  }
+
+  console.log(chalk.red("Invalid XAI API Key format"));
+  console.log('XAI keys should start with "xai-"');
+
+  return await getXaiApiKey();
+}
+
+async function getE2bApiKey(): Promise<string> {
+  console.log(`\n${chalk.bold("Getting E2B API Key for cloud sandbox")}`);
+  console.log(
+    "E2B provides the cloud sandbox environment for agent mode (paid feature, free users use local sandbox)",
+  );
+  console.log("You can find your E2B API Key at: https://e2b.dev/dashboard");
+  const key = await question("Enter your E2B API Key: ");
+
+  if (key.startsWith("e2b_")) {
+    return key;
+  }
+
+  console.log(chalk.red("Invalid E2B API Key format"));
+  console.log('E2B keys should start with "e2b_"');
+
+  return await getE2bApiKey();
+}
+
+async function getWorkOSApiKey(): Promise<string> {
+  console.log(`\n${chalk.bold("Getting WorkOS API Key")}`);
+  console.log(
+    'You can find your WorkOS API Key in the dashboard under the "Quick start" section: https://dashboard.workos.com/get-started',
+  );
+
+  const key = await question("Enter your WorkOS API Key: ");
+
+  if (key.startsWith("sk_")) {
+    return key;
+  }
+
+  console.log(chalk.red("Invalid WorkOS API Key format"));
+  console.log('WorkOS keys should start with "sk_"');
+
+  return await getWorkOSApiKey();
+}
+
+async function getWorkOSClientId(): Promise<string> {
+  console.log(`\n${chalk.bold("Getting WorkOS Client ID")}`);
+  console.log(
+    'You can find your WorkOS Client ID in the dashboard under the "Quick start" section: https://dashboard.workos.com/get-started',
+  );
+  return await question("Enter your WorkOS Client ID: ");
+}
+
+async function getWorkOSAuthDomain(): Promise<string> {
+  console.log(`\n${chalk.bold("Getting WorkOS Authentication API Domain")}`);
+  console.log(
+    "Press enter to use api.workos.com, or enter the custom domain configured in WorkOS.",
+  );
+
+  const input = (
+    await question("Enter your WorkOS auth domain [api.workos.com]: ")
+  ).trim();
+  const configuredDomain = input || "api.workos.com";
+
+  try {
+    const authOrigin = new URL(
+      configuredDomain.includes("://")
+        ? configuredDomain
+        : `https://${configuredDomain}`,
+    );
+
+    if (
+      authOrigin.protocol === "https:" &&
+      !authOrigin.username &&
+      !authOrigin.password &&
+      !authOrigin.port &&
+      /^[a-z0-9.-]+$/i.test(authOrigin.hostname) &&
+      /^\/+$/.test(authOrigin.pathname) &&
+      !authOrigin.search &&
+      !authOrigin.hash
+    ) {
+      return authOrigin.hostname;
+    }
+  } catch {
+    // Show the validation message below.
+  }
+
+  console.log(
+    chalk.red(
+      "Invalid WorkOS auth domain. Enter a hostname or HTTPS origin without a path.",
+    ),
+  );
+  return await getWorkOSAuthDomain();
+}
+
+function generateWorkOSCookiePassword(): string {
+  console.log(`\n${chalk.bold("Generating WORKOS_COOKIE_PASSWORD")}`);
+  console.log(
+    "Generated a secure random password for WorkOS cookie encryption",
+  );
+  return crypto.randomBytes(32).toString("base64");
+}
+
+function generateConvexServiceRoleKey(): string {
+  console.log(`\n${chalk.bold("Generating CONVEX_SERVICE_ROLE_KEY")}`);
+  console.log("Generated a secure random key for Convex service role");
+  return crypto.randomBytes(32).toString("base64");
+}
+
+function generateAccountIdentityHmacSecret(): string {
+  console.log(`\n${chalk.bold("Generating ACCOUNT_IDENTITY_HMAC_SECRET")}`);
+  console.log("Generated a secure random key for free quota identity hashing");
+  return crypto.randomBytes(32).toString("base64");
+}
+
+async function configureWorkOSDashboard() {
+  console.log(`\n${chalk.bold("Configure WorkOS Dashboard")}`);
+  console.log("Please complete the following steps in your WorkOS dashboard:");
+  console.log(
+    '1. Set redirect URI to: http://localhost:3000/callback (in "Redirects" section)',
+  );
+  console.log('2. Create an "Admin" role (in "Roles" section)');
+  console.log("\nVisit: https://dashboard.workos.com/");
+  return await question(
+    "Hit enter after you have configured the WorkOS dashboard",
+  );
+}
+
+async function configureConvexDashboard(
+  workOSClientId: string,
+  workOSAuthDomain: string,
+  convexServiceRoleKey: string,
+) {
+  console.log(`\n${chalk.bold("Configure Convex Dashboard")}`);
+  console.log(
+    "Please add the following environment variables to your Convex Dashboard:",
+  );
+  console.log("\n1. Go to: https://dashboard.convex.dev/");
+  console.log("2. Select your project");
+  console.log("3. Go to Settings → Environment Variables");
+  console.log("4. Add the following required variables:\n");
+  console.log(chalk.bold(`   WORKOS_CLIENT_ID=${workOSClientId}`));
+  console.log(chalk.bold(`   WORKOS_AUTH_DOMAIN=${workOSAuthDomain}`));
+  console.log(chalk.bold(`   CONVEX_SERVICE_ROLE_KEY=${convexServiceRoleKey}`));
+  console.log("\nOptional variables (add later if using these features):");
+  console.log("   - AWS_S3_* variables (if using S3 storage)");
+  console.log("   - REDIS_URL (if using Redis for stream resumption)");
+  console.log("   - STRIPE_* variables (if using Stripe payments)");
+  return await question(
+    "\nHit enter after you have added the required environment variables to Convex Dashboard",
+  );
+}
+
+async function writeEnvFile(envVars: Record<string, string>) {
+  console.log(`\n${chalk.bold("Writing environment variables to .env.local")}`);
+
+  const envContent = `# =============================================================================
+# AUTHENTICATION - WorkOS (Required)
+# =============================================================================
+# Sign up at: https://workos.com/
+WORKOS_API_KEY=${envVars.WORKOS_API_KEY}
+
+# ⚠️ IMPORTANT: Also add this to Convex Dashboard → Environment Variables
+WORKOS_CLIENT_ID=${envVars.WORKOS_CLIENT_ID}
+
+# Use api.workos.com unless WorkOS has configured a custom Authentication API domain.
+# ⚠️ IMPORTANT: Also add this to Convex Dashboard → Environment Variables
+WORKOS_AUTH_DOMAIN=${envVars.WORKOS_AUTH_DOMAIN}
+
+# Generate with: node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+WORKOS_COOKIE_PASSWORD=${envVars.WORKOS_COOKIE_PASSWORD}
+NEXT_PUBLIC_WORKOS_REDIRECT_URI=${envVars.NEXT_PUBLIC_WORKOS_REDIRECT_URI}
+
+# Server-only HMAC key for privacy-preserving free quota identity hashes.
+# Generate with: node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+ACCOUNT_IDENTITY_HMAC_SECRET=${envVars.ACCOUNT_IDENTITY_HMAC_SECRET}
+
+# =============================================================================
+# CONVEX DATABASE (Required)
+# =============================================================================
+# Run \`npx convex dev\` first to generate these values
+CONVEX_DEPLOYMENT=${envVars.CONVEX_DEPLOYMENT || ""}
+NEXT_PUBLIC_CONVEX_URL=${envVars.NEXT_PUBLIC_CONVEX_URL || ""}
+
+# Generate with: node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+# ⚠️ IMPORTANT: Also add this to Convex Dashboard → Environment Variables
+CONVEX_SERVICE_ROLE_KEY=${envVars.CONVEX_SERVICE_ROLE_KEY}
+
+# =============================================================================
+# S3 FILE STORAGE (Optional - Feature Flag Controlled)
+# =============================================================================
+# AWS S3 credentials for file storage (only needed if S3 is enabled)
+# Sign up at: https://aws.amazon.com/s3/
+# ⚠️ IMPORTANT: If using S3, also add these to Convex Dashboard → Environment Variables
+AWS_S3_ACCESS_KEY_ID=
+AWS_S3_SECRET_ACCESS_KEY=
+AWS_S3_REGION=us-east-1
+AWS_S3_BUCKET_NAME=
+
+# Regional storage rollout. Keep false until the matching bucket names and IAM
+# access are configured in both Convex and Trigger.dev for this environment.
+S3_REGIONAL_STORAGE_ENABLED=false
+AWS_S3_BUCKET_NAME_EU_CENTRAL_1=
+AWS_S3_BUCKET_NAME_US_EAST_1=
+AWS_S3_BUCKET_NAME_US_WEST_2=
+
+# Optional S3 configuration (defaults shown, uncomment to override)
+# S3_URL_LIFETIME_SECONDS=3600
+# S3_URL_EXPIRATION_BUFFER_SECONDS=300
+
+# =============================================================================
+# AI PROVIDERS (Required)
+# =============================================================================
+# OpenRouter - Get key at: https://openrouter.ai/
+OPENROUTER_API_KEY=${envVars.OPENROUTER_API_KEY}
+
+# OpenAI - Get key at: https://platform.openai.com/
+OPENAI_API_KEY=${envVars.OPENAI_API_KEY}
+
+# XAI (Grok) - Get key at: https://x.ai/
+XAI_API_KEY=${envVars.XAI_API_KEY}
+
+# =============================================================================
+# CODE EXECUTION - E2B (Required for Agent Mode)
+# =============================================================================
+# Sign up at: https://e2b.dev/
+E2B_API_KEY=${envVars.E2B_API_KEY}
+E2B_TEMPLATE=terminal-agent-sandbox
+
+# =============================================================================
+# WEB SEARCH & SCRAPING (Optional)
+# =============================================================================
+# Web Search API - https://docs.perplexity.ai/guides/search-quickstart
+# PERPLEXITY_API_KEY=
+
+# Jina AI - URL content extraction: https://jina.ai/reader
+# JINA_API_KEY=
+
+# =============================================================================
+# REDIS (Optional - for stream resumption)
+# =============================================================================
+# ⚠️ IMPORTANT: Also add this to Convex Dashboard → Environment Variables
+# REDIS_URL=redis://localhost:6379
+
+# =============================================================================
+# RATE LIMITING (Optional - Upstash Redis)
+# =============================================================================
+# Sign up at: https://upstash.com/
+# UPSTASH_REDIS_REST_URL=https://your-endpoint.upstash.io
+# UPSTASH_REDIS_REST_TOKEN=
+
+# =============================================================================
+# FEATURE FLAGS (Optional)
+# =============================================================================
+# Cross-tab token sharing - coordinates auth token refresh across browser tabs
+# to prevent WorkOS rate limits. Value is rollout percentage (0-100).
+# NEXT_PUBLIC_FF_CROSS_TAB_TOKEN_SHARING=0
+
+# =============================================================================
+# ANALYTICS & OBSERVABILITY (Optional - PostHog)
+# =============================================================================
+# Sign up at: https://posthog.com/
+# Used for product analytics, tool-call events, and server error tracking.
+# NEXT_PUBLIC_POSTHOG_KEY=phc_
+# NEXT_PUBLIC_POSTHOG_HOST=https://app.posthog.com
+# NEXT_PUBLIC_POSTHOG_TRACK_FREE_USERS=true
+# Required in CI/production builds to upload source maps for readable stack traces.
+# Personal API key with the Source map upload preset.
+# POSTHOG_CLI_API_KEY=phx_
+# POSTHOG_CLI_PROJECT_ID=
+# POSTHOG_CLI_HOST=https://us.posthog.com
+
+# =============================================================================
+# PAYMENTS (Optional - Stripe)
+# =============================================================================
+# Sign up at: https://stripe.com/
+# ⚠️ IMPORTANT: If using Stripe, also add these to Convex Dashboard → Environment Variables
+# STRIPE_API_KEY=sk_test_
+# STRIPE_EXTRA_USAGE_WEBHOOK_SECRET=
+
+# =============================================================================
+# BASE URL (Required)
+# =============================================================================
+NEXT_PUBLIC_BASE_URL=${envVars.NEXT_PUBLIC_BASE_URL || "http://localhost:3000"}
+`;
+
+  await fs.writeFile(path.join(process.cwd(), ".env.local"), envContent);
+  console.log(
+    chalk.green("✓ .env.local file created with all necessary variables"),
+  );
+}
+
+async function setupConvex(): Promise<{
+  NEXT_PUBLIC_CONVEX_URL: string;
+  CONVEX_DEPLOYMENT: string;
+  useLocal: boolean;
+}> {
+  console.log(`\n${chalk.bold("Setting up Convex Database")}`);
+  console.log(
+    "Convex provides the real-time database and authentication backend",
+  );
+
+  const deploymentType = await question(
+    "\nUse a local Convex deployment? (y/N): ",
+  );
+  const useLocal = deploymentType.trim().toLowerCase() === "y";
+
+  if (useLocal) {
+    console.log(
+      chalk.cyan(
+        "\nLocal deployment selected. Convex will run on your machine.",
+      ),
+    );
+    console.log(
+      "No Convex account required. Code sync is faster and doesn't count against quotas.",
+    );
+
+    try {
+      console.log(
+        "\nInitializing local Convex deployment (this may take a moment)...",
+      );
+      await execAsync("npx convex dev --local --once");
+      console.log(
+        chalk.green("✓ Local Convex deployment initialized successfully"),
+      );
+
+      // Read Convex variables from the generated .env.local file
+      try {
+        const envContent = await fs.readFile(
+          path.join(process.cwd(), ".env.local"),
+          "utf8",
+        );
+        const convexUrlMatch = envContent.match(
+          /^NEXT_PUBLIC_CONVEX_URL=(.*)$/m,
+        );
+        const deploymentMatch = envContent.match(/^CONVEX_DEPLOYMENT=(.*)$/m);
+        return {
+          NEXT_PUBLIC_CONVEX_URL:
+            convexUrlMatch?.[1] || "http://localhost:3210",
+          CONVEX_DEPLOYMENT: deploymentMatch?.[1] || "",
+          useLocal: true,
+        };
+      } catch {
+        return {
+          NEXT_PUBLIC_CONVEX_URL: "http://localhost:3210",
+          CONVEX_DEPLOYMENT: "",
+          useLocal: true,
+        };
+      }
+    } catch (error) {
+      console.log(chalk.red("✗ Failed to initialize local Convex deployment"));
+      console.log(error);
+      process.exit(1);
+    }
+  }
+
+  console.log(`\nFirst, login to Convex: ${chalk.bold("npx convex login")}`);
+  await question("Hit enter after you have logged into Convex");
+
+  const projectName = await question(
+    "\nEnter a name for your new Convex project: ",
+  );
+  const safeProject = projectName.trim();
+  if (!/^[a-zA-Z0-9_-]+$/.test(safeProject)) {
+    console.log(chalk.red("Project name must match /^[a-zA-Z0-9_-]+$/."));
+    return await setupConvex();
+  }
+
+  try {
+    console.log("Creating new Convex project (this may take a few moments)...");
+    await execAsync(
+      `npx convex dev --once --configure=new --project=${safeProject}`,
+    );
+    console.log(chalk.green("✓ Convex project created successfully"));
+
+    // Read Convex variables from the generated .env.local file
+    try {
+      const envContent = await fs.readFile(
+        path.join(process.cwd(), ".env.local"),
+        "utf8",
+      );
+      const convexUrlMatch = envContent.match(/^NEXT_PUBLIC_CONVEX_URL=(.*)$/m);
+      const deploymentMatch = envContent.match(/^CONVEX_DEPLOYMENT=(.*)$/m);
+      return {
+        NEXT_PUBLIC_CONVEX_URL: convexUrlMatch?.[1] || "",
+        CONVEX_DEPLOYMENT: deploymentMatch?.[1] || "",
+        useLocal: false,
+      };
+    } catch (error) {
+      console.log(
+        chalk.yellow("⚠️  Could not read Convex env from generated file"),
+      );
+      return {
+        NEXT_PUBLIC_CONVEX_URL: "",
+        CONVEX_DEPLOYMENT: "",
+        useLocal: false,
+      };
+    }
+  } catch (error) {
+    console.log(chalk.red("✗ Failed to create Convex project"));
+    console.log("Please check your internet connection and try again");
+    console.log(error);
+    process.exit(1);
+  }
+}
+
+async function main() {
+  console.log(chalk.bold.blue("🚀 HackerAI Setup Script"));
+  console.log(
+    "This script will help you configure all the necessary environment variables\n",
+  );
+
+  // Get required API keys
+  const OPENROUTER_API_KEY = await getOpenRouterApiKey();
+  const OPENAI_API_KEY = await getOpenAiApiKey();
+  const XAI_API_KEY = await getXaiApiKey();
+  const E2B_API_KEY = await getE2bApiKey();
+
+  // Get WorkOS configuration
+  const WORKOS_API_KEY = await getWorkOSApiKey();
+  const WORKOS_CLIENT_ID = await getWorkOSClientId();
+  const WORKOS_AUTH_DOMAIN = await getWorkOSAuthDomain();
+  const NEXT_PUBLIC_BASE_URL = "http://localhost:3000";
+  const NEXT_PUBLIC_WORKOS_REDIRECT_URI = `${NEXT_PUBLIC_BASE_URL}/callback`;
+  const WORKOS_COOKIE_PASSWORD = generateWorkOSCookiePassword();
+  const CONVEX_SERVICE_ROLE_KEY = generateConvexServiceRoleKey();
+  const ACCOUNT_IDENTITY_HMAC_SECRET = generateAccountIdentityHmacSecret();
+
+  // Configure WorkOS dashboard
+  await configureWorkOSDashboard();
+
+  // Setup Convex database
+  const { NEXT_PUBLIC_CONVEX_URL, CONVEX_DEPLOYMENT, useLocal } =
+    await setupConvex();
+
+  // Write the complete environment file
+  await writeEnvFile({
+    OPENROUTER_API_KEY,
+    OPENAI_API_KEY,
+    XAI_API_KEY,
+    E2B_API_KEY,
+    WORKOS_API_KEY,
+    WORKOS_CLIENT_ID,
+    WORKOS_AUTH_DOMAIN,
+    NEXT_PUBLIC_WORKOS_REDIRECT_URI,
+    WORKOS_COOKIE_PASSWORD,
+    ACCOUNT_IDENTITY_HMAC_SECRET,
+    NEXT_PUBLIC_CONVEX_URL,
+    CONVEX_DEPLOYMENT,
+    CONVEX_SERVICE_ROLE_KEY,
+    NEXT_PUBLIC_BASE_URL,
+  });
+
+  if (useLocal) {
+    // For local deployments, set env vars directly on the local backend
+    console.log(
+      `\n${chalk.bold("Setting environment variables on local Convex deployment...")}`,
+    );
+    try {
+      await execAsync(
+        `npx convex env set WORKOS_CLIENT_ID ${WORKOS_CLIENT_ID} --local`,
+      );
+      await execAsync(
+        `npx convex env set WORKOS_AUTH_DOMAIN ${WORKOS_AUTH_DOMAIN} --local`,
+      );
+      await execAsync(
+        `npx convex env set CONVEX_SERVICE_ROLE_KEY ${CONVEX_SERVICE_ROLE_KEY} --local`,
+      );
+      console.log(
+        chalk.green("✓ Environment variables set on local Convex deployment"),
+      );
+    } catch {
+      console.log(
+        chalk.yellow(
+          "⚠️  Could not set env vars on local deployment. You can set them manually with:",
+        ),
+      );
+      console.log(
+        `   npx convex env set WORKOS_CLIENT_ID ${WORKOS_CLIENT_ID} --local`,
+      );
+      console.log(
+        `   npx convex env set WORKOS_AUTH_DOMAIN ${WORKOS_AUTH_DOMAIN} --local`,
+      );
+      console.log(
+        `   npx convex env set CONVEX_SERVICE_ROLE_KEY ${CONVEX_SERVICE_ROLE_KEY} --local`,
+      );
+    }
+  } else {
+    // Configure Convex Dashboard for cloud deployments
+    await configureConvexDashboard(
+      WORKOS_CLIENT_ID,
+      WORKOS_AUTH_DOMAIN,
+      CONVEX_SERVICE_ROLE_KEY,
+    );
+  }
+
+  const devCommand = useLocal ? "pnpm run dev:local" : "pnpm run dev";
+
+  console.log(`\n${chalk.green.bold("🎉 Setup completed successfully!")}`);
+  console.log("\nNext steps:");
+  console.log(`1. Review your ${chalk.bold(".env.local")} file`);
+  console.log(`2. Start the development server: ${chalk.bold(devCommand)}`);
+  console.log(`3. Visit: ${chalk.bold("http://localhost:3000")}`);
+  if (useLocal) {
+    console.log(
+      `\n${chalk.cyan("Note:")} Local Convex deployment runs as a subprocess of the dev command.`,
+    );
+    console.log(
+      "To stop using local deployments, run: npx convex disable-local-deployments",
+    );
+  }
+}
+
+main().catch(console.error);

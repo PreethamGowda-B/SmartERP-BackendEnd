@@ -1,0 +1,176 @@
+import { afterEach, describe, it, expect, jest } from "@jest/globals";
+import { cn, convertToUIMessages, fetchWithErrorHandlers } from "../utils";
+import type { MessageRecord } from "../utils";
+import type { Id } from "@/convex/_generated/dataModel";
+
+const originalFetch = globalThis.fetch;
+
+const setFetchResponse = (response: Partial<Response>) => {
+  Object.defineProperty(globalThis, "fetch", {
+    configurable: true,
+    value: jest.fn(async () => response as Response),
+  });
+};
+
+describe("utils", () => {
+  afterEach(() => {
+    if (originalFetch) {
+      Object.defineProperty(globalThis, "fetch", {
+        configurable: true,
+        value: originalFetch,
+      });
+    } else {
+      Reflect.deleteProperty(globalThis, "fetch");
+    }
+  });
+
+  describe("fetchWithErrorHandlers", () => {
+    it("turns a plain-text error response into a structured Chat error", async () => {
+      setFetchResponse({
+        ok: false,
+        status: 500,
+        clone: () =>
+          ({
+            json: async () => {
+              throw new SyntaxError("Not JSON");
+            },
+          }) as Response,
+        text: async () => "Failed to start agent run",
+      });
+
+      await expect(fetchWithErrorHandlers("/api/agent")).rejects.toMatchObject({
+        type: "bad_request",
+        surface: "api",
+        cause: "Failed to start agent run",
+      });
+    });
+
+    it("preserves structured API error details", async () => {
+      setFetchResponse({
+        ok: false,
+        status: 404,
+        clone: () =>
+          ({
+            json: async () => ({
+              code: "not_found:chat",
+              cause: "The chat no longer exists",
+              metadata: { chatId: "chat-1" },
+            }),
+          }) as Response,
+        text: async () => "",
+      });
+
+      await expect(fetchWithErrorHandlers("/api/agent")).rejects.toMatchObject({
+        type: "not_found",
+        surface: "chat",
+        cause: "The chat no longer exists",
+        metadata: { chatId: "chat-1" },
+      });
+    });
+  });
+
+  describe("cn", () => {
+    it("should merge class names correctly", () => {
+      const result = cn("px-4", "py-2", "bg-blue-500");
+      expect(result).toBe("px-4 py-2 bg-blue-500");
+    });
+
+    it("should handle conditional classes", () => {
+      const isActive = true;
+      const result = cn("base-class", isActive && "active-class");
+      expect(result).toBe("base-class active-class");
+    });
+
+    it("should handle tailwind conflicts", () => {
+      const result = cn("px-4", "px-8");
+      expect(result).toBe("px-8");
+    });
+  });
+
+  describe("convertToUIMessages", () => {
+    it("should convert MessageRecord array to ChatMessage array", () => {
+      const messages: MessageRecord[] = [
+        {
+          id: "msg1",
+          role: "user",
+          created_at: 1_700_000_000_000,
+          parts: [{ type: "text", text: "Hello" }],
+        },
+        {
+          id: "msg2",
+          role: "assistant",
+          parts: [{ type: "text", text: "Hi there!" }],
+          source_message_id: "msg1",
+          feedback: { feedbackType: "positive" },
+        },
+      ];
+
+      const result = convertToUIMessages(messages);
+
+      expect(result).toHaveLength(2);
+      expect(result[0].id).toBe("msg1");
+      expect(result[0].role).toBe("user");
+      expect(result[0].createdAt).toBe(1_700_000_000_000);
+      expect(result[0].parts[0]).toEqual({ type: "text", text: "Hello" });
+      expect(result[1].sourceMessageId).toBe("msg1");
+      expect(result[1].metadata?.feedbackType).toBe("positive");
+    });
+
+    it("should handle messages without feedback", () => {
+      const messages: MessageRecord[] = [
+        {
+          id: "msg1",
+          role: "user",
+          parts: [{ type: "text", text: "Hello" }],
+        },
+      ];
+
+      const result = convertToUIMessages(messages);
+
+      expect(result[0].metadata).toBeUndefined();
+    });
+
+    it("should convert generation timing metadata", () => {
+      const messages: MessageRecord[] = [
+        {
+          id: "msg1",
+          role: "assistant",
+          parts: [{ type: "text", text: "Done" }],
+          mode: "agent",
+          generation_started_at: 1_000,
+          generation_time_ms: 2_500,
+        },
+      ];
+
+      const result = convertToUIMessages(messages);
+
+      expect(result[0].metadata).toEqual({
+        mode: "agent",
+        generationStartedAt: 1_000,
+        generationTimeMs: 2_500,
+      });
+    });
+
+    it("should handle messages with file details", () => {
+      const messages: MessageRecord[] = [
+        {
+          id: "msg1",
+          role: "user",
+          parts: [{ type: "text", text: "Check this file" }],
+          fileDetails: [
+            {
+              fileId: "file1" as Id<"files">,
+              name: "document.pdf",
+              url: "https://example.com/document.pdf",
+            },
+          ],
+        },
+      ];
+
+      const result = convertToUIMessages(messages);
+
+      expect(result[0].fileDetails).toHaveLength(1);
+      expect(result[0].fileDetails?.[0].name).toBe("document.pdf");
+    });
+  });
+});

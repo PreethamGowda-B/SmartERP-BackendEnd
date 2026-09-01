@@ -1,0 +1,260 @@
+import { UIMessage, UIMessagePart } from "ai";
+import {
+  countTokens as countGptTokens,
+  encode as encodeGptTokens,
+  decode,
+} from "gpt-tokenizer";
+import type { Id } from "@/convex/_generated/dataModel";
+import { MAX_TOKENS_PAID } from "@/lib/token-limits";
+export {
+  FILE_TOKEN_PERCENT,
+  getMaxFileTokens,
+  getMaxTokensForSubscription,
+  MAX_TOKENS_FREE,
+  MAX_TOKENS_PAID,
+} from "@/lib/token-limits";
+
+const DISALLOWED_SPECIAL_TOKEN_MESSAGE = "Disallowed special token";
+const TOKENIZE_SPECIAL_TOKENS_AS_TEXT: NonNullable<
+  Parameters<typeof encodeGptTokens>[1]
+> = {
+  disallowedSpecial: new Set(),
+};
+let hasLoggedSpecialTokenFallback = false;
+
+const logSpecialTokenFallback = (): void => {
+  if (hasLoggedSpecialTokenFallback) return;
+
+  hasLoggedSpecialTokenFallback = true;
+  console.warn("[token-utils] Tokenized special token sentinel as plain text");
+};
+
+export const safeCountTokens = (content: string): number => {
+  try {
+    return countGptTokens(content);
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      error.message.includes(DISALLOWED_SPECIAL_TOKEN_MESSAGE)
+    ) {
+      logSpecialTokenFallback();
+      return countGptTokens(content, TOKENIZE_SPECIAL_TOKENS_AS_TEXT);
+    }
+
+    throw error;
+  }
+};
+
+export const safeEncode = (
+  content: string,
+): ReturnType<typeof encodeGptTokens> => {
+  try {
+    return encodeGptTokens(content);
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      error.message.includes(DISALLOWED_SPECIAL_TOKEN_MESSAGE)
+    ) {
+      logSpecialTokenFallback();
+      return encodeGptTokens(content, TOKENIZE_SPECIAL_TOKENS_AS_TEXT);
+    }
+
+    throw error;
+  }
+};
+
+// Token limits for different contexts
+export const STREAM_MAX_TOKENS = 4096;
+export const TOOL_DEFAULT_MAX_TOKENS = 4096;
+
+// Truncation messages
+export const TRUNCATION_MESSAGE =
+  "\n\n[... OUTPUT TRUNCATED - middle content removed ...]\n\n";
+export const FILE_READ_TRUNCATION_MESSAGE =
+  "\n\n[Content truncated due to size limit. Use line ranges to read in chunks]\n\n";
+export const TIMEOUT_MESSAGE = (
+  seconds: number,
+  pid?: number,
+  session?: string,
+) => {
+  if (session) {
+    const pidSuffix = pid ? ` (PID: ${pid})` : "";
+    return `\n\nCommand output paused after ${seconds} seconds. Command continues in terminal session ${session}${pidSuffix}. Use interact_terminal_session with this exact session ID to wait, view, or kill it.`;
+  }
+
+  const pidSuffix = pid ? ` with PID: ${pid}` : "";
+  return `\n\nCommand output paused after ${seconds} seconds. Command continues in the background${pidSuffix}, but no reusable terminal session was created. Do not derive a session ID from the PID or call interact_terminal_session for this command.`;
+};
+
+export const FULL_OUTPUT_SAVED_MESSAGE = (
+  filePath: string,
+  charCount: number,
+  capped?: boolean,
+) =>
+  capped
+    ? `\n[Output too large - first ${charCount} chars saved to: ${filePath}]`
+    : `\n[Full output (${charCount} chars) saved to: ${filePath}]`;
+
+/**
+ * Count tokens for a single message part, excluding providerMetadata/callProviderMetadata
+ */
+const countPartTokens = (
+  part: UIMessagePart<any, any>,
+  fileTokens: Record<Id<"files">, number> = {},
+): number => {
+  if (part.type === "text" && "text" in part) {
+    return safeCountTokens((part as { text?: string }).text || "");
+  }
+  if (
+    part.type === "file" &&
+    "fileId" in part &&
+    (part as { fileId?: Id<"files"> }).fileId
+  ) {
+    const fileId = (part as { fileId: Id<"files"> }).fileId;
+    return fileTokens[fileId] || 0;
+  }
+
+  // For other part types, exclude provider metadata (e.g., OpenRouter reasoning_details)
+  const partAny = part as any;
+  const hasMetadata = partAny.providerMetadata || partAny.callProviderMetadata;
+
+  if (hasMetadata) {
+    const { providerMetadata, callProviderMetadata, ...partWithoutMetadata } =
+      partAny;
+    return safeCountTokens(JSON.stringify(partWithoutMetadata));
+  }
+
+  return safeCountTokens(JSON.stringify(part));
+};
+
+/**
+ * Count tokens for a message, excluding step-start and reasoning parts
+ */
+const getMessageTokenCountWithFiles = (
+  message: UIMessage,
+  fileTokens: Record<Id<"files">, number> = {},
+): number => {
+  const partsWithoutReasoning = message.parts.filter(
+    (part) => part.type !== "step-start" && part.type !== "reasoning",
+  );
+
+  const totalTokens = partsWithoutReasoning.reduce(
+    (sum, part) => sum + countPartTokens(part, fileTokens),
+    0,
+  );
+
+  return totalTokens;
+};
+
+/**
+ * Truncates messages to stay within token limit, keeping newest messages first
+ */
+export const truncateMessagesToTokenLimit = (
+  messages: UIMessage[],
+  fileTokens: Record<Id<"files">, number> = {},
+  maxTokens: number = MAX_TOKENS_PAID,
+): UIMessage[] => {
+  if (messages.length === 0) return messages;
+
+  const result: UIMessage[] = [];
+  let totalTokens = 0;
+
+  // Process from newest to oldest
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const messageTokens = getMessageTokenCountWithFiles(
+      messages[i],
+      fileTokens,
+    );
+
+    if (totalTokens + messageTokens > maxTokens) break;
+
+    totalTokens += messageTokens;
+    result.unshift(messages[i]);
+  }
+
+  return result;
+};
+
+/**
+ * Counts total tokens in all messages
+ */
+export const countMessagesTokens = (
+  messages: UIMessage[],
+  fileTokens: Record<Id<"files">, number> = {},
+): number => {
+  return messages.reduce(
+    (total, message) =>
+      total + getMessageTokenCountWithFiles(message, fileTokens),
+    0,
+  );
+};
+
+/**
+ * Truncates content by token count using 25% head + 75% tail strategy.
+ * This preserves both the command start (context) and the end (final results/errors),
+ * which is typically more useful for debugging than keeping only the beginning.
+ */
+export const truncateContent = (
+  content: string,
+  marker: string = TRUNCATION_MESSAGE,
+  maxTokens: number = TOOL_DEFAULT_MAX_TOKENS,
+): string => {
+  const tokens = safeEncode(content);
+  if (tokens.length <= maxTokens) return content;
+
+  const markerTokens = safeCountTokens(marker);
+  if (maxTokens <= markerTokens) {
+    return maxTokens <= 0 ? "" : decode(safeEncode(marker).slice(-maxTokens));
+  }
+
+  const budgetForContent = maxTokens - markerTokens;
+
+  // 25% head + 75% tail strategy
+  const headBudget = Math.floor(budgetForContent * 0.25);
+  const tailBudget = budgetForContent - headBudget;
+
+  const headTokens = tokens.slice(0, headBudget);
+  const tailTokens = tokens.slice(-tailBudget);
+
+  return decode(headTokens) + marker + decode(tailTokens);
+};
+
+/**
+ * Slices content to fit within a specific token budget
+ */
+export const sliceByTokens = (content: string, maxTokens: number): string => {
+  if (maxTokens <= 0) return "";
+
+  const tokens = safeEncode(content);
+  if (tokens.length <= maxTokens) return content;
+
+  return decode(tokens.slice(0, maxTokens));
+};
+
+/**
+ * Counts tokens for user input including text and uploaded files
+ */
+export const countInputTokens = (
+  input: string,
+  uploadedFiles: Array<{ tokens?: number }> = [],
+): number => {
+  const textTokens = safeCountTokens(input);
+  const fileTokens = uploadedFiles.reduce(
+    (total, file) => total + (file.tokens || 0),
+    0,
+  );
+  return textTokens + fileTokens;
+};
+
+/**
+ * Legacy wrapper for backward compatibility
+ */
+export function truncateOutput(args: {
+  content: string;
+  mode?: "read-file" | "generic";
+}): string {
+  const { content, mode } = args;
+  const suffix =
+    mode === "read-file" ? FILE_READ_TRUNCATION_MESSAGE : TRUNCATION_MESSAGE;
+  return truncateContent(content, suffix);
+}

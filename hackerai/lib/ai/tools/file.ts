@@ -1,0 +1,1954 @@
+import { tool } from "ai";
+import { createHash } from "crypto";
+import type {
+  AgentApprovalSandboxIdentity,
+  AnySandbox,
+  ToolContext,
+} from "@/types";
+import { truncateOutput } from "@/lib/token-utils";
+import { supportsMultimodalToolResults } from "@/lib/ai/providers";
+import { buildSandboxCommandOptions } from "./utils/sandbox-command-options";
+import { isCentrifugoSandbox } from "./utils/sandbox-types";
+import {
+  getSandboxUploadedFileUrl,
+  uploadSandboxFileToConvex,
+} from "./utils/sandbox-file-uploader";
+import type { Id } from "@/convex/_generated/dataModel";
+import { logger } from "@/lib/logger";
+import { phLogger } from "@/lib/posthog/server";
+import { validateImageBytes } from "@/lib/utils/image-validation";
+import { validateDownloadUrl } from "./utils/path-validation";
+import {
+  getSandboxWithFallbackGuard,
+  resolveToolErrorMessage,
+} from "./utils/sandbox-fallback";
+import { createFileToolSchema } from "./schemas";
+
+const MAX_VIEW_FILE_BYTES = 10 * 1024 * 1024;
+const MAX_TEXT_FILE_READ_BYTES = 1024 * 1024;
+const MAX_TEXT_READ_RESULT_BYTES = 1024 * 1024;
+const MAX_AUTO_REVIEW_FILE_CHANGE_CHARS = 24 * 1024;
+const RASTER_IMAGE_EXTENSIONS = new Set([
+  "gif",
+  "jpe",
+  "jfif",
+  "jpeg",
+  "jpg",
+  "png",
+  "webp",
+]);
+const RASTER_READ_REDIRECT_MESSAGE =
+  "Raster image files cannot be read as text. Use the view action instead; Agent will inspect the image with its configured vision path.";
+const MULTIMODAL_UPGRADE_MESSAGE =
+  "The current model does not support multimodal tool results for sandbox images. Please select a model with image viewing support and retry the view action.";
+
+type ViewKind = "image";
+
+type ViewPreviewFile = {
+  fileId: Id<"files">;
+  name: string;
+  mediaType: string;
+  s3Key?: string;
+};
+
+type ViewMetadata = {
+  action: "view";
+  content: string;
+  path: string;
+  filename: string;
+  mediaType: string;
+  sizeBytes: number;
+  kind: ViewKind;
+  previewUploadSucceeded?: boolean;
+  previewFiles?: ViewPreviewFile[];
+  previewError?: string;
+  visionDescription?: string;
+  visionDescriptionError?: string;
+};
+
+type SandboxViewPayload = {
+  path: string;
+  mediaType: string;
+  sizeBytes: number;
+  kind: ViewKind;
+  data?: string;
+};
+
+type FileViewImageUsageOutcome =
+  "success" | "unsupported_model" | "inspection_failed";
+
+type FileViewStage = "initial_inspection" | "model_output";
+
+type FileViewErrorClassification = {
+  failureReason: string;
+  failureDetail: string;
+  failureCategory: FileViewFailureCategory;
+  expectedFailure: boolean;
+  imageValidationReason?: string;
+  errorName?: string;
+  errorMessageHash: string;
+};
+
+type FileViewFailureCategory =
+  | "image_validation"
+  | "inspection_protocol"
+  | "missing_file"
+  | "sandbox_lifecycle"
+  | "unsupported_capability"
+  | "unsupported_input";
+
+const escapeImageDescriptionText = (value: string): string =>
+  value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+
+const escapeImageDescriptionAttribute = (value: string): string =>
+  escapeImageDescriptionText(value).replaceAll('"', "&quot;");
+
+const formatImageDescriptionForModel = (
+  content: string,
+  filename: string,
+  description: string,
+): string =>
+  `${content}\n<image_description filename="${escapeImageDescriptionAttribute(filename)}" trust="untrusted">\n${escapeImageDescriptionText(description)}\n</image_description>`;
+
+const VIEW_FILE_SCRIPT = String.raw`
+import base64
+import json
+import mimetypes
+import os
+import sys
+
+path = os.environ["HACKERAI_FILE_VIEW_PATH"]
+include_data = os.environ.get("HACKERAI_FILE_VIEW_INCLUDE_DATA") == "1"
+max_bytes = int(os.environ.get("HACKERAI_FILE_VIEW_MAX_BYTES", "10485760"))
+
+def emit(payload, code=0):
+    print(json.dumps(payload, separators=(",", ":")))
+    sys.exit(code)
+
+if not os.path.isfile(path):
+    emit({"error": f"File not found or is not a regular file: {path}"}, 2)
+
+size = os.path.getsize(path)
+if size > max_bytes:
+    emit({
+        "error": (
+            f"Image is too large for view ({size} bytes). "
+            f"Maximum supported size is {max_bytes} bytes."
+        )
+    }, 3)
+
+with open(path, "rb") as f:
+    head = f.read(32)
+
+def detect_media_type(head_bytes, file_path):
+    if head_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if head_bytes.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if head_bytes.startswith(b"GIF87a") or head_bytes.startswith(b"GIF89a"):
+        return "image/gif"
+    if head_bytes.startswith(b"RIFF") and head_bytes[8:12] == b"WEBP":
+        return "image/webp"
+    guessed, _ = mimetypes.guess_type(file_path)
+    return guessed or "application/octet-stream"
+
+media_type = detect_media_type(head, path)
+if media_type == "image/svg+xml":
+    emit({"error": "SVG files are text/vector files. Use the read action instead of view."}, 4)
+if not media_type.startswith("image/"):
+    emit({
+        "error": (
+            f"Unsupported media type for view: {media_type}. "
+            "The view action is only for raster image files. Use read or a purpose-built converter for PDFs and text-based files."
+        )
+    }, 5)
+
+payload = {
+    "path": path,
+    "mediaType": media_type,
+    "sizeBytes": size,
+    "kind": "image",
+}
+
+if include_data:
+    with open(path, "rb") as f:
+        payload["data"] = base64.b64encode(f.read()).decode("ascii")
+
+emit(payload)
+`;
+
+const READ_TEXT_FILE_SCRIPT = String.raw`
+import json
+import mimetypes
+import os
+import sys
+
+path = os.environ["HACKERAI_FILE_READ_PATH"]
+range_start = int(os.environ.get("HACKERAI_FILE_READ_RANGE_START", "0"))
+range_end = int(os.environ.get("HACKERAI_FILE_READ_RANGE_END", "-1"))
+max_full_bytes = int(os.environ.get("HACKERAI_FILE_READ_MAX_FULL_BYTES", "1048576"))
+max_result_bytes = int(os.environ.get("HACKERAI_FILE_READ_MAX_RESULT_BYTES", "1048576"))
+
+def emit(payload, code=0):
+    print(json.dumps(payload, separators=(",", ":")))
+    sys.exit(code)
+
+if range_start < 0:
+    emit({"error": f"Invalid start_line: {range_start}. Line numbers are 1-indexed, must be >= 1."}, 2)
+if range_start > 0 and range_end != -1 and range_end < range_start:
+    emit({"error": f"Invalid range: start_line ({range_start}) cannot be greater than end_line ({range_end})."}, 2)
+
+if not os.path.isfile(path):
+    emit({"error": f"File not found or is not a regular file: {path}"}, 3)
+
+size = os.path.getsize(path)
+
+with open(path, "rb") as f:
+    head = f.read(32)
+
+def detect_raster_media_type(head_bytes, file_path):
+    if head_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if head_bytes.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if head_bytes.startswith(b"GIF87a") or head_bytes.startswith(b"GIF89a"):
+        return "image/gif"
+    if head_bytes.startswith(b"RIFF") and head_bytes[8:12] == b"WEBP":
+        return "image/webp"
+    guessed, _ = mimetypes.guess_type(file_path)
+    if guessed in {"image/gif", "image/jpeg", "image/png", "image/webp"}:
+        return guessed
+    return None
+
+image_media_type = detect_raster_media_type(head, path)
+if image_media_type:
+    emit({
+        "path": path,
+        "sizeBytes": size,
+        "totalLines": 0,
+        "imageMediaType": image_media_type,
+    })
+
+def count_lines(file_path, file_size):
+    if file_size == 0:
+        return 0
+    lines = 0
+    last_byte = b""
+    with open(file_path, "rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            lines += chunk.count(b"\n")
+            last_byte = chunk[-1:]
+    if last_byte != b"\n":
+        lines += 1
+    return lines
+
+total_lines = count_lines(path, size)
+if range_start == 0 and size > max_full_bytes:
+    emit({
+        "path": path,
+        "sizeBytes": size,
+        "totalLines": total_lines,
+        "tooLarge": True,
+    })
+
+if range_start > 0:
+    if range_start > total_lines:
+        emit({"error": f"Invalid start_line: {range_start}. File has {total_lines} lines (1-indexed)."}, 2)
+    if range_end != -1 and range_end > total_lines:
+        emit({"error": f"Invalid end_line: {range_end}. File has {total_lines} lines (1-indexed)."}, 2)
+
+selected = []
+selected_bytes = 0
+truncated = False
+start_line = range_start if range_start > 0 else 1
+
+def add_text(text):
+    global selected_bytes, truncated
+    encoded = text.encode("utf-8", errors="replace")
+    remaining = max_result_bytes - selected_bytes
+    if remaining <= 0:
+        truncated = True
+        return False
+    if len(encoded) > remaining:
+        selected.append(encoded[:remaining].decode("utf-8", errors="replace"))
+        selected_bytes = max_result_bytes
+        truncated = True
+        return False
+    selected.append(text)
+    selected_bytes += len(encoded)
+    return True
+
+with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
+    for line_no, line in enumerate(f, 1):
+        if range_start > 0 and line_no < range_start:
+            continue
+        if range_start > 0 and range_end != -1 and line_no > range_end:
+            break
+        if not add_text(line):
+            break
+
+emit({
+    "path": path,
+    "sizeBytes": size,
+    "totalLines": total_lines,
+    "content": "".join(selected),
+    "startLine": start_line,
+    "truncated": truncated,
+})
+`;
+
+const FILE_STATE_SCRIPT = String.raw`
+import json
+import os
+import sys
+
+path = os.environ["HACKERAI_FILE_STATE_PATH"]
+
+def emit(payload, code=0):
+    print(json.dumps(payload, separators=(",", ":")))
+    sys.exit(code)
+
+if not os.path.exists(path):
+    emit({"kind": "missing", "path": path})
+
+if not os.path.isfile(path):
+    emit({"kind": "not_file", "path": path})
+
+emit({
+    "kind": "file",
+    "path": path,
+    "sizeBytes": os.path.getsize(path),
+})
+`;
+
+const APPEND_TEXT_FILE_SCRIPT = String.raw`
+import os
+
+target_path = os.environ["HACKERAI_FILE_APPEND_TARGET_PATH"]
+source_path = os.environ["HACKERAI_FILE_APPEND_SOURCE_PATH"]
+
+with open(source_path, "rb") as source, open(target_path, "ab") as target:
+    while True:
+        chunk = source.read(1024 * 1024)
+        if not chunk:
+            break
+        target.write(chunk)
+
+try:
+    os.remove(source_path)
+except OSError:
+    pass
+`;
+
+const getFilename = (path: string) => path.split("/").pop() || path;
+
+const getFileExtension = (path: string): string | undefined => {
+  const filename = getFilename(path);
+  const dotIndex = filename.lastIndexOf(".");
+  if (dotIndex <= 0 || dotIndex === filename.length - 1) return undefined;
+  return filename.slice(dotIndex + 1).toLowerCase();
+};
+
+const isRasterImagePath = (path: string): boolean => {
+  const extension = getFileExtension(path);
+  return extension ? RASTER_IMAGE_EXTENSIONS.has(extension) : false;
+};
+
+function getViewSandboxType(sandbox: any): "centrifugo" | "e2b" {
+  return isCentrifugoSandbox(sandbox) ? "centrifugo" : "e2b";
+}
+
+function getActiveModelName(context: ToolContext): string | undefined {
+  return context.getCurrentModelName?.() ?? context.modelName;
+}
+
+function hashTelemetryValue(value: string): string {
+  return createHash("sha256").update(value).digest("hex").slice(0, 16);
+}
+
+function getPathPrefixClass(path: string): string {
+  const normalizedPath = path.replace(/\\/g, "/");
+  const lowerPath = normalizedPath.toLowerCase();
+
+  if (path.trim() === "") return "empty";
+  if (lowerPath.startsWith("/tmp/") || lowerPath.startsWith("c:/temp/")) {
+    return "tmp";
+  }
+  if (lowerPath.startsWith("/home/") || lowerPath.startsWith("c:/users/")) {
+    return "home";
+  }
+  if (lowerPath.startsWith("/workspace/") || lowerPath.includes("/workdir/")) {
+    return "workspace";
+  }
+  if (normalizedPath.startsWith("/") || /^[a-z]:\//i.test(normalizedPath)) {
+    return "absolute_other";
+  }
+  return "relative";
+}
+
+function getPathDepth(path: string): number {
+  return path
+    .replace(/\\/g, "/")
+    .split("/")
+    .filter((part) => part.length > 0).length;
+}
+
+function getPathTelemetry(path: string, userId: string) {
+  return {
+    path_fingerprint: hashTelemetryValue(`${userId}:${path}`),
+    path_prefix_class: getPathPrefixClass(path),
+    path_is_absolute: path.startsWith("/") || /^[a-z]:[\\/]/i.test(path),
+    path_has_extension: Boolean(getFileExtension(path)),
+    path_depth: getPathDepth(path),
+    path_length: path.length,
+  };
+}
+
+function getFailureCategory(
+  failureReason?: string,
+  failureDetail?: string,
+): FileViewFailureCategory | undefined {
+  if (!failureReason && !failureDetail) return undefined;
+
+  if (
+    failureReason === "unsupported_model" ||
+    failureReason === "unsupported_sandbox"
+  ) {
+    return "unsupported_capability";
+  }
+  if (
+    failureReason === "unsupported_media_type" ||
+    failureReason === "unsupported_svg" ||
+    failureReason === "file_too_large"
+  ) {
+    return "unsupported_input";
+  }
+  if (failureReason === "file_not_found") return "missing_file";
+  if (
+    failureReason === "sandbox_unavailable" ||
+    failureReason === "sandbox_timeout"
+  ) {
+    return "sandbox_lifecycle";
+  }
+  if (
+    failureReason === "image_validation_failed" ||
+    failureDetail === "invalid_image_data"
+  ) {
+    return "image_validation";
+  }
+  if (failureReason === "inspection_error") return "inspection_protocol";
+
+  return undefined;
+}
+
+function isExpectedFileViewFailure(
+  failureCategory?: FileViewFailureCategory,
+): boolean | undefined {
+  if (!failureCategory) return undefined;
+  return (
+    failureCategory === "unsupported_capability" ||
+    failureCategory === "unsupported_input"
+  );
+}
+
+function extractImageValidationReason(message: string): string | undefined {
+  const match = message.match(
+    /^View inspection found invalid image data \(([a-zA-Z0-9_]+)\)\.$/,
+  );
+  return match?.[1];
+}
+
+function classifyFileViewError(error: unknown): FileViewErrorClassification {
+  const message = error instanceof Error ? error.message : String(error);
+  const base = {
+    errorName: error instanceof Error ? error.name : undefined,
+    errorMessageHash: hashTelemetryValue(message),
+  };
+  const build = (classification: {
+    failureReason: string;
+    failureDetail: string;
+    imageValidationReason?: string;
+  }): FileViewErrorClassification => {
+    const failureCategory = getFailureCategory(
+      classification.failureReason,
+      classification.failureDetail,
+    );
+    return {
+      ...base,
+      ...classification,
+      failureCategory: failureCategory ?? "inspection_protocol",
+      expectedFailure: isExpectedFileViewFailure(failureCategory) ?? false,
+    };
+  };
+
+  if (base.errorName === "SandboxNotFoundError") {
+    return build({
+      failureReason: "sandbox_unavailable",
+      failureDetail: "sandbox_not_found",
+    });
+  }
+  if (base.errorName === "TimeoutError") {
+    return build({
+      failureReason: "sandbox_timeout",
+      failureDetail: "sandbox_command_timeout",
+    });
+  }
+
+  if (message.includes("Unsupported media type")) {
+    return build({
+      failureReason: "unsupported_media_type",
+      failureDetail: "unsupported_media_type",
+    });
+  }
+  if (message.includes("too large")) {
+    return build({
+      failureReason: "file_too_large",
+      failureDetail: "file_too_large",
+    });
+  }
+  if (message.includes("File not found")) {
+    return build({
+      failureReason: "file_not_found",
+      failureDetail: "file_not_found",
+    });
+  }
+  if (message.includes("Windows local sandboxes")) {
+    return build({
+      failureReason: "unsupported_sandbox",
+      failureDetail: "windows_local_sandbox",
+    });
+  }
+  if (message.includes("SVG files")) {
+    return build({
+      failureReason: "unsupported_svg",
+      failureDetail: "unsupported_svg",
+    });
+  }
+  if (message.includes("Failed to inspect file for view")) {
+    return build({
+      failureReason: "inspection_error",
+      failureDetail: "invalid_inspection_output",
+    });
+  }
+  if (message.includes("View inspection returned an invalid payload")) {
+    return build({
+      failureReason: "inspection_error",
+      failureDetail: "invalid_payload",
+    });
+  }
+  if (message.includes("View inspection did not return image data")) {
+    return build({
+      failureReason: "inspection_error",
+      failureDetail: "missing_image_data",
+    });
+  }
+  if (message.includes("View inspection found invalid image data")) {
+    return build({
+      failureReason: "image_validation_failed",
+      failureDetail: "invalid_image_data",
+      imageValidationReason: extractImageValidationReason(message),
+    });
+  }
+
+  return build({
+    failureReason: "inspection_error",
+    failureDetail: "inspection_error",
+  });
+}
+
+function captureFileViewImageUsage(args: {
+  context: ToolContext;
+  sandbox?: any;
+  path: string;
+  stage: FileViewStage;
+  outcome: FileViewImageUsageOutcome;
+  durationMs: number;
+  mediaType?: string;
+  sizeBytes?: number;
+  previewUploadSucceeded?: boolean;
+  failureReason?: string;
+  failureDetail?: string;
+  failureCategory?: FileViewFailureCategory;
+  expectedFailure?: boolean;
+  imageValidationReason?: string;
+  errorName?: string;
+  errorMessageHash?: string;
+}) {
+  const {
+    context,
+    sandbox,
+    path,
+    stage,
+    outcome,
+    durationMs,
+    mediaType,
+    sizeBytes,
+    previewUploadSucceeded,
+    failureReason,
+    failureDetail,
+    failureCategory,
+    expectedFailure,
+    imageValidationReason,
+    errorName,
+    errorMessageHash,
+  } = args;
+  const derivedFailureCategory =
+    failureCategory ?? getFailureCategory(failureReason, failureDetail);
+  const derivedExpectedFailure =
+    expectedFailure ?? isExpectedFileViewFailure(derivedFailureCategory);
+
+  phLogger.event("file_view_image_used", {
+    userId: context.userID,
+    user_id: context.userID,
+    chat_id: context.chatId,
+    mode: context.mode,
+    subscription: context.subscription,
+    subscription_tier: context.subscription,
+    model: getActiveModelName(context),
+    configured_model: context.modelName,
+    ...(sandbox ? { sandbox_type: getViewSandboxType(sandbox) } : {}),
+    file_extension: getFileExtension(path),
+    stage,
+    outcome,
+    success: outcome === "success",
+    duration_ms: durationMs,
+    ...getPathTelemetry(path, context.userID),
+    ...(mediaType && { media_type: mediaType }),
+    ...(typeof sizeBytes === "number" && { size_bytes: sizeBytes }),
+    ...(typeof previewUploadSucceeded === "boolean" && {
+      preview_upload_succeeded: previewUploadSucceeded,
+    }),
+    ...(failureReason && { failure_reason: failureReason }),
+    ...(failureDetail && { failure_detail: failureDetail }),
+    ...(derivedFailureCategory && { failure_category: derivedFailureCategory }),
+    ...(typeof derivedExpectedFailure === "boolean" && {
+      expected_failure: derivedExpectedFailure,
+    }),
+    ...(imageValidationReason && {
+      image_validation_reason: imageValidationReason,
+    }),
+    ...(errorName && { error_name: errorName }),
+    ...(errorMessageHash && { error_message_hash: errorMessageHash }),
+  });
+}
+
+function errorToLog(error: unknown) {
+  if (error instanceof Error) {
+    const commandError = error as Error & {
+      exitCode?: unknown;
+      stdout?: unknown;
+      stderr?: unknown;
+    };
+    return {
+      name: error.name,
+      message: error.message,
+      ...(typeof commandError.exitCode === "number"
+        ? { exit_code: commandError.exitCode }
+        : {}),
+      ...(typeof commandError.stderr === "string" && commandError.stderr
+        ? { stderr: commandError.stderr.slice(0, 500) }
+        : {}),
+      ...(typeof commandError.stdout === "string" && commandError.stdout
+        ? { stdout: commandError.stdout.slice(0, 500) }
+        : {}),
+    };
+  }
+
+  return { message: String(error) };
+}
+
+type SandboxCommandResult = {
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+  error?: string;
+};
+
+type SandboxTextReadPayload = {
+  path: string;
+  sizeBytes: number;
+  totalLines: number;
+  imageMediaType?: string;
+  content?: string;
+  startLine?: number;
+  tooLarge?: boolean;
+  truncated?: boolean;
+  error?: string;
+};
+
+type SandboxFileState =
+  | { kind: "file"; path: string; sizeBytes: number }
+  | { kind: "missing"; path: string }
+  | { kind: "not_file"; path: string }
+  | { kind: "unknown"; path: string; error: string };
+
+function commandErrorToResult(error: unknown): SandboxCommandResult | null {
+  if (!(error instanceof Error)) return null;
+
+  const commandError = error as Error & {
+    exitCode?: unknown;
+    stdout?: unknown;
+    stderr?: unknown;
+  };
+
+  if (typeof commandError.exitCode !== "number") return null;
+
+  return {
+    stdout:
+      typeof commandError.stdout === "string"
+        ? commandError.stdout
+        : error.message,
+    stderr: typeof commandError.stderr === "string" ? commandError.stderr : "",
+    exitCode: commandError.exitCode,
+    error: error.message,
+  };
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function cmdQuote(value: string): string {
+  return `"${value.replace(/"/g, '""')}"`;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = bytes / 1024;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  return `${value.toFixed(value >= 10 ? 1 : 2)} ${units[unitIndex]}`;
+}
+
+function normalizeLineEndings(text: string): string {
+  return text.replace(/\r\n/g, "\n");
+}
+
+function detectLineEnding(text: string): "\n" | "\r\n" {
+  return text.includes("\r\n") ? "\r\n" : "\n";
+}
+
+function convertToLineEnding(text: string, lineEnding: "\n" | "\r\n"): string {
+  const normalized = normalizeLineEndings(text);
+  return lineEnding === "\r\n" ? normalized.replace(/\n/g, "\r\n") : normalized;
+}
+
+async function runSandboxCommand(
+  sandbox: AnySandbox,
+  command: string,
+  envVars?: Record<string, string>,
+  timeoutMs = 60_000,
+): Promise<SandboxCommandResult> {
+  try {
+    const result = await sandbox.commands.run(command, {
+      ...buildSandboxCommandOptions(sandbox, undefined, envVars),
+      envs: envVars,
+      timeoutMs,
+    } as ReturnType<typeof buildSandboxCommandOptions> & {
+      envs?: Record<string, string>;
+    });
+    return {
+      stdout: result.stdout ?? "",
+      stderr: result.stderr ?? "",
+      exitCode: typeof result.exitCode === "number" ? result.exitCode : 0,
+    };
+  } catch (error) {
+    const commandResult = commandErrorToResult(error);
+    if (commandResult) return commandResult;
+    throw error;
+  }
+}
+
+function isWindowsSandbox(sandbox: AnySandbox): boolean {
+  return isCentrifugoSandbox(sandbox) && sandbox.isWindows();
+}
+
+function getWindowsNativePath(path: string): string {
+  if (/^[A-Za-z]:[\\/]/.test(path)) return path;
+  if (path.startsWith("/tmp/")) {
+    return `C:\\temp${path.slice(4).replace(/\//g, "\\")}`;
+  }
+  return path.replace(/\//g, "\\");
+}
+
+function getPythonPathForSandbox(sandbox: AnySandbox, path: string): string {
+  return isWindowsSandbox(sandbox) ? getWindowsNativePath(path) : path;
+}
+
+type NativeDesktopFiles = {
+  stat?: (path: string) => Promise<SandboxFileState>;
+  readText?: (
+    path: string,
+    options?: {
+      range?: [number, number];
+      maxFullBytes?: number;
+      maxResultBytes?: number;
+    },
+  ) => Promise<SandboxTextReadPayload>;
+  append?: (path: string, content: string) => Promise<void>;
+};
+
+function getNativeDesktopFiles(sandbox: AnySandbox): NativeDesktopFiles | null {
+  if (!isCentrifugoSandbox(sandbox)) return null;
+
+  const maybeSandbox = sandbox as unknown as {
+    supportsNativeFileRelay?: () => boolean;
+    files?: NativeDesktopFiles;
+  };
+  if (maybeSandbox.supportsNativeFileRelay?.() !== true) {
+    return null;
+  }
+  return maybeSandbox.files ?? null;
+}
+
+function toWindowsBashPath(path: string): string {
+  const drive = path.match(/^([A-Za-z]):[\\/](.*)$/);
+  if (drive) {
+    return `/${drive[1].toLowerCase()}/${drive[2].replace(/\\/g, "/")}`;
+  }
+  return path.replace(/\\/g, "/");
+}
+
+async function detectSandboxShell(
+  sandbox: AnySandbox,
+): Promise<"bash" | "cmd"> {
+  if (!isWindowsSandbox(sandbox)) return "bash";
+
+  const probe = await runSandboxCommand(
+    sandbox,
+    "echo $BASH_VERSION",
+    undefined,
+    10_000,
+  ).catch(() => null);
+  if (probe?.exitCode === 0 && /^\d/.test(probe.stdout.trim())) {
+    return "bash";
+  }
+
+  return "cmd";
+}
+
+async function runPythonScript(
+  sandbox: AnySandbox,
+  script: string,
+  envVars: Record<string, string>,
+  timeoutMs: number,
+): Promise<SandboxCommandResult> {
+  if (!isWindowsSandbox(sandbox)) {
+    const command = `PYTHON_BIN="$(command -v python3 || command -v python)" && "$PYTHON_BIN" - <<'PY'\n${script}\nPY`;
+    return runSandboxCommand(sandbox, command, envVars, timeoutMs);
+  }
+
+  const shell = await detectSandboxShell(sandbox);
+  const tempScriptPath = `/tmp/hackerai_script_${Date.now()}_${Math.random().toString(36).slice(2)}.py`;
+  await sandbox.files.write(tempScriptPath, script, {
+    user: "user" as const,
+  });
+
+  const nativePath = getWindowsNativePath(tempScriptPath);
+  const commandPath =
+    shell === "bash" ? toWindowsBashPath(nativePath) : nativePath;
+  const quotedPath =
+    shell === "bash" ? shellQuote(commandPath) : cmdQuote(commandPath);
+  const command =
+    shell === "bash"
+      ? `PYTHON_BIN="$(command -v python3 || command -v python)" && "$PYTHON_BIN" ${quotedPath}; status=$?; rm -f ${quotedPath}; exit $status`
+      : `python ${quotedPath}`;
+
+  try {
+    return await runSandboxCommand(sandbox, command, envVars, timeoutMs);
+  } finally {
+    if (shell === "cmd") {
+      await sandbox.files.remove(tempScriptPath).catch(() => undefined);
+    }
+  }
+}
+
+async function getSandboxFileState(
+  sandbox: AnySandbox,
+  path: string,
+): Promise<SandboxFileState> {
+  const nativeFiles = getNativeDesktopFiles(sandbox);
+  if (nativeFiles?.stat) {
+    return nativeFiles.stat(path);
+  }
+
+  const pythonPath = getPythonPathForSandbox(sandbox, path);
+  const result = await runPythonScript(
+    sandbox,
+    FILE_STATE_SCRIPT,
+    { HACKERAI_FILE_STATE_PATH: pythonPath },
+    30_000,
+  ).catch((error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      stdout: "",
+      stderr: message,
+      exitCode: 1,
+    } satisfies SandboxCommandResult;
+  });
+
+  if (result.exitCode !== 0) {
+    return {
+      kind: "unknown",
+      path,
+      error: result.stderr || result.stdout || "file state command failed",
+    };
+  }
+
+  try {
+    const payload = JSON.parse(result.stdout.trim()) as SandboxFileState;
+    if (
+      payload.kind === "file" &&
+      typeof payload.sizeBytes === "number" &&
+      Number.isFinite(payload.sizeBytes)
+    ) {
+      return { ...payload, path };
+    }
+    if (payload.kind === "missing" || payload.kind === "not_file") {
+      return { ...payload, path };
+    }
+  } catch {
+    // Fall through to unknown below.
+  }
+
+  return {
+    kind: "unknown",
+    path,
+    error: result.stderr || result.stdout || "invalid file state response",
+  };
+}
+
+function buildNumberedFileContent(args: {
+  filename: string;
+  content: string;
+  startLineNumber?: number;
+  truncated?: boolean;
+}): {
+  content: string;
+  originalContent: string;
+} {
+  const { filename, content, startLineNumber = 1, truncated } = args;
+  const lines = content.split("\n");
+  const numberedLines = lines.map((line, index) => {
+    const lineNumber = startLineNumber + index;
+    return `${lineNumber.toString().padStart(6)}|${line}`;
+  });
+
+  const truncatedNotice = truncated
+    ? `\n\n[Range output truncated at ${formatBytes(MAX_TEXT_READ_RESULT_BYTES)}. Request a narrower line range to continue.]`
+    : "";
+  const numberedContent = numberedLines.join("\n");
+  const result = `Text file: ${filename}\nLatest content with line numbers:\n${numberedContent}${truncatedNotice}`;
+
+  return {
+    content: truncateOutput({
+      content: result,
+      mode: "read-file",
+    }) as string,
+    originalContent: truncateOutput({
+      content,
+      mode: "read-file",
+    }),
+  };
+}
+
+async function readSandboxTextFile(
+  sandbox: AnySandbox,
+  path: string,
+  range?: number[],
+): Promise<SandboxTextReadPayload> {
+  const nativeFiles = getNativeDesktopFiles(sandbox);
+  if (nativeFiles?.readText) {
+    return nativeFiles.readText(path, {
+      ...(range ? { range: [range[0], range[1]] } : {}),
+      maxFullBytes: MAX_TEXT_FILE_READ_BYTES,
+      maxResultBytes: MAX_TEXT_READ_RESULT_BYTES,
+    });
+  }
+
+  const pythonPath = getPythonPathForSandbox(sandbox, path);
+  const envVars = {
+    HACKERAI_FILE_READ_PATH: pythonPath,
+    HACKERAI_FILE_READ_RANGE_START: String(range?.[0] ?? 0),
+    HACKERAI_FILE_READ_RANGE_END: String(range?.[1] ?? -1),
+    HACKERAI_FILE_READ_MAX_FULL_BYTES: String(MAX_TEXT_FILE_READ_BYTES),
+    HACKERAI_FILE_READ_MAX_RESULT_BYTES: String(MAX_TEXT_READ_RESULT_BYTES),
+  };
+  const result = await runPythonScript(
+    sandbox,
+    READ_TEXT_FILE_SCRIPT,
+    envVars,
+    120_000,
+  );
+  const stdout = result.stdout.trim();
+  let payload: SandboxTextReadPayload;
+
+  try {
+    payload = JSON.parse(stdout);
+  } catch {
+    throw new Error(
+      `Failed to inspect text file: ${
+        result.stderr || stdout || "No output returned"
+      }`,
+    );
+  }
+
+  if (result.exitCode !== 0 || payload.error) {
+    throw new Error(payload.error || result.stderr || "Failed to read file");
+  }
+
+  return payload;
+}
+
+async function readSandboxTextFileWithFallback(
+  sandbox: AnySandbox,
+  path: string,
+  range?: number[],
+): Promise<SandboxTextReadPayload> {
+  try {
+    return await readSandboxTextFile(sandbox, path, range);
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    if (
+      errorMessage.startsWith("Invalid ") ||
+      errorMessage.includes("File not found")
+    ) {
+      throw error;
+    }
+
+    const state = await getSandboxFileState(sandbox, path);
+    if (state.kind === "unknown") {
+      throw new Error(
+        `Unable to determine file size for ${path}; refusing to load the file into memory. ${state.error}`,
+      );
+    }
+    if (state.kind === "missing") {
+      throw new Error(`File not found or is not a regular file: ${path}`);
+    }
+    if (state.kind === "not_file") {
+      throw new Error(`File is not a regular file: ${path}`);
+    }
+    if (state.sizeBytes > MAX_TEXT_FILE_READ_BYTES) {
+      if (range) {
+        throw new Error(
+          `Unable to perform a bounded range read for ${path}, and the file is too large to load safely (${formatBytes(state.sizeBytes)}). Use a targeted terminal command that writes a small result to a separate file.`,
+        );
+      }
+
+      return {
+        path,
+        sizeBytes: state.sizeBytes,
+        totalLines: 0,
+        tooLarge: true,
+      };
+    }
+
+    const fileContent = await sandbox.files.read(path, {
+      user: "user" as const,
+    });
+    const lines = fileContent.split("\n");
+
+    if (range) {
+      const [start, end] = range;
+      if (start < 1) {
+        throw new Error(
+          `Invalid start_line: ${start}. Line numbers are 1-indexed, must be >= 1.`,
+        );
+      }
+      if (end !== -1 && end < start) {
+        throw new Error(
+          `Invalid range: start_line (${start}) cannot be greater than end_line (${end}).`,
+        );
+      }
+      if (start > lines.length) {
+        throw new Error(
+          `Invalid start_line: ${start}. File has ${lines.length} lines (1-indexed).`,
+        );
+      }
+      if (end !== -1 && end > lines.length) {
+        throw new Error(
+          `Invalid end_line: ${end}. File has ${lines.length} lines (1-indexed).`,
+        );
+      }
+      const startIndex = start - 1;
+      const endIndex = end === -1 ? lines.length : end;
+      return {
+        path,
+        sizeBytes: Buffer.byteLength(fileContent),
+        totalLines: lines.length,
+        content: lines.slice(startIndex, endIndex).join("\n"),
+        startLine: start,
+      };
+    }
+
+    return {
+      path,
+      sizeBytes: Buffer.byteLength(fileContent),
+      totalLines: lines.length,
+      content: fileContent,
+      startLine: 1,
+    };
+  }
+}
+
+async function appendSandboxTextFile(
+  sandbox: AnySandbox,
+  path: string,
+  text: string,
+): Promise<void> {
+  const nativeFiles = getNativeDesktopFiles(sandbox);
+  if (nativeFiles?.append) {
+    await nativeFiles.append(path, text);
+    return;
+  }
+
+  const tempPath = `/tmp/hackerai_append_${Date.now()}_${Math.random().toString(36).slice(2)}.tmp`;
+  await sandbox.files.write(tempPath, text, {
+    user: "user" as const,
+  });
+
+  const result = await runPythonScript(
+    sandbox,
+    APPEND_TEXT_FILE_SCRIPT,
+    {
+      HACKERAI_FILE_APPEND_TARGET_PATH: getPythonPathForSandbox(sandbox, path),
+      HACKERAI_FILE_APPEND_SOURCE_PATH: getPythonPathForSandbox(
+        sandbox,
+        tempPath,
+      ),
+    },
+    60_000,
+  );
+  if (result.exitCode !== 0) {
+    throw new Error(result.stderr || result.stdout || "Failed to append file");
+  }
+}
+
+const getSandboxViewPath = (sandbox: unknown, path: string): string => {
+  const maybeSandbox = sandbox as any;
+  if (
+    isCentrifugoSandbox(maybeSandbox) &&
+    maybeSandbox.isWindows() &&
+    path.startsWith("/tmp/")
+  ) {
+    return `C:\\temp${path.slice(4).replace(/\//g, "\\")}`;
+  }
+
+  return path;
+};
+
+async function readSandboxFileForView(
+  sandbox: any,
+  path: string,
+  includeData: boolean,
+): Promise<SandboxViewPayload> {
+  if (isCentrifugoSandbox(sandbox) && sandbox.isWindows()) {
+    throw new Error(
+      "The view action is not available for Windows local sandboxes yet. Use a Linux/E2B sandbox or inspect the image manually.",
+    );
+  }
+
+  const sandboxPath = getSandboxViewPath(sandbox, path);
+  const viewEnvVars = {
+    HACKERAI_FILE_VIEW_PATH: sandboxPath,
+    HACKERAI_FILE_VIEW_INCLUDE_DATA: includeData ? "1" : "0",
+    HACKERAI_FILE_VIEW_MAX_BYTES: String(MAX_VIEW_FILE_BYTES),
+  };
+  const command = `PYTHON_BIN="$(command -v python3 || command -v python)" && "$PYTHON_BIN" - <<'PY'\n${VIEW_FILE_SCRIPT}\nPY`;
+  let result: {
+    stdout: string;
+    stderr: string;
+    exitCode: number;
+    error?: string;
+  };
+
+  try {
+    result = await sandbox.commands.run(command, {
+      ...buildSandboxCommandOptions(sandbox, undefined, viewEnvVars),
+      // E2B's command API calls this option `envs`; local sandboxes use
+      // `envVars`. Provide both so the same binary-safe helper works in both.
+      envs: viewEnvVars,
+      timeoutMs: 30_000,
+    });
+  } catch (error) {
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      "stdout" in error &&
+      "stderr" in error
+    ) {
+      const commandError = error as Record<string, unknown>;
+      result = {
+        stdout: String(commandError.stdout ?? ""),
+        stderr: String(commandError.stderr ?? ""),
+        exitCode:
+          typeof commandError.exitCode === "number" ? commandError.exitCode : 1,
+        error:
+          typeof commandError.error === "string"
+            ? commandError.error
+            : error instanceof Error
+              ? error.message
+              : String(error),
+      };
+    } else {
+      throw error;
+    }
+  }
+
+  const stdout = result.stdout.trim();
+  let payload: { error?: string } & Partial<SandboxViewPayload>;
+
+  try {
+    payload = JSON.parse(stdout);
+  } catch {
+    throw new Error(
+      `Failed to inspect file for view: ${
+        result.stderr || stdout || "No output returned"
+      }`,
+    );
+  }
+
+  if (result.exitCode !== 0 || payload.error) {
+    throw new Error(payload.error || result.stderr || "Failed to view file");
+  }
+
+  if (
+    !payload.path ||
+    !payload.mediaType ||
+    typeof payload.sizeBytes !== "number" ||
+    payload.kind !== "image"
+  ) {
+    throw new Error("View inspection returned an invalid payload.");
+  }
+
+  if (includeData && !payload.data) {
+    throw new Error("View inspection did not return image data.");
+  }
+
+  if (includeData && payload.data) {
+    const validation = validateImageBytes(
+      Buffer.from(payload.data, "base64"),
+      payload.mediaType,
+    );
+    if (!validation.valid) {
+      throw new Error(
+        `View inspection found invalid image data (${validation.reason}).`,
+      );
+    }
+    payload.mediaType = validation.mediaType;
+  }
+
+  return payload as SandboxViewPayload;
+}
+
+async function uploadViewPreviewFiles(args: {
+  context: ToolContext;
+  sandbox: any;
+  sourcePath: string;
+  payload: SandboxViewPayload;
+}): Promise<{ files: ViewPreviewFile[]; url: string }> {
+  const { context, sandbox, sourcePath, payload } = args;
+
+  const uploaded = await uploadSandboxFileToConvex({
+    sandbox,
+    userId: context.userID,
+    fullPath: sourcePath,
+    mediaType: payload.mediaType,
+    name: getFilename(sourcePath),
+    storageRegion: context.triggerRegion,
+  });
+
+  return {
+    files: [
+      {
+        fileId: uploaded.fileId,
+        name: uploaded.name,
+        mediaType: uploaded.mediaType,
+        s3Key: uploaded.s3Key,
+      },
+    ],
+    url: uploaded.url,
+  };
+}
+
+export const createFile = (context: ToolContext) => {
+  const { sandboxManager, modelName, getCurrentModelName } = context;
+  const getAuxiliaryVision = () =>
+    context.auxiliaryVision?.isEnabled?.() === false
+      ? undefined
+      : context.auxiliaryVision;
+  const getSandboxForFileTool = (
+    expectedSandboxIdentity?: AgentApprovalSandboxIdentity,
+  ) =>
+    getSandboxWithFallbackGuard({
+      sandboxManager,
+      expectedSandboxIdentity,
+    });
+  const canViewMultimodalFiles = () =>
+    supportsMultimodalToolResults(getCurrentModelName?.() ?? modelName);
+  // Agent streams consume image-data as a handoff boundary: prepareStep
+  // promotes the active text model before the provider sees the tool result.
+  const canHandoffMultimodalFiles = context.mode === "agent";
+  const canReturnMultimodalFiles = () =>
+    !!getAuxiliaryVision() ||
+    canHandoffMultimodalFiles ||
+    canViewMultimodalFiles();
+  const auxiliaryDescriptionCache = new Map<string, Promise<string>>();
+  const previewUrlCache = new Map<string, string>();
+  const describeViewPayload = (
+    viewPayload: SandboxViewPayload,
+    filename: string,
+    auxiliaryVision: NonNullable<ToolContext["auxiliaryVision"]>,
+  ): Promise<string> => {
+    const existing = auxiliaryDescriptionCache.get(viewPayload.path);
+    if (existing) return existing;
+    const description = auxiliaryVision
+      .describeImage({
+        image: viewPayload.data!,
+        mediaType: viewPayload.mediaType,
+        filename,
+        source: "file_view",
+      })
+      .then((result) => result.description);
+    auxiliaryDescriptionCache.set(viewPayload.path, description);
+    return description;
+  };
+  const supportsViewInSchema = canReturnMultimodalFiles();
+  const fileToolSchema = createFileToolSchema({
+    supportsView: supportsViewInSchema,
+    approvalGated: !!context.requestToolApproval,
+    modelName: context.getCurrentModelName?.() ?? context.modelName,
+  });
+
+  return tool({
+    ...fileToolSchema,
+    execute: async (
+      { action, path, brief, text, range, edits },
+      { toolCallId },
+    ) => {
+      try {
+        let approvedSandboxIdentity: AgentApprovalSandboxIdentity | undefined;
+        if (action === "write" || action === "append" || action === "edit") {
+          const serializedEdits = edits ? JSON.stringify(edits) : undefined;
+          const exactContent =
+            action === "edit" ? serializedEdits : (text ?? undefined);
+          const autoReviewContentComplete =
+            exactContent !== undefined &&
+            exactContent.length <= MAX_AUTO_REVIEW_FILE_CHANGE_CHARS;
+          const approval = await context.requestToolApproval?.({
+            toolCallId,
+            toolName: "file",
+            operation:
+              action === "write"
+                ? "file_write"
+                : action === "append"
+                  ? "file_append"
+                  : "file_edit",
+            target: path,
+            brief,
+            autoReviewContext: {
+              type: "file_change",
+              action,
+              path,
+              ...(action === "edit"
+                ? autoReviewContentComplete
+                  ? { edits }
+                  : {}
+                : exactContent !== undefined
+                  ? {
+                      text: exactContent.slice(
+                        0,
+                        MAX_AUTO_REVIEW_FILE_CHANGE_CHARS,
+                      ),
+                    }
+                  : {}),
+              complete: autoReviewContentComplete,
+            },
+          });
+          if (approval && !approval.approved) {
+            return {
+              error: approval.reason,
+              approvalDenied: true,
+            };
+          }
+          approvedSandboxIdentity = approval?.approved
+            ? approval.sandboxIdentity
+            : undefined;
+        }
+
+        const { sandbox } = await getSandboxForFileTool(
+          approvedSandboxIdentity,
+        );
+
+        switch (action) {
+          case "view": {
+            const viewStartedAt = Date.now();
+
+            if (!canReturnMultimodalFiles()) {
+              captureFileViewImageUsage({
+                context,
+                sandbox,
+                path,
+                stage: "initial_inspection",
+                outcome: "unsupported_model",
+                durationMs: Date.now() - viewStartedAt,
+                failureReason: "unsupported_model",
+                failureDetail: "unsupported_model",
+              });
+              return { error: MULTIMODAL_UPGRADE_MESSAGE };
+            }
+
+            let viewPayload: SandboxViewPayload;
+            try {
+              viewPayload = await readSandboxFileForView(
+                sandbox,
+                path,
+                !!getAuxiliaryVision(),
+              );
+            } catch (error) {
+              const classification = classifyFileViewError(error);
+              captureFileViewImageUsage({
+                context,
+                sandbox,
+                path,
+                stage: "initial_inspection",
+                outcome: "inspection_failed",
+                durationMs: Date.now() - viewStartedAt,
+                failureReason: classification.failureReason,
+                failureDetail: classification.failureDetail,
+                failureCategory: classification.failureCategory,
+                expectedFailure: classification.expectedFailure,
+                imageValidationReason: classification.imageValidationReason,
+                errorName: classification.errorName,
+                errorMessageHash: classification.errorMessageHash,
+              });
+              throw error;
+            }
+
+            const filename = getFilename(path);
+            let previewFiles: ViewPreviewFile[] = [];
+            let previewUploadError: string | undefined;
+            try {
+              const uploadedPreview = await uploadViewPreviewFiles({
+                context,
+                sandbox,
+                sourcePath: path,
+                payload: viewPayload,
+              });
+              previewFiles = uploadedPreview.files;
+              const previewFileId = String(uploadedPreview.files[0].fileId);
+              validateDownloadUrl(uploadedPreview.url);
+              previewUrlCache.set(previewFileId, uploadedPreview.url);
+            } catch (error) {
+              previewUploadError =
+                error instanceof Error ? error.message : String(error);
+              logger.error(
+                "file_view_preview_upload_failed",
+                error instanceof Error ? error : undefined,
+                {
+                  event: "file_view_preview_upload_failed",
+                  service: "chat-handler",
+                  user_id: context.userID,
+                  sandbox_type: getViewSandboxType(sandbox),
+                  file_name: filename,
+                  source_path: path,
+                  kind: viewPayload.kind,
+                  media_type: viewPayload.mediaType,
+                  size_bytes: viewPayload.sizeBytes,
+                  error: errorToLog(error),
+                },
+              );
+            }
+
+            let visionDescription: string | undefined;
+            let visionDescriptionError: string | undefined;
+            const auxiliaryVision = getAuxiliaryVision();
+            if (auxiliaryVision) {
+              try {
+                // A new explicit view may observe changed file contents and is
+                // also the retry boundary after a prior descriptor failure.
+                auxiliaryDescriptionCache.delete(viewPayload.path);
+                visionDescription = await describeViewPayload(
+                  viewPayload,
+                  filename,
+                  auxiliaryVision,
+                );
+              } catch (error) {
+                if (auxiliaryVision.isAborted?.()) throw error;
+                visionDescriptionError =
+                  "The auxiliary vision model could not inspect this image. Retry the view action.";
+              }
+            }
+
+            return {
+              action: "view",
+              content: `Viewing image file: ${filename} (${viewPayload.mediaType}, ${viewPayload.sizeBytes} bytes).`,
+              path,
+              filename,
+              mediaType: viewPayload.mediaType,
+              sizeBytes: viewPayload.sizeBytes,
+              kind: viewPayload.kind,
+              previewUploadSucceeded: !previewUploadError,
+              previewFiles,
+              ...(visionDescription ? { visionDescription } : {}),
+              ...(visionDescriptionError ? { visionDescriptionError } : {}),
+              ...(previewUploadError
+                ? { previewError: previewUploadError }
+                : {}),
+            } satisfies ViewMetadata;
+          }
+
+          case "read": {
+            if (isRasterImagePath(path)) {
+              return { error: RASTER_READ_REDIRECT_MESSAGE };
+            }
+
+            const filename = path.split("/").pop() || path;
+            const readPayload = await readSandboxTextFileWithFallback(
+              sandbox,
+              path,
+              range,
+            );
+
+            if (readPayload.imageMediaType) {
+              return { error: RASTER_READ_REDIRECT_MESSAGE };
+            }
+
+            if (readPayload.tooLarge) {
+              const totalLines =
+                readPayload.totalLines > 0
+                  ? `${readPayload.totalLines} lines`
+                  : "line count unavailable";
+              return {
+                content: `Text file: ${filename}\nFile is too large to read in full (${formatBytes(readPayload.sizeBytes)}, ${totalLines}). Use the range parameter to read a smaller slice, e.g. range [1, 200].`,
+                originalContent: "",
+              };
+            }
+
+            if (!readPayload.content || readPayload.content.trim() === "") {
+              return { error: "File is empty." };
+            }
+
+            // Return object with raw content for UI and formatted content for model
+            return buildNumberedFileContent({
+              filename,
+              content: readPayload.content,
+              startLineNumber: readPayload.startLine,
+              truncated: readPayload.truncated,
+            });
+          }
+
+          case "write": {
+            if (text === undefined) {
+              return { error: "text is required for write action" };
+            }
+
+            await sandbox.files.write(path, text, {
+              user: "user" as const,
+            });
+
+            return `File written: ${path}`;
+          }
+
+          case "append": {
+            if (text === undefined) {
+              return { error: "text is required for append action" };
+            }
+
+            const existingState = await getSandboxFileState(sandbox, path);
+            if (existingState.kind === "unknown") {
+              return {
+                error: `Cannot append safely because the existing file size could not be determined for ${path}. ${existingState.error}`,
+              };
+            }
+            if (existingState.kind === "not_file") {
+              return {
+                error: `Cannot append to ${path} because it is not a file.`,
+              };
+            }
+            if (
+              existingState.kind === "file" &&
+              existingState.sizeBytes > MAX_TEXT_FILE_READ_BYTES
+            ) {
+              await appendSandboxTextFile(sandbox, path, text);
+              return {
+                content: `File appended: ${path}\nExisting file is ${formatBytes(existingState.sizeBytes)}, so the full diff preview was skipped to avoid loading the entire file into memory.`,
+              };
+            }
+
+            // Read existing content first
+            let existingContent = "";
+            try {
+              existingContent = await sandbox.files.read(path, {
+                user: "user" as const,
+              });
+            } catch {
+              // File doesn't exist, start with empty content
+            }
+
+            // Append directly without adding extra newline - agent controls exact content
+            const appendText = existingContent
+              ? convertToLineEnding(text, detectLineEnding(existingContent))
+              : text;
+            const newContent = existingContent + appendText;
+
+            await sandbox.files.write(path, newContent, {
+              user: "user" as const,
+            });
+
+            // Return both original and modified content for UI diff view in computer sidebar
+            // toModelOutput controls what the model sees (summary only)
+            return {
+              content: `File appended: ${path}`,
+              originalContent: truncateOutput({
+                content: existingContent,
+                mode: "read-file",
+              }),
+              modifiedContent: truncateOutput({
+                content: newContent,
+                mode: "read-file",
+              }),
+            };
+          }
+
+          case "edit": {
+            if (!edits || edits.length === 0) {
+              return { error: "edits array is required for edit action" };
+            }
+
+            const existingState = await getSandboxFileState(sandbox, path);
+            if (existingState.kind === "unknown") {
+              return {
+                error: `Cannot edit ${path} safely because the file size could not be determined. ${existingState.error}`,
+              };
+            }
+            if (existingState.kind === "missing") {
+              return {
+                error: `Cannot edit file ${path} - file is empty or does not exist`,
+              };
+            }
+            if (existingState.kind === "not_file") {
+              return { error: `Cannot edit ${path} because it is not a file.` };
+            }
+            if (existingState.sizeBytes > MAX_TEXT_FILE_READ_BYTES) {
+              return {
+                error: `File ${path} is too large for the edit action (${formatBytes(existingState.sizeBytes)}). Use a targeted shell command, restore the file from a clean source, or replace it with the write action instead of loading the whole file into memory.`,
+              };
+            }
+
+            // Read existing content
+            const originalContent = await sandbox.files.read(path, {
+              user: "user" as const,
+            });
+
+            if (!originalContent) {
+              return {
+                error: `Cannot edit file ${path} - file is empty or does not exist`,
+              };
+            }
+
+            // Validate all find strings exist before applying any edits (atomic behavior)
+            const lineEnding = detectLineEnding(originalContent);
+            const normalizedEdits = edits.map((edit) => ({
+              ...edit,
+              find: convertToLineEnding(edit.find, lineEnding),
+              replace: convertToLineEnding(edit.replace, lineEnding),
+            }));
+            const missingFinds: { index: number; find: string }[] = [];
+            for (let i = 0; i < normalizedEdits.length; i++) {
+              if (!originalContent.includes(normalizedEdits[i].find)) {
+                missingFinds.push({ index: i + 1, find: edits[i].find });
+              }
+            }
+
+            if (missingFinds.length > 0) {
+              const details = missingFinds
+                .map(
+                  (m) =>
+                    `Edit #${m.index}: "${m.find.length > 50 ? m.find.slice(0, 50) + "..." : m.find}"`,
+                )
+                .join("\n");
+              return {
+                error: `Atomic edit failed - the following find string(s) were not found in the file:\n${details}\nNo edits were applied.`,
+              };
+            }
+
+            // Apply edits sequentially (all find strings validated above)
+            let content = originalContent;
+            let totalReplacements = 0;
+
+            for (const edit of normalizedEdits) {
+              const { find, replace, all = false } = edit;
+
+              if (all) {
+                const count = content.split(find).length - 1;
+                content = content.split(find).join(replace);
+                totalReplacements += count;
+              } else {
+                content = content.replace(find, replace);
+                totalReplacements += 1;
+              }
+            }
+
+            // Write the modified content back
+            await sandbox.files.write(path, content, {
+              user: "user" as const,
+            });
+
+            // Format content with line numbers for model output (padded format with pipe separator)
+            const lines = normalizeLineEndings(content).split("\n");
+            const numberedLines = lines
+              .map(
+                (line, index) =>
+                  `${(index + 1).toString().padStart(6)}|${line}`,
+              )
+              .join("\n");
+
+            // Return full diff data (persisted for UI)
+            // toModelOutput will control what the model sees
+            return {
+              content: truncateOutput({
+                content: `Multi-edit completed: ${edits.length} edits applied, ${totalReplacements} total replacements made\nLatest content with line numbers:\n${numberedLines}`,
+                mode: "read-file",
+              }),
+              originalContent: truncateOutput({
+                content: originalContent,
+                mode: "read-file",
+              }),
+              modifiedContent: truncateOutput({
+                content,
+                mode: "read-file",
+              }),
+            };
+          }
+
+          default:
+            return { error: `Unknown action ${action}` };
+        }
+      } catch (error) {
+        if (context.auxiliaryVision?.isAborted?.()) throw error;
+        return {
+          error: resolveToolErrorMessage(error),
+        };
+      }
+    },
+    // Control what the model sees (exclude large diff content)
+    async toModelOutput({ output }) {
+      // If output is a string (write action), pass through
+      if (typeof output === "string") {
+        return { type: "text" as const, value: output };
+      }
+
+      if (typeof output === "object" && output !== null) {
+        // Handle error responses
+        if ("error" in output) {
+          return {
+            type: "text" as const,
+            value: `Error: ${(output as { error: string }).error}`,
+          };
+        }
+
+        if (
+          "action" in output &&
+          (output as { action?: string }).action === "view"
+        ) {
+          const viewOutput = output as ViewMetadata;
+
+          if (!canReturnMultimodalFiles()) {
+            return {
+              type: "text" as const,
+              value: `Error: ${MULTIMODAL_UPGRADE_MESSAGE}`,
+            };
+          }
+
+          const auxiliaryVision = getAuxiliaryVision();
+          if (auxiliaryVision) {
+            if (viewOutput.visionDescription) {
+              return {
+                type: "text" as const,
+                value: formatImageDescriptionForModel(
+                  viewOutput.content,
+                  viewOutput.filename,
+                  viewOutput.visionDescription,
+                ),
+              };
+            }
+            if (viewOutput.visionDescriptionError) {
+              return {
+                type: "text" as const,
+                value: `Error: ${viewOutput.visionDescriptionError}`,
+              };
+            }
+
+            // Older persisted view results predate auxiliary descriptions.
+            // Resolve them once per request and keep the result in the tool
+            // closure so repeated prepareStep conversions do not rebill it.
+            try {
+              const { sandbox } = await getSandboxForFileTool();
+              const viewPayload = await readSandboxFileForView(
+                sandbox,
+                viewOutput.path,
+                true,
+              );
+              const description = await describeViewPayload(
+                viewPayload,
+                viewOutput.filename,
+                auxiliaryVision,
+              );
+              return {
+                type: "text" as const,
+                value: formatImageDescriptionForModel(
+                  viewOutput.content,
+                  viewOutput.filename,
+                  description,
+                ),
+              };
+            } catch (error) {
+              if (auxiliaryVision.isAborted?.()) throw error;
+              return {
+                type: "text" as const,
+                value:
+                  "Error: The auxiliary vision model could not inspect this historical image. Retry the view action.",
+              };
+            }
+          }
+
+          const viewStartedAt = Date.now();
+          let outputSandbox: any | undefined;
+          const previewFile = viewOutput.previewFiles?.[0];
+          if (previewFile) {
+            try {
+              const previewFileId = String(previewFile.fileId);
+              let imageUrl = previewUrlCache.get(previewFileId);
+              if (!imageUrl) {
+                imageUrl = await getSandboxUploadedFileUrl({
+                  fileId: previewFile.fileId,
+                  userId: context.userID,
+                });
+              }
+
+              if (imageUrl) {
+                validateDownloadUrl(imageUrl);
+                previewUrlCache.set(previewFileId, imageUrl);
+                try {
+                  captureFileViewImageUsage({
+                    context,
+                    path: viewOutput.path,
+                    stage: "model_output",
+                    outcome: "success",
+                    durationMs: Date.now() - viewStartedAt,
+                    mediaType: viewOutput.mediaType,
+                    sizeBytes: viewOutput.sizeBytes,
+                    previewUploadSucceeded: viewOutput.previewUploadSucceeded,
+                  });
+                } catch {
+                  // Telemetry must never break a successful image handoff.
+                }
+
+                return {
+                  type: "content" as const,
+                  value: [
+                    { type: "text" as const, text: viewOutput.content },
+                    { type: "image-url" as const, url: imageUrl },
+                  ],
+                };
+              }
+            } catch {
+              // Fall back to a validated inline image when the preview URL is
+              // unavailable, expired, or temporarily cannot be refreshed.
+            }
+          }
+
+          try {
+            const { sandbox } = await getSandboxForFileTool();
+            outputSandbox = sandbox;
+            const viewPayload = await readSandboxFileForView(
+              sandbox,
+              viewOutput.path,
+              true,
+            );
+
+            try {
+              captureFileViewImageUsage({
+                context,
+                sandbox,
+                path: viewOutput.path,
+                stage: "model_output",
+                outcome: "success",
+                durationMs: Date.now() - viewStartedAt,
+                mediaType: viewPayload.mediaType,
+                sizeBytes: viewPayload.sizeBytes,
+                previewUploadSucceeded: viewOutput.previewUploadSucceeded,
+              });
+            } catch {
+              // Telemetry must never break a successful image handoff.
+            }
+
+            return {
+              type: "content" as const,
+              value: [
+                { type: "text" as const, text: viewOutput.content },
+                {
+                  type: "image-data" as const,
+                  data: viewPayload.data!,
+                  mediaType: viewPayload.mediaType,
+                },
+              ],
+            };
+          } catch (error) {
+            try {
+              const sandbox =
+                outputSandbox ?? (await getSandboxForFileTool()).sandbox;
+              const classification = classifyFileViewError(error);
+              captureFileViewImageUsage({
+                context,
+                sandbox,
+                path: viewOutput.path,
+                stage: "model_output",
+                outcome: "inspection_failed",
+                durationMs: Date.now() - viewStartedAt,
+                mediaType: viewOutput.mediaType,
+                sizeBytes: viewOutput.sizeBytes,
+                previewUploadSucceeded: viewOutput.previewUploadSucceeded,
+                failureReason: classification.failureReason,
+                failureDetail: classification.failureDetail,
+                failureCategory: classification.failureCategory,
+                expectedFailure: classification.expectedFailure,
+                imageValidationReason: classification.imageValidationReason,
+                errorName: classification.errorName,
+                errorMessageHash: classification.errorMessageHash,
+              });
+            } catch {
+              // Preserve the model-visible error if telemetry capture itself fails.
+            }
+            return {
+              type: "text" as const,
+              value: `Error: ${resolveToolErrorMessage(error)}`,
+            };
+          }
+        }
+
+        // For read, edit, and append actions, return the content message
+        if ("content" in output) {
+          return {
+            type: "text" as const,
+            value: (output as { content: string }).content,
+          };
+        }
+      }
+
+      // Fallback: stringify the output
+      return { type: "text" as const, value: JSON.stringify(output) };
+    },
+  });
+};

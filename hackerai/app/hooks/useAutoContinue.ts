@@ -1,0 +1,218 @@
+"use client";
+
+import { useEffect, useRef, useCallback } from "react";
+import type { ChatStatus, MessageMetadata, Todo } from "@/types";
+import {
+  useDataStreamState,
+  useDataStreamDispatch,
+  type ScopedDataUIPart,
+} from "@/app/components/DataStreamProvider";
+import { useLatestRef } from "./useLatestRef";
+
+export const MAX_AUTO_CONTINUES = 1;
+export const AUTO_CONTINUE_PROMPT =
+  "Continue from the latest saved progress. Do not restart the original task or repeat completed work.";
+const AUTO_CONTINUE_SETTLE_DELAY_MS = 250;
+
+export interface UseAutoContinueParams {
+  chatId: string;
+  status: ChatStatus;
+  chatMode: string;
+  sendMessage: (
+    message: { text: string; metadata?: MessageMetadata },
+    options?: { body?: Record<string, unknown> },
+  ) => void;
+  hasManuallyStoppedRef: React.RefObject<boolean>;
+  todos: Todo[];
+  sandboxPreference: string;
+  agentPermissionMode: string;
+  selectedModel: string;
+}
+
+export function useAutoContinue({
+  chatId,
+  status,
+  chatMode,
+  sendMessage,
+  hasManuallyStoppedRef,
+  todos,
+  sandboxPreference,
+  agentPermissionMode,
+  selectedModel,
+}: UseAutoContinueParams) {
+  const { dataStream } = useDataStreamState();
+  const { setIsAutoResuming, setIsAutoContinuing, setAutoContinueCount } =
+    useDataStreamDispatch();
+  const autoContinueCountRef = useRef(0);
+  const pendingAutoContinueRef = useRef(false);
+  const autoContinueRunScheduledRef = useRef(false);
+  const autoContinueRunStartedRef = useRef(false);
+  const autoContinueTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+  const lastProcessedIndexRef = useRef(0);
+
+  const todosRef = useLatestRef(todos);
+  const sendMessageRef = useLatestRef(sendMessage);
+  const sandboxPreferenceRef = useLatestRef(sandboxPreference);
+  const agentPermissionModeRef = useLatestRef(agentPermissionMode);
+  const selectedModelRef = useLatestRef(selectedModel);
+  const isPartForCurrentChat = (part: ScopedDataUIPart) =>
+    part.__chatId === undefined || part.__chatId === chatId;
+
+  const clearScheduledAutoContinue = useCallback(() => {
+    if (autoContinueTimerRef.current !== null) {
+      clearTimeout(autoContinueTimerRef.current);
+      autoContinueTimerRef.current = null;
+    }
+  }, []);
+
+  const clearAutoContinueLifecycle = useCallback(() => {
+    clearScheduledAutoContinue();
+    pendingAutoContinueRef.current = false;
+    autoContinueRunScheduledRef.current = false;
+    autoContinueRunStartedRef.current = false;
+    setIsAutoContinuing(false);
+  }, [clearScheduledAutoContinue, setIsAutoContinuing]);
+
+  useEffect(() => {
+    autoContinueCountRef.current = 0;
+    pendingAutoContinueRef.current = false;
+    lastProcessedIndexRef.current = 0;
+    clearAutoContinueLifecycle();
+    setIsAutoResuming(false);
+    setAutoContinueCount(0);
+  }, [
+    chatId,
+    clearAutoContinueLifecycle,
+    setAutoContinueCount,
+    setIsAutoResuming,
+  ]);
+
+  // Detect data-auto-continue signal and immediately mark pending
+  useEffect(() => {
+    if (!dataStream?.length) return;
+    const currentChatDataStream = dataStream.filter(isPartForCurrentChat);
+    const newParts = currentChatDataStream.slice(lastProcessedIndexRef.current);
+    if (newParts.some((part) => part.type === "data-auto-continue")) {
+      pendingAutoContinueRef.current = true;
+      setIsAutoResuming(true);
+      setIsAutoContinuing(true);
+    }
+    lastProcessedIndexRef.current = currentChatDataStream.length;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dataStream, setIsAutoContinuing, setIsAutoResuming]);
+
+  // Fire auto-continue when status is ready and signal was detected.
+  // Depends on both `status` and `dataStream` so it re-evaluates when
+  // the signal arrives after the stream has already ended (status already "ready").
+  useEffect(() => {
+    if (status !== "ready" || !pendingAutoContinueRef.current) return;
+    if (hasManuallyStoppedRef.current || chatMode !== "agent") {
+      pendingAutoContinueRef.current = false;
+      clearAutoContinueLifecycle();
+      setIsAutoResuming(false);
+      return;
+    }
+    if (autoContinueCountRef.current >= MAX_AUTO_CONTINUES) {
+      pendingAutoContinueRef.current = false;
+      clearAutoContinueLifecycle();
+      setIsAutoResuming(false);
+      return;
+    }
+
+    pendingAutoContinueRef.current = false;
+    autoContinueRunScheduledRef.current = true;
+    autoContinueRunStartedRef.current = false;
+    setIsAutoContinuing(true);
+    autoContinueCountRef.current += 1;
+    setAutoContinueCount(autoContinueCountRef.current);
+
+    clearScheduledAutoContinue();
+    autoContinueTimerRef.current = setTimeout(() => {
+      autoContinueTimerRef.current = null;
+      if (!autoContinueRunScheduledRef.current) return;
+      sendMessageRef.current(
+        {
+          text: AUTO_CONTINUE_PROMPT,
+          metadata: { isAutoContinue: true },
+        },
+        {
+          body: {
+            mode: chatMode,
+            isAutoContinue: true,
+            isAutomaticContinuation: true,
+            todos: todosRef.current,
+            sandboxPreference: sandboxPreferenceRef.current,
+            agentPermissionMode: agentPermissionModeRef.current,
+            selectedModel: selectedModelRef.current,
+          },
+        },
+      );
+    }, 500);
+
+    return clearScheduledAutoContinue;
+  }, [
+    status,
+    dataStream,
+    chatMode,
+    hasManuallyStoppedRef,
+    clearAutoContinueLifecycle,
+    setAutoContinueCount,
+    setIsAutoContinuing,
+    setIsAutoResuming,
+    sendMessageRef,
+    todosRef,
+    sandboxPreferenceRef,
+    agentPermissionModeRef,
+    selectedModelRef,
+    clearScheduledAutoContinue,
+  ]);
+
+  useEffect(() => {
+    if (status === "error") {
+      clearAutoContinueLifecycle();
+      setIsAutoResuming(false);
+      return;
+    }
+
+    if (status === "submitted" || status === "streaming") {
+      if (autoContinueRunScheduledRef.current) {
+        autoContinueRunStartedRef.current = true;
+      }
+    }
+    if (status === "streaming") {
+      setIsAutoResuming(false);
+    }
+  }, [status, clearAutoContinueLifecycle, setIsAutoResuming]);
+
+  useEffect(() => {
+    if (
+      status !== "ready" ||
+      pendingAutoContinueRef.current ||
+      !autoContinueRunScheduledRef.current ||
+      !autoContinueRunStartedRef.current
+    ) {
+      return;
+    }
+
+    const timeout = setTimeout(() => {
+      if (!pendingAutoContinueRef.current) {
+        clearAutoContinueLifecycle();
+      }
+    }, AUTO_CONTINUE_SETTLE_DELAY_MS);
+
+    return () => clearTimeout(timeout);
+  }, [status, dataStream, clearAutoContinueLifecycle]);
+
+  const resetAutoContinueCount = useCallback(() => {
+    autoContinueCountRef.current = 0;
+    pendingAutoContinueRef.current = false;
+    lastProcessedIndexRef.current = 0;
+    clearAutoContinueLifecycle();
+    setIsAutoResuming(false);
+    setAutoContinueCount(0);
+  }, [clearAutoContinueLifecycle, setAutoContinueCount, setIsAutoResuming]);
+
+  return { resetAutoContinueCount };
+}

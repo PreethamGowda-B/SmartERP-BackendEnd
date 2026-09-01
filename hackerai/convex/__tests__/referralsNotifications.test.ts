@@ -1,0 +1,463 @@
+import { describe, it, expect, jest } from "@jest/globals";
+
+jest.mock("../_generated/server", () => ({
+  mutation: jest.fn((config: any) => config),
+  query: jest.fn((config: any) => config),
+}));
+jest.mock("convex/values", () => ({
+  v: {
+    id: jest.fn(() => "id"),
+    null: jest.fn(() => "null"),
+    string: jest.fn(() => "string"),
+    number: jest.fn(() => "number"),
+    optional: jest.fn(() => "optional"),
+    object: jest.fn(() => "object"),
+    union: jest.fn(() => "union"),
+    array: jest.fn(() => "array"),
+    boolean: jest.fn(() => "boolean"),
+    literal: jest.fn(() => "literal"),
+    any: jest.fn(() => "any"),
+  },
+  ConvexError: class ConvexError extends Error {
+    data: any;
+    constructor(data: any) {
+      super(typeof data === "string" ? data : data.message);
+      this.data = data;
+      this.name = "ConvexError";
+    }
+  },
+}));
+jest.mock("../lib/utils", () => ({
+  validateServiceKey: jest.fn(),
+}));
+jest.mock("../lib/logger", () => ({
+  convexLogger: {
+    info: jest.fn(),
+    warn: jest.fn(),
+    error: jest.fn(),
+  },
+}));
+
+const SERVICE_KEY = "test-service-key";
+const USER_ID = "user_referrer";
+const REFERRED_USER_ID = "user_referred";
+
+type Row = Record<string, any> & { _id: string };
+type Tables = Record<string, Row[]>;
+
+function makeMockCtx(initialTables: Partial<Tables>, userId = USER_ID) {
+  const tables: Tables = {
+    referral_attributions: [],
+    referral_codes: [],
+    referral_rewards: [],
+    account_identities: [],
+    extra_usage: [],
+    team_extra_usage: [],
+    user_customization: [],
+    ...initialTables,
+  };
+  const queryCalls: string[] = [];
+
+  const findById = (id: string) => {
+    for (const rows of Object.values(tables)) {
+      const row = rows.find((candidate) => candidate._id === id);
+      if (row) return row;
+    }
+    return null;
+  };
+
+  const ctx: any = {
+    auth: {
+      getUserIdentity: jest.fn(async () => ({ subject: userId })),
+    },
+    db: {
+      query: jest.fn((table: string) => {
+        queryCalls.push(table);
+        const rows = tables[table] ?? [];
+
+        return {
+          withIndex: jest.fn((_indexName: string, predicate: any) => {
+            const filters: Array<{ field: string; value: unknown }> = [];
+            const q = {
+              eq: (field: string, value: unknown) => {
+                filters.push({ field, value });
+                return q;
+              },
+            };
+            predicate(q);
+
+            const matches = rows.filter((row) =>
+              filters.every((filter) => row[filter.field] === filter.value),
+            );
+            const chain = {
+              first: jest.fn(async () => matches[0] ?? null),
+              unique: jest.fn(async () => {
+                if (matches.length > 1) {
+                  throw new Error("Expected unique result");
+                }
+                return matches[0] ?? null;
+              }),
+              order: jest.fn(() => ({
+                first: jest.fn(async () => matches[0] ?? null),
+                take: jest.fn(async (limit: number) => matches.slice(0, limit)),
+              })),
+              take: jest.fn(async (limit: number) => matches.slice(0, limit)),
+            };
+
+            return chain;
+          }),
+        };
+      }),
+      get: jest.fn(async (id: string) => findById(id)),
+      insert: jest.fn(async (table: string, doc: Record<string, any>) => {
+        const row = {
+          _id: `${table}_${tables[table].length + 1}`,
+          ...doc,
+        };
+        tables[table].push(row);
+        return row._id;
+      }),
+      patch: jest.fn(async (id: string, patch: Record<string, any>) => {
+        const row = findById(id);
+        if (!row) throw new Error(`row ${id} not found`);
+        Object.assign(row, patch);
+      }),
+    },
+  };
+
+  return { ctx, tables, queryCalls };
+}
+
+describe("referral reward notifications", () => {
+  it("blocks referral attribution for an identity deleted within the cooldown", async () => {
+    const { attributeReferredSignup } = await import("../referrals");
+    const now = 1_700_000_000_000;
+    const nowSpy = jest.spyOn(Date, "now").mockReturnValue(now);
+    const identityHash = "free_quota:v1:identity_hash";
+    const { ctx, tables } = makeMockCtx({
+      account_identities: [
+        {
+          _id: "identity_1",
+          identity_hash: identityHash,
+          first_seen_at: now - 2 * 24 * 60 * 60 * 1000,
+          last_seen_at: now - 2 * 24 * 60 * 60 * 1000,
+          latest_user_id: "deleted_user",
+          deleted_at: now - 24 * 60 * 60 * 1000,
+        },
+      ],
+      referral_codes: [
+        {
+          _id: "code_1",
+          user_id: USER_ID,
+          code: "ABC1234",
+          status: "active",
+          referrer_subscription_tier: "pro",
+          created_at: now,
+          updated_at: now,
+        },
+      ],
+    });
+
+    try {
+      const result = await attributeReferredSignup.handler(ctx, {
+        serviceKey: SERVICE_KEY,
+        referredUserId: REFERRED_USER_ID,
+        referralCode: "ABC1234",
+        starterBonusUnits: 10,
+        referredIdentityHash: identityHash,
+        userCreatedAtMs: now,
+        maxUserAgeDays: 7,
+        source: "referral_cookie",
+      });
+
+      expect(result).toMatchObject({
+        status: "blocked",
+        reason: "recreated_identity",
+        starterBonusAwarded: false,
+        starterBonusEligible: false,
+      });
+      expect(tables.referral_attributions).toEqual([]);
+      expect(tables.referral_rewards).toEqual([
+        expect.objectContaining({
+          reward_type: "referred_signup",
+          status: "withheld",
+          referred_user_id: REFERRED_USER_ID,
+          reason: "recreated_identity",
+        }),
+      ]);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it("returns only unseen awarded conversion rewards for the signed-in referrer", async () => {
+    const { getUnreadRewardNotifications } = await import("../referrals");
+    const { ctx } = makeMockCtx({
+      referral_rewards: [
+        {
+          _id: "reward_unseen",
+          reward_type: "referrer_conversion",
+          status: "awarded",
+          referrer_user_id: USER_ID,
+          amount_dollars: 10,
+          created_at: 100,
+        },
+        {
+          _id: "reward_seen",
+          reward_type: "referrer_conversion",
+          status: "awarded",
+          referrer_user_id: USER_ID,
+          amount_dollars: 10,
+          created_at: 90,
+          notification_seen_at: 95,
+        },
+        {
+          _id: "reward_signup",
+          reward_type: "referred_signup",
+          status: "awarded",
+          referrer_user_id: USER_ID,
+          amount_dollars: 0,
+          amount_units: 10,
+          created_at: 80,
+        },
+        {
+          _id: "reward_other_user",
+          reward_type: "referrer_conversion",
+          status: "awarded",
+          referrer_user_id: "user_other",
+          amount_dollars: 10,
+          created_at: 70,
+        },
+      ],
+    });
+
+    await expect(
+      getUnreadRewardNotifications.handler(ctx, {}),
+    ).resolves.toEqual([
+      {
+        rewardId: "reward_unseen",
+        amountDollars: 10,
+        createdAt: 100,
+      },
+    ]);
+  });
+
+  it("marks only the signed-in referrer's awarded conversion rewards as seen", async () => {
+    const { markRewardNotificationsSeen } = await import("../referrals");
+    const { ctx, tables } = makeMockCtx({
+      referral_rewards: [
+        {
+          _id: "reward_own",
+          reward_type: "referrer_conversion",
+          status: "awarded",
+          referrer_user_id: USER_ID,
+          amount_dollars: 10,
+          created_at: 100,
+        },
+        {
+          _id: "reward_other",
+          reward_type: "referrer_conversion",
+          status: "awarded",
+          referrer_user_id: "user_other",
+          amount_dollars: 10,
+          created_at: 100,
+        },
+      ],
+    });
+
+    await markRewardNotificationsSeen.handler(ctx, {
+      rewardIds: ["reward_own", "reward_other"],
+    });
+
+    expect(tables.referral_rewards[0].notification_seen_at).toEqual(
+      expect.any(Number),
+    );
+    expect(tables.referral_rewards[1].notification_seen_at).toBeUndefined();
+  });
+
+  it("enables extra usage for referral credits without changing auto-reload", async () => {
+    const { awardConversionReward } = await import("../referrals");
+    const { ctx, tables, queryCalls } = makeMockCtx({
+      referral_attributions: [
+        {
+          _id: "attribution_1",
+          referred_user_id: REFERRED_USER_ID,
+          referrer_user_id: USER_ID,
+          referral_code: "ABC1234",
+          referrer_subscription_tier: "pro",
+          status: "attributed",
+          sign_up_reward_status: "awarded",
+          conversion_reward_status: "pending",
+          created_at: 1,
+          updated_at: 1,
+        },
+      ],
+      referral_codes: [
+        {
+          _id: "code_1",
+          user_id: USER_ID,
+          code: "ABC1234",
+          status: "active",
+          referrer_subscription_tier: "pro",
+          created_at: 1,
+          updated_at: 1,
+        },
+      ],
+      user_customization: [
+        {
+          _id: "customization_1",
+          user_id: USER_ID,
+          extra_usage_enabled: false,
+          updated_at: 1,
+        },
+      ],
+      extra_usage: [
+        {
+          _id: "extra_usage_1",
+          user_id: USER_ID,
+          balance_points: 20_000,
+          auto_reload_enabled: true,
+          updated_at: 1,
+        },
+      ],
+    });
+
+    const result = await awardConversionReward.handler(ctx, {
+      serviceKey: SERVICE_KEY,
+      referrerRewardDollars: 10,
+      referredUserId: REFERRED_USER_ID,
+      stripeCustomerId: "cus_123",
+      stripeSubscriptionId: "sub_123",
+      stripeInvoiceId: "in_123",
+      plan: "pro-monthly-plan",
+      tier: "pro",
+    });
+
+    expect(result.status).toBe("awarded");
+    expect(tables.extra_usage).toMatchObject([
+      {
+        user_id: USER_ID,
+        balance_points: 120_000,
+        auto_reload_enabled: true,
+      },
+    ]);
+    expect(tables.user_customization[0].extra_usage_enabled).toBe(true);
+    expect(queryCalls).toContain("user_customization");
+  });
+
+  it("withholds conversion rewards from free referrer codes", async () => {
+    const { awardConversionReward } = await import("../referrals");
+    const { ctx, tables } = makeMockCtx({
+      referral_attributions: [
+        {
+          _id: "attribution_1",
+          referred_user_id: REFERRED_USER_ID,
+          referrer_user_id: USER_ID,
+          referral_code: "FREE123",
+          referrer_subscription_tier: "free",
+          status: "attributed",
+          sign_up_reward_status: "awarded",
+          conversion_reward_status: "pending",
+          created_at: 1,
+          updated_at: 1,
+        },
+      ],
+      referral_codes: [
+        {
+          _id: "code_1",
+          user_id: USER_ID,
+          code: "FREE123",
+          status: "active",
+          referrer_subscription_tier: "free",
+          created_at: 1,
+          updated_at: 1,
+        },
+      ],
+    });
+
+    const result = await awardConversionReward.handler(ctx, {
+      serviceKey: SERVICE_KEY,
+      referrerRewardDollars: 10,
+      referredUserId: REFERRED_USER_ID,
+      stripeCustomerId: "cus_123",
+      stripeSubscriptionId: "sub_123",
+      stripeInvoiceId: "in_123",
+      plan: "pro-monthly-plan",
+      tier: "pro",
+    });
+
+    expect(result.status).toBe("withheld");
+    expect(result.reason).toBe("ineligible_referrer_tier");
+    expect(tables.referral_attributions[0]).toMatchObject({
+      conversion_reward_status: "withheld",
+      withheld_reason: "ineligible_referrer_tier",
+    });
+    expect(tables.referral_rewards).toMatchObject([
+      expect.objectContaining({
+        reward_type: "referrer_conversion",
+        status: "withheld",
+        reason: "ineligible_referrer_tier",
+      }),
+    ]);
+    expect(tables.extra_usage).toEqual([]);
+    expect(tables.user_customization).toEqual([]);
+    expect(tables.team_extra_usage).toEqual([]);
+  });
+
+  it("awards paid credits when an originally free referrer upgrades before conversion", async () => {
+    const { awardConversionReward } = await import("../referrals");
+    const { ctx, tables } = makeMockCtx({
+      referral_attributions: [
+        {
+          _id: "attribution_1",
+          referred_user_id: REFERRED_USER_ID,
+          referrer_user_id: USER_ID,
+          referral_code: "UPGRADE",
+          referrer_subscription_tier: "free",
+          status: "attributed",
+          sign_up_reward_status: "awarded",
+          conversion_reward_status: "pending",
+          created_at: 1,
+          updated_at: 1,
+        },
+      ],
+      referral_codes: [
+        {
+          _id: "code_1",
+          user_id: USER_ID,
+          code: "UPGRADE",
+          status: "active",
+          referrer_subscription_tier: "pro",
+          created_at: 1,
+          updated_at: 1,
+        },
+      ],
+    });
+
+    const result = await awardConversionReward.handler(ctx, {
+      serviceKey: SERVICE_KEY,
+      referrerRewardDollars: 10,
+      referredUserId: REFERRED_USER_ID,
+      stripeCustomerId: "cus_123",
+      stripeSubscriptionId: "sub_123",
+      stripeInvoiceId: "in_123",
+      plan: "pro-monthly-plan",
+      tier: "pro",
+    });
+
+    expect(result.status).toBe("awarded");
+    expect(result.referrerSubscriptionTier).toBe("pro");
+    expect(tables.extra_usage).toMatchObject([
+      {
+        user_id: USER_ID,
+        balance_points: 100_000,
+      },
+    ]);
+    expect(tables.user_customization).toMatchObject([
+      {
+        user_id: USER_ID,
+        extra_usage_enabled: true,
+      },
+    ]);
+  });
+});

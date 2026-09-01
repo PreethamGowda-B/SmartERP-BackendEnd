@@ -1,0 +1,1991 @@
+/**
+ * Shared streamText factory for the agent loop.
+ *
+ * Both the Next.js chat handler and the trigger.dev agent-long task
+ * run the same multi-step tool loop. This module owns the single canonical
+ * implementation of that loop — prepareStep, stopWhen, onChunk, onStepFinish,
+ * streamText.onFinish, onError, onAbort — so divergence is impossible.
+ *
+ * Callers supply:
+ *  - AgentStreamState   a mutable object; the runner reads and writes it in
+ *                       place so callers see every update (finalMessages,
+ *                       ctxUsage, stop-flags, finish reason, …).
+ *  - AgentStreamContext immutable config + stable dependency references.
+ */
+
+import {
+  convertToModelMessages,
+  streamText,
+  type LanguageModel,
+  type ModelMessage,
+  type UIMessage,
+  type UIMessageStreamWriter,
+  type ToolSet,
+} from "ai";
+import { randomUUID } from "crypto";
+import {
+  buildProviderOptions,
+  buildSystemPrompt,
+  addCacheBreakpointToLastUserMessage,
+  applyPrepareStepReminders,
+  runSummarizationStep,
+  getFallbackSlugs,
+  isXaiSafetyError,
+  resolveServedModelForCostAccounting,
+} from "@/lib/api/chat-stream-helpers";
+import {
+  elapsedTimeExceeds,
+  tokenExhaustedAfterSummarization,
+  doomLoopDetected,
+  PREEMPTIVE_TIMEOUT_FINISH_REASON,
+  TOKEN_EXHAUSTION_FINISH_REASON,
+  DOOM_LOOP_FINISH_REASON,
+  BUDGET_EXHAUSTION_FINISH_REASON,
+  AGENT_RUN_SPEND_CAP_FINISH_REASON,
+  POST_SUMMARIZATION_INCOMPLETE_FINISH_REASON,
+} from "@/lib/chat/stop-conditions";
+import {
+  detectDoomLoop,
+  generateDoomLoopNudge,
+} from "@/lib/chat/doom-loop-detection";
+import {
+  createAssistantContentLoopMonitor,
+  type AssistantContentLoopDetection,
+} from "@/lib/chat/agent-long-provider-retry";
+import {
+  filterEmptyAssistantMessages,
+  repairAnthropicModelMessagesWithTelemetry,
+  pruneToolOutputs,
+  pruneModelMessages,
+  limitModelImageToolResults,
+} from "@/lib/chat/compaction/prune-tool-outputs";
+import {
+  isProviderMultimodalToolResultRejectionError,
+  toolResultsContainImageViewResult,
+  uiMessagesContainImageViewResult,
+} from "@/lib/chat/multimodal-tool-result-recovery";
+import {
+  isAnthropicModel,
+  isDeepSeekModel,
+  PDF_PARSER_ENGINE_HEADER,
+  PDF_PARSER_RECOVERY_HEADER,
+} from "@/lib/ai/providers";
+import { MAX_OUTPUT_TOKENS } from "@/lib/ai/output-limits";
+import { ptySessionManager } from "@/lib/ai/tools/utils/pty-session-manager";
+import { getMaxTokensForSubscription } from "@/lib/token-utils";
+import {
+  getSummarizationThresholdTokens,
+  MAX_CONTEXT_COMPACTION_ATTEMPTS_PER_AGENT_STREAM,
+  ROLLING_COMPACTION_MAX_SIZE_RATIO,
+} from "@/lib/chat/summarization/constants";
+import { compactModelMessagesInRun } from "@/lib/chat/summarization";
+import { getRecentCompleteModelTail } from "@/lib/chat/summarization/helpers";
+import { getProviderPromptPressure } from "@/lib/chat/summarization/provider-pressure";
+import { getMaxStepsForUser } from "@/lib/chat/chat-processor";
+import {
+  extractSubagentDeliveryClaims,
+  requiresSubagentParentGate,
+  SUBAGENT_PARENT_GATE_EXTRA_STEPS,
+  type SubagentDeliveryClaim,
+  type SubagentParentCompletionGate,
+} from "@/lib/ai/subagents/parent-delivery";
+import {
+  isIncompletePostSummarizationStop,
+  POST_SUMMARIZATION_CONTINUATION_PROMPT,
+} from "@/lib/chat/post-summarization-continuation";
+import { appendPlatformAuthorizationToLatestUserMessage } from "@/lib/chat/platform-authorization";
+import { createPromptSerializationTools } from "@/lib/ai/tools/prompt-serialization";
+import {
+  writeSummarizationCleared,
+  writeSummarizationCompleted,
+} from "@/lib/utils/stream-writer-utils";
+import {
+  extractOpenRouterMetadata,
+  extractOpenRouterMetadataFromError,
+  fetchOpenRouterGenerationMetadata,
+  mergeOpenRouterMetadata,
+  type OpenRouterModelMetadata,
+} from "@/lib/api/openrouter-metadata";
+import { getOpenRouterUpstreamInferenceCostFromUsageRaw } from "@/lib/provider-usage-cost";
+import {
+  classifyProviderOverflowError,
+  isProviderContentBlockedFinishReasonError,
+} from "@/lib/utils/error-utils";
+import { createProviderContentBlockedRefundLifecycle } from "@/lib/api/provider-content-blocked-refund";
+import type { UsageTracker } from "@/lib/usage-tracker";
+import type {
+  BudgetAbortDetails,
+  BudgetMonitor,
+} from "@/lib/chat/budget-monitor";
+import type { UsageRefundTracker } from "@/lib/rate-limit";
+import type {
+  ProviderReasoningOverride,
+  SummarizationTracker,
+} from "@/lib/api/chat-stream-helpers";
+import type { ChatLogger } from "@/lib/api/chat-logger";
+import type { ChatApiEndpoint } from "@/lib/api/agent-endpoints";
+import type { createTrackedProvider } from "@/lib/ai/providers";
+import type {
+  ProviderRequestDiagnostics,
+  ProviderRequestRetentionDiagnostics,
+} from "@/lib/logger";
+import type { ChatMode, SelectedModel, SubscriptionTier } from "@/types";
+import { namespaceLanguageModelToolCalls } from "@/lib/ai/tool-call-id-namespace";
+import {
+  guardLanguageModelProviderResponse,
+  MAX_PROVIDER_TOOL_CALLS_PER_RESPONSE,
+} from "@/lib/ai/provider-response-guard";
+
+const STANDARD_AGENT_VISION_MODEL = "model-grok-4.5";
+const PRO_AGENT_VISION_MODEL = "model-grok-4.5-pro";
+const STANDARD_AGENT_GLM_VISION_MODEL = "model-glm-5.3-flash";
+const PRO_AGENT_GLM_VISION_MODEL = "model-glm-5.3-flash-pro";
+const STANDARD_AGENT_TEXT_MODEL = "model-deepseek-v4-flash-0731";
+const PRO_AGENT_TEXT_MODEL = "model-deepseek-v4-pro-0813";
+
+const uiMessagesContainImageAttachment = (messages: UIMessage[]): boolean =>
+  messages.some((message) =>
+    message.parts?.some(
+      (part) =>
+        part.type === "file" &&
+        typeof part.mediaType === "string" &&
+        part.mediaType.startsWith("image/"),
+    ),
+  );
+
+export const omitPdfFilePartsFromModelMessages = (
+  messages: ModelMessage[],
+): ModelMessage[] => {
+  let changed = false;
+  const nextMessages = messages.flatMap<ModelMessage>((message) => {
+    if (message.role !== "user" || !Array.isArray(message.content)) {
+      return message;
+    }
+    const content = message.content.filter((part) => {
+      const shouldRemove =
+        part.type === "file" && part.mediaType === "application/pdf";
+      changed ||= shouldRemove;
+      return !shouldRemove;
+    });
+    if (content.length === message.content.length) return message;
+    return content.length === 0 ? [] : { ...message, content };
+  });
+  return changed ? nextMessages : messages;
+};
+
+const getResponseHeader = (
+  headers: unknown,
+  name: string,
+): string | undefined => {
+  if (headers instanceof Headers) return headers.get(name) ?? undefined;
+  if (!headers || typeof headers !== "object") return undefined;
+  const headerRecord = headers as Record<string, unknown>;
+  const target = name.toLowerCase();
+  const entry = Object.entries(headerRecord).find(
+    ([key]) => key.toLowerCase() === target,
+  );
+  return typeof entry?.[1] === "string" ? entry[1] : undefined;
+};
+
+export const resolveAgentModelAfterSummarization = (
+  modelName: string,
+  mode: ChatMode,
+  compactedContextHasImages: boolean,
+): string => {
+  if (mode !== "agent" || compactedContextHasImages) return modelName;
+  if (modelName === STANDARD_AGENT_VISION_MODEL) {
+    return STANDARD_AGENT_TEXT_MODEL;
+  }
+  if (modelName === PRO_AGENT_VISION_MODEL) {
+    return PRO_AGENT_TEXT_MODEL;
+  }
+  if (modelName === STANDARD_AGENT_GLM_VISION_MODEL) {
+    return STANDARD_AGENT_TEXT_MODEL;
+  }
+  if (modelName === PRO_AGENT_GLM_VISION_MODEL) {
+    return PRO_AGENT_TEXT_MODEL;
+  }
+  return modelName;
+};
+
+export const resolveAgentModelForImageToolResults = (
+  modelName: string,
+  mode: ChatMode,
+  hasImageToolResults: boolean,
+  selectedModelOverride?: SelectedModel,
+  auxiliaryVisionEnabled = false,
+  directGlmVisionEnabled = false,
+): string => {
+  if (mode !== "agent" || !hasImageToolResults || auxiliaryVisionEnabled) {
+    return modelName;
+  }
+  if (directGlmVisionEnabled) {
+    if (
+      selectedModelOverride === "hackerai-pro" ||
+      (!selectedModelOverride &&
+        (modelName === "model-deepseek-v4-pro" ||
+          modelName === "model-deepseek-v4-pro-0813" ||
+          modelName === PRO_AGENT_GLM_VISION_MODEL))
+    ) {
+      return PRO_AGENT_GLM_VISION_MODEL;
+    }
+    return STANDARD_AGENT_GLM_VISION_MODEL;
+  }
+  if (
+    selectedModelOverride === "hackerai-pro" ||
+    (!selectedModelOverride &&
+      (modelName === "model-deepseek-v4-pro" ||
+        modelName === "model-deepseek-v4-pro-0813"))
+  ) {
+    return PRO_AGENT_VISION_MODEL;
+  }
+  if (isDeepSeekModel(modelName)) {
+    return STANDARD_AGENT_VISION_MODEL;
+  }
+  return modelName;
+};
+
+export const resolveFallbackServedTelemetry = ({
+  requestedModel,
+  responseModel,
+  fallbackModels,
+}: {
+  requestedModel: string;
+  responseModel?: string;
+  fallbackModels: string[];
+}): boolean | undefined => {
+  if (!responseModel) return undefined;
+  if (responseModel === requestedModel) return false;
+  return fallbackModels.includes(responseModel) ? true : undefined;
+};
+
+export const retryUsesDifferentModel = (
+  selectedModel: string,
+  retryModel: string,
+): boolean => retryModel !== selectedModel;
+
+export type RollingModelContextCheckpoint = {
+  /** Latest compacted provider context, excluding later raw SDK responses. */
+  baseMessages: ModelMessage[];
+  /** Number of raw SDK messages covered by baseMessages. */
+  rawMessageCursor: number;
+};
+
+/**
+ * AI SDK prepareStep overrides apply to one request only. Rebase its cumulative
+ * raw history onto our latest compacted checkpoint for every later request.
+ */
+export const buildRollingModelMessages = (
+  rawMessages: ModelMessage[],
+  checkpoint?: RollingModelContextCheckpoint,
+): ModelMessage[] => {
+  if (!checkpoint) return rawMessages;
+  const cursor = Math.min(checkpoint.rawMessageCursor, rawMessages.length);
+  return [...checkpoint.baseMessages, ...rawMessages.slice(cursor)];
+};
+
+export const isRollingCompactionEffective = (
+  previousMessages: ModelMessage[],
+  compactedMessages: ModelMessage[],
+): boolean => {
+  const previousBytes = getSerializedBytes(previousMessages);
+  const compactedBytes = getSerializedBytes(compactedMessages);
+  if (previousBytes === undefined || compactedBytes === undefined) return true;
+  return compactedBytes < previousBytes * ROLLING_COMPACTION_MAX_SIZE_RATIO;
+};
+
+// ---------------------------------------------------------------------------
+// Mutable state — the runner updates these in place; callers read them back.
+// ---------------------------------------------------------------------------
+
+export type AgentStreamState = {
+  /** Current UI messages fed into the model; updated each prepareStep. */
+  finalMessages: UIMessage[];
+  /** Raw UI messages captured before in-memory pruning, for transcript sidecars. */
+  transcriptSourceMessages?: UIMessage[];
+  /** Context-window usage data; updated after summarization and each step. */
+  ctxUsage: { usedTokens: number; maxTokens: number };
+  lastStepInputTokens: number;
+  /** Set in streamText.onFinish; read by the caller's toUIMessageStream.onFinish. */
+  streamFinishReason: string | undefined;
+  streamUsage: Record<string, unknown> | undefined;
+  responseModel: string | undefined;
+  /** Set only when provider/retry state can identify fallback serving. */
+  fallbackServed: boolean | undefined;
+  /** Original provider/AI SDK error captured from streamText.onError. */
+  providerError: unknown;
+  /** Best-effort OpenRouter IDs/provider attribution, including failed streams. */
+  openRouterMetadata: OpenRouterModelMetadata;
+  /** True when a provider rejected an image-bearing tool result. */
+  providerRejectedMultimodalToolResults: boolean;
+  /** Stop-condition flags set by the respective onFired callbacks. */
+  configuredMaxSteps: number;
+  /** Total completed model steps across provider attempts in this request. */
+  agentStepCount: number;
+  /** True only when the final provider attempt stopped at the step condition. */
+  stoppedDueToStepLimit: boolean;
+  stoppedDueToTokenExhaustion: boolean;
+  /** Maps to stoppedDueToPreemptiveTimeout in chat-handler, stoppedDueToElapsedTimeout in agent-long. */
+  stoppedDueToElapsedTimeout: boolean;
+  stoppedDueToDoomLoop: boolean;
+  stoppedDueToAssistantContentLoop: boolean;
+  assistantContentLoopDetection: AssistantContentLoopDetection | undefined;
+  stoppedDueToBudgetExhaustion: boolean;
+  stoppedDueToAgentRunSpendCap: boolean;
+  stoppedDueToPostSummarizationIncomplete: boolean;
+  postSummarizationContinuationActive: boolean;
+  postSummarizationToolCallCount: number;
+  postSummarizationText: string;
+  budgetAbortDetails: BudgetAbortDetails | undefined;
+};
+
+export function initAgentStreamState(
+  finalMessages: UIMessage[],
+  ctxUsage: { usedTokens: number; maxTokens: number },
+): AgentStreamState {
+  return {
+    finalMessages,
+    ctxUsage,
+    lastStepInputTokens: 0,
+    streamFinishReason: undefined,
+    streamUsage: undefined,
+    responseModel: undefined,
+    fallbackServed: undefined,
+    providerError: undefined,
+    openRouterMetadata: {},
+    providerRejectedMultimodalToolResults: false,
+    configuredMaxSteps: 0,
+    agentStepCount: 0,
+    stoppedDueToStepLimit: false,
+    stoppedDueToTokenExhaustion: false,
+    stoppedDueToElapsedTimeout: false,
+    stoppedDueToDoomLoop: false,
+    stoppedDueToAssistantContentLoop: false,
+    assistantContentLoopDetection: undefined,
+    stoppedDueToBudgetExhaustion: false,
+    stoppedDueToAgentRunSpendCap: false,
+    stoppedDueToPostSummarizationIncomplete: false,
+    postSummarizationContinuationActive: false,
+    postSummarizationToolCallCount: 0,
+    postSummarizationText: "",
+    budgetAbortDetails: undefined,
+  };
+}
+
+export const resetServedModelTelemetryForRetry = (
+  state: Pick<AgentStreamState, "responseModel" | "fallbackServed">,
+): void => {
+  state.responseModel = undefined;
+  state.fallbackServed = undefined;
+};
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null;
+
+export const getOpenRouterFileAnnotations = (
+  providerMetadata: unknown,
+): unknown[] | undefined => {
+  if (!isRecord(providerMetadata)) return undefined;
+  const openrouter = providerMetadata.openrouter;
+  if (!isRecord(openrouter) || !Array.isArray(openrouter.annotations)) {
+    return undefined;
+  }
+  return openrouter.annotations.length > 0
+    ? [...openrouter.annotations]
+    : undefined;
+};
+
+export const addOpenRouterFileAnnotationsToLastAssistantMessage = (
+  messages: ModelMessage[],
+  annotations: unknown[] | undefined,
+): ModelMessage[] => {
+  if (!annotations?.length) return messages;
+
+  const index = messages.findLastIndex(
+    (message) => message.role === "assistant",
+  );
+  if (index < 0) return messages;
+
+  const message = messages[index] as ModelMessage & {
+    providerOptions?: Record<string, unknown>;
+  };
+  const providerOptions = isRecord(message.providerOptions)
+    ? message.providerOptions
+    : {};
+  const openrouter = isRecord(providerOptions.openrouter)
+    ? providerOptions.openrouter
+    : {};
+  const nextMessages = [...messages];
+  nextMessages[index] = {
+    ...message,
+    providerOptions: {
+      ...providerOptions,
+      openrouter: {
+        ...openrouter,
+        annotations,
+      },
+    },
+  } as ModelMessage;
+  return nextMessages;
+};
+
+const ESTIMATED_BYTES_PER_TOKEN = 4;
+
+const incrementCount = (counts: Record<string, number>, key: string): void => {
+  counts[key] = (counts[key] ?? 0) + 1;
+};
+
+const getSerializedBytes = (value: unknown): number | undefined => {
+  try {
+    return new TextEncoder().encode(JSON.stringify(value)).byteLength;
+  } catch {
+    return undefined;
+  }
+};
+
+const getContentType = (part: unknown): string => {
+  if (isRecord(part) && typeof part.type === "string") return part.type;
+  if (part == null) return "empty";
+  if (Array.isArray(part)) return "array";
+  return typeof part;
+};
+
+const summarizeContentTypes = (content: unknown): string[] => {
+  if (typeof content === "string") return content.trim() ? ["text"] : ["empty"];
+  if (!Array.isArray(content)) return [getContentType(content)];
+  if (content.length === 0) return ["empty"];
+  return content.map(getContentType);
+};
+
+const addContentPartCounts = (
+  content: unknown,
+  counts: Record<string, number>,
+): void => {
+  for (const type of summarizeContentTypes(content)) {
+    incrementCount(counts, type);
+  }
+};
+
+const contentHasToolCall = (content: unknown): boolean =>
+  Array.isArray(content) &&
+  content.some((part) => isRecord(part) && part.type === "tool-call");
+
+const combineAbortSignals = (signals: AbortSignal[]): AbortSignal => {
+  const abortSignalAny = (
+    AbortSignal as typeof AbortSignal & {
+      any?: (signals: AbortSignal[]) => AbortSignal;
+    }
+  ).any;
+  if (typeof abortSignalAny === "function") {
+    return abortSignalAny(signals);
+  }
+
+  const controller = new AbortController();
+  const abort = () => {
+    if (!controller.signal.aborted) controller.abort();
+  };
+
+  for (const signal of signals) {
+    if (signal.aborted) {
+      abort();
+      break;
+    }
+    signal.addEventListener("abort", abort, { once: true });
+  }
+
+  return controller.signal;
+};
+
+const summarizeProviderOptions = (
+  providerOptions: unknown,
+): Pick<
+  ProviderRequestDiagnostics,
+  | "reasoning_enabled"
+  | "reasoning_effort"
+  | "fallback_model_count"
+  | "fallback_model_slugs"
+  | "has_user_attribution"
+> => {
+  const openrouter =
+    isRecord(providerOptions) && isRecord(providerOptions.openrouter)
+      ? providerOptions.openrouter
+      : undefined;
+  const reasoning = isRecord(openrouter?.reasoning)
+    ? openrouter.reasoning
+    : undefined;
+  const fallbackModelSlugs = Array.isArray(openrouter?.models)
+    ? openrouter.models.filter(
+        (model): model is string => typeof model === "string",
+      )
+    : [];
+
+  return {
+    reasoning_enabled:
+      typeof reasoning?.enabled === "boolean" ? reasoning.enabled : undefined,
+    reasoning_effort:
+      typeof reasoning?.effort === "string" ? reasoning.effort : undefined,
+    fallback_model_count: fallbackModelSlugs.length,
+    fallback_model_slugs:
+      fallbackModelSlugs.length > 0 ? fallbackModelSlugs : undefined,
+    has_user_attribution: typeof openrouter?.user === "string",
+  };
+};
+
+const buildProviderRequestDiagnostics = (args: {
+  modelName: string;
+  requestedSlug?: string;
+  stepIndex: number;
+  source: ProviderRequestDiagnostics["source"];
+  messages: ModelMessage[];
+  providerOptions: unknown;
+  activeTools: readonly unknown[] | undefined;
+  availableToolCount: number;
+  contextUsage: { usedTokens: number; maxTokens: number };
+  systemTokens: number;
+  maxOutputTokens: number;
+  hasMultimodalToolResults: boolean;
+}): ProviderRequestDiagnostics => {
+  const roleCounts: Record<string, number> = {};
+  const contentPartCounts: Record<string, number> = {};
+
+  for (const message of args.messages) {
+    const messageRecord = message as Record<string, unknown>;
+    const role =
+      typeof messageRecord.role === "string" ? messageRecord.role : "unknown";
+    incrementCount(roleCounts, role);
+    addContentPartCounts(messageRecord.content, contentPartCounts);
+  }
+
+  const lastMessage = args.messages.at(-1) as
+    Record<string, unknown> | undefined;
+  const serializedBytes = getSerializedBytes(args.messages);
+  const contextUsedPercent =
+    args.contextUsage.maxTokens > 0
+      ? Math.round(
+          (args.contextUsage.usedTokens / args.contextUsage.maxTokens) * 1000,
+        ) / 10
+      : 0;
+
+  return {
+    model: args.modelName,
+    requested_model_slug: args.requestedSlug,
+    step_index: args.stepIndex,
+    source: args.source,
+    message_count: args.messages.length,
+    role_counts: roleCounts,
+    content_part_counts: contentPartCounts,
+    last_message_role:
+      typeof lastMessage?.role === "string" ? lastMessage.role : undefined,
+    last_message_content_types: summarizeContentTypes(lastMessage?.content),
+    trailing_assistant_has_tool_call:
+      lastMessage?.role === "assistant"
+        ? contentHasToolCall(lastMessage.content)
+        : undefined,
+    serialized_message_bytes: serializedBytes,
+    estimated_serialized_message_tokens:
+      serializedBytes != null
+        ? Math.ceil(serializedBytes / ESTIMATED_BYTES_PER_TOKEN)
+        : undefined,
+    context_used_tokens: args.contextUsage.usedTokens,
+    context_max_tokens: args.contextUsage.maxTokens,
+    context_used_percent: contextUsedPercent,
+    system_tokens: args.systemTokens,
+    max_output_tokens: args.maxOutputTokens,
+    tool_count: args.availableToolCount,
+    active_tool_count: args.activeTools?.length ?? args.availableToolCount,
+    active_tools_mode: args.activeTools ? "subset" : "all",
+    ...summarizeProviderOptions(args.providerOptions),
+    has_multimodal_tool_results: args.hasMultimodalToolResults,
+  };
+};
+
+// ---------------------------------------------------------------------------
+// Immutable context — everything the runner needs besides mutable state.
+// ---------------------------------------------------------------------------
+
+export type AgentStreamContext = {
+  trackedProvider: ReturnType<typeof createTrackedProvider>;
+  currentSystemPrompt: string;
+  tools: ToolSet;
+  mode: ChatMode;
+  endpoint: ChatApiEndpoint;
+  userId: string;
+  subscription: SubscriptionTier;
+  selectedModelOverride?: SelectedModel;
+  chatId: string;
+  fileTokens: Record<string, number>;
+  noteInjectionOpts: {
+    userId: string;
+    subscription: SubscriptionTier;
+    shouldIncludeNotes: boolean;
+  };
+  systemPromptTokens: number;
+  ctxSystemTokens: number;
+  ctxMaxTokens: number;
+  streamStartTime: number;
+  contextUsageOn: boolean;
+  isReasoningModel: boolean;
+  platformAuthorized: boolean;
+  /** Images are represented as auxiliary descriptions; never promote the active model. */
+  auxiliaryVisionEnabled?: boolean;
+  /** Eligible paid image turns promote directly to GLM Flash before summary recovery. */
+  directGlmVisionEnabled?: boolean;
+  providerReasoningOverride?: {
+    modelName: string;
+    reasoning: ProviderReasoningOverride;
+  };
+  /** Provider model IDs that must not be used by an OpenRouter fallback. */
+  excludedProviderModelSlugs?: readonly string[];
+  /** elapsedTimeExceeds threshold; callers supply their platform ceiling. */
+  maxDurationMs: number;
+  getActiveElapsedTimeMs?: () => number;
+
+  // Dependencies
+  writer: UIMessageStreamWriter;
+  abortController: AbortController;
+  summarizationTracker: SummarizationTracker;
+  usageTracker: UsageTracker;
+  budgetMonitor: BudgetMonitor | null;
+  sandboxManager: {
+    getSandboxType(toolName: string): string | undefined;
+    supportsInteractivePty?(): Promise<boolean>;
+  };
+  getTodoManager: () => { getAllTodos: () => import("@/types").Todo[] };
+  ensureSandbox: import("@/lib/chat/summarization").EnsureSandbox;
+  chatLogger: ChatLogger | undefined;
+  usageRefundTracker: UsageRefundTracker;
+  onBudgetAbort?: (details: BudgetAbortDetails & { model: string }) => void;
+  onModelStreamStart?: () => void;
+  onModelStreamFinish?: () => void;
+  onModelChunk?: () => void;
+  onProviderRequestDiagnostics?: (
+    diagnostics: ProviderRequestDiagnostics,
+    retention: ProviderRequestRetentionDiagnostics,
+  ) => void;
+  /** Current cumulative runtime cost outside UsageTracker, such as a sandbox. */
+  getSandboxCostDollars?: () => number;
+  /** Current cumulative Trigger.dev run cost, including compute and invocation. */
+  getTriggerRunCostDollars?: () => number;
+  settleUsageAfterStep?: (args: {
+    currentCostDollars: number;
+    sandboxCostDollars: number;
+    triggerRunCostDollars: number;
+    force: boolean;
+    model: string;
+  }) => Promise<void>;
+  subagentCompletionGate?: SubagentParentCompletionGate;
+
+  /**
+   * Platform-specific: return a finish-reason string if a hard platform
+   * timeout fired synchronously (Vercel: preemptiveTimeout.isPreemptive()),
+   * or null when no hard timeout applies (trigger.dev: always null).
+   */
+  getHardTimeoutReason: () => string | null;
+};
+
+// ---------------------------------------------------------------------------
+// The shared factory — returns a streamText result (not awaited).
+// ---------------------------------------------------------------------------
+
+export async function createAgentStream(
+  modelName: string,
+  ctx: AgentStreamContext,
+  state: AgentStreamState,
+) {
+  const configuredMaxSteps = getMaxStepsForUser(ctx.mode);
+  state.configuredMaxSteps = configuredMaxSteps;
+  const toolCallRunNamespace = randomUUID().replaceAll("-", "").slice(0, 8);
+  const stepUsageCostIndexes: Array<number | undefined> = [];
+  let pendingDeliveryClaims: SubagentDeliveryClaim[] = [];
+  let hasObservedSubagents = false;
+  const parentGateReminder =
+    "A delegated subagent is still active or has an unconsumed result. Call wait_for_agents now. You cannot finish this response until every delegated result has been incorporated.";
+  const resolveParentGate = async (
+    toolResults: readonly unknown[],
+  ): Promise<{
+    blocked: boolean;
+    reminder?: string;
+    toolChoice?: { type: "tool"; toolName: "wait_for_agents" };
+  }> => {
+    const gate = ctx.subagentCompletionGate;
+    if (!gate) return { blocked: false };
+
+    const claims = extractSubagentDeliveryClaims(toolResults);
+    let injectedClaims: SubagentDeliveryClaim[] = [];
+    if (claims.length > 0) {
+      hasObservedSubagents = true;
+      try {
+        await gate.markInjected(claims);
+        pendingDeliveryClaims = claims;
+        injectedClaims = claims;
+      } catch {
+        console.warn(
+          JSON.stringify({
+            timestamp: new Date().toISOString(),
+            level: "warn",
+            event: "subagent_result_injection_ack_failed",
+            service: "agent-stream",
+            environment:
+              process.env.TRIGGER_ENV ?? process.env.NODE_ENV ?? "unknown",
+            request_id: ctx.chatId,
+            claim_count: claims.length,
+          }),
+        );
+        return {
+          blocked: true,
+          reminder: parentGateReminder,
+          toolChoice: { type: "tool", toolName: "wait_for_agents" },
+        };
+      }
+    }
+
+    try {
+      const completionState = await gate.getState();
+      hasObservedSubagents ||=
+        completionState.activeCount > 0 ||
+        completionState.unconsumedSubagentIds.length > 0;
+      const blocked = requiresSubagentParentGate(
+        completionState,
+        injectedClaims,
+      );
+      if (!blocked) return { blocked: false };
+      gate.onBlocked?.(completionState);
+      return {
+        blocked: true,
+        reminder: parentGateReminder,
+        toolChoice: { type: "tool", toolName: "wait_for_agents" },
+      };
+    } catch {
+      if (!hasObservedSubagents) return { blocked: false };
+      console.warn(
+        JSON.stringify({
+          timestamp: new Date().toISOString(),
+          level: "warn",
+          event: "subagent_parent_gate_lookup_failed",
+          service: "agent-stream",
+          environment:
+            process.env.TRIGGER_ENV ?? process.env.NODE_ENV ?? "unknown",
+          request_id: ctx.chatId,
+        }),
+      );
+      return {
+        blocked: true,
+        reminder: parentGateReminder,
+        toolChoice: { type: "tool", toolName: "wait_for_agents" },
+      };
+    }
+  };
+  const getActiveToolsWithExclusions = async (
+    excludedToolNames: ReadonlySet<string> = new Set(),
+  ): Promise<Array<keyof typeof ctx.tools> | undefined> => {
+    const hasExclusions = excludedToolNames.size > 0;
+    const withoutExcludedTools = (toolName: string) =>
+      !excludedToolNames.has(toolName);
+    let supportsPty: boolean | undefined;
+    try {
+      supportsPty = await ctx.sandboxManager.supportsInteractivePty?.();
+    } catch (error) {
+      console.warn("[agent-stream] PTY capability probe failed:", error);
+      return hasExclusions
+        ? (Object.keys(ctx.tools).filter(withoutExcludedTools) as Array<
+            keyof typeof ctx.tools
+          >)
+        : undefined;
+    }
+    if (supportsPty !== false) {
+      return hasExclusions
+        ? (Object.keys(ctx.tools).filter(withoutExcludedTools) as Array<
+            keyof typeof ctx.tools
+          >)
+        : undefined;
+    }
+
+    return Object.keys(ctx.tools).filter(
+      (toolName) =>
+        toolName !== "interact_terminal_session" &&
+        withoutExcludedTools(toolName),
+    ) as Array<keyof typeof ctx.tools>;
+  };
+  const getActiveTools = async (): Promise<
+    Array<keyof typeof ctx.tools> | undefined
+  > => getActiveToolsWithExclusions();
+  const requestedLanguageModel = ctx.trackedProvider.languageModel(modelName);
+  const requestedSlug = requestedLanguageModel.modelId;
+  let lastRequestedSlug = requestedSlug;
+  const assistantContentLoopMonitor = createAssistantContentLoopMonitor();
+  const assistantContentLoopAbortController = new AbortController();
+  const abortSignal = combineAbortSignals([
+    ctx.abortController.signal,
+    assistantContentLoopAbortController.signal,
+  ]);
+  const summarizationThreshold = getSummarizationThresholdTokens(
+    getMaxTokensForSubscription(ctx.subscription, { mode: ctx.mode }),
+  );
+  let rollingContextCheckpoint: RollingModelContextCheckpoint | undefined;
+  let compactionAttemptCount = 0;
+  let lastCompactionRawMessageCount = -1;
+  const canSummarizeAgain = () =>
+    compactionAttemptCount < MAX_CONTEXT_COMPACTION_ATTEMPTS_PER_AGENT_STREAM;
+  const getNamespacedLanguageModel = (
+    languageModel: LanguageModel,
+    stepIndex: number,
+  ): LanguageModel =>
+    namespaceLanguageModelToolCalls(
+      guardLanguageModelProviderResponse(languageModel, {
+        onToolCallsDropped: ({ droppedToolCallCount, maxToolCalls }) => {
+          console.warn("[agent-stream] provider tool calls bounded", {
+            event: "provider_tool_call_guard_applied",
+            model:
+              typeof languageModel === "string"
+                ? languageModel
+                : languageModel.modelId,
+            step: stepIndex + 1,
+            droppedToolCallCount,
+            maxToolCalls,
+          });
+        },
+        maxToolCalls: MAX_PROVIDER_TOOL_CALLS_PER_RESPONSE,
+      }),
+      `r${toolCallRunNamespace}c${ctx.summarizationTracker.summarizationCount}s${stepIndex}`,
+    );
+  type AbortStepLike = {
+    usage?: unknown;
+    response?: Parameters<typeof extractOpenRouterMetadata>[0]["response"] & {
+      modelId?: string;
+    };
+    providerMetadata?: unknown;
+  };
+  const recordAssistantContentLoopAbortState = (
+    steps?: readonly AbortStepLike[],
+  ) => {
+    if (!state.stoppedDueToAssistantContentLoop) return;
+
+    const lastStep = steps?.at(-1);
+    state.streamFinishReason = DOOM_LOOP_FINISH_REASON;
+    if (lastStep?.usage) {
+      state.streamUsage = lastStep.usage as Record<string, unknown>;
+    }
+    state.responseModel = lastStep?.response?.modelId ?? state.responseModel;
+    state.responseModel ??= lastRequestedSlug;
+    state.fallbackServed = resolveFallbackServedTelemetry({
+      requestedModel: lastRequestedSlug,
+      responseModel: state.responseModel,
+      fallbackModels: getFallbackSlugs(modelName, ctx.mode, {
+        hasMultimodalToolResults: streamHasImageViewResults,
+      }),
+    });
+
+    const openRouterMetadata = lastStep
+      ? extractOpenRouterMetadata({
+          response: lastStep.response,
+          providerMetadata: lastStep.providerMetadata,
+        })
+      : undefined;
+    ctx.chatLogger?.setStreamResponse(
+      state.responseModel,
+      state.streamUsage,
+      openRouterMetadata,
+    );
+  };
+
+  type DoomLoopRecovery = {
+    nudge?: string;
+    excludedTools?: ReadonlySet<string>;
+  };
+
+  const getDoomLoopRecovery = (
+    steps: unknown[],
+    stepNumber: number,
+  ): DoomLoopRecovery => {
+    const loopCheck = detectDoomLoop(
+      steps as Parameters<typeof detectDoomLoop>[0],
+    );
+
+    if (loopCheck.severity === "none") {
+      return {};
+    }
+
+    console.log(
+      `[doom-loop] severity=${loopCheck.severity} reason=${loopCheck.reason ?? "unknown"} tools=${loopCheck.toolNames.join(",")} count=${loopCheck.consecutiveCount} step=${stepNumber}`,
+    );
+
+    if (loopCheck.severity !== "warning") {
+      return {};
+    }
+
+    const recovery: DoomLoopRecovery = {
+      nudge: generateDoomLoopNudge(loopCheck),
+    };
+    console.log("[doom-loop] Injecting nudge as last user message");
+
+    if (loopCheck.activeToolExclusions?.length) {
+      recovery.excludedTools = new Set(loopCheck.activeToolExclusions);
+      console.warn("[doom-loop] Applying active tool exclusions", {
+        event: "doom_loop_tool_exclusion_recovery",
+        chatId: ctx.chatId,
+        modelName,
+        requestedModel: requestedSlug,
+        responseModel: state.responseModel,
+        reason: loopCheck.reason,
+        consecutiveCount: loopCheck.consecutiveCount,
+        rawInput: {},
+        excludedTools: loopCheck.activeToolExclusions,
+      });
+    }
+
+    return recovery;
+  };
+
+  const getActiveToolsForRecovery = async (
+    recovery: DoomLoopRecovery,
+  ): Promise<Array<keyof typeof ctx.tools> | undefined> =>
+    recovery.excludedTools && recovery.excludedTools.size > 0
+      ? getActiveToolsWithExclusions(recovery.excludedTools)
+      : getActiveTools();
+
+  const initialActiveTools = await getActiveTools();
+  const maxOutputTokens = MAX_OUTPUT_TOKENS;
+  let routeModelName = modelName;
+  let streamHasImageViewResults =
+    !ctx.auxiliaryVisionEnabled &&
+    uiMessagesContainImageViewResult(state.finalMessages);
+  let streamHasPdfAttachments = state.finalMessages.some((message) =>
+    message.parts?.some(
+      (part) => part.type === "file" && part.mediaType === "application/pdf",
+    ),
+  );
+  let pdfParserEngine: "mistral-ocr" | "cloudflare-ai" = "mistral-ocr";
+  let providerPdfAttachmentsDisabled = false;
+  let openRouterFileAnnotations: unknown[] | undefined;
+  const getEffectiveModelName = () =>
+    resolveAgentModelForImageToolResults(
+      routeModelName,
+      ctx.mode,
+      streamHasImageViewResults,
+      ctx.selectedModelOverride,
+      ctx.auxiliaryVisionEnabled,
+      ctx.directGlmVisionEnabled,
+    );
+  const getEffectiveModelInfo = () => {
+    const effectiveModelName = getEffectiveModelName();
+    const languageModel = ctx.trackedProvider.languageModel(effectiveModelName);
+    lastRequestedSlug = languageModel.modelId;
+    return {
+      modelName: effectiveModelName,
+      languageModel,
+      requestedSlug: languageModel.modelId,
+    };
+  };
+  const getStepProviderOptions = (
+    effectiveModelName = getEffectiveModelName(),
+  ) => {
+    const requestedModelSlug =
+      ctx.trackedProvider.languageModel(effectiveModelName).modelId;
+    return buildProviderOptions(
+      ctx.isReasoningModel,
+      ctx.userId,
+      effectiveModelName,
+      ctx.mode,
+      {
+        requestedModelSlug,
+        hasMultimodalToolResults: streamHasImageViewResults,
+        hasPdfAttachments:
+          streamHasPdfAttachments && !providerPdfAttachmentsDisabled,
+        pdfParserEngine,
+        excludedModelSlugs: ctx.excludedProviderModelSlugs,
+        ...(ctx.providerReasoningOverride?.modelName === effectiveModelName && {
+          reasoningOverride: ctx.providerReasoningOverride.reasoning,
+        }),
+      },
+    );
+  };
+  const prepareProviderMessages = (
+    messages: ModelMessage[],
+    effectiveModelName = getEffectiveModelName(),
+  ): ModelMessage[] => {
+    const providerMessages = providerPdfAttachmentsDisabled
+      ? omitPdfFilePartsFromModelMessages(messages)
+      : messages;
+    const nonEmptyMessages = filterEmptyAssistantMessages(providerMessages);
+    let repairedMessages = nonEmptyMessages;
+
+    if (isAnthropicModel(effectiveModelName)) {
+      const repair =
+        repairAnthropicModelMessagesWithTelemetry(nonEmptyMessages);
+      if (repair.action !== "none") {
+        ctx.chatLogger?.recordAnthropicPromptRepair({
+          action: repair.action,
+          reason: repair.reason,
+          trailingAssistantContentTypes: repair.trailingAssistantContentTypes,
+          model: effectiveModelName,
+        });
+      }
+      repairedMessages = repair.messages as ModelMessage[];
+    }
+
+    return addOpenRouterFileAnnotationsToLastAssistantMessage(
+      appendPlatformAuthorizationToLatestUserMessage(
+        repairedMessages,
+        ctx.platformAuthorized,
+      ),
+      openRouterFileAnnotations,
+    );
+  };
+  let latestProviderRequestDiagnostics: ProviderRequestDiagnostics | undefined;
+  const recordProviderRequestDiagnostics = (args: {
+    modelName: string;
+    requestedSlug?: string;
+    stepIndex: number;
+    source: ProviderRequestDiagnostics["source"];
+    messages: ModelMessage[];
+    rawMessages?: ModelMessage[];
+    rollingMessages?: ModelMessage[];
+    providerOptions: unknown;
+    activeTools: Array<keyof typeof ctx.tools> | undefined;
+  }) => {
+    latestProviderRequestDiagnostics = buildProviderRequestDiagnostics({
+      modelName: args.modelName,
+      requestedSlug: args.requestedSlug,
+      stepIndex: args.stepIndex,
+      source: args.source,
+      messages: args.messages,
+      providerOptions: args.providerOptions,
+      activeTools: args.activeTools,
+      availableToolCount: Object.keys(ctx.tools).length,
+      contextUsage: state.ctxUsage,
+      systemTokens: ctx.systemPromptTokens,
+      maxOutputTokens,
+      hasMultimodalToolResults: streamHasImageViewResults,
+    });
+    ctx.chatLogger?.recordProviderRequestDiagnostics(
+      latestProviderRequestDiagnostics,
+    );
+    ctx.onProviderRequestDiagnostics?.(latestProviderRequestDiagnostics, {
+      raw_message_count: args.rawMessages?.length ?? args.messages.length,
+      rolling_message_count:
+        args.rollingMessages?.length ?? args.messages.length,
+      final_ui_message_count: state.finalMessages.length,
+      transcript_source_message_count:
+        state.transcriptSourceMessages?.length ?? 0,
+      summarization_count: ctx.summarizationTracker.summarizationCount,
+      compaction_attempt_count: compactionAttemptCount,
+    });
+    return latestProviderRequestDiagnostics;
+  };
+  const initialModelInfo = getEffectiveModelInfo();
+  const initialProviderOptions = getStepProviderOptions(
+    initialModelInfo.modelName,
+  );
+  const promptSerializationTools = createPromptSerializationTools(ctx.tools);
+  const initialModelMessages = prepareProviderMessages(
+    await convertToModelMessages(state.finalMessages, {
+      tools: promptSerializationTools,
+    }),
+    initialModelInfo.modelName,
+  );
+  recordProviderRequestDiagnostics({
+    modelName: initialModelInfo.modelName,
+    requestedSlug: initialModelInfo.requestedSlug,
+    stepIndex: 0,
+    source: "initial",
+    messages: initialModelMessages,
+    rawMessages: initialModelMessages,
+    rollingMessages: initialModelMessages,
+    providerOptions: initialProviderOptions,
+    activeTools: initialActiveTools,
+  });
+
+  const refundProviderContentBlockedIfSettled =
+    createProviderContentBlockedRefundLifecycle({
+      hasUsage: () => ctx.usageTracker.hasUsage,
+      refund: () => ctx.usageRefundTracker.refund(),
+    });
+
+  return streamText({
+    model: getNamespacedLanguageModel(initialModelInfo.languageModel, 0),
+    maxOutputTokens,
+    system: buildSystemPrompt(
+      ctx.currentSystemPrompt,
+      initialModelInfo.modelName,
+    ),
+    messages: initialModelMessages,
+    tools: ctx.tools,
+    activeTools: initialActiveTools,
+    abortSignal,
+    providerOptions: initialProviderOptions,
+    experimental_onStepStart: () => ctx.onModelStreamStart?.(),
+    experimental_onToolCallStart: () => ctx.onModelStreamFinish?.(),
+
+    prepareStep: async ({ steps, messages }) => {
+      const rawModelMessages = messages as ModelMessage[];
+      let rollingModelMessages = buildRollingModelMessages(
+        rawModelMessages,
+        rollingContextCheckpoint,
+      );
+      rollingModelMessages = limitModelImageToolResults(
+        rollingModelMessages as Array<Record<string, unknown>>,
+      ).messages as ModelMessage[];
+      const lastStep = Array.isArray(steps) ? steps.at(-1) : undefined;
+      const toolResults =
+        (lastStep && (lastStep as { toolResults?: unknown[] }).toolResults) ||
+        [];
+      const parentGate = await resolveParentGate(toolResults);
+      const enforceParentGateTool = (
+        activeTools: Array<keyof typeof ctx.tools> | undefined,
+      ): Array<keyof typeof ctx.tools> | undefined => {
+        if (!parentGate.blocked || !activeTools) return activeTools;
+        return activeTools.includes("wait_for_agents")
+          ? activeTools
+          : [...activeTools, "wait_for_agents"];
+      };
+      try {
+        const pruneResult = pruneToolOutputs(state.finalMessages);
+        if (pruneResult.prunedCount > 0) {
+          state.transcriptSourceMessages ??= state.finalMessages;
+          state.finalMessages = pruneResult.messages;
+        }
+
+        if (
+          !ctx.auxiliaryVisionEnabled &&
+          toolResultsContainImageViewResult(toolResults)
+        ) {
+          streamHasImageViewResults = true;
+        }
+        const effectiveModelInfo = getEffectiveModelInfo();
+
+        const loopRecovery = getDoomLoopRecovery(steps, steps.length);
+        const providerPromptPressure =
+          getProviderPromptPressure(rollingModelMessages);
+        const shouldCheckDurableSummary =
+          ctx.summarizationTracker.summarizationCount === 0 &&
+          steps.length === 0;
+        const shouldCompactInRun =
+          !shouldCheckDurableSummary &&
+          (providerPromptPressure !== null ||
+            state.lastStepInputTokens > summarizationThreshold);
+
+        if (
+          canSummarizeAgain() &&
+          (shouldCheckDurableSummary || shouldCompactInRun)
+        ) {
+          if (shouldCheckDurableSummary) {
+            const result = await runSummarizationStep({
+              messages: state.finalMessages,
+              modelMessages: rawModelMessages,
+              subscription: ctx.subscription,
+              languageModel: effectiveModelInfo.languageModel,
+              mode: ctx.mode,
+              writer: ctx.writer,
+              chatId: ctx.chatId,
+              fileTokens: ctx.fileTokens,
+              todos: ctx.getTodoManager().getAllTodos(),
+              abortSignal: ctx.abortController.signal,
+              ensureSandbox: ctx.ensureSandbox,
+              systemPromptTokens: ctx.systemPromptTokens,
+              ctxSystemTokens: ctx.ctxSystemTokens,
+              ctxMaxTokens: ctx.ctxMaxTokens,
+              providerInputTokens: state.lastStepInputTokens,
+              chatSystemPrompt: ctx.currentSystemPrompt,
+              tools: ctx.tools,
+              providerOptions: getStepProviderOptions(
+                effectiveModelInfo.modelName,
+              ),
+              transcriptMessages: state.transcriptSourceMessages,
+              providerPromptPressure,
+            });
+
+            if (result.summarizationAttempted) {
+              compactionAttemptCount++;
+              lastCompactionRawMessageCount = rawModelMessages.length;
+            }
+
+            if (result.needsSummarization && result.summarizedMessages) {
+              ctx.summarizationTracker.recordSummarization(
+                steps.length,
+                result.summarizationUsage,
+                ctx.usageTracker,
+              );
+              if (result.contextUsage) {
+                state.ctxUsage = result.contextUsage;
+              }
+              state.finalMessages = result.summarizedMessages;
+              state.transcriptSourceMessages = undefined;
+              streamHasImageViewResults =
+                !ctx.auxiliaryVisionEnabled &&
+                uiMessagesContainImageViewResult(result.summarizedMessages);
+              routeModelName = resolveAgentModelAfterSummarization(
+                routeModelName,
+                ctx.mode,
+                streamHasImageViewResults ||
+                  uiMessagesContainImageAttachment(result.summarizedMessages),
+              );
+              const continuationModelInfo = getEffectiveModelInfo();
+              const activeTools = enforceParentGateTool(
+                await getActiveToolsForRecovery(loopRecovery),
+              );
+              const providerOptions = getStepProviderOptions(
+                continuationModelInfo.modelName,
+              );
+              let summarizedModelMessages = await convertToModelMessages(
+                result.summarizedMessages,
+                {
+                  tools: createPromptSerializationTools(ctx.tools),
+                },
+              );
+              state.postSummarizationContinuationActive = true;
+              state.postSummarizationToolCallCount = 0;
+              state.postSummarizationText = "";
+              const continuationPrompt = loopRecovery.nudge
+                ? `${POST_SUMMARIZATION_CONTINUATION_PROMPT}\n\n${loopRecovery.nudge}`
+                : POST_SUMMARIZATION_CONTINUATION_PROMPT;
+              summarizedModelMessages = [
+                ...summarizedModelMessages,
+                { role: "user", content: continuationPrompt },
+                ...(parentGate.reminder
+                  ? [{ role: "user" as const, content: parentGate.reminder }]
+                  : []),
+              ];
+              rollingContextCheckpoint = {
+                baseMessages: summarizedModelMessages,
+                rawMessageCursor: rawModelMessages.length,
+              };
+              const preparedMessages = prepareProviderMessages(
+                summarizedModelMessages,
+                continuationModelInfo.modelName,
+              );
+              recordProviderRequestDiagnostics({
+                modelName: continuationModelInfo.modelName,
+                requestedSlug: continuationModelInfo.requestedSlug,
+                stepIndex: steps.length + 1,
+                source: "summarized_prepare_step",
+                messages: preparedMessages,
+                rawMessages: rawModelMessages,
+                rollingMessages: summarizedModelMessages,
+                providerOptions,
+                activeTools,
+              });
+              return {
+                model: getNamespacedLanguageModel(
+                  continuationModelInfo.languageModel,
+                  steps.length,
+                ),
+                activeTools,
+                providerOptions,
+                messages: preparedMessages,
+                ...(parentGate.toolChoice
+                  ? { toolChoice: parentGate.toolChoice }
+                  : {}),
+              };
+            }
+          } else if (
+            rawModelMessages.length === lastCompactionRawMessageCount
+          ) {
+            // Never repeatedly summarize the same raw source cursor. A later
+            // provider step advances the cursor and can become eligible again.
+          } else {
+            compactionAttemptCount++;
+            lastCompactionRawMessageCount = rawModelMessages.length;
+            const inRunResult = await compactModelMessagesInRun({
+              modelMessages: rollingModelMessages,
+              transcriptModelMessages: rawModelMessages,
+              subscription: ctx.subscription,
+              languageModel: effectiveModelInfo.languageModel,
+              mode: ctx.mode,
+              writer: ctx.writer,
+              chatId: ctx.chatId,
+              todos: ctx.getTodoManager().getAllTodos(),
+              abortSignal: ctx.abortController.signal,
+              ensureSandbox: ctx.ensureSandbox,
+              systemPromptTokens: ctx.systemPromptTokens,
+              providerInputTokens: state.lastStepInputTokens,
+              chatSystemPrompt: ctx.currentSystemPrompt,
+              tools: ctx.tools,
+              providerOptions: getStepProviderOptions(
+                effectiveModelInfo.modelName,
+              ),
+              maxTokens: ctx.ctxMaxTokens,
+              providerPromptPressure,
+              compactionIndex: ctx.summarizationTracker.summarizationCount + 1,
+              hasExistingSummary:
+                ctx.summarizationTracker.hasSummarized ||
+                state.finalMessages.some((message) =>
+                  message.parts.some(
+                    (part) =>
+                      part.type === "text" &&
+                      part.text.includes("<context_summary>"),
+                  ),
+                ),
+            });
+
+            if (!inRunResult) {
+              // The helper clears its transient UI state. A later raw cursor
+              // may retry while the bounded attempt budget remains.
+            } else {
+              const compactedModelMessages = await convertToModelMessages(
+                [inRunResult.summaryMessage],
+                { tools: createPromptSerializationTools(ctx.tools) },
+              );
+              const continuationPrompt = loopRecovery.nudge
+                ? `${POST_SUMMARIZATION_CONTINUATION_PROMPT}\n\n${loopRecovery.nudge}`
+                : POST_SUMMARIZATION_CONTINUATION_PROMPT;
+              const retainedModelTail =
+                getRecentCompleteModelTail(rollingModelMessages);
+              const nextBaseMessages: ModelMessage[] = [
+                ...compactedModelMessages,
+                ...retainedModelTail,
+                { role: "user", content: continuationPrompt },
+                ...(parentGate.reminder
+                  ? [{ role: "user" as const, content: parentGate.reminder }]
+                  : []),
+              ];
+              const effectiveCompaction = isRollingCompactionEffective(
+                rollingModelMessages,
+                nextBaseMessages,
+              );
+
+              if (!effectiveCompaction) {
+                ctx.summarizationTracker.recordSummarizationUsage(
+                  inRunResult.summarizationUsage,
+                  ctx.usageTracker,
+                );
+                writeSummarizationCleared(
+                  ctx.writer,
+                  ctx.summarizationTracker.summarizationCount + 1,
+                );
+                console.warn(
+                  JSON.stringify({
+                    level: "warn",
+                    event: "agent_in_run_context_compaction_ineffective",
+                    service: "chat-handler",
+                    timestamp: new Date().toISOString(),
+                    chat_id: ctx.chatId ?? undefined,
+                    mode: ctx.mode,
+                    compaction_attempt: compactionAttemptCount,
+                    summarization_count:
+                      ctx.summarizationTracker.summarizationCount,
+                    raw_message_count: rawModelMessages.length,
+                  }),
+                );
+              } else {
+                ctx.summarizationTracker.recordSummarization(
+                  steps.length,
+                  inRunResult.summarizationUsage,
+                  ctx.usageTracker,
+                );
+                writeSummarizationCompleted(
+                  ctx.writer,
+                  ctx.summarizationTracker.summarizationCount,
+                );
+                console.info(
+                  JSON.stringify({
+                    level: "info",
+                    event: "agent_in_run_context_compaction_completed",
+                    service: "chat-handler",
+                    timestamp: new Date().toISOString(),
+                    chat_id: ctx.chatId ?? undefined,
+                    mode: ctx.mode,
+                    subscription: ctx.subscription,
+                    compaction_attempt: compactionAttemptCount,
+                    summarization_count:
+                      ctx.summarizationTracker.summarizationCount,
+                    persistence: "run_scoped",
+                    raw_message_count: rawModelMessages.length,
+                    retained_model_tail_message_count: retainedModelTail.length,
+                  }),
+                );
+                rollingContextCheckpoint = {
+                  baseMessages: nextBaseMessages,
+                  rawMessageCursor: rawModelMessages.length,
+                };
+                rollingModelMessages = nextBaseMessages;
+                streamHasImageViewResults =
+                  !ctx.auxiliaryVisionEnabled &&
+                  limitModelImageToolResults(
+                    nextBaseMessages as Array<Record<string, unknown>>,
+                  ).totalImageCount > 0;
+                routeModelName = resolveAgentModelAfterSummarization(
+                  routeModelName,
+                  ctx.mode,
+                  streamHasImageViewResults,
+                );
+                const continuationModelInfo = getEffectiveModelInfo();
+                state.postSummarizationContinuationActive = true;
+                state.postSummarizationToolCallCount = 0;
+                state.postSummarizationText = "";
+
+                const activeTools = enforceParentGateTool(
+                  await getActiveToolsForRecovery(loopRecovery),
+                );
+                const providerOptions = getStepProviderOptions(
+                  continuationModelInfo.modelName,
+                );
+                const preparedMessages = prepareProviderMessages(
+                  nextBaseMessages,
+                  continuationModelInfo.modelName,
+                );
+                recordProviderRequestDiagnostics({
+                  modelName: continuationModelInfo.modelName,
+                  requestedSlug: continuationModelInfo.requestedSlug,
+                  stepIndex: steps.length + 1,
+                  source: "summarized_prepare_step",
+                  messages: preparedMessages,
+                  rawMessages: rawModelMessages,
+                  rollingMessages: nextBaseMessages,
+                  providerOptions,
+                  activeTools,
+                });
+                return {
+                  model: getNamespacedLanguageModel(
+                    continuationModelInfo.languageModel,
+                    steps.length,
+                  ),
+                  activeTools,
+                  providerOptions,
+                  messages: preparedMessages,
+                  ...(parentGate.toolChoice
+                    ? { toolChoice: parentGate.toolChoice }
+                    : {}),
+                };
+              }
+            }
+          }
+        }
+
+        let currentMessages = rollingModelMessages as Array<
+          Record<string, unknown>
+        >;
+        const modelPrune = pruneModelMessages(currentMessages);
+        if (modelPrune.prunedCount > 0) {
+          currentMessages = modelPrune.messages;
+        }
+
+        let updatedMessages = await applyPrepareStepReminders(currentMessages, {
+          toolResults,
+          noteInjectionOpts: ctx.noteInjectionOpts,
+        });
+
+        if (loopRecovery.nudge) {
+          updatedMessages = [
+            ...updatedMessages,
+            { role: "user", content: loopRecovery.nudge },
+          ] as typeof updatedMessages;
+        }
+        if (parentGate.reminder) {
+          updatedMessages = [
+            ...updatedMessages,
+            { role: "user", content: parentGate.reminder },
+          ] as typeof updatedMessages;
+        }
+
+        const activeTools = enforceParentGateTool(
+          await getActiveToolsForRecovery(loopRecovery),
+        );
+        const providerOptions = getStepProviderOptions(
+          effectiveModelInfo.modelName,
+        );
+        const preparedMessages = prepareProviderMessages(
+          addCacheBreakpointToLastUserMessage(
+            updatedMessages,
+            effectiveModelInfo.modelName,
+          ) as ModelMessage[],
+          effectiveModelInfo.modelName,
+        ) as typeof messages;
+        recordProviderRequestDiagnostics({
+          modelName: effectiveModelInfo.modelName,
+          requestedSlug: effectiveModelInfo.requestedSlug,
+          stepIndex: steps.length + 1,
+          source: "prepare_step",
+          messages: preparedMessages as ModelMessage[],
+          rawMessages: rawModelMessages,
+          rollingMessages: rollingModelMessages,
+          providerOptions,
+          activeTools,
+        });
+        return {
+          model: getNamespacedLanguageModel(
+            effectiveModelInfo.languageModel,
+            steps.length,
+          ),
+          activeTools,
+          providerOptions,
+          messages: preparedMessages,
+          ...(parentGate.toolChoice
+            ? { toolChoice: parentGate.toolChoice }
+            : {}),
+        };
+      } catch (error) {
+        if (error instanceof DOMException && error.name === "AbortError") {
+          // Expected on user stop
+        } else {
+          console.error("[agent-stream] prepareStep error:", error);
+        }
+        const fallbackModelInfo = getEffectiveModelInfo();
+        const providerOptions = getStepProviderOptions(
+          fallbackModelInfo.modelName,
+        );
+        const fallbackMessages = prepareProviderMessages(
+          rollingModelMessages,
+        ) as typeof messages;
+        recordProviderRequestDiagnostics({
+          modelName: getEffectiveModelName(),
+          requestedSlug: lastRequestedSlug,
+          stepIndex: steps.length + 1,
+          source: "prepare_step",
+          messages: fallbackMessages as ModelMessage[],
+          rawMessages: rawModelMessages,
+          rollingMessages: rollingModelMessages,
+          providerOptions,
+          activeTools: undefined,
+        });
+        return {
+          model: getNamespacedLanguageModel(
+            fallbackModelInfo.languageModel,
+            steps.length,
+          ),
+          providerOptions,
+          messages: fallbackMessages,
+          ...(parentGate.toolChoice
+            ? { toolChoice: parentGate.toolChoice }
+            : {}),
+          ...(ctx.currentSystemPrompt
+            ? { system: ctx.currentSystemPrompt }
+            : undefined),
+        };
+      }
+    },
+
+    stopWhen: [
+      async ({ steps }) => {
+        if (steps.length < configuredMaxSteps) return false;
+        const gate = ctx.subagentCompletionGate;
+        if (gate) {
+          try {
+            const completionState = await gate.getState();
+            const hasActive = completionState.activeCount > 0;
+            const hasUnconsumed =
+              completionState.unconsumedSubagentIds.length > 0;
+            const withinActiveReserve =
+              steps.length <
+              configuredMaxSteps + SUBAGENT_PARENT_GATE_EXTRA_STEPS;
+            const withinResultReserve =
+              steps.length <=
+              configuredMaxSteps + SUBAGENT_PARENT_GATE_EXTRA_STEPS;
+            if (
+              (hasActive && withinActiveReserve) ||
+              (hasUnconsumed && withinResultReserve)
+            ) {
+              hasObservedSubagents = true;
+              gate.onBlocked?.(completionState);
+              return false;
+            }
+          } catch {
+            if (
+              hasObservedSubagents &&
+              steps.length <
+                configuredMaxSteps + SUBAGENT_PARENT_GATE_EXTRA_STEPS
+            ) {
+              return false;
+            }
+          }
+        }
+        state.stoppedDueToStepLimit = true;
+        return true;
+      },
+      tokenExhaustedAfterSummarization({
+        threshold: summarizationThreshold,
+        getLastStepInputTokens: () => state.lastStepInputTokens,
+        getHasSummarized: () =>
+          ctx.summarizationTracker.hasSummarized || compactionAttemptCount > 0,
+        getCanSummarizeAgain: canSummarizeAgain,
+        onFired: () => {
+          state.stoppedDueToTokenExhaustion = true;
+        },
+      }),
+      elapsedTimeExceeds({
+        maxDurationMs: ctx.maxDurationMs,
+        getElapsedTimeMs:
+          ctx.getActiveElapsedTimeMs ??
+          (() => Date.now() - ctx.streamStartTime),
+        onFired: () => {
+          state.stoppedDueToElapsedTimeout = true;
+        },
+      }),
+      doomLoopDetected({
+        onFired: () => {
+          state.stoppedDueToDoomLoop = true;
+        },
+      }),
+    ],
+
+    onChunk: async (chunk) => {
+      ctx.onModelChunk?.();
+      if (chunk.chunk.type === "text-delta") {
+        if (state.postSummarizationContinuationActive) {
+          state.postSummarizationText += chunk.chunk.text;
+        }
+
+        const loopDetection = assistantContentLoopMonitor.appendDelta(
+          chunk.chunk.text,
+        );
+        if (
+          loopDetection.detected &&
+          !state.stoppedDueToAssistantContentLoop &&
+          !ctx.abortController.signal.aborted
+        ) {
+          state.stoppedDueToAssistantContentLoop = true;
+          state.assistantContentLoopDetection = loopDetection;
+          console.warn("[agent-stream] assistant content loop detected", {
+            event: "assistant_content_loop_detected",
+            chatId: ctx.chatId,
+            endpoint: ctx.endpoint,
+            mode: ctx.mode,
+            modelName,
+            requestedModel: requestedSlug,
+            responseModel: state.responseModel,
+            reason: loopDetection.reason,
+            repeatedText: loopDetection.repeatedText,
+            repeatCount: loopDetection.repeatCount,
+          });
+          recordAssistantContentLoopAbortState();
+          assistantContentLoopAbortController.abort();
+        }
+      }
+
+      if (chunk.chunk.type === "tool-call") {
+        if (state.postSummarizationContinuationActive) {
+          state.postSummarizationToolCallCount++;
+        }
+        ctx.chatLogger?.recordToolCall(
+          chunk.chunk.toolName,
+          ctx.sandboxManager.getSandboxType(chunk.chunk.toolName),
+        );
+      }
+    },
+
+    onStepFinish: async ({ usage, response, providerMetadata }) => {
+      ctx.onModelStreamFinish?.();
+      state.agentStepCount += 1;
+      const responsePdfParserEngine = getResponseHeader(
+        response?.headers,
+        PDF_PARSER_ENGINE_HEADER,
+      );
+      if (responsePdfParserEngine === "cloudflare-ai") {
+        pdfParserEngine = "cloudflare-ai";
+      }
+      if (
+        getResponseHeader(response?.headers, PDF_PARSER_RECOVERY_HEADER) ===
+        "sandbox"
+      ) {
+        providerPdfAttachmentsDisabled = true;
+        streamHasPdfAttachments = false;
+      }
+      if (pendingDeliveryClaims.length > 0 && ctx.subagentCompletionGate) {
+        try {
+          await ctx.subagentCompletionGate.markConsumed(pendingDeliveryClaims);
+          pendingDeliveryClaims = [];
+        } catch (error) {
+          console.warn(
+            JSON.stringify({
+              timestamp: new Date().toISOString(),
+              level: "warn",
+              event: "subagent_result_consumption_ack_failed",
+              service: "agent-stream",
+              environment:
+                process.env.TRIGGER_ENV ?? process.env.NODE_ENV ?? "unknown",
+              request_id: ctx.chatId,
+              claim_count: pendingDeliveryClaims.length,
+              error_name: error instanceof Error ? error.name : "unknown",
+            }),
+          );
+        }
+      }
+      openRouterFileAnnotations =
+        getOpenRouterFileAnnotations(providerMetadata) ??
+        openRouterFileAnnotations;
+      let stepUsageCostIndex: number | undefined;
+      if (usage) {
+        const stepAccountingModel = resolveServedModelForCostAccounting({
+          modelName,
+          responseModel: response?.modelId,
+          mode: ctx.mode,
+          options: {
+            hasMultimodalToolResults: streamHasImageViewResults,
+          },
+        });
+        stepUsageCostIndex = ctx.usageTracker.accumulateStep(
+          usage as Parameters<typeof ctx.usageTracker.accumulateStep>[0],
+          stepAccountingModel,
+        );
+        state.lastStepInputTokens = usage.inputTokens || 0;
+        if (usage.inputTokens) {
+          state.ctxUsage = {
+            ...state.ctxUsage,
+            usedTokens: usage.inputTokens,
+          };
+        }
+      }
+      stepUsageCostIndexes.push(stepUsageCostIndex);
+
+      const stepOpenRouterMetadata = extractOpenRouterMetadata({
+        response,
+        providerMetadata,
+      });
+      state.openRouterMetadata = mergeOpenRouterMetadata(
+        stepOpenRouterMetadata,
+        state.openRouterMetadata,
+      );
+      ctx.usageTracker.setAuthoritativeModelCostForStep(
+        stepUsageCostIndex,
+        stepOpenRouterMetadata.openrouter_upstream_inference_cost,
+      );
+
+      const sandboxCostDollars = ctx.getSandboxCostDollars?.() ?? 0;
+      const triggerRunCostDollars = ctx.getTriggerRunCostDollars?.() ?? 0;
+      const currentCostDollars =
+        ctx.usageTracker.computeCostDollars(modelName) +
+        sandboxCostDollars +
+        triggerRunCostDollars;
+      const budgetDecision =
+        ctx.budgetMonitor?.checkAfterStep(currentCostDollars);
+      await ctx.settleUsageAfterStep?.({
+        currentCostDollars,
+        sandboxCostDollars,
+        triggerRunCostDollars,
+        force:
+          budgetDecision?.type === "abort" ||
+          budgetDecision?.type === "abort-agent-run-spend-cap",
+        model: response?.modelId ?? modelName,
+      });
+      if (budgetDecision?.type === "abort-agent-run-spend-cap") {
+        state.stoppedDueToAgentRunSpendCap = true;
+        ctx.abortController.abort();
+      } else if (budgetDecision?.type === "abort") {
+        state.stoppedDueToBudgetExhaustion = true;
+        state.budgetAbortDetails = budgetDecision.details;
+        ctx.abortController.abort();
+        try {
+          ctx.onBudgetAbort?.({ ...budgetDecision.details, model: modelName });
+        } catch (error) {
+          console.error("[agent-stream] onBudgetAbort failed:", error);
+        }
+      }
+    },
+
+    onFinish: async (finishResult) => {
+      ctx.onModelStreamFinish?.();
+      const { finishReason, usage, response } = finishResult;
+      const hardReason = ctx.getHardTimeoutReason();
+      if (
+        hardReason === null &&
+        state.postSummarizationContinuationActive &&
+        isIncompletePostSummarizationStop({
+          finishReason,
+          text: state.postSummarizationText,
+          toolCallCount: state.postSummarizationToolCallCount,
+        })
+      ) {
+        state.stoppedDueToPostSummarizationIncomplete = true;
+        console.warn("[agent-stream] post-summarization continuation stalled", {
+          event: "post_summarization_continuation_incomplete",
+          chatId: ctx.chatId,
+          endpoint: ctx.endpoint,
+          mode: ctx.mode,
+          modelName,
+          requestedModel: requestedSlug,
+          textChars: state.postSummarizationText.length,
+          toolCallCount: state.postSummarizationToolCallCount,
+        });
+      }
+      if (hardReason !== null) {
+        state.streamFinishReason = hardReason;
+      } else if (state.stoppedDueToElapsedTimeout) {
+        state.streamFinishReason = PREEMPTIVE_TIMEOUT_FINISH_REASON;
+      } else if (state.stoppedDueToTokenExhaustion) {
+        state.streamFinishReason = TOKEN_EXHAUSTION_FINISH_REASON;
+      } else if (state.stoppedDueToDoomLoop) {
+        state.streamFinishReason = DOOM_LOOP_FINISH_REASON;
+      } else if (state.stoppedDueToAssistantContentLoop) {
+        state.streamFinishReason = DOOM_LOOP_FINISH_REASON;
+      } else if (state.stoppedDueToAgentRunSpendCap) {
+        state.streamFinishReason = AGENT_RUN_SPEND_CAP_FINISH_REASON;
+      } else if (state.stoppedDueToBudgetExhaustion) {
+        state.streamFinishReason = BUDGET_EXHAUSTION_FINISH_REASON;
+      } else if (state.stoppedDueToPostSummarizationIncomplete) {
+        state.streamFinishReason = POST_SUMMARIZATION_INCOMPLETE_FINISH_REASON;
+      } else {
+        state.streamFinishReason = finishReason;
+      }
+      state.streamUsage = usage as Record<string, unknown>;
+      state.responseModel = response?.modelId;
+
+      const finishMetadata = finishResult as {
+        providerMetadata?: unknown;
+        steps?: Array<{
+          response?: typeof response;
+          providerMetadata?: unknown;
+          usage?: { raw?: unknown };
+        }>;
+      };
+      const stepOpenRouterMetadatas = Array.isArray(finishMetadata.steps)
+        ? finishMetadata.steps.map((step) => {
+            const metadata = extractOpenRouterMetadata({
+              response: step.response,
+              providerMetadata: step.providerMetadata,
+            });
+            return {
+              ...metadata,
+              openrouter_upstream_inference_cost:
+                metadata.openrouter_upstream_inference_cost ??
+                getOpenRouterUpstreamInferenceCostFromUsageRaw(step.usage?.raw),
+            };
+          })
+        : [];
+      for (const [index, metadata] of stepOpenRouterMetadatas.entries()) {
+        ctx.usageTracker.setAuthoritativeModelCostForStep(
+          stepUsageCostIndexes[index],
+          metadata.openrouter_upstream_inference_cost,
+        );
+      }
+      const finishOpenRouterMetadata = extractOpenRouterMetadata({
+        response,
+        providerMetadata: finishMetadata.providerMetadata,
+      });
+      const openRouterMetadata = mergeOpenRouterMetadata(
+        finishOpenRouterMetadata,
+        stepOpenRouterMetadatas.at(-1),
+      );
+      state.openRouterMetadata = mergeOpenRouterMetadata(
+        openRouterMetadata,
+        state.openRouterMetadata,
+      );
+
+      ctx.usageTracker.setAuthoritativeModelCostForStep(
+        stepUsageCostIndexes.at(-1),
+        openRouterMetadata.openrouter_upstream_inference_cost,
+      );
+
+      const fallbackSlugs = getFallbackSlugs(modelName, ctx.mode, {
+        hasMultimodalToolResults: streamHasImageViewResults,
+      });
+      state.fallbackServed = resolveFallbackServedTelemetry({
+        requestedModel: lastRequestedSlug,
+        responseModel: state.responseModel,
+        fallbackModels: fallbackSlugs,
+      });
+      if (state.fallbackServed && state.responseModel) {
+        ctx.chatLogger?.recordModelFallback({
+          requested: requestedSlug,
+          served: state.responseModel,
+          chain: fallbackSlugs,
+          model: modelName,
+        });
+      }
+      ctx.chatLogger?.setStreamResponse(
+        state.responseModel,
+        state.streamUsage,
+        openRouterMetadata,
+      );
+
+      await refundProviderContentBlockedIfSettled({
+        finishReason,
+        settled: true,
+      });
+
+      await ptySessionManager
+        .closeAll(ctx.chatId)
+        .catch((err) =>
+          console.error("[agent-stream] PTY closeAll (onFinish) failed:", err),
+        );
+    },
+
+    onError: async ({ error }) => {
+      state.providerError = error;
+      const errorOpenRouterMetadata = extractOpenRouterMetadataFromError(error);
+      state.openRouterMetadata = mergeOpenRouterMetadata(
+        errorOpenRouterMetadata,
+        state.openRouterMetadata,
+      );
+      await refundProviderContentBlockedIfSettled({
+        error,
+        settled: false,
+      });
+      if (
+        streamHasImageViewResults &&
+        isProviderMultimodalToolResultRejectionError(error)
+      ) {
+        state.providerRejectedMultimodalToolResults = true;
+      }
+      const overflowKind = classifyProviderOverflowError(error);
+      if (overflowKind) {
+        state.stoppedDueToTokenExhaustion = true;
+        state.streamFinishReason = TOKEN_EXHAUSTION_FINISH_REASON;
+        console.warn("[agent-stream] provider overflow detected", {
+          overflowKind,
+          chatId: ctx.chatId,
+          model: modelName,
+          hadSummarization: ctx.summarizationTracker.hasSummarized,
+        });
+      }
+      if (
+        !isProviderContentBlockedFinishReasonError(error) &&
+        !ctx.usageTracker.hasUsage
+      ) {
+        await ctx.usageRefundTracker.refund();
+      }
+      await ptySessionManager
+        .closeAll(ctx.chatId)
+        .catch((err) =>
+          console.error("[agent-stream] PTY closeAll (onError) failed:", err),
+        );
+
+      // The generation endpoint can lag the stream failure. Keep it out of the
+      // latency-sensitive /api/chat path and run it only after refunds/cleanup.
+      if (
+        ctx.endpoint !== "/api/chat" &&
+        errorOpenRouterMetadata.openrouter_generation_id &&
+        (!errorOpenRouterMetadata.openrouter_request_id ||
+          !errorOpenRouterMetadata.openrouter_upstream_id ||
+          !errorOpenRouterMetadata.provider_name)
+      ) {
+        const generationMetadata = await fetchOpenRouterGenerationMetadata(
+          errorOpenRouterMetadata.openrouter_generation_id,
+        );
+        state.openRouterMetadata = mergeOpenRouterMetadata(
+          errorOpenRouterMetadata,
+          mergeOpenRouterMetadata(generationMetadata, state.openRouterMetadata),
+        );
+      }
+
+      if (!isXaiSafetyError(error)) {
+        const fallbackSlugs = getFallbackSlugs(modelName, ctx.mode, {
+          hasMultimodalToolResults: streamHasImageViewResults,
+        });
+        ctx.chatLogger?.recordProviderError(error, {
+          mode: ctx.mode,
+          model: modelName,
+          requestedModelSlug: requestedSlug,
+          fallbackModelSlugs:
+            fallbackSlugs.length > 0 ? fallbackSlugs : undefined,
+          userId: ctx.userId,
+          subscription: ctx.subscription,
+          providerRequest: latestProviderRequestDiagnostics,
+          openRouterMetadata: state.openRouterMetadata,
+        });
+      }
+    },
+
+    onAbort: async ({ steps }) => {
+      recordAssistantContentLoopAbortState(steps);
+      await refundProviderContentBlockedIfSettled({
+        error: state.providerError,
+        finishReason: state.streamFinishReason,
+        settled: true,
+      });
+      await ptySessionManager
+        .closeAll(ctx.chatId)
+        .catch((err) =>
+          console.error("[agent-stream] PTY closeAll (onAbort) failed:", err),
+        );
+    },
+  });
+}

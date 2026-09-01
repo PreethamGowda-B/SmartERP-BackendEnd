@@ -1,0 +1,447 @@
+import { Page, expect, Locator, type Response } from "@playwright/test";
+import path from "path";
+import { TIMEOUTS } from "../constants";
+
+type AssistantMessageSnapshot = {
+  count: number;
+  lastText: string | null;
+};
+
+export class ChatComponent {
+  constructor(private page: Page) {}
+
+  private get chatInput(): Locator {
+    return this.page.getByTestId("chat-input");
+  }
+
+  private get sendButton(): Locator {
+    return this.page.getByRole("button", { name: "Send message" });
+  }
+
+  private get stopButton(): Locator {
+    return this.page.getByRole("button", { name: "Stop generation" });
+  }
+
+  private get attachButton(): Locator {
+    return this.page.getByRole("button", { name: "Attach files" });
+  }
+
+  private get fileInput(): Locator {
+    return this.page.locator('input[type="file"]');
+  }
+
+  private get messages(): Locator {
+    return this.page.locator(
+      '[data-testid="user-message"], [data-testid="assistant-message"]',
+    );
+  }
+
+  private get assistantMessages(): Locator {
+    return this.page.getByTestId("assistant-message");
+  }
+
+  private get streamingIndicator(): Locator {
+    return this.page.getByTestId("streaming");
+  }
+
+  private get modeDropdown(): Locator {
+    return this.page.getByTestId("mode-selector");
+  }
+
+  private get agentPermissionSelector(): Locator {
+    return this.page.getByRole("button", {
+      name: /^(Ask for approval|Auto review|Full access)$/,
+    });
+  }
+
+  private get askModeOption(): Locator {
+    return this.page.getByTestId("mode-ask");
+  }
+
+  private get agentModeOption(): Locator {
+    return this.page.getByTestId("mode-agent");
+  }
+
+  private get upgradeDialog(): Locator {
+    return this.page.getByRole("dialog").filter({ hasText: "Upgrade plan" });
+  }
+
+  private get upgradePopover(): Locator {
+    return this.page.getByRole("dialog").filter({ hasText: "Upgrade now" });
+  }
+
+  private get upgradeNowButton(): Locator {
+    return this.page.getByRole("button", { name: "Upgrade now" });
+  }
+
+  private get upgradePlanButton(): Locator {
+    return this.page.getByRole("button", { name: "Upgrade plan" });
+  }
+
+  private get attachedFiles(): Locator {
+    return this.page.getByTestId("attached-file");
+  }
+
+  private get removeFileButtons(): Locator {
+    return this.page.getByTestId("remove-file");
+  }
+
+  async sendMessage(message: string): Promise<void> {
+    await this.chatInput.fill(message);
+    await expect(this.sendButton).toBeEnabled({ timeout: TIMEOUTS.MEDIUM });
+    await this.sendButton.click();
+  }
+
+  waitForGenerationResponse(
+    timeout: number = TIMEOUTS.LONG,
+  ): Promise<Response | null> {
+    return this.page
+      .waitForResponse(
+        (response) => {
+          const method = response.request().method();
+          if (method !== "POST") return false;
+
+          const pathname = new URL(response.url()).pathname;
+          return (
+            pathname === "/api/chat" ||
+            pathname === "/api/agent" ||
+            pathname === "/api/agent-long"
+          );
+        },
+        { timeout },
+      )
+      .catch(() => null);
+  }
+
+  async typeMessage(message: string): Promise<void> {
+    await this.chatInput.fill(message);
+  }
+
+  async clickSend(): Promise<void> {
+    await this.sendButton.click();
+  }
+
+  async stopGeneration(): Promise<void> {
+    await this.stopButton.click();
+  }
+
+  async attachFile(filePath: string): Promise<void> {
+    const absolutePath = path.resolve(filePath);
+    const fileName = filePath.split("/").pop() || "";
+    await this.waitForHydrated();
+    await expect(this.attachButton).toBeEnabled({ timeout: TIMEOUTS.MEDIUM });
+    await this.fileInput.setInputFiles(absolutePath);
+
+    await this.waitForUploadComplete(fileName);
+  }
+
+  async attachFiles(filePaths: string[]): Promise<void> {
+    const absolutePaths = filePaths.map((p) => path.resolve(p));
+    await this.waitForHydrated();
+    await expect(this.attachButton).toBeEnabled({ timeout: TIMEOUTS.MEDIUM });
+    await this.fileInput.setInputFiles(absolutePaths);
+
+    await this.waitForUploadComplete();
+  }
+
+  async waitForUploadComplete(fileName?: string): Promise<void> {
+    if (fileName) {
+      const isImage = fileName.match(/\.(png|jpg|jpeg|gif|webp)$/i);
+      if (isImage) {
+        await this.page
+          .getByRole("button", { name: fileName })
+          .waitFor({ state: "visible", timeout: TIMEOUTS.SHORT });
+      } else {
+        await this.page
+          .getByTestId("attached-file")
+          .filter({ hasText: fileName })
+          .waitFor({ state: "visible", timeout: TIMEOUTS.SHORT });
+      }
+    }
+
+    await expect(this.sendButton).toBeEnabled({ timeout: TIMEOUTS.SHORT });
+  }
+
+  async clickAttachButton(): Promise<void> {
+    await this.attachButton.click();
+  }
+
+  async removeAttachedFile(index: number = 0): Promise<void> {
+    await this.removeFileButtons.nth(index).click();
+  }
+
+  async switchToAgentMode(): Promise<void> {
+    if (await this.modeDropdown.isVisible().catch(() => false)) {
+      await this.modeDropdown.click();
+      await this.agentModeOption.click();
+      return;
+    }
+
+    await expect(this.agentPermissionSelector).toBeVisible({
+      timeout: TIMEOUTS.MEDIUM,
+    });
+  }
+
+  async switchToAskMode(): Promise<void> {
+    await this.modeDropdown.click();
+    await this.askModeOption.click();
+  }
+
+  async waitForResponse(timeout: number = TIMEOUTS.MEDIUM): Promise<void> {
+    const isGenerating = await this.stopButton
+      .isVisible({ timeout: TIMEOUTS.STOP_BUTTON_CHECK })
+      .catch(() => false);
+
+    if (isGenerating) {
+      await this.stopButton.waitFor({ state: "hidden", timeout });
+    }
+
+    await this.messages.last().waitFor({ state: "visible", timeout });
+  }
+
+  async waitForAssistantMessage(
+    timeout: number = TIMEOUTS.MEDIUM,
+  ): Promise<void> {
+    await this.assistantMessages.last().waitFor({ state: "visible", timeout });
+  }
+
+  async getAssistantMessageSnapshot(): Promise<AssistantMessageSnapshot> {
+    const count = await this.assistantMessages.count();
+    if (count === 0) {
+      return { count, lastText: null };
+    }
+
+    const lastText = await this.assistantMessages
+      .last()
+      .innerText()
+      .catch(() => null);
+    return { count, lastText };
+  }
+
+  async waitForAssistantMessageAfter(
+    snapshot: AssistantMessageSnapshot,
+    timeout: number = TIMEOUTS.MEDIUM,
+  ): Promise<void> {
+    await expect(async () => {
+      const count = await this.assistantMessages.count();
+      expect(count).toBeGreaterThan(0);
+
+      const lastAssistant = this.assistantMessages.last();
+      await expect(lastAssistant).toBeVisible({ timeout: 1000 });
+
+      const lastText = await lastAssistant.innerText();
+      if (count <= snapshot.count && lastText === snapshot.lastText) {
+        throw new Error("Waiting for a new assistant message");
+      }
+    }).toPass({ timeout });
+  }
+
+  async getMessageCount(
+    timeout: number = TIMEOUTS.SHORT,
+    options?: { allowEmpty?: boolean },
+  ): Promise<number> {
+    if (!options?.allowEmpty) {
+      // Wait for at least one message to exist before counting
+      await this.messages.first().waitFor({ state: "visible", timeout });
+    }
+    return await this.messages.count();
+  }
+
+  async getLastMessageText(timeout: number = TIMEOUTS.SHORT): Promise<string> {
+    const lastMessage = this.messages.last();
+    await lastMessage.waitFor({ state: "visible", timeout });
+    return await lastMessage.innerText();
+  }
+
+  async expectMessageContains(
+    text: string,
+    timeout: number = TIMEOUTS.MEDIUM,
+  ): Promise<void> {
+    const messages = this.messages;
+
+    await expect(async () => {
+      const textMatchVisible = await messages
+        .filter({ hasText: text })
+        .first()
+        .isVisible({ timeout: 1000 })
+        .catch(() => false);
+      if (textMatchVisible) return;
+
+      if (/^\d+$/.test(text)) {
+        const markerMatchVisible = await messages
+          .last()
+          .evaluate((element, expectedText) => {
+            const isVisible =
+              element instanceof HTMLElement && element.offsetParent !== null;
+            if (!isVisible) return false;
+
+            return Array.from(element.querySelectorAll("ol")).some((list) => {
+              const start = list.getAttribute("start") ?? "1";
+              return (
+                start === expectedText && list.querySelector("li") !== null
+              );
+            });
+          }, text)
+          .catch(() => false);
+        if (markerMatchVisible) return;
+      }
+
+      throw new Error(`Message containing ${text} was not visible`);
+    }).toPass({ timeout });
+  }
+
+  async expectStreamingVisible(): Promise<void> {
+    const isGenerating = await this.stopButton
+      .isVisible({ timeout: TIMEOUTS.SHORT })
+      .catch(() => false);
+    const streamingVisible = await this.streamingIndicator
+      .isVisible({ timeout: TIMEOUTS.SHORT })
+      .catch(() => false);
+
+    expect(isGenerating || streamingVisible).toBe(true);
+  }
+
+  async expectStreamingNotVisible(
+    timeout: number = TIMEOUTS.AGENT,
+  ): Promise<void> {
+    await expect(async () => {
+      const stopButtonVisible = await this.stopButton
+        .isVisible({ timeout: 1000 })
+        .catch(() => false);
+      const streamingVisible = await this.streamingIndicator
+        .isVisible({ timeout: 1000 })
+        .catch(() => false);
+
+      expect(stopButtonVisible).toBe(false);
+      expect(streamingVisible).toBe(false);
+    }).toPass({ timeout });
+
+    await expect(this.chatInput).toBeEditable({ timeout: TIMEOUTS.SHORT });
+  }
+
+  async expectUpgradeDialogVisible(): Promise<void> {
+    await expect(this.upgradeDialog).toBeVisible({ timeout: TIMEOUTS.SHORT });
+  }
+
+  async expectUpgradePopoverVisible(): Promise<void> {
+    await expect(this.upgradePopover).toBeVisible({ timeout: TIMEOUTS.SHORT });
+  }
+
+  async expectUpgradeNowButtonVisible(): Promise<void> {
+    await expect(this.upgradeNowButton).toBeVisible({
+      timeout: TIMEOUTS.SHORT,
+    });
+  }
+
+  async expectUpgradePlanButtonVisible(): Promise<void> {
+    await expect(this.upgradePlanButton).toBeVisible({
+      timeout: TIMEOUTS.SHORT,
+    });
+  }
+
+  async clickUpgradeNow(): Promise<void> {
+    await this.upgradeNowButton.click();
+  }
+
+  async clickUpgradePlan(): Promise<void> {
+    await this.upgradePlanButton.click();
+  }
+
+  async expectImageAttached(fileName: string): Promise<void> {
+    const imageButton = this.page.getByRole("button", { name: fileName });
+    await expect(imageButton).toBeVisible();
+    // Wait for send button to be enabled (upload complete)
+    await expect(this.sendButton).toBeEnabled({ timeout: TIMEOUTS.SHORT });
+  }
+
+  async expectNonImageFileAttached(fileName: string): Promise<void> {
+    const fileDiv = this.attachedFiles.filter({ hasText: fileName });
+    await expect(fileDiv).toBeVisible();
+    // Wait for send button to be enabled (upload complete)
+    await expect(this.sendButton).toBeEnabled({ timeout: TIMEOUTS.MEDIUM });
+  }
+
+  async expectFileAttached(fileName: string): Promise<void> {
+    const imageButton = this.page.getByRole("button", { name: fileName });
+    const fileDiv = this.attachedFiles.filter({ hasText: fileName });
+
+    const imageVisible = await imageButton.isVisible().catch(() => false);
+    const fileVisible = await fileDiv.isVisible().catch(() => false);
+
+    expect(imageVisible || fileVisible).toBe(true);
+  }
+
+  async expectAttachedFileCount(count: number): Promise<void> {
+    await expect(this.attachedFiles).toHaveCount(count, {
+      timeout: TIMEOUTS.MEDIUM,
+    });
+  }
+
+  async waitForHydrated(): Promise<void> {
+    await expect(this.chatInput).toBeVisible({ timeout: TIMEOUTS.MEDIUM });
+    await expect(this.chatInput).toBeEditable({ timeout: TIMEOUTS.MEDIUM });
+    await expect(this.sendButton).toBeVisible({ timeout: TIMEOUTS.MEDIUM });
+  }
+
+  async expectChatInputVisible(): Promise<void> {
+    await expect(this.chatInput).toBeVisible({ timeout: TIMEOUTS.MEDIUM });
+  }
+
+  async expectSendButtonEnabled(): Promise<void> {
+    await expect(this.sendButton).toBeEnabled();
+  }
+
+  async expectSendButtonDisabled(): Promise<void> {
+    await expect(this.sendButton).toBeDisabled();
+  }
+
+  async getCurrentMode(): Promise<string> {
+    if (!(await this.modeDropdown.isVisible().catch(() => false))) {
+      await expect(this.agentPermissionSelector).toBeVisible({
+        timeout: TIMEOUTS.MEDIUM,
+      });
+      return "agent";
+    }
+
+    const modeText = await this.modeDropdown.innerText();
+    if (modeText.includes("Agent")) return "agent";
+    return "ask";
+  }
+
+  async expectPaidAgentOnlyControls(): Promise<void> {
+    await expect(this.modeDropdown).toBeHidden();
+    await expect(this.agentPermissionSelector).toBeVisible({
+      timeout: TIMEOUTS.MEDIUM,
+    });
+  }
+
+  async expectMode(mode: "ask" | "agent"): Promise<void> {
+    const currentMode = await this.getCurrentMode();
+    expect(currentMode).toBe(mode);
+  }
+
+  /**
+   * Get the chat title from the header
+   */
+  async getChatHeaderTitle(timeout: number = TIMEOUTS.SHORT): Promise<string> {
+    // The chat title is displayed in a div with text-lg font-medium classes
+    // It contains a span with the title text, and may include icons (like Split icon for branched chats)
+    // We need to get the text content excluding SVG icons
+    const titleContainer = this.page.locator("div.text-lg.font-medium").first();
+
+    await titleContainer.waitFor({ state: "visible", timeout });
+
+    // Get all text nodes, excluding SVG elements
+    // The title is in a span, and we want to exclude any SVG icons
+    const titleText = await titleContainer.evaluate((el) => {
+      // Clone the element to avoid modifying the original
+      const clone = el.cloneNode(true) as HTMLElement;
+      // Remove all SVG elements
+      clone.querySelectorAll("svg").forEach((svg) => svg.remove());
+      // Get the text content
+      return clone.textContent?.trim() || "";
+    });
+
+    return titleText;
+  }
+}

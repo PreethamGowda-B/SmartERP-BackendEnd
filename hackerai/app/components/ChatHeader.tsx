@@ -1,0 +1,309 @@
+"use client";
+
+import React, { useState } from "react";
+import { Button } from "@/components/ui/button";
+import { useAuth } from "@workos-inc/authkit-nextjs/components";
+import { PanelLeft, Sparkle, SquarePen, Split, Share } from "lucide-react";
+import { useGlobalState } from "../contexts/GlobalState";
+import { redirectToPricing } from "../hooks/usePricingDialog";
+import { useRouter } from "next/navigation";
+import { useIsMobile } from "@/hooks/use-mobile";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { ShareDialog } from "./ShareDialog";
+import { navigateToAuth } from "@/app/hooks/useTauri";
+import { captureUpgradeCtaImpression } from "@/lib/analytics/client";
+import { formatTaskTitle } from "@/app/utils/task-ui-copy";
+
+interface ChatHeaderProps {
+  hasMessages: boolean;
+  hasActiveChat: boolean;
+  chatTitle?: string | null;
+  id?: string;
+  chatData?:
+    | {
+        title?: string;
+        branched_from_chat_id?: string;
+        share_id?: string;
+      }
+    | null
+    | undefined;
+  chatSidebarOpen?: boolean;
+  isExistingChat?: boolean;
+  isChatNotFound?: boolean;
+  branchedFromChatTitle?: string;
+}
+
+const ChatHeader: React.FC<ChatHeaderProps> = ({
+  hasMessages,
+  hasActiveChat,
+  chatTitle,
+  id,
+  chatData,
+  chatSidebarOpen = false,
+  isExistingChat = false,
+  isChatNotFound = false,
+  branchedFromChatTitle,
+}) => {
+  const { user, loading } = useAuth();
+  const {
+    toggleChatSidebar,
+    subscription,
+    isCheckingProPlan,
+    initializeNewChat,
+    closeSidebar,
+    setChatSidebarOpen,
+  } = useGlobalState();
+  const router = useRouter();
+  const isMobile = useIsMobile();
+  const [showShareDialog, setShowShareDialog] = useState(false);
+  const taskTitle = chatTitle ? formatTaskTitle(chatTitle) : chatTitle;
+
+  // Show sidebar toggle for logged-in users
+  const showSidebarToggle = user && !loading;
+
+  // Check if we're currently in a chat (use isExistingChat prop for accurate state)
+  const isInChat = isExistingChat;
+
+  // Check if this is a branched chat
+  const isBranchedChat = !!chatData?.branched_from_chat_id;
+  const showEmptyStateHeader = !hasMessages && !hasActiveChat;
+  const showUpgradeCta = Boolean(
+    !loading && user && !isCheckingProPlan && subscription === "free",
+  );
+  const showVisibleUpgradeCta = showEmptyStateHeader && showUpgradeCta;
+
+  React.useEffect(() => {
+    if (!showVisibleUpgradeCta) return;
+
+    captureUpgradeCtaImpression({
+      surface: isMobile ? "chat_header_mobile" : "chat_header_desktop",
+      source: "empty_chat_header",
+      from_tier: subscription,
+      cta_text: "Upgrade plan",
+    });
+  }, [isMobile, showVisibleUpgradeCta, subscription]);
+
+  const handleUpgradeClick = () => {
+    // Navigate to pricing page
+    redirectToPricing({
+      surface: isMobile ? "chat_header_mobile" : "chat_header_desktop",
+      source: "empty_chat_header",
+      from_tier: subscription,
+      cta_text: "Upgrade plan",
+    });
+  };
+
+  const handleNewChat = () => {
+    // Close computer sidebar when creating new chat
+    closeSidebar();
+
+    // Close chat sidebar when creating new chat on mobile screens
+    if (isMobile) {
+      setChatSidebarOpen(false);
+    }
+
+    // Reset chat state while current Chat is still mounted (so chatResetRef is set)
+    initializeNewChat();
+    router.push("/");
+  };
+
+  // Show empty state header when no messages and no active chat
+  if (showEmptyStateHeader) {
+    return (
+      <div className="flex-shrink-0">
+        <header className="w-full px-6 max-sm:px-4 flex-shrink-0">
+          {/* Desktop header */}
+          <div className="py-[10px] flex gap-10 items-center justify-between max-md:hidden">
+            <div className="flex items-center gap-2">
+              {/* Removed sidebar toggle for desktop - handled by collapsed sidebar logo */}
+              {/* Show upgrade button for logged-in users without pro plan */}
+              {showVisibleUpgradeCta && (
+                <Button
+                  onClick={handleUpgradeClick}
+                  className="flex items-center gap-1 rounded-full py-2 ps-2.5 pe-3 text-sm font-medium bg-premium-bg text-premium-text hover:bg-premium-hover border-0 transition-all duration-200"
+                  size="default"
+                >
+                  <Sparkle className="mr-2 h-4 w-4 fill-current" />
+                  Upgrade plan
+                </Button>
+              )}
+            </div>
+            <div className="flex flex-1 gap-2 justify-between items-center">
+              <div className="flex gap-[40px]"></div>
+              <div className="flex gap-2 items-center">
+                {/* Show sign in/up buttons for non-logged-in users */}
+                {!loading && !user && (
+                  <>
+                    <Button
+                      onClick={() => navigateToAuth("/login")}
+                      variant="default"
+                      size="default"
+                      className="min-w-[74px] rounded-[10px]"
+                    >
+                      Sign in
+                    </Button>
+                    <Button
+                      onClick={() => navigateToAuth("/signup")}
+                      variant="outline"
+                      size="default"
+                      className="min-w-16 rounded-[10px]"
+                    >
+                      Sign up
+                    </Button>
+                  </>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Mobile header */}
+          <div className="py-3 flex items-center justify-between md:hidden">
+            <div className="flex items-center gap-2">
+              {showSidebarToggle && !chatSidebarOpen && (
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label="Toggle task sidebar"
+                  onClick={toggleChatSidebar}
+                  className="h-7 w-7 mr-2"
+                >
+                  <PanelLeft className="size-5" />
+                </Button>
+              )}
+              {/* Show upgrade button for logged-in users without pro plan */}
+              {showVisibleUpgradeCta && (
+                <Button
+                  onClick={handleUpgradeClick}
+                  className="flex items-center gap-1 rounded-full py-2 ps-2.5 pe-3 text-sm font-medium bg-premium-bg text-premium-text hover:bg-premium-hover border-0 transition-all duration-200"
+                  size="sm"
+                >
+                  <Sparkle className="mr-1 h-3 w-3 fill-current" />
+                  Upgrade plan
+                </Button>
+              )}
+            </div>
+            <div className="flex items-center gap-2">
+              {/* Show sign in/up buttons for non-logged-in users */}
+              {!loading && !user && (
+                <>
+                  <Button
+                    onClick={() => navigateToAuth("/login")}
+                    variant="default"
+                    size="sm"
+                    className="rounded-[10px]"
+                  >
+                    Sign in
+                  </Button>
+                  <Button
+                    onClick={() => navigateToAuth("/signup")}
+                    variant="outline"
+                    size="sm"
+                    className="rounded-[10px]"
+                  >
+                    Sign up
+                  </Button>
+                </>
+              )}
+            </div>
+          </div>
+        </header>
+      </div>
+    );
+  }
+
+  // Show chat header when there are messages or active chat
+  if (hasMessages || hasActiveChat) {
+    return (
+      <>
+        <ShareDialog
+          open={showShareDialog}
+          onOpenChange={setShowShareDialog}
+          chatId={id || ""}
+          chatTitle={taskTitle || ""}
+          existingShareId={chatData?.share_id}
+        />
+        <div className="px-4 bg-background flex-shrink-0">
+          <div className="flex flex-row items-center justify-between pt-3 pb-1 gap-1 sticky top-0 z-10 bg-background flex-shrink-0">
+            <div className="flex items-center gap-2 min-w-0">
+              {/* Only show sidebar toggle on mobile - desktop uses collapsed sidebar logo */}
+              {showSidebarToggle && !chatSidebarOpen && (
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label="Open sidebar"
+                  onClick={toggleChatSidebar}
+                  className="h-7 w-7 flex-shrink-0 md:hidden"
+                >
+                  <PanelLeft className="size-5" />
+                </Button>
+              )}
+              <div className="flex flex-row items-center gap-[6px] min-w-0 text-foreground text-lg font-medium">
+                <span className="whitespace-nowrap text-ellipsis overflow-hidden flex items-center gap-2">
+                  {isChatNotFound ? (
+                    ""
+                  ) : (
+                    <>
+                      {isBranchedChat && branchedFromChatTitle && (
+                        <TooltipProvider delayDuration={300}>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Split className="size-4 rotate-90 flex-shrink-0 text-muted-foreground" />
+                            </TooltipTrigger>
+                            <TooltipContent>
+                              <p className="text-xs">
+                                Branched from: {branchedFromChatTitle}
+                              </p>
+                            </TooltipContent>
+                          </Tooltip>
+                        </TooltipProvider>
+                      )}
+                      {taskTitle || (isExistingChat ? " " : "New Task")}
+                    </>
+                  )}
+                </span>
+              </div>
+            </div>
+            <div className="flex items-center gap-2 flex-shrink-0">
+              {/* Share button stays in the desktop layout so title loading does not shift it. */}
+              <button
+                aria-label="Share"
+                data-testid="share-chat-button"
+                onClick={() => setShowShareDialog(true)}
+                className={`relative flex-shrink-0 rounded-full h-[34px] px-3 py-0 text-sm font-medium transition-colors hover:bg-[#ffffff1a] max-md:hidden ${
+                  isExistingChat && id && taskTitle
+                    ? ""
+                    : "invisible pointer-events-none"
+                }`}
+              >
+                <div className="flex w-full items-center justify-center gap-1.5">
+                  <Share className="h-4 w-4 -ms-0.5" />
+                  Share
+                </div>
+              </button>
+              {isMobile && isInChat && showSidebarToggle && (
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label="Start new task"
+                  onClick={handleNewChat}
+                  className="h-7 w-7"
+                >
+                  <SquarePen className="size-5" />
+                </Button>
+              )}
+            </div>
+          </div>
+        </div>
+      </>
+    );
+  }
+
+  return null;
+};
+
+export default ChatHeader;

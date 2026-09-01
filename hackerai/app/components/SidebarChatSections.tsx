@@ -1,0 +1,360 @@
+"use client";
+
+import {
+  useId,
+  useMemo,
+  useState,
+  useSyncExternalStore,
+  type ReactNode,
+  type RefObject,
+} from "react";
+import { ChevronRight, SquarePen } from "lucide-react";
+import { toast } from "sonner";
+import {
+  DndContext,
+  DragOverlay,
+  KeyboardSensor,
+  MouseSensor,
+  pointerWithin,
+  rectIntersection,
+  TouchSensor,
+  useDroppable,
+  useSensor,
+  useSensors,
+  type CollisionDetection,
+  type DragCancelEvent,
+  type DragEndEvent,
+  type DragStartEvent,
+} from "@dnd-kit/core";
+import type { Doc } from "@/convex/_generated/dataModel";
+import { Button } from "@/components/ui/button";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { usePinChat, useUnpinChat } from "@/app/hooks/useChats";
+import { useStartNewChat } from "@/app/hooks/useStartNewChat";
+import {
+  getOpenSidebarProjectIdsSnapshot,
+  getServerOpenSidebarProjectIdsSnapshot,
+  parseOpenSidebarProjectIdsSnapshot,
+  subscribeOpenSidebarProjectIds,
+  writeOpenSidebarProjectIds,
+} from "@/lib/utils/client-storage";
+import SidebarHistory, { type SidebarPaginationStatus } from "./SidebarHistory";
+import { SidebarProjects } from "./SidebarProjects";
+import {
+  dispatchSidebarChatDrop,
+  getSidebarChatDragData,
+  SIDEBAR_MOUSE_DRAG_DISTANCE,
+  SIDEBAR_PINNED_DROP_ID,
+  SIDEBAR_TASKS_DROP_ID,
+  SIDEBAR_TOUCH_DRAG_DELAY,
+  SIDEBAR_TOUCH_DRAG_TOLERANCE,
+  type SidebarChatDragData,
+  type SidebarChatDropData,
+} from "./sidebar-chat-drag";
+
+interface SidebarChat {
+  _id: string;
+  id: string;
+  title: string;
+  pinned_at?: number;
+  [key: string]: unknown;
+}
+
+interface SidebarChatSectionsProps {
+  chats: SidebarChat[];
+  projects: Doc<"projects">[] | undefined;
+  projectPaginationStatus?: SidebarPaginationStatus;
+  loadMoreProjects?: (numItems: number) => void;
+  paginationStatus?: SidebarPaginationStatus;
+  loadMore?: (numItems: number) => void;
+  containerRef?: RefObject<HTMLDivElement | null>;
+}
+
+interface CollapsibleChatSectionProps {
+  action?: ReactNode;
+  children: ReactNode;
+  dropId: string;
+  onDrop: SidebarChatDropData["onDrop"];
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  testId: string;
+  title: string;
+}
+
+const sidebarChatCollisionDetection: CollisionDetection = (args) => {
+  const pointerCollisions = pointerWithin(args);
+
+  return pointerCollisions.length > 0
+    ? pointerCollisions
+    : rectIntersection(args);
+};
+
+function CollapsibleChatSection({
+  action,
+  children,
+  dropId,
+  onDrop,
+  open,
+  onOpenChange,
+  testId,
+  title,
+}: CollapsibleChatSectionProps) {
+  const contentId = useId();
+  const dropData: SidebarChatDropData = {
+    type: "sidebar-chat-drop",
+    onDrop,
+  };
+  const { isOver, setNodeRef } = useDroppable({
+    id: dropId,
+    data: dropData,
+  });
+
+  return (
+    <section
+      ref={setNodeRef}
+      className={`relative flex flex-col gap-px rounded-[10px] bg-sidebar ${
+        isOver ? "bg-sidebar-accent/40 ring-1 ring-sidebar-ring" : ""
+      }`}
+      data-testid={testId}
+      data-drop-active={isOver ? "true" : undefined}
+    >
+      <div
+        className={`group/chat-section sticky top-0 z-[3] flex h-9 w-full items-center bg-sidebar py-0.5 ps-2.5 pe-0.5 hover:rounded-[10px] hover:bg-sidebar-accent/40 ${
+          isOver
+            ? "rounded-[10px] bg-sidebar-accent/70 ring-1 ring-sidebar-ring"
+            : ""
+        }`}
+      >
+        <button
+          type="button"
+          className="flex min-w-0 flex-1 items-center gap-0.5 self-stretch rounded-md text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sidebar-ring"
+          onClick={() => onOpenChange(!open)}
+          aria-expanded={open}
+          aria-controls={contentId}
+        >
+          <span className="min-w-0 truncate text-[13px] font-medium leading-[18px] tracking-[-0.091px] text-sidebar-foreground/50">
+            {title}
+          </span>
+          <ChevronRight
+            className={`size-3.5 shrink-0 text-sidebar-foreground/45 transition-[transform,opacity] ${
+              open
+                ? "rotate-90 opacity-0 group-hover/chat-section:opacity-100"
+                : "opacity-100"
+            }`}
+            data-testid={`${testId}-chevron`}
+            aria-hidden="true"
+          />
+        </button>
+        {action}
+      </div>
+
+      {open ? <div id={contentId}>{children}</div> : null}
+    </section>
+  );
+}
+
+export function SidebarChatSections({
+  chats,
+  projects,
+  projectPaginationStatus,
+  loadMoreProjects,
+  paginationStatus,
+  loadMore,
+  containerRef,
+}: SidebarChatSectionsProps) {
+  const [isPinnedOpen, setIsPinnedOpen] = useState(true);
+  const [isTasksOpen, setIsTasksOpen] = useState(true);
+  const openProjectIdsSnapshot = useSyncExternalStore(
+    subscribeOpenSidebarProjectIds,
+    getOpenSidebarProjectIdsSnapshot,
+    getServerOpenSidebarProjectIdsSnapshot,
+  );
+  const openProjectIds = useMemo(
+    () => new Set(parseOpenSidebarProjectIdsSnapshot(openProjectIdsSnapshot)),
+    [openProjectIdsSnapshot],
+  );
+  const [activeTask, setActiveTask] = useState<SidebarChatDragData>();
+  const startNewChat = useStartNewChat();
+  const pinChat = usePinChat();
+  const unpinChat = useUnpinChat();
+  const pinnedChats = chats.filter((chat) => chat.pinned_at != null);
+  const taskChats = chats.filter((chat) => chat.pinned_at == null);
+  const pinnedProjects = projects?.filter(
+    (project) => project.pinned_at != null,
+  );
+  const unpinnedProjects = projects?.filter(
+    (project) => project.pinned_at == null,
+  );
+  const hasPinnedItems =
+    pinnedChats.length > 0 || (pinnedProjects?.length ?? 0) > 0;
+
+  const handleProjectOpenChange = (projectId: string, open: boolean) => {
+    const next = new Set(openProjectIds);
+    if (open) next.add(projectId);
+    else next.delete(projectId);
+    writeOpenSidebarProjectIds(next);
+  };
+
+  const handleCollapseProjects = (projectIds: readonly string[]) => {
+    const next = new Set(openProjectIds);
+    projectIds.forEach((projectId) => next.delete(projectId));
+    writeOpenSidebarProjectIds(next);
+  };
+
+  const handlePinnedDrop = async (chat: SidebarChatDragData) => {
+    if (chat.isPinned) return;
+
+    try {
+      await pinChat({ chatId: chat.chatId });
+      toast.success("Task pinned");
+    } catch (error) {
+      console.error("Failed to pin dropped task:", error);
+      toast.error("Failed to pin task");
+    }
+  };
+
+  const handleTasksDrop = async (chat: SidebarChatDragData) => {
+    if (!chat.isPinned) return;
+
+    try {
+      await unpinChat({ chatId: chat.chatId });
+      toast.success("Task unpinned");
+    } catch (error) {
+      console.error("Failed to unpin dropped task:", error);
+      toast.error("Failed to unpin task");
+    }
+  };
+
+  const handleDragStart = (event: DragStartEvent) => {
+    setActiveTask(getSidebarChatDragData(event.active.data.current));
+  };
+
+  const handleDragCancel = (_event: DragCancelEvent) => {
+    setActiveTask(undefined);
+  };
+
+  const handleDragEnd = (event: DragEndEvent) => {
+    setActiveTask(undefined);
+    dispatchSidebarChatDrop(
+      event.active.data.current,
+      event.over?.data.current,
+    );
+  };
+
+  const sensors = useSensors(
+    useSensor(MouseSensor, {
+      activationConstraint: { distance: SIDEBAR_MOUSE_DRAG_DISTANCE },
+    }),
+    useSensor(TouchSensor, {
+      activationConstraint: {
+        delay: SIDEBAR_TOUCH_DRAG_DELAY,
+        tolerance: SIDEBAR_TOUCH_DRAG_TOLERANCE,
+      },
+    }),
+    useSensor(KeyboardSensor),
+  );
+
+  return (
+    <DndContext
+      sensors={sensors}
+      collisionDetection={sidebarChatCollisionDetection}
+      onDragStart={handleDragStart}
+      onDragCancel={handleDragCancel}
+      onDragEnd={handleDragEnd}
+    >
+      <div
+        className="flex min-h-full flex-col gap-3 pb-3"
+        data-testid="sidebar-chat-sections"
+      >
+        {hasPinnedItems || activeTask ? (
+          <CollapsibleChatSection
+            title="Pinned"
+            dropId={SIDEBAR_PINNED_DROP_ID}
+            onDrop={handlePinnedDrop}
+            open={isPinnedOpen}
+            onOpenChange={setIsPinnedOpen}
+            testId="sidebar-pinned-section"
+          >
+            <SidebarHistory
+              chats={pinnedChats}
+              containerRef={containerRef}
+              showEmptyState={false}
+              testId="sidebar-pinned-chat-list"
+            />
+            <SidebarProjects
+              projects={pinnedProjects}
+              openProjectIds={openProjectIds}
+              onProjectOpenChange={handleProjectOpenChange}
+              onCollapseProjects={handleCollapseProjects}
+              variant="pinned-list"
+            />
+          </CollapsibleChatSection>
+        ) : null}
+
+        <SidebarProjects
+          projects={unpinnedProjects}
+          openProjectIds={openProjectIds}
+          onProjectOpenChange={handleProjectOpenChange}
+          onCollapseProjects={handleCollapseProjects}
+          paginationStatus={projectPaginationStatus}
+          loadMore={loadMoreProjects}
+        />
+
+        <CollapsibleChatSection
+          title="Tasks"
+          dropId={SIDEBAR_TASKS_DROP_ID}
+          onDrop={handleTasksDrop}
+          open={isTasksOpen}
+          onOpenChange={setIsTasksOpen}
+          testId="sidebar-tasks-section"
+          action={
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="size-8 rounded-lg text-sidebar-foreground/45 opacity-0 transition-opacity hover:bg-sidebar-accent hover:text-sidebar-foreground group-hover/chat-section:opacity-100 group-focus-within/chat-section:opacity-100 focus-visible:opacity-100 touch-device:!opacity-100"
+                  onClick={() => startNewChat()}
+                  aria-label="Start new task"
+                >
+                  <SquarePen className="size-[18px]" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent
+                side="top"
+                sideOffset={8}
+                className="border-0 bg-black px-3 py-1.5 text-sm text-white shadow-md [&_svg]:bg-black [&_svg]:fill-black"
+              >
+                New task
+              </TooltipContent>
+            </Tooltip>
+          }
+        >
+          <SidebarHistory
+            chats={taskChats}
+            paginationStatus={paginationStatus}
+            loadMore={loadMore}
+            containerRef={containerRef}
+            showEmptyState={
+              projects !== undefined &&
+              projects.length === 0 &&
+              pinnedChats.length === 0
+            }
+          />
+        </CollapsibleChatSection>
+      </div>
+      <DragOverlay>
+        {activeTask ? (
+          <div className="max-w-64 truncate rounded-lg border border-sidebar-border bg-sidebar-accent px-3 py-2 text-sm font-medium text-sidebar-foreground shadow-lg">
+            {activeTask.title}
+          </div>
+        ) : null}
+      </DragOverlay>
+    </DndContext>
+  );
+}

@@ -1,0 +1,140 @@
+import "@testing-library/jest-dom";
+import { describe, expect, it, jest } from "@jest/globals";
+import { render, screen } from "@testing-library/react";
+import type SidebarHistoryType from "../SidebarHistory";
+
+jest.mock("../ChatItem", () => ({
+  __esModule: true,
+  default: ({ id, title, isStreaming, isAwaitingApproval }: any) => (
+    <div data-testid={`chat-item-${id}`}>
+      <span>{title}</span>
+      {isAwaitingApproval ? (
+        <span data-testid={`awaiting-approval-${id}`}>Awaiting approval</span>
+      ) : null}
+      {isStreaming ? (
+        <span data-testid={`streaming-${id}`}>loading</span>
+      ) : null}
+    </div>
+  ),
+}));
+
+const SidebarHistory = require("../SidebarHistory")
+  .default as typeof SidebarHistoryType;
+
+const chat = (overrides: Record<string, unknown>) => ({
+  _id: overrides.id,
+  id: overrides.id,
+  title: "Chat",
+  ...overrides,
+});
+
+describe("SidebarHistory", () => {
+  it("marks chats with active ask streams as streaming", () => {
+    render(
+      <SidebarHistory
+        chats={[chat({ id: "ask-chat", active_stream_id: "stream-1" })]}
+        paginationStatus="Exhausted"
+      />,
+    );
+
+    expect(screen.getByTestId("streaming-ask-chat")).toBeInTheDocument();
+    expect(screen.getByTestId("sidebar-chat-list")).toHaveClass("py-2");
+    expect(screen.getByTestId("sidebar-chat-list")).not.toHaveClass(
+      "p-2",
+      "px-2",
+    );
+  });
+
+  it("marks chats with active agent trigger runs as streaming", () => {
+    render(
+      <SidebarHistory
+        chats={[chat({ id: "agent-chat", active_trigger_run_id: "run-1" })]}
+        paginationStatus="Exhausted"
+      />,
+    );
+
+    expect(screen.getByTestId("streaming-agent-chat")).toBeInTheDocument();
+  });
+
+  it("does not mark idle chats as streaming", () => {
+    render(
+      <SidebarHistory
+        chats={[chat({ id: "idle-chat" })]}
+        paginationStatus="Exhausted"
+      />,
+    );
+
+    expect(screen.queryByTestId("streaming-idle-chat")).not.toBeInTheDocument();
+  });
+
+  it("shows pending approval without a streaming indicator", () => {
+    render(
+      <SidebarHistory
+        chats={[
+          chat({
+            id: "approval-chat",
+            active_trigger_run_id: "run-1",
+            active_agent_approval_pending: true,
+          }),
+        ]}
+        paginationStatus="Exhausted"
+      />,
+    );
+
+    expect(
+      screen.getByTestId("awaiting-approval-approval-chat"),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByTestId("streaming-approval-chat"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows stored pending approval without a streaming indicator", () => {
+    render(
+      <SidebarHistory
+        chats={[
+          chat({
+            id: "stored-approval-chat",
+            active_agent_approval_pending: true,
+          }),
+        ]}
+        paginationStatus="Exhausted"
+      />,
+    );
+
+    expect(
+      screen.getByTestId("awaiting-approval-stored-approval-chat"),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByTestId("streaming-stored-approval-chat"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps the pagination sentinel when the loaded page has no unpinned chats", () => {
+    const observe = jest.fn();
+    const disconnect = jest.fn();
+    global.IntersectionObserver = jest.fn(
+      () =>
+        ({
+          disconnect,
+          observe,
+        }) as unknown as IntersectionObserver,
+    ) as unknown as typeof IntersectionObserver;
+
+    render(
+      <SidebarHistory
+        chats={[]}
+        paginationStatus="CanLoadMore"
+        loadMore={jest.fn()}
+        showEmptyState={false}
+      />,
+    );
+
+    expect(
+      screen.getByTestId("sidebar-load-more-sentinel"),
+    ).toBeInTheDocument();
+    expect(observe).toHaveBeenCalledWith(
+      screen.getByTestId("sidebar-load-more-sentinel"),
+    );
+  });
+});

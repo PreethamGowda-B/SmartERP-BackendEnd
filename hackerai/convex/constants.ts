@@ -1,0 +1,1 @@
+export const MAX_PREVIOUS_SUMMARIES = 10;

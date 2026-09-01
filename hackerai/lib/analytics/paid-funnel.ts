@@ -1,0 +1,151 @@
+export const PAID_FUNNEL_EVENT_VERSION = 1;
+
+export const UPGRADE_CTA_IMPRESSION_DEDUPE = {
+  scope: "identified_user_surface_source_utc_day",
+  version: 1,
+} as const;
+
+export const PAID_FUNNEL_EVENTS = {
+  upgradeCtaImpressed: "upgrade_cta_impressed",
+  upgradeCtaClicked: "upgrade_cta_clicked",
+  addCreditCtaImpressed: "add_credit_cta_impressed",
+  addCreditCtaClicked: "add_credit_cta_clicked",
+  addCreditCheckoutStarted: "add_credit_checkout_started",
+  addCreditCheckoutSucceeded: "add_credit_checkout_succeeded",
+  checkoutStarted: "checkout_started",
+  checkoutSucceeded: "checkout_succeeded",
+  checkoutRedirectSuppressed: "checkout_redirect_suppressed",
+  cancellationStarted: "cancellation_started",
+  cancellationReasonSelected: "cancellation_reason_selected",
+  cancellationReasonFollowUpSelected: "cancellation_reason_follow_up_selected",
+  cancellationReasonSubmitted: "cancellation_reason_free_text_submitted",
+  cancellationCompleted: "cancellation_completed",
+  cancellationReversed: "cancellation_reversed",
+  billingPaymentFailed: "billing_payment_failed",
+  billingPaymentRecovered: "billing_payment_recovered",
+  recoveryPromptImpressed: "recovery_prompt_impressed",
+  billingPastDuePaymentUpdateClicked: "billing_past_due_payment_update_clicked",
+  paymentUpdateOpened: "payment_update_opened",
+  paymentMethodUpdated: "payment_method_updated",
+  invoicePaid: "invoice_paid",
+  limitHit: "limit_hit",
+  paidDailyFreeAllowanceImpressed: "paid_daily_free_allowance_impressed",
+  paidDailyFreeAllowanceClicked: "paid_daily_free_allowance_clicked",
+  paidDailyFreeAllowanceStarted: "paid_daily_free_allowance_started",
+  paidDailyFreeAllowanceSucceeded: "paid_daily_free_allowance_succeeded",
+  paidDailyFreeAllowanceBlocked: "paid_daily_free_allowance_blocked",
+  paidDailyFreeAllowanceCutOff: "paid_daily_free_allowance_cut_off",
+} as const;
+
+export function cancellationCompletionInsertId(
+  stripeSubscriptionId: string,
+): string {
+  return `${PAID_FUNNEL_EVENTS.cancellationCompleted}:${stripeSubscriptionId}`;
+}
+
+export function billingPaymentRecoveryInsertId(
+  stripeEventId: string,
+  userId: string,
+): string {
+  return `${PAID_FUNNEL_EVENTS.billingPaymentRecovered}:${stripeEventId}:${userId}`;
+}
+
+export function checkoutStartedInsertId(checkoutAttemptId: string): string {
+  return `${PAID_FUNNEL_EVENTS.checkoutStarted}:${checkoutAttemptId}`;
+}
+
+export function upgradeCtaImpressionInsertId({
+  distinctId,
+  surface,
+  source,
+  utcDay,
+}: {
+  distinctId: string;
+  surface: string;
+  source?: string;
+  utcDay: string;
+}): string {
+  return JSON.stringify([
+    PAID_FUNNEL_EVENTS.upgradeCtaImpressed,
+    UPGRADE_CTA_IMPRESSION_DEDUPE.version,
+    distinctId,
+    surface,
+    source ?? null,
+    utcDay,
+  ]);
+}
+
+export type PaidFunnelPlan =
+  | "pro-monthly-plan"
+  | "pro-plus-monthly-plan"
+  | "ultra-monthly-plan"
+  | "pro-yearly-plan"
+  | "pro-plus-yearly-plan"
+  | "ultra-yearly-plan"
+  | "team-monthly-plan"
+  | "team-yearly-plan";
+
+export type PaidFunnelTier = "free" | "pro" | "pro-plus" | "ultra" | "team";
+
+export function planLookupKeyToTier(
+  lookupKey: string | undefined,
+): Exclude<PaidFunnelTier, "free"> | null {
+  if (!lookupKey) return null;
+  if (lookupKey.startsWith("ultra")) return "ultra";
+  if (lookupKey.startsWith("pro-plus")) return "pro-plus";
+  if (lookupKey.startsWith("team")) return "team";
+  if (lookupKey.startsWith("pro")) return "pro";
+  return null;
+}
+
+export function planLookupKeyToBillingInterval(
+  lookupKey: string | undefined,
+): "month" | "year" | undefined {
+  if (!lookupKey) return undefined;
+  if (lookupKey.includes("yearly")) return "year";
+  if (lookupKey.includes("monthly")) return "month";
+  return undefined;
+}
+
+export function normalizePaidFunnelLabel(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!/^[A-Za-z0-9_.:-]{1,80}$/.test(trimmed)) return undefined;
+  return trimmed;
+}
+
+export function paidFunnelTierFromUnknown(
+  value: unknown,
+  fallback: PaidFunnelTier = "free",
+): PaidFunnelTier {
+  return value === "free" ||
+    value === "pro" ||
+    value === "pro-plus" ||
+    value === "ultra" ||
+    value === "team"
+    ? value
+    : fallback;
+}
+
+export function createCheckoutAttemptId(): string {
+  const uuid = globalThis.crypto?.randomUUID?.();
+  if (uuid) return `ca_${uuid}`;
+
+  return `ca_${Date.now().toString(36)}_${Math.random()
+    .toString(36)
+    .slice(2, 12)}`;
+}
+
+export function normalizeCheckoutAttemptId(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!/^[A-Za-z0-9_-]{8,128}$/.test(trimmed)) return undefined;
+  return trimmed;
+}
+
+export function paidFunnelProperties(properties: Record<string, unknown> = {}) {
+  return {
+    ...properties,
+    paid_funnel_event_version: PAID_FUNNEL_EVENT_VERSION,
+  };
+}

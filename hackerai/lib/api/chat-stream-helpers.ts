@@ -1,0 +1,1487 @@
+/**
+ * Chat Stream Helpers
+ *
+ * Utility functions extracted from chat-handler to keep it clean and focused.
+ */
+
+import type {
+  LanguageModel,
+  UIMessage,
+  UIMessageStreamWriter,
+  ToolSet,
+  ModelMessage,
+  SystemModelMessage,
+} from "ai";
+import { NoSuchModelError } from "ai";
+import type {
+  ChatMode,
+  ExtraUsageConfig,
+  SandboxPreference,
+  SelectedModel,
+  SubscriptionTier,
+  Todo,
+  UserCustomization,
+} from "@/types";
+import {
+  DEEPSEEK_V4_FLASH_VISION_SLUG,
+  GLM_5_3_FLASH_SLUG,
+  GLM_5_3_SLUG,
+  GROK_4_5_SLUG,
+  GROK_4_6_SLUG,
+  getOpenRouterProviderRoutingForModel,
+  isAnthropicModel,
+  myProvider,
+} from "@/lib/ai/providers";
+import type { ModelName } from "@/lib/ai/providers";
+import type { Id } from "@/convex/_generated/dataModel";
+import type { UIMessagePart } from "ai";
+import {
+  writeRateLimitWarning,
+  createSummarizationCompletedPart,
+  findSummarizationInsertIndex,
+} from "@/lib/utils/stream-writer-utils";
+import { POINTS_PER_DOLLAR } from "@/lib/rate-limit/token-bucket";
+import { countMessagesTokens, safeCountTokens } from "@/lib/token-utils";
+import {
+  checkAndSummarizeIfNeeded,
+  type EnsureSandbox,
+  type SummarizationUsage,
+} from "@/lib/chat/summarization";
+import type { ProviderPromptPressure } from "@/lib/chat/summarization/provider-pressure";
+import { getNotes } from "@/lib/db/actions";
+import { generateNotesSection } from "@/lib/system-prompt/notes";
+import { logger } from "@/lib/logger";
+import { UsageTracker } from "@/lib/usage-tracker";
+import { ChatSDKError } from "@/lib/errors";
+import type { LimitCapReason } from "@/lib/limit-pressure";
+import {
+  getExtraUsageBalance,
+  getTeamExtraUsageState,
+} from "@/lib/extra-usage";
+import { systemPrompt } from "@/lib/system-prompt";
+import { isAgentMode } from "@/lib/utils/mode-helpers";
+import {
+  extractErrorDetails,
+  getProviderStatusCode,
+} from "@/lib/utils/error-utils";
+
+/**
+ * Check if messages contain file attachments
+ */
+export function hasFileAttachments(
+  messages: Array<{ parts?: Array<{ type?: string }> }>,
+): boolean {
+  return messages.some((msg) =>
+    msg.parts?.some((part) => part.type === "file"),
+  );
+}
+
+/**
+ * Count total file attachments and how many are images
+ */
+export function countFileAttachments(
+  messages: Array<{ parts?: Array<{ type?: string; mediaType?: string }> }>,
+): { totalFiles: number; imageCount: number } {
+  let totalFiles = 0;
+  let imageCount = 0;
+
+  for (const msg of messages) {
+    if (!msg.parts) continue;
+    for (const part of msg.parts) {
+      if (part.type !== "file") continue;
+      totalFiles++;
+      if ((part.mediaType ?? "").startsWith("image/")) {
+        imageCount++;
+      }
+    }
+  }
+
+  return { totalFiles, imageCount };
+}
+
+/**
+ * Remove image file parts from messages. Used for free-tier users continuing
+ * chats that already contain images uploaded while paid. Messages that would
+ * end up empty get a text placeholder so turn structure stays intact.
+ */
+export function stripImageAttachments<
+  T extends { parts?: Array<{ type?: string; mediaType?: string }> },
+>(messages: T[]): T[] {
+  return messages.map((msg) => {
+    if (!msg.parts) return msg;
+    const filtered = msg.parts.filter(
+      (p) => !(p.type === "file" && (p.mediaType ?? "").startsWith("image/")),
+    );
+    if (filtered.length === msg.parts.length) return msg;
+    return {
+      ...msg,
+      parts:
+        filtered.length > 0
+          ? filtered
+          : [
+              {
+                type: "text",
+                text: "[Image attachment hidden — image attachments are a paid-plan feature and aren't available on the free plan.]",
+              },
+            ],
+    } as T;
+  });
+}
+
+/**
+ * Send rate limit warnings based on subscription and rate limit info
+ */
+export function sendRateLimitWarnings(
+  writer: UIMessageStreamWriter,
+  options: {
+    subscription: SubscriptionTier;
+    mode: ChatMode;
+    rateLimitInfo: {
+      remaining: number;
+      limit: number;
+      resetTime: Date;
+      monthly?: { remaining: number; limit: number; resetTime: Date };
+      extraUsagePointsDeducted?: number;
+      rateLimitSkipped?: boolean;
+    };
+    extraUsageConfig?: ExtraUsageConfig;
+    paidDailyFreeAllowance?: {
+      costLimitDollars: number;
+      resetTime: Date;
+    };
+  },
+): void {
+  const {
+    subscription,
+    mode,
+    rateLimitInfo,
+    extraUsageConfig,
+    paidDailyFreeAllowance,
+  } = options;
+
+  if (paidDailyFreeAllowance) {
+    writeRateLimitWarning(writer, {
+      warningType: "paid-daily-free-allowance",
+      resetTime: paidDailyFreeAllowance.resetTime.toISOString(),
+      subscription,
+      mode,
+      costLimitDollars: paidDailyFreeAllowance.costLimitDollars,
+    });
+    return;
+  }
+
+  if (subscription === "free") {
+    // Warn when roughly 30% of daily limit remains (minimum threshold of 1)
+    const warningThreshold = Math.max(1, Math.ceil(rateLimitInfo.limit * 0.3));
+    if (
+      !rateLimitInfo.rateLimitSkipped &&
+      rateLimitInfo.remaining <= warningThreshold
+    ) {
+      writeRateLimitWarning(writer, {
+        warningType: "sliding-window",
+        remaining: rateLimitInfo.remaining,
+        resetTime: rateLimitInfo.resetTime.toISOString(),
+        mode,
+        subscription,
+      });
+    }
+  } else if (rateLimitInfo.monthly) {
+    const canUseExtraUsage =
+      !!extraUsageConfig?.enabled &&
+      (extraUsageConfig.hasBalance || extraUsageConfig.autoReloadEnabled) &&
+      (extraUsageConfig.monthlyRemainingDollars === undefined ||
+        extraUsageConfig.monthlyRemainingDollars > 0);
+    const isUsingExtraUsage =
+      !!rateLimitInfo.extraUsagePointsDeducted &&
+      rateLimitInfo.extraUsagePointsDeducted > 0;
+
+    // Paid users with extra usage: warn when credits are being used, including
+    // the edge case where the included bucket is empty before output starts.
+    if (
+      isUsingExtraUsage ||
+      (rateLimitInfo.monthly.remaining <= 0 && canUseExtraUsage)
+    ) {
+      writeRateLimitWarning(writer, {
+        warningType: "extra-usage-active",
+        bucketType: "monthly",
+        resetTime: rateLimitInfo.monthly.resetTime.toISOString(),
+        subscription,
+        capReason: "extra_usage_active",
+      });
+    } else {
+      // Paid users without extra usage: warn at 75% and 90%
+      const usedPercent =
+        100 -
+        (rateLimitInfo.monthly.remaining / rateLimitInfo.monthly.limit) * 100;
+
+      if (usedPercent >= 75) {
+        emitTokenBucketThresholdWarning(writer, {
+          usedPercent,
+          projectedUsedPoints:
+            rateLimitInfo.monthly.limit - rateLimitInfo.monthly.remaining,
+          monthlyLimitPoints: rateLimitInfo.monthly.limit,
+          resetTime: rateLimitInfo.monthly.resetTime,
+          subscription,
+          capReason: "monthly_near_limit",
+        });
+      }
+    }
+  }
+}
+
+/**
+ * Inputs to {@link emitTokenBucketThresholdWarning}. Both start-of-stream
+ * (`sendRateLimitWarnings`) and mid-stream (`BudgetMonitor`) callers build
+ * one of these and let the helper format the dollar/severity payload.
+ */
+export interface TokenBucketEmitContext {
+  /** Used percentage (0–100+), pre-rounding. */
+  usedPercent: number;
+  /** Points consumed against the monthly bucket so far. */
+  projectedUsedPoints: number;
+  /** Monthly bucket size in points. */
+  monthlyLimitPoints: number;
+  /** When the bucket resets. */
+  resetTime: Date;
+  subscription: SubscriptionTier;
+  /** Set when the warning is emitted from inside an active stream. */
+  midStream?: boolean;
+  /** Set when the response was cut off because the bucket hit 0. */
+  cutOff?: boolean;
+  /** Monetization/guardrail reason that should drive the client CTA. */
+  capReason?: LimitCapReason;
+}
+
+export function emitTokenBucketThresholdWarning(
+  writer: UIMessageStreamWriter,
+  ctx: TokenBucketEmitContext,
+): void {
+  const remainingPercent = Math.max(0, Math.round(100 - ctx.usedPercent));
+  const severity: "info" | "warning" =
+    ctx.usedPercent >= 90 ? "warning" : "info";
+  writeRateLimitWarning(writer, {
+    warningType: "token-bucket",
+    bucketType: "monthly",
+    remainingPercent,
+    resetTime: ctx.resetTime.toISOString(),
+    subscription: ctx.subscription,
+    severity,
+    usedDollars:
+      Math.round((ctx.projectedUsedPoints / POINTS_PER_DOLLAR) * 100) / 100,
+    limitDollars: ctx.monthlyLimitPoints / POINTS_PER_DOLLAR,
+    ...(ctx.capReason ? { capReason: ctx.capReason } : {}),
+    ...(ctx.midStream ? { midStream: true } : {}),
+    ...(ctx.cutOff ? { cutOff: true } : {}),
+  });
+}
+
+/**
+ * Check if an error is an xAI safety check error (403 from api.x.ai)
+ * These are false positives that should be suppressed from logging
+ */
+export function isXaiSafetyError(error: unknown): boolean {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+
+  // Handle both direct errors (from generateText) and wrapped errors (from streamText onError)
+  const apiError =
+    "error" in error && error.error instanceof Error
+      ? (error.error as Error & {
+          statusCode?: number;
+          url?: string;
+          responseBody?: string;
+        })
+      : (error as Error & {
+          statusCode?: number;
+          url?: string;
+          responseBody?: string;
+        });
+
+  return (
+    apiError.statusCode === 403 &&
+    typeof apiError.url === "string" &&
+    apiError.url.includes("api.x.ai") &&
+    typeof apiError.responseBody === "string"
+  );
+}
+
+const PROVIDER_CAPACITY_ERROR_PATTERN =
+  /\bprovider_unavailable\b|\bcurrently at capacity\b|\bhigh demand\b/i;
+
+const stringifyErrorField = (value: unknown): string => {
+  if (typeof value === "string") return value;
+  if (value == null) return "";
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return "";
+  }
+};
+
+/** Check if a pre-stream provider API error should trigger model fallback. */
+export function isProviderApiError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+
+  const details = extractErrorDetails(error);
+  const statusCode = getProviderStatusCode(details);
+  const providerErrorText = [
+    details.errorMessage,
+    details.providerErrorMessage,
+    details.providerRawError,
+    details.responseBody,
+    details.providerData,
+  ]
+    .map(stringifyErrorField)
+    .join(" ");
+
+  // xAI returns this when Grok is temporarily saturated. It is safe to retry
+  // with the configured fallback because the request never produced output.
+  if (
+    statusCode != null &&
+    statusCode >= 500 &&
+    PROVIDER_CAPACITY_ERROR_PATTERN.test(providerErrorText)
+  ) {
+    return true;
+  }
+
+  const err = error as {
+    statusCode?: number;
+    responseBody?: string;
+    data?: {
+      error?: {
+        code?: number;
+        message?: string;
+        metadata?: { raw?: string; provider_name?: string };
+      };
+    };
+  };
+
+  // Must be a 400 error
+  if (err.statusCode !== 400 && err.data?.error?.code !== 400) return false;
+
+  // Check for INVALID_ARGUMENT in response body or nested metadata
+  const responseBody = err.responseBody || "";
+  const rawMetadata = err.data?.error?.metadata?.raw || "";
+  const combined = responseBody + rawMetadata;
+
+  return combined.includes("INVALID_ARGUMENT");
+}
+
+/**
+ * Compute total context usage from messages.
+ */
+export interface ContextUsageData {
+  usedTokens: number;
+  maxTokens: number;
+}
+
+export function computeContextUsage(
+  messages: UIMessage[],
+  fileTokens: Record<Id<"files">, number>,
+  systemTokens: number,
+  maxTokens: number,
+): ContextUsageData {
+  const usedTokens = systemTokens + countMessagesTokens(messages, fileTokens);
+  return { usedTokens, maxTokens };
+}
+
+export function isContextUsageEnabled(
+  subscription: SubscriptionTier,
+  mode?: ChatMode,
+): boolean {
+  if (subscription !== "free") return true;
+  return mode === "agent";
+}
+
+export interface SummarizationStepResult {
+  summarizationAttempted: boolean;
+  needsSummarization: boolean;
+  summarizedMessages?: UIMessage[];
+  contextUsage?: ContextUsageData;
+  summarizationUsage?: SummarizationUsage;
+}
+
+export async function runSummarizationStep(options: {
+  messages: UIMessage[];
+  subscription: SubscriptionTier;
+  languageModel: LanguageModel;
+  mode: ChatMode;
+  writer: UIMessageStreamWriter;
+  chatId: string | null;
+  fileTokens: Record<Id<"files">, number>;
+  todos: Todo[];
+  abortSignal?: AbortSignal;
+  ensureSandbox?: EnsureSandbox;
+  systemPromptTokens: number;
+  ctxSystemTokens: number;
+  ctxMaxTokens: number;
+  providerInputTokens?: number;
+  chatSystemPrompt: string;
+  tools?: ToolSet;
+  providerOptions?: Record<string, Record<string, unknown>>;
+  modelMessages?: ModelMessage[];
+  transcriptMessages?: UIMessage[];
+  providerPromptPressure?: ProviderPromptPressure | null;
+}): Promise<SummarizationStepResult> {
+  const {
+    summarizationAttempted,
+    needsSummarization,
+    summarizedMessages,
+    summarizationUsage,
+  } = await checkAndSummarizeIfNeeded({
+    uiMessages: options.messages,
+    subscription: options.subscription,
+    languageModel: options.languageModel,
+    mode: options.mode,
+    writer: options.writer,
+    chatId: options.chatId,
+    fileTokens: options.fileTokens,
+    todos: options.todos,
+    abortSignal: options.abortSignal,
+    ensureSandbox: options.ensureSandbox,
+    systemPromptTokens: options.systemPromptTokens,
+    providerInputTokens: options.providerInputTokens ?? 0,
+    chatSystemPrompt: options.chatSystemPrompt,
+    tools: options.tools,
+    providerOptions: options.providerOptions,
+    modelMessages: options.modelMessages,
+    transcriptMessages: options.transcriptMessages,
+    maxTokensOverride: options.ctxMaxTokens,
+    providerPromptPressure: options.providerPromptPressure,
+  });
+
+  if (!needsSummarization) {
+    return { summarizationAttempted, needsSummarization: false };
+  }
+
+  const contextUsage = isContextUsageEnabled(options.subscription, options.mode)
+    ? computeContextUsage(
+        summarizedMessages,
+        options.fileTokens,
+        options.ctxSystemTokens,
+        options.ctxMaxTokens,
+      )
+    : undefined;
+
+  return {
+    summarizationAttempted,
+    needsSummarization: true,
+    summarizedMessages,
+    contextUsage,
+    summarizationUsage,
+  };
+}
+
+/**
+ * Tracks summarization state and handles inserting the summarization badge
+ * into message parts at the correct position during save.
+ */
+export class SummarizationTracker {
+  hasSummarized = false;
+  private records: Array<{
+    part: UIMessagePart<any, any>;
+    atStep: number;
+  }> = [];
+
+  get summarizationCount(): number {
+    return this.records.length;
+  }
+
+  /**
+   * Record that summarization completed at the given step and accumulate
+   * usage into the provided UsageTracker.
+   */
+  recordSummarization(
+    stepNumber: number,
+    usage: SummarizationUsage | undefined,
+    usageTracker: UsageTracker,
+  ): void {
+    this.hasSummarized = true;
+    const part = createSummarizationCompletedPart();
+    this.records.push({
+      part: {
+        ...part,
+        id: `summarization-status-${this.records.length + 1}`,
+      } as UIMessagePart<any, any>,
+      atStep: stepNumber,
+    });
+
+    this.recordSummarizationUsage(usage, usageTracker);
+  }
+
+  /** Account for generated-summary usage, whether accepted or rejected. */
+  recordSummarizationUsage(
+    usage: SummarizationUsage | undefined,
+    usageTracker: UsageTracker,
+  ): void {
+    if (usage) {
+      usageTracker.accumulateSummarization(usage);
+    }
+  }
+
+  /**
+   * Insert summarization parts into an assistant message at the correct
+   * position (before the step-start for the step where summarization happened).
+   * Returns the original message unchanged if no summarization occurred.
+   */
+  processMessageForSave<T extends { role: string; parts: any[] }>(
+    message: T,
+  ): T {
+    if (message.role !== "assistant" || this.records.length === 0) {
+      return message;
+    }
+    const parts = [...message.parts];
+    const insertions = this.records
+      .map((record, recordIndex) => ({
+        ...record,
+        recordIndex,
+        insertionIndex: findSummarizationInsertIndex(
+          message.parts,
+          record.atStep,
+        ),
+      }))
+      .sort(
+        (a, b) =>
+          b.insertionIndex - a.insertionIndex || b.recordIndex - a.recordIndex,
+      );
+
+    for (const insertion of insertions) {
+      parts.splice(insertion.insertionIndex, 0, insertion.part);
+    }
+    return { ...message, parts };
+  }
+}
+
+/**
+ * OpenRouter `models` fallback chain, expressed in local registry keys.
+ *
+ * When the primary 5xx's, rate-limits, or otherwise errors before any tokens
+ * stream, OpenRouter rolls forward through this list and bills at the served
+ * model's rate (response.modelId reflects what actually ran).
+ *
+ * Paid Auto/Standard use DeepSeek V4 Flash 0731, Pro uses DeepSeek V4 Pro
+ * 0813, and Max uses Grok 4.6. Historical aliases remain recognized for
+ * in-flight requests and cost accounting.
+ *
+ * Keys and values are registry names (see lib/ai/providers.ts) — the actual
+ * OpenRouter slugs are resolved at request-build time so this stays in sync
+ * with the registry.
+ */
+const KIMI_K3_THEN_GROK_FALLBACK_CHAIN = [
+  "model-kimi-k3",
+  "model-grok-4.6",
+] as const satisfies readonly ModelName[];
+
+const GROK_4_6_FALLBACK_CHAIN = [
+  "model-glm-5.3",
+  "model-kimi-k3",
+] as const satisfies readonly ModelName[];
+
+const PRO_TEXT_FALLBACK_CHAIN = [
+  "model-glm-5.3",
+  "model-kimi-k3",
+] as const satisfies readonly ModelName[];
+
+// OpenRouter rejects requests whose `models` fallback array has more than
+// three entries. Longer logical routes can still be used by app-side retries.
+const OPENROUTER_MAX_FALLBACK_MODELS = 3;
+
+const DEEPSEEK_V4_FLASH_0731_FALLBACK_CHAIN = [
+  "model-deepseek-v4-pro-0813",
+  ...PRO_TEXT_FALLBACK_CHAIN,
+] as const satisfies readonly ModelName[];
+
+const FREE_ASK_GLM_FLASH_FALLBACK_CHAIN = [
+  "model-deepseek-v4-flash-0731",
+  ...DEEPSEEK_V4_FLASH_0731_FALLBACK_CHAIN,
+] as const satisfies readonly ModelName[];
+
+const AGENT_GLM_FLASH_FALLBACK_CHAIN = [
+  "model-deepseek-v4-flash-0731",
+  ...DEEPSEEK_V4_FLASH_0731_FALLBACK_CHAIN,
+] as const satisfies readonly ModelName[];
+
+const DEEPSEEK_V4_PRO_0813_FALLBACK_CHAIN = [
+  ...PRO_TEXT_FALLBACK_CHAIN,
+] as const satisfies readonly ModelName[];
+
+// Preserve the historical Grok 4.6 Pro alias for in-flight requests. GLM 5.3
+// remains its first fallback, followed by Kimi K3.
+const HACKERAI_PRO_FALLBACK_CHAIN = [
+  "model-glm-5.3",
+  "model-kimi-k3",
+] as const satisfies readonly ModelName[];
+
+const MODEL_FALLBACK_CHAIN: Partial<Record<ModelName, readonly ModelName[]>> = {
+  "ask-model-free": FREE_ASK_GLM_FLASH_FALLBACK_CHAIN,
+  "agent-model-free": AGENT_GLM_FLASH_FALLBACK_CHAIN,
+  "model-glm-5.3-flash-agent": AGENT_GLM_FLASH_FALLBACK_CHAIN,
+  "model-deepseek-v4-flash-0731": DEEPSEEK_V4_FLASH_0731_FALLBACK_CHAIN,
+  "model-deepseek-v4-pro": PRO_TEXT_FALLBACK_CHAIN,
+  "model-deepseek-v4-pro-0813": DEEPSEEK_V4_PRO_0813_FALLBACK_CHAIN,
+  "ask-model": GROK_4_6_FALLBACK_CHAIN,
+  "agent-model": GROK_4_6_FALLBACK_CHAIN,
+  "model-grok-4.6": GROK_4_6_FALLBACK_CHAIN,
+  "model-grok-4.5": ["model-kimi-k3"],
+  "model-grok-4.5-pro": ["model-kimi-k3"],
+  "model-grok-4.6-pro": HACKERAI_PRO_FALLBACK_CHAIN,
+  "model-opus-4.6": ["model-grok-4.6"],
+  "model-glm-5.2": KIMI_K3_THEN_GROK_FALLBACK_CHAIN,
+  "model-glm-5.3": ["model-kimi-k3"],
+  "model-glm-5.3-flash": ["model-deepseek-v4-flash-vision"],
+  "model-glm-5.3-flash-pro": ["model-deepseek-v4-flash-vision"],
+  "fallback-agent-model": GROK_4_6_FALLBACK_CHAIN,
+  "fallback-ask-model": GROK_4_6_FALLBACK_CHAIN,
+  "model-kimi-k3": ["model-grok-4.6"],
+};
+
+const AUTO_MODEL_KEYS = new Set<string>([
+  "ask-model",
+  "ask-model-free",
+  "agent-model",
+  "agent-model-free",
+]);
+const EXPLICIT_RETRY_MODEL_KEYS = new Set<string>([
+  "model-grok-4.6",
+  "model-grok-4.6-pro",
+]);
+const EXPLICIT_DEEPSEEK_PRO_RETRY_MODEL_KEYS = new Set<string>([
+  "model-deepseek-v4-pro",
+  "model-deepseek-v4-pro-0813",
+]);
+
+export function isAutoModelSelectionForRetry({
+  selectedModel,
+  selectedModelOverride,
+}: {
+  selectedModel: string;
+  selectedModelOverride?: SelectedModel | null;
+}): boolean {
+  return (
+    !selectedModelOverride ||
+    selectedModelOverride === "auto" ||
+    AUTO_MODEL_KEYS.has(selectedModel) ||
+    EXPLICIT_RETRY_MODEL_KEYS.has(selectedModel)
+  );
+}
+
+export function isExplicitDeepSeekProSelectionForRetry({
+  selectedModel,
+  selectedModelOverride,
+}: {
+  selectedModel: string;
+  selectedModelOverride?: SelectedModel | null;
+}): boolean {
+  return (
+    selectedModelOverride === "hackerai-pro" &&
+    EXPLICIT_DEEPSEEK_PRO_RETRY_MODEL_KEYS.has(selectedModel)
+  );
+}
+
+const HIGH_REASONING_MODELS = [
+  "agent-model-free",
+  "model-grok-4.5-pro",
+  "model-grok-4.6",
+  "model-grok-4.6-pro",
+  "model-deepseek-v4-flash-0731",
+  "model-deepseek-v4-pro-0813",
+  "model-glm-5.2",
+  "model-glm-5.3",
+  "model-glm-5.3-flash-pro",
+  "model-glm-5.3-flash-agent",
+  "model-opus-4.6",
+] as const satisfies readonly ModelName[];
+
+const isHighReasoningModel = (modelName?: string): boolean =>
+  typeof modelName === "string" &&
+  (HIGH_REASONING_MODELS as readonly string[]).includes(modelName);
+
+type FallbackOptions = {
+  hasMultimodalToolResults?: boolean;
+  hasPdfAttachments?: boolean;
+  pdfParserEngine?: "mistral-ocr" | "cloudflare-ai";
+  reasoningOverride?: ProviderReasoningOverride;
+  excludedModelSlugs?: readonly string[];
+  requestedModelSlug?: string;
+};
+
+export type ProviderReasoningOverride = {
+  enabled: boolean;
+  effort?: string;
+  exclude?: boolean;
+};
+
+const HIGH_OR_GREATER_REASONING_EFFORTS = new Set(["high", "xhigh", "max"]);
+
+const isHighOrGreaterReasoningOverride = (
+  reasoningOverride: ProviderReasoningOverride | undefined,
+): reasoningOverride is ProviderReasoningOverride & { effort: string } =>
+  reasoningOverride?.enabled === true &&
+  reasoningOverride.exclude !== true &&
+  typeof reasoningOverride.effort === "string" &&
+  HIGH_OR_GREATER_REASONING_EFFORTS.has(reasoningOverride.effort);
+
+const getFallbackKeys = (
+  modelName?: string,
+): readonly ModelName[] | undefined => {
+  if (!modelName) return undefined;
+  return MODEL_FALLBACK_CHAIN[modelName as ModelName];
+};
+
+/** Returns the first app-side retry model for a failed provider route. */
+export function getRetryFallbackModel(
+  modelName: ModelName,
+  _mode: ChatMode,
+): ModelName {
+  if (
+    modelName === "agent-model-free" ||
+    modelName === "model-glm-5.3-flash-agent"
+  ) {
+    return "model-deepseek-v4-flash-0731";
+  }
+  if (modelName === "model-deepseek-v4-flash-0731") {
+    return "model-deepseek-v4-pro-0813";
+  }
+  if (modelName === "ask-model-free") {
+    return "model-deepseek-v4-flash-0731";
+  }
+  if (modelName === "model-deepseek-v4-pro-0813") {
+    return "model-glm-5.3";
+  }
+  if (modelName === "model-grok-4.6-pro") {
+    return "model-glm-5.3";
+  }
+  if (modelName === "model-grok-4.5" || modelName === "model-grok-4.5-pro") {
+    return "model-kimi-k3";
+  }
+  if (modelName === "model-opus-4.6") {
+    return "model-grok-4.6";
+  }
+  if (modelName === "model-deepseek-v4-pro") {
+    return "model-glm-5.3";
+  }
+  if (
+    modelName === "ask-model" ||
+    modelName === "agent-model" ||
+    modelName === "model-grok-4.6" ||
+    modelName === "model-grok-4.5" ||
+    modelName === "fallback-agent-model" ||
+    modelName === "fallback-ask-model"
+  ) {
+    return "model-glm-5.3";
+  }
+  if (modelName === "model-glm-5.3") {
+    return "model-kimi-k3";
+  }
+  if (
+    modelName === "model-glm-5.3-flash" ||
+    modelName === "model-glm-5.3-flash-pro"
+  ) {
+    return "model-deepseek-v4-flash-vision";
+  }
+  return "model-grok-4.6";
+}
+
+const CONTENT_FILTER_RETRY_CANDIDATES = [
+  "model-glm-5.3",
+  "model-kimi-k3",
+  "model-grok-4.6",
+] as const satisfies readonly ModelName[];
+
+/**
+ * Pick a retry model that differs from the model OpenRouter actually served.
+ * The served model can itself be an internal fallback, so the configured
+ * primary model is not sufficient for this decision.
+ */
+export function getContentFilterRetryModel(
+  modelName: ModelName,
+  mode: ChatMode,
+  servedModel?: string,
+): ModelName {
+  const preferredFallback = getRetryFallbackModel(modelName, mode);
+  if (!servedModel) return preferredFallback;
+
+  const route = [modelName, ...(getFallbackKeys(modelName) ?? [])];
+  const servedIndex = route.findIndex((candidate) => {
+    const candidateSlug = resolveSlug(candidate);
+    return (
+      candidateSlug !== undefined &&
+      areEquivalentProviderModelIds(candidateSlug, servedModel)
+    );
+  });
+  const candidates = [
+    ...(servedIndex >= 0 ? route.slice(servedIndex + 1) : []),
+    preferredFallback,
+    ...CONTENT_FILTER_RETRY_CANDIDATES,
+  ];
+  const retryModel = candidates.find((candidate) => {
+    const candidateSlug = resolveSlug(candidate);
+    return (
+      candidateSlug !== undefined &&
+      !areEquivalentProviderModelIds(candidateSlug, servedModel)
+    );
+  });
+  if (!retryModel) {
+    throw new Error(
+      `No content-filter retry model differs from served model ${servedModel}`,
+    );
+  }
+  return retryModel;
+}
+
+const resolveSlug = (modelName: string): string | undefined => {
+  try {
+    const lm = myProvider.languageModel(modelName) as { modelId?: unknown };
+    return typeof lm?.modelId === "string" ? lm.modelId : undefined;
+  } catch (err) {
+    if (err instanceof NoSuchModelError) {
+      // Stale fallback entry — treat as "no slug" so it can't bring down the
+      // primary request. Anything else is an unexpected failure and surfaces.
+      return undefined;
+    }
+    throw err;
+  }
+};
+
+/**
+ * Resolve a model's fallback chain to OpenRouter slugs.
+ * Returns at most the number of fallback models accepted by OpenRouter, or an
+ * empty array if the model has no chain or all entries are stale.
+ */
+export function getFallbackSlugs(
+  modelName?: string,
+  _mode?: ChatMode,
+  options: FallbackOptions = {},
+): string[] {
+  const fallbackKeys = getFallbackKeys(modelName);
+  const excludedModelSlugs = options.excludedModelSlugs ?? [];
+  return (
+    fallbackKeys
+      ?.map((key) => resolveSlug(key))
+      .filter((s): s is string => typeof s === "string" && s.length > 0)
+      .filter(
+        (slug) =>
+          !excludedModelSlugs.some((excludedSlug) =>
+            areEquivalentProviderModelIds(slug, excludedSlug),
+          ),
+      ) ?? []
+  ).slice(0, OPENROUTER_MAX_FALLBACK_MODELS);
+}
+
+const OPENROUTER_RESPONSE_MODEL_COST_KEYS: Record<string, string> = {
+  "anthropic/claude-opus-4.6": "model-opus-4.6",
+  "deepseek/deepseek-v4-flash": "deepseek/deepseek-v4-flash",
+  "deepseek/deepseek-v4-flash-20260423": "deepseek/deepseek-v4-flash",
+  "deepseek/deepseek-v4-flash-0731": "model-deepseek-v4-flash-0731",
+  "deepseek/deepseek-v4-flash-20260731": "model-deepseek-v4-flash-0731",
+  "deepseek/deepseek-v4-pro-0813": "model-deepseek-v4-pro-0813",
+  "deepseek/deepseek-v4-pro-20260813": "model-deepseek-v4-pro-0813",
+  "x-ai/grok-4.5": "model-grok-4.5",
+  "x-ai/grok-4.5-20260708": "model-grok-4.5",
+  "x-ai/grok-4.6": "model-grok-4.6",
+  "z-ai/glm-5.2": "model-glm-5.2",
+  "z-ai/glm-5.2-20260616": "model-glm-5.2",
+  "z-ai/glm-5.3": "model-glm-5.3",
+  "z-ai/glm-5.3-20260816": "model-glm-5.3",
+  [GLM_5_3_FLASH_SLUG]: "model-glm-5.3-flash",
+  [DEEPSEEK_V4_FLASH_VISION_SLUG]: "model-deepseek-v4-flash-vision",
+  "moonshotai/kimi-k3": "model-kimi-k3",
+  "moonshotai/kimi-k3-20260715": "model-kimi-k3",
+};
+
+function resolveOpenRouterResponseModelCostKey(
+  responseModel: string,
+): string | undefined {
+  const exactKey = OPENROUTER_RESPONSE_MODEL_COST_KEYS[responseModel];
+  if (exactKey) return exactKey;
+  // Scope Opus response aliases to the priced generation rather than matching
+  // every Claude family or version.
+  if (/^anthropic\/claude-4\.6-opus-\d{8}$/.test(responseModel)) {
+    return "model-opus-4.6";
+  }
+  return undefined;
+}
+
+function areEquivalentProviderModelIds(
+  firstModelId: string,
+  secondModelId: string,
+): boolean {
+  if (firstModelId === secondModelId) return true;
+  const firstKey = resolveOpenRouterResponseModelCostKey(firstModelId);
+  const secondKey = resolveOpenRouterResponseModelCostKey(secondModelId);
+  return firstKey !== undefined && firstKey === secondKey;
+}
+
+export function resolveServedModelForCostAccounting({
+  modelName,
+  responseModel,
+}: {
+  modelName: string;
+  responseModel?: string;
+  mode?: ChatMode;
+  options?: FallbackOptions;
+}): string {
+  if (!responseModel) return modelName;
+
+  const candidateKeys = [
+    modelName as ModelName,
+    ...(getFallbackKeys(modelName) ?? []),
+  ];
+  const matchedKey = candidateKeys.find(
+    (key) => resolveSlug(key) === responseModel,
+  );
+
+  return (
+    matchedKey ??
+    resolveOpenRouterResponseModelCostKey(responseModel) ??
+    responseModel
+  );
+}
+
+/**
+ * Build provider options for streamText
+ */
+export function buildProviderOptions(
+  isReasoningModel: boolean,
+  userId?: string,
+  modelName?: string,
+  mode?: ChatMode,
+  options: FallbackOptions = {},
+) {
+  const modelId =
+    options.requestedModelSlug ??
+    (modelName ? resolveSlug(modelName) : undefined);
+  const isDeepSeekV4 = modelId?.startsWith("deepseek/deepseek-v4") ?? false;
+  const isGrok45 = modelId === GROK_4_5_SLUG;
+  const isGrok46 = modelId === GROK_4_6_SLUG;
+  // Agent routes use high for both DeepSeek V4 Flash and Pro. Keep this
+  // mode-scoped for any future route that does not also include Grok.
+  const isAgentDeepSeekV4 = mode === "agent" && isDeepSeekV4;
+  const fallbackSlugs = getFallbackSlugs(modelName, mode, options);
+  const reasoningFallbackSlugs = options.excludedModelSlugs?.length
+    ? getFallbackSlugs(modelName, mode, {
+        ...options,
+        excludedModelSlugs: undefined,
+      })
+    : fallbackSlugs;
+  // OpenRouter applies one reasoning configuration to both the primary model
+  // and every provider fallback. Standard GLM vision uses low, legacy Standard
+  // Grok vision uses medium, and Pro/full reasoning routes remain high.
+  const isMediumGrok45Vision = modelName === "model-grok-4.5" && isGrok45;
+  const isStandardGlmFlashVision = modelName === "model-glm-5.3-flash";
+  const routesThroughHighReasoningModel =
+    isGrok45 ||
+    isGrok46 ||
+    reasoningFallbackSlugs.includes(GROK_4_5_SLUG) ||
+    reasoningFallbackSlugs.includes(GROK_4_6_SLUG) ||
+    reasoningFallbackSlugs.includes(GLM_5_3_SLUG);
+  const providerRouting = modelId
+    ? getOpenRouterProviderRoutingForModel(modelId)
+    : undefined;
+  const reasoning = isStandardGlmFlashVision
+    ? {
+        enabled: true,
+        effort: "low",
+      }
+    : isMediumGrok45Vision
+      ? {
+          enabled: true,
+          effort: "medium",
+        }
+      : routesThroughHighReasoningModel
+        ? isHighOrGreaterReasoningOverride(options.reasoningOverride)
+          ? options.reasoningOverride
+          : {
+              enabled: true,
+              effort: "high",
+            }
+        : (options.reasoningOverride ??
+          (isHighReasoningModel(modelName) || isAgentDeepSeekV4
+            ? {
+                enabled: true,
+                effort: "high",
+              }
+            : isReasoningModel
+              ? {
+                  enabled: true,
+                  ...(isDeepSeekV4 ? { effort: "xhigh" } : {}),
+                }
+              : { enabled: false }));
+
+  return {
+    openrouter: {
+      reasoning,
+      ...(options.hasPdfAttachments && isDeepSeekV4
+        ? {
+            plugins: [
+              {
+                id: "file-parser" as const,
+                pdf: { engine: options.pdfParserEngine ?? "mistral-ocr" },
+              },
+            ],
+          }
+        : {}),
+      ...(userId && { user: userId }),
+      ...(providerRouting && { provider: providerRouting }),
+      ...(fallbackSlugs.length > 0 && { models: fallbackSlugs }),
+    },
+  } as const;
+}
+
+const ANTHROPIC_CACHE_BREAKPOINT = {
+  openrouter: { cacheControl: { type: "ephemeral" as const } },
+};
+
+/**
+ * Build a system prompt with an Anthropic cache breakpoint.
+ * Returns a structured system message for Anthropic models, plain string otherwise.
+ */
+export function buildSystemPrompt(
+  systemPrompt: string,
+  modelName: string,
+): string | SystemModelMessage {
+  if (!isAnthropicModel(modelName)) return systemPrompt;
+  return {
+    role: "system",
+    content: systemPrompt,
+    providerOptions: ANTHROPIC_CACHE_BREAKPOINT,
+  } satisfies SystemModelMessage;
+}
+
+/**
+ * Add an Anthropic cache breakpoint to the last user message.
+ * This tells Anthropic to cache everything up to and including that message,
+ * maximizing cache hits on subsequent agentic steps.
+ */
+export function addCacheBreakpointToLastUserMessage<
+  T extends Array<Record<string, unknown>>,
+>(messages: T, modelName: string): T {
+  if (!isAnthropicModel(modelName)) return messages;
+  const result = [...messages] as T;
+  for (let i = result.length - 1; i >= 0; i--) {
+    if (result[i].role === "user") {
+      result[i] = {
+        ...result[i],
+        providerOptions: {
+          ...((result[i].providerOptions as Record<string, unknown>) || {}),
+          ...ANTHROPIC_CACHE_BREAKPOINT,
+        },
+      };
+      break;
+    }
+  }
+  return result;
+}
+
+/**
+ * Appends a <system-reminder> block to the last user message's text part.
+ * Returns a new array (does not mutate input).
+ */
+export function appendSystemReminderToLastUserMessage(
+  messages: UIMessage[],
+  reminderContent: string,
+): UIMessage[] {
+  const result = [...messages];
+  for (let i = result.length - 1; i >= 0; i--) {
+    if (result[i].role === "user") {
+      const parts = [...(result[i].parts || [])];
+      const textPartIndex = parts.findIndex((p) => p.type === "text");
+
+      if (textPartIndex >= 0) {
+        const textPart = parts[textPartIndex] as { type: "text"; text: string };
+        parts[textPartIndex] = {
+          ...textPart,
+          text: `${textPart.text}\n\n<system-reminder>\n${reminderContent}\n</system-reminder>`,
+        };
+      } else {
+        parts.push({
+          type: "text" as const,
+          text: `<system-reminder>\n${reminderContent}\n</system-reminder>`,
+        });
+      }
+
+      result[i] = { ...result[i], parts };
+      break;
+    }
+  }
+  return result;
+}
+
+/**
+ * Fetches user notes and injects them into messages via <system-reminder>.
+ * Returns the (possibly updated) messages array.
+ */
+export async function injectNotesIntoMessages(
+  messages: UIMessage[],
+  opts: {
+    userId: string;
+    subscription: SubscriptionTier;
+    shouldIncludeNotes: boolean;
+  },
+): Promise<UIMessage[]> {
+  if (!opts.shouldIncludeNotes) return messages;
+
+  try {
+    const notes = await getNotes({
+      userId: opts.userId,
+      subscription: opts.subscription,
+    });
+    const notesContent = generateNotesSection(notes);
+    if (!notesContent) return messages;
+
+    return appendSystemReminderToLastUserMessage(messages, notesContent);
+  } catch (error) {
+    logger.warn("Failed to fetch notes, continuing without them", {
+      userId: opts.userId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return messages;
+  }
+}
+
+// Regex to match a system-reminder block that contains <notes>.
+// Uses \s* instead of literal \n so it stays in sync even if the
+// template strings in appendSystemReminderToLastUserMessage or
+// generateNotesSection change their whitespace slightly.
+const NOTES_REMINDER_REGEX =
+  /<system-reminder>\s*<notes>[\s\S]*?<\/notes>\s*<\/system-reminder>/;
+
+/**
+ * Replaces the notes <system-reminder> block inside a text string.
+ * Returns the original string unchanged if no notes block is found.
+ */
+export function replaceNotesBlock(
+  text: string,
+  newNotesContent: string,
+): string {
+  if (NOTES_REMINDER_REGEX.test(text)) {
+    return newNotesContent
+      ? text.replace(
+          NOTES_REMINDER_REGEX,
+          `<system-reminder>\n${newNotesContent}\n</system-reminder>`,
+        )
+      : text.replace(NOTES_REMINDER_REGEX, "");
+  }
+  return text;
+}
+
+/**
+ * Updates the notes in model messages (ModelMessage[]) from prepareStep.
+ * Preserves full conversation history (tool calls, results, assistant messages).
+ *
+ * The AI SDK does NOT preserve `<system-reminder>` text that was injected into
+ * user messages via `appendSystemReminderToLastUserMessage`. So on subsequent
+ * agentic steps, the notes block will be missing from prepareStep's messages.
+ *
+ * Strategy:
+ * 1. Try to find and replace an existing `<notes>` block (in case the SDK
+ *    does preserve it in some path).
+ * 2. If no block is found, append the notes as a new `<system-reminder>` to
+ *    the last user message — this ensures the model always sees fresh notes.
+ */
+export async function refreshNotesInModelMessages(
+  messages: Array<Record<string, unknown>>,
+  opts: {
+    userId: string;
+    subscription: SubscriptionTier;
+    shouldIncludeNotes: boolean;
+  },
+): Promise<Array<Record<string, unknown>>> {
+  if (!opts.shouldIncludeNotes) return messages;
+
+  try {
+    const notes = await getNotes({
+      userId: opts.userId,
+      subscription: opts.subscription,
+    });
+    const newNotesContent = generateNotesSection(notes);
+
+    // First pass: try to replace (or remove) an existing notes block.
+    // replaceNotesBlock handles empty newNotesContent by removing the block.
+    const result = [...messages];
+    for (let i = result.length - 1; i >= 0; i--) {
+      const msg = result[i];
+      if (msg.role !== "user") continue;
+
+      const content = msg.content;
+
+      if (typeof content === "string") {
+        const updated = replaceNotesBlock(content, newNotesContent);
+        if (updated !== content) {
+          result[i] = { ...msg, content: updated };
+          return result;
+        }
+      } else if (Array.isArray(content)) {
+        const parts = [...(content as Array<Record<string, unknown>>)];
+        for (let j = 0; j < parts.length; j++) {
+          if (parts[j].type !== "text") continue;
+          const text = parts[j].text as string;
+          const updated = replaceNotesBlock(text, newNotesContent);
+          if (updated !== text) {
+            parts[j] = { ...parts[j], text: updated };
+            result[i] = { ...msg, content: parts };
+            return result;
+          }
+        }
+      }
+    }
+
+    // Nothing to append if user has no notes (and no existing block to remove)
+    if (!newNotesContent) return messages;
+
+    // No existing notes block found (AI SDK strips <system-reminder> from its
+    // internal message state). Append the notes to the last user message.
+    return appendReminderToModelMessages(result, newNotesContent);
+  } catch (error) {
+    logger.warn("Failed to refresh notes in prepareStep, continuing without", {
+      userId: opts.userId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return messages;
+  }
+}
+
+/**
+ * Appends a <system-reminder> block to the last user message in a ModelMessage array.
+ * Used in prepareStep to inject runtime reminders without mutating the original.
+ */
+export function appendReminderToModelMessages(
+  messages: Array<Record<string, unknown>>,
+  reminderText: string,
+): Array<Record<string, unknown>> {
+  const result = [...messages];
+  const reminder = `<system-reminder>\n${reminderText}\n</system-reminder>`;
+  for (let i = result.length - 1; i >= 0; i--) {
+    const msg = result[i];
+    if (msg.role !== "user") continue;
+    const content = msg.content;
+    if (typeof content === "string") {
+      result[i] = { ...msg, content: `${content}\n\n${reminder}` };
+    } else if (Array.isArray(content)) {
+      const parts = [...content];
+      const textIdx = parts.findLastIndex(
+        (p: unknown) => (p as Record<string, unknown>).type === "text",
+      );
+      if (textIdx >= 0) {
+        const part = parts[textIdx] as Record<string, unknown>;
+        parts[textIdx] = {
+          ...part,
+          text: `${part.text as string}\n\n${reminder}`,
+        };
+      } else {
+        parts.push({ type: "text", text: reminder });
+      }
+      result[i] = { ...msg, content: parts };
+    }
+    break;
+  }
+  return result;
+}
+
+/**
+ * Shared logic for the post-prune section of prepareStep in both
+ * chat-handler.ts and agent-task.ts: refreshes notes if a note tool
+ * was used.
+ */
+export async function applyPrepareStepReminders(
+  messages: Array<Record<string, unknown>>,
+  opts: {
+    toolResults: unknown[];
+    noteInjectionOpts: {
+      userId: string;
+      subscription: SubscriptionTier;
+      shouldIncludeNotes: boolean;
+    };
+  },
+): Promise<Array<Record<string, unknown>>> {
+  // Refresh notes if a note tool was used
+  const wasNoteModified =
+    Array.isArray(opts.toolResults) &&
+    opts.toolResults.some((r) =>
+      ["create_note", "update_note", "delete_note"].includes(
+        (r as { toolName?: string })?.toolName ?? "",
+      ),
+    );
+
+  if (wasNoteModified) {
+    return (await refreshNotesInModelMessages(
+      messages,
+      opts.noteInjectionOpts,
+    )) as Array<Record<string, unknown>>;
+  }
+
+  return messages;
+}
+
+/**
+ * Free-tier agent mode is restricted to the local sandbox.
+ * Model overrides are normalized to auto before stream setup.
+ * Throws ChatSDKError("forbidden:chat") if the sandbox gate fails.
+ */
+export function assertFreeAgentGates(args: {
+  mode: ChatMode;
+  subscription: SubscriptionTier;
+  sandboxPreference: SandboxPreference | undefined;
+}): void {
+  const { mode, subscription, sandboxPreference } = args;
+  if (!isAgentMode(mode) || subscription !== "free") return;
+
+  const isLocalSandbox = sandboxPreference && sandboxPreference !== "e2b";
+  if (!isLocalSandbox) {
+    throw new ChatSDKError(
+      "forbidden:chat",
+      "Agent mode on the free plan requires a local sandbox. Install the desktop app or upgrade to Pro for cloud access.",
+    );
+  }
+}
+
+/**
+ * Paid plans are Agent-only. Enforce this at the API boundary so stale clients
+ * and direct requests cannot restore the removed paid Ask path.
+ */
+export function assertChatModeAccess(args: {
+  mode: unknown;
+  subscription: SubscriptionTier;
+}): void {
+  if (args.mode !== "ask" && args.mode !== "agent") {
+    throw new ChatSDKError("bad_request:api", "Invalid chat mode.");
+  }
+
+  if (args.mode !== "ask" || args.subscription === "free") return;
+
+  throw new ChatSDKError(
+    "forbidden:chat",
+    "Paid plans use Agent mode. Ask mode is only available on the free plan.",
+  );
+}
+
+/**
+ * Build the extra-usage config for paid users with `extra_usage_enabled`.
+ * Falls back to an optimistic config if the balance lookup fails so a
+ * transient Convex error doesn't silently disable extra usage and force
+ * the user into the hard subscription limit.
+ */
+export async function buildExtraUsageConfig(args: {
+  userId: string;
+  subscription: SubscriptionTier;
+  userCustomization: UserCustomization | null | undefined;
+  organizationId?: string;
+  failClosedOnLookupError?: boolean;
+}): Promise<ExtraUsageConfig | undefined> {
+  const {
+    userId,
+    subscription,
+    userCustomization,
+    organizationId,
+    failClosedOnLookupError = false,
+  } = args;
+  if (subscription === "free") return undefined;
+
+  // Team users: extra usage is org-funded and admin-controlled. Personal
+  // extra_usage settings are ignored — overflow routes through the team pool.
+  if (subscription === "team") {
+    if (!organizationId) return undefined;
+    const state = await getTeamExtraUsageState(organizationId, userId);
+    if (!state) {
+      if (failClosedOnLookupError) {
+        throw new ChatSDKError(
+          "rate_limit:chat",
+          "Current team billing authorization could not be verified. Start a new Agent request and try again.",
+        );
+      }
+      console.warn(
+        `[chat-handler] getTeamExtraUsageState returned null for org ${organizationId}, using optimistic extra usage config`,
+      );
+      return { enabled: true, hasBalance: true, autoReloadEnabled: false };
+    }
+    if (!state.enabled || state.memberDisabled) return undefined;
+    return {
+      enabled: true,
+      hasBalance: state.balanceDollars > 0,
+      balanceDollars: state.balanceDollars,
+      autoReloadEnabled: state.autoReloadEnabled,
+      ...(state.monthlyCapDollars !== undefined && {
+        monthlyCapDollars: state.monthlyCapDollars,
+      }),
+      ...(state.monthlySpentDollars !== undefined && {
+        monthlySpentDollars: state.monthlySpentDollars,
+      }),
+      ...(state.monthlyRemainingDollars !== undefined && {
+        monthlyRemainingDollars: state.monthlyRemainingDollars,
+      }),
+    };
+  }
+
+  if (!(userCustomization?.extra_usage_enabled ?? false)) return undefined;
+
+  const balanceInfo = await getExtraUsageBalance(userId);
+
+  if (!balanceInfo) {
+    if (failClosedOnLookupError) {
+      throw new ChatSDKError(
+        "rate_limit:chat",
+        "Current extra usage authorization could not be verified. Start a new Agent request and try again.",
+      );
+    }
+    console.warn(
+      `[chat-handler] getExtraUsageBalance returned null for user ${userId}, using optimistic extra usage config`,
+    );
+    return { enabled: true, hasBalance: true, autoReloadEnabled: false };
+  }
+
+  return {
+    enabled: true,
+    hasBalance: balanceInfo.balanceDollars > 0,
+    balanceDollars: balanceInfo.balanceDollars,
+    autoReloadEnabled: balanceInfo.autoReloadEnabled,
+    ...(balanceInfo.monthlyCapDollars !== undefined && {
+      monthlyCapDollars: balanceInfo.monthlyCapDollars,
+    }),
+    ...(balanceInfo.monthlySpentDollars !== undefined && {
+      monthlySpentDollars: balanceInfo.monthlySpentDollars,
+    }),
+    ...(balanceInfo.monthlyRemainingDollars !== undefined && {
+      monthlyRemainingDollars: balanceInfo.monthlyRemainingDollars,
+    }),
+  };
+}
+
+/**
+ * Pre-flight token estimate used to size the rate-limit deduction before
+ * the actual stream runs. File tokens are excluded (PDF counts are
+ * inaccurate; deductUsage reconciles against real provider cost). Tool
+ * schemas can't be computed here (they depend on sandboxManager), so we
+ * approximate: ~1500 for agent (~8 tools), ~500 for ask (~4 tools).
+ */
+export async function estimatePreflightInputTokens(args: {
+  mode: ChatMode;
+  subscription: SubscriptionTier;
+  userId: string;
+  selectedModel: ModelName;
+  userCustomization: UserCustomization | null | undefined;
+  truncatedMessages: UIMessage[];
+}): Promise<number> {
+  const {
+    mode,
+    subscription,
+    userId,
+    selectedModel,
+    userCustomization,
+    truncatedMessages,
+  } = args;
+  if (!isAgentMode(mode) && subscription === "free") return 0;
+
+  const messageTokens = countMessagesTokens(truncatedMessages);
+  const estimatedSystemPrompt = await systemPrompt(
+    userId,
+    mode,
+    subscription,
+    selectedModel,
+    userCustomization,
+    null,
+  );
+  const systemTokens = safeCountTokens(estimatedSystemPrompt);
+  const toolSchemaOverhead = isAgentMode(mode) ? 1500 : 500;
+  return messageTokens + systemTokens + toolSchemaOverhead;
+}

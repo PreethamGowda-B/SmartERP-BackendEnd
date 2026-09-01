@@ -1,0 +1,1693 @@
+import { describe, it, expect, jest, beforeEach } from "@jest/globals";
+
+// Mock s3Utils module
+jest.mock("../s3Utils");
+
+// Mock Convex server functions
+jest.mock("../_generated/server", () => ({
+  action: jest.fn((config) => config),
+  query: jest.fn((config) => config),
+  internalQuery: jest.fn((config) => config),
+}));
+
+// Mock chats module to avoid circular dependency
+jest.mock("../lib/utils", () => ({
+  validateServiceKey: jest.fn(),
+}));
+
+// Mock fileActions module for rate limiting
+const mockCheckFileUploadRateLimit = jest.fn<any>();
+jest.mock("../fileActions", () => ({
+  checkFileUploadRateLimit: mockCheckFileUploadRateLimit,
+}));
+
+// Mock internal API
+jest.mock("../_generated/api", () => ({
+  internal: {
+    fileStorage: {
+      getUserStorageUsage: "internal.fileStorage.getUserStorageUsage",
+      createPendingS3File: "internal.fileStorage.createPendingS3File",
+      getFilesByIds: "internal.fileStorage.getFilesByIds",
+    },
+  },
+}));
+
+describe("s3Actions", () => {
+  beforeEach(async () => {
+    // Reset mocks
+    jest.clearAllMocks();
+
+    // Reset validateServiceKey mock to no-op
+    const { validateServiceKey } = await import("../lib/utils");
+    const mockValidateServiceKey = validateServiceKey as jest.MockedFunction<
+      typeof validateServiceKey
+    >;
+    mockValidateServiceKey.mockImplementation(() => {});
+
+    // Reset checkFileUploadRateLimit mock to return success by default
+    mockCheckFileUploadRateLimit.mockResolvedValue({
+      remaining: 399,
+      limit: 400,
+      reset: Date.now() + 5 * 60 * 60 * 1000,
+    });
+
+    const { getStoredS3Location } = await import("../s3Utils");
+    (
+      getStoredS3Location as jest.MockedFunction<typeof getStoredS3Location>
+    ).mockReturnValue(undefined);
+
+    // Setup environment variables
+    process.env.AWS_S3_ACCESS_KEY_ID = "test-access-key";
+    process.env.AWS_S3_SECRET_ACCESS_KEY = "test-secret-key";
+    process.env.AWS_S3_REGION = "us-east-1";
+    process.env.AWS_S3_BUCKET_NAME = "test-bucket";
+  });
+
+  describe("generateS3UploadUrlAction", () => {
+    it("should generate upload URL for authenticated user", async () => {
+      const { generateS3UploadUrl } = await import("../s3Utils");
+      const mockGenerateS3UploadUrl =
+        generateS3UploadUrl as jest.MockedFunction<typeof generateS3UploadUrl>;
+
+      mockGenerateS3UploadUrl.mockResolvedValue({
+        uploadUrl: "https://s3.amazonaws.com/test-upload-url",
+        s3Key: "users/user123/123-uuid-test.pdf",
+        storageLocation: { region: "us-east-1", bucket: "test-bucket" },
+      });
+
+      const { generateS3UploadUrlAction } = await import("../s3Actions");
+
+      // Create mock context - rate limiting is handled by mocked checkFileUploadRateLimit
+      const mockCtx: any = {
+        auth: {
+          getUserIdentity: jest.fn<any>().mockResolvedValue({
+            subject: "user123",
+            email: "test@example.com",
+            entitlements: ["pro-plan"],
+          }),
+        },
+        // Mock runQuery to return storage usage (user has space available)
+        runQuery: jest.fn<any>().mockResolvedValue({
+          usedBytes: 1024 * 1024 * 1024, // 1 GB used
+          maxBytes: 10 * 1024 * 1024 * 1024, // 10 GB max
+          availableBytes: 9 * 1024 * 1024 * 1024, // 9 GB available
+        }),
+        runMutation: jest.fn<any>().mockResolvedValue("file_123"),
+      };
+
+      const result = await generateS3UploadUrlAction.handler(mockCtx, {
+        fileName: "test.pdf",
+        contentType: "application/pdf",
+        size: 1024,
+      });
+
+      expect(result).toEqual({
+        uploadUrl: "https://s3.amazonaws.com/test-upload-url",
+        s3Key: "users/user123/123-uuid-test.pdf",
+        rateLimit: {
+          remaining: 399,
+          limit: 400,
+          reset: expect.any(Number),
+        },
+      });
+
+      expect(mockGenerateS3UploadUrl).toHaveBeenCalledWith(
+        "test.pdf",
+        "application/pdf",
+        "user123",
+        1024,
+      );
+      expect(mockCtx.runMutation).toHaveBeenCalledWith(
+        "internal.fileStorage.createPendingS3File",
+        {
+          s3Key: "users/user123/123-uuid-test.pdf",
+          userId: "user123",
+          name: "test.pdf",
+          mediaType: "application/pdf",
+          size: 1024,
+          s3Region: "us-east-1",
+          s3Bucket: "test-bucket",
+        },
+      );
+
+      expect(mockCheckFileUploadRateLimit).toHaveBeenCalledWith(
+        "user123",
+        true,
+        { entitlements: ["pro-plan"] },
+      );
+    });
+
+    it("should reject free users before generating an upload URL", async () => {
+      const { generateS3UploadUrl } = await import("../s3Utils");
+      const mockGenerateS3UploadUrl =
+        generateS3UploadUrl as jest.MockedFunction<typeof generateS3UploadUrl>;
+      const { generateS3UploadUrlAction } = await import("../s3Actions");
+
+      const mockCtx: any = {
+        auth: {
+          getUserIdentity: jest.fn<any>().mockResolvedValue({
+            subject: "free-user",
+            email: "free@example.com",
+            entitlements: [],
+          }),
+        },
+        runQuery: jest.fn<any>(),
+      };
+
+      await expect(
+        generateS3UploadUrlAction.handler(mockCtx, {
+          fileName: "test.pdf",
+          contentType: "application/pdf",
+          size: 1024,
+        }),
+      ).rejects.toMatchObject({
+        data: expect.objectContaining({ code: "PAID_PLAN_REQUIRED" }),
+      });
+
+      expect(mockCtx.runQuery).not.toHaveBeenCalled();
+      expect(mockCheckFileUploadRateLimit).not.toHaveBeenCalled();
+      expect(mockGenerateS3UploadUrl).not.toHaveBeenCalled();
+    });
+
+    it("should reject missing size before generating an upload URL", async () => {
+      const { generateS3UploadUrl } = await import("../s3Utils");
+      const mockGenerateS3UploadUrl =
+        generateS3UploadUrl as jest.MockedFunction<typeof generateS3UploadUrl>;
+      const { generateS3UploadUrlAction } = await import("../s3Actions");
+
+      const mockCtx: any = {
+        auth: {
+          getUserIdentity: jest.fn<any>().mockResolvedValue({
+            subject: "user123",
+            email: "test@example.com",
+            entitlements: ["pro-plan"],
+          }),
+        },
+        runQuery: jest.fn<any>(),
+        runMutation: jest.fn<any>(),
+      };
+
+      await expect(
+        generateS3UploadUrlAction.handler(mockCtx, {
+          fileName: "test.pdf",
+          contentType: "application/pdf",
+        }),
+      ).rejects.toMatchObject({
+        data: expect.objectContaining({ code: "INVALID_FILE_SIZE" }),
+      });
+
+      expect(mockCtx.runQuery).not.toHaveBeenCalled();
+      expect(mockCtx.runMutation).not.toHaveBeenCalled();
+      expect(mockGenerateS3UploadUrl).not.toHaveBeenCalled();
+    });
+
+    it("should throw error for unauthenticated user", async () => {
+      const { generateS3UploadUrlAction } = await import("../s3Actions");
+
+      // Create mock context with no user
+      const mockCtx = {
+        auth: {
+          getUserIdentity: jest.fn().mockResolvedValue(null),
+        },
+      } as any;
+
+      await expect(
+        generateS3UploadUrlAction.handler(mockCtx, {
+          fileName: "test.pdf",
+          contentType: "application/pdf",
+        }),
+      ).rejects.toThrow("Unauthenticated");
+    });
+
+    it("uses the persisted bucket and region for regional files", async () => {
+      const { generateS3DownloadUrl, getStoredS3Location } =
+        await import("../s3Utils");
+      const storageLocation = {
+        region: "eu-central-1" as const,
+        bucket: "test-eu-bucket",
+      };
+      (
+        getStoredS3Location as jest.MockedFunction<typeof getStoredS3Location>
+      ).mockReturnValue(storageLocation);
+      (
+        generateS3DownloadUrl as jest.MockedFunction<
+          typeof generateS3DownloadUrl
+        >
+      ).mockResolvedValue("https://s3.example/regional-download");
+      const { getFileUrlAction } = await import("../s3Actions");
+      const mockCtx = {
+        auth: {
+          getUserIdentity: jest.fn().mockResolvedValue({ subject: "user123" }),
+        },
+        runQuery: jest.fn().mockResolvedValue({
+          s3_key: "users/user123/regional.pdf",
+          s3_region: "eu-central-1",
+          s3_bucket: "test-eu-bucket",
+          user_id: "user123",
+          name: "regional.pdf",
+          media_type: "application/pdf",
+          size: 1024,
+        }),
+      } as any;
+
+      await expect(
+        getFileUrlAction.handler(mockCtx, { fileId: "file123" as any }),
+      ).resolves.toBe("https://s3.example/regional-download");
+      expect(getStoredS3Location).toHaveBeenCalledWith(
+        "eu-central-1",
+        "test-eu-bucket",
+      );
+      expect(generateS3DownloadUrl).toHaveBeenCalledWith(
+        "users/user123/regional.pdf",
+        storageLocation,
+      );
+    });
+
+    it("should throw error for empty fileName", async () => {
+      const { generateS3UploadUrlAction } = await import("../s3Actions");
+
+      // Create mock context
+      const mockCtx = {
+        auth: {
+          getUserIdentity: jest.fn().mockResolvedValue({
+            subject: "user123",
+            email: "test@example.com",
+            entitlements: ["pro-plan"],
+          }),
+        },
+      } as any;
+
+      await expect(
+        generateS3UploadUrlAction.handler(mockCtx, {
+          fileName: "",
+          contentType: "application/pdf",
+        }),
+      ).rejects.toThrow("Invalid fileName");
+    });
+
+    it("should throw error for empty contentType", async () => {
+      const { generateS3UploadUrlAction } = await import("../s3Actions");
+
+      // Create mock context
+      const mockCtx = {
+        auth: {
+          getUserIdentity: jest.fn().mockResolvedValue({
+            subject: "user123",
+            email: "test@example.com",
+            entitlements: ["pro-plan"],
+          }),
+        },
+      } as any;
+
+      await expect(
+        generateS3UploadUrlAction.handler(mockCtx, {
+          fileName: "test.pdf",
+          contentType: "",
+        }),
+      ).rejects.toThrow("Invalid contentType");
+    });
+
+    it("should throw error for whitespace-only fileName", async () => {
+      const { generateS3UploadUrlAction } = await import("../s3Actions");
+
+      // Create mock context
+      const mockCtx = {
+        auth: {
+          getUserIdentity: jest.fn().mockResolvedValue({
+            subject: "user123",
+            email: "test@example.com",
+            entitlements: ["pro-plan"],
+          }),
+        },
+      } as any;
+
+      await expect(
+        generateS3UploadUrlAction.handler(mockCtx, {
+          fileName: "   ",
+          contentType: "application/pdf",
+        }),
+      ).rejects.toThrow("Invalid fileName");
+    });
+
+    it("should handle S3 utility errors gracefully", async () => {
+      const { generateS3UploadUrl } = await import("../s3Utils");
+      const mockGenerateS3UploadUrl =
+        generateS3UploadUrl as jest.MockedFunction<typeof generateS3UploadUrl>;
+
+      mockGenerateS3UploadUrl.mockRejectedValue(
+        new Error("S3 service unavailable"),
+      );
+
+      const { generateS3UploadUrlAction } = await import("../s3Actions");
+
+      // Create mock context with runQuery for storage check
+      const mockCtx: any = {
+        auth: {
+          getUserIdentity: jest.fn<any>().mockResolvedValue({
+            subject: "user123",
+            email: "test@example.com",
+            entitlements: ["pro-plan"],
+          }),
+        },
+        runQuery: jest.fn<any>().mockResolvedValue({
+          usedBytes: 1024 * 1024 * 1024,
+          maxBytes: 10 * 1024 * 1024 * 1024,
+          availableBytes: 9 * 1024 * 1024 * 1024,
+        }),
+        runMutation: jest.fn<any>().mockResolvedValue("file_123"),
+      };
+
+      await expect(
+        generateS3UploadUrlAction.handler(mockCtx, {
+          fileName: "test.pdf",
+          contentType: "application/pdf",
+          size: 1024,
+        }),
+      ).rejects.toThrow("Failed to generate upload URL");
+    });
+
+    it("should reject oversized files before generating an upload URL", async () => {
+      const { generateS3UploadUrl } = await import("../s3Utils");
+      const mockGenerateS3UploadUrl =
+        generateS3UploadUrl as jest.MockedFunction<typeof generateS3UploadUrl>;
+      const { generateS3UploadUrlAction } = await import("../s3Actions");
+
+      const mockCtx: any = {
+        auth: {
+          getUserIdentity: jest.fn<any>().mockResolvedValue({
+            subject: "user123",
+            email: "test@example.com",
+            entitlements: ["pro-plan"],
+          }),
+        },
+        runQuery: jest.fn<any>(),
+      };
+
+      await expect(
+        generateS3UploadUrlAction.handler(mockCtx, {
+          fileName: "large.pdf",
+          contentType: "application/pdf",
+          size: 11 * 1024 * 1024,
+          mode: "ask",
+        }),
+      ).rejects.toMatchObject({
+        data: expect.objectContaining({ code: "FILE_SIZE_EXCEEDED" }),
+      });
+
+      expect(mockCtx.runQuery).not.toHaveBeenCalled();
+      expect(mockCheckFileUploadRateLimit).not.toHaveBeenCalled();
+      expect(mockGenerateS3UploadUrl).not.toHaveBeenCalled();
+    });
+
+    it("should accept various file types", async () => {
+      const { generateS3UploadUrl } = await import("../s3Utils");
+      const mockGenerateS3UploadUrl =
+        generateS3UploadUrl as jest.MockedFunction<typeof generateS3UploadUrl>;
+
+      const { generateS3UploadUrlAction } = await import("../s3Actions");
+
+      const testCases = [
+        { fileName: "image.png", contentType: "image/png", size: 1024 },
+        {
+          fileName: "document.pdf",
+          contentType: "application/pdf",
+          size: 1024,
+        },
+        { fileName: "data.csv", contentType: "text/csv", size: 1024 },
+        { fileName: "notes.txt", contentType: "text/plain", size: 1024 },
+      ];
+
+      for (const testCase of testCases) {
+        mockGenerateS3UploadUrl.mockClear();
+        mockGenerateS3UploadUrl.mockResolvedValue({
+          uploadUrl: "https://s3.amazonaws.com/test-upload-url",
+          s3Key: `users/user123/123-uuid-${testCase.fileName}`,
+          storageLocation: { region: "us-east-1", bucket: "test-bucket" },
+        });
+
+        // Create mock context with runQuery for storage check
+        const mockCtx: any = {
+          auth: {
+            getUserIdentity: jest.fn<any>().mockResolvedValue({
+              subject: "user123",
+              email: "test@example.com",
+              entitlements: ["pro-plan"],
+            }),
+          },
+          runQuery: jest.fn<any>().mockResolvedValue({
+            usedBytes: 1024 * 1024 * 1024,
+            maxBytes: 10 * 1024 * 1024 * 1024,
+            availableBytes: 9 * 1024 * 1024 * 1024,
+          }),
+          runMutation: jest.fn<any>().mockResolvedValue("file_123"),
+        };
+
+        await generateS3UploadUrlAction.handler(mockCtx, testCase);
+
+        expect(mockGenerateS3UploadUrl).toHaveBeenCalledWith(
+          testCase.fileName,
+          testCase.contentType,
+          "user123",
+          testCase.size,
+        );
+      }
+    });
+
+    it("should throw error when rate limit exceeded", async () => {
+      // Import ConvexError for rate limit error
+      const { ConvexError } = await import("convex/values");
+
+      // Mock rate limit to throw error
+      mockCheckFileUploadRateLimit.mockRejectedValue(
+        new ConvexError({
+          code: "FILE_UPLOAD_RATE_LIMIT",
+          message:
+            "You've reached your file upload limit of 80 files per 5 hours. Please try again after 2h 30m.",
+        }),
+      );
+
+      const { generateS3UploadUrlAction } = await import("../s3Actions");
+
+      const mockCtx: any = {
+        auth: {
+          getUserIdentity: jest.fn<any>().mockResolvedValue({
+            subject: "user123",
+            email: "test@example.com",
+            entitlements: ["pro-plan"],
+          }),
+        },
+        runQuery: jest.fn<any>().mockResolvedValue({
+          usedBytes: 1024 * 1024 * 1024,
+          maxBytes: 10 * 1024 * 1024 * 1024,
+          availableBytes: 9 * 1024 * 1024 * 1024,
+        }),
+      };
+
+      await expect(
+        generateS3UploadUrlAction.handler(mockCtx, {
+          fileName: "test.pdf",
+          contentType: "application/pdf",
+          size: 1024,
+        }),
+      ).rejects.toThrow("file upload limit");
+    });
+
+    it("should return undefined rateLimit when Redis is not configured", async () => {
+      const { generateS3UploadUrl } = await import("../s3Utils");
+      const mockGenerateS3UploadUrl =
+        generateS3UploadUrl as jest.MockedFunction<typeof generateS3UploadUrl>;
+
+      mockGenerateS3UploadUrl.mockResolvedValue({
+        uploadUrl: "https://s3.amazonaws.com/test-upload-url",
+        s3Key: "users/user123/123-uuid-test.pdf",
+        storageLocation: { region: "us-east-1", bucket: "test-bucket" },
+      });
+
+      // Mock rate limit to return null (Redis not configured)
+      mockCheckFileUploadRateLimit.mockResolvedValue(null);
+
+      const { generateS3UploadUrlAction } = await import("../s3Actions");
+
+      const mockCtx: any = {
+        auth: {
+          getUserIdentity: jest.fn<any>().mockResolvedValue({
+            subject: "user123",
+            email: "test@example.com",
+            entitlements: ["pro-plan"],
+          }),
+        },
+        runQuery: jest.fn<any>().mockResolvedValue({
+          usedBytes: 1024 * 1024 * 1024,
+          maxBytes: 10 * 1024 * 1024 * 1024,
+          availableBytes: 9 * 1024 * 1024 * 1024,
+        }),
+        runMutation: jest.fn<any>().mockResolvedValue("file_123"),
+      };
+
+      const result = await generateS3UploadUrlAction.handler(mockCtx, {
+        fileName: "test.pdf",
+        contentType: "application/pdf",
+        size: 1024,
+      });
+
+      expect(result).toEqual({
+        uploadUrl: "https://s3.amazonaws.com/test-upload-url",
+        s3Key: "users/user123/123-uuid-test.pdf",
+        rateLimit: undefined,
+      });
+    });
+  });
+
+  describe("getFileUrlAction", () => {
+    it("should generate presigned URL for S3 file", async () => {
+      const { generateS3DownloadUrl } = await import("../s3Utils");
+      const mockGenerateS3DownloadUrl =
+        generateS3DownloadUrl as jest.MockedFunction<
+          typeof generateS3DownloadUrl
+        >;
+
+      mockGenerateS3DownloadUrl.mockResolvedValue(
+        "https://s3.amazonaws.com/test-bucket/presigned-download-url",
+      );
+
+      const { getFileUrlAction } = await import("../s3Actions");
+
+      const mockFileId = "file123" as any;
+      const mockFile = {
+        _id: mockFileId,
+        s3_key: "users/user123/123-uuid-test.pdf",
+        user_id: "user123",
+        name: "test.pdf",
+        media_type: "application/pdf",
+        size: 1024,
+        file_token_size: 100,
+        is_attached: true,
+        _creationTime: Date.now(),
+      };
+
+      const mockCtx = {
+        auth: {
+          getUserIdentity: jest.fn().mockResolvedValue({
+            subject: "user123",
+            email: "test@example.com",
+            entitlements: ["pro-plan"],
+          }),
+        },
+        runQuery: jest.fn().mockResolvedValue(mockFile),
+      } as any;
+
+      const result = await getFileUrlAction.handler(mockCtx, {
+        fileId: mockFileId,
+      });
+
+      expect(result).toBe(
+        "https://s3.amazonaws.com/test-bucket/presigned-download-url",
+      );
+      expect(mockGenerateS3DownloadUrl).toHaveBeenCalledWith(
+        "users/user123/123-uuid-test.pdf",
+      );
+    });
+
+    it("should throw error for unauthenticated user", async () => {
+      const { getFileUrlAction } = await import("../s3Actions");
+
+      const mockCtx = {
+        auth: {
+          getUserIdentity: jest.fn().mockResolvedValue(null),
+        },
+      } as any;
+
+      await expect(
+        getFileUrlAction.handler(mockCtx, { fileId: "file123" as any }),
+      ).rejects.toThrow("Unauthenticated");
+    });
+
+    it("should return null for file not found", async () => {
+      const { getFileUrlAction } = await import("../s3Actions");
+
+      const mockCtx = {
+        auth: {
+          getUserIdentity: jest.fn().mockResolvedValue({
+            subject: "user123",
+            email: "test@example.com",
+            entitlements: ["pro-plan"],
+          }),
+        },
+        runQuery: jest.fn().mockResolvedValue(null),
+      } as any;
+
+      await expect(
+        getFileUrlAction.handler(mockCtx, { fileId: "file123" as any }),
+      ).resolves.toBeNull();
+    });
+
+    it("should return null for access denied", async () => {
+      const { getFileUrlAction } = await import("../s3Actions");
+
+      const mockFileId = "file123" as any;
+      const mockFile = {
+        _id: mockFileId,
+        s3_key: "users/user456/123-uuid-test.pdf",
+        user_id: "user456",
+        name: "test.pdf",
+        media_type: "application/pdf",
+        size: 1024,
+        file_token_size: 100,
+        is_attached: true,
+        _creationTime: Date.now(),
+      };
+
+      const mockCtx = {
+        auth: {
+          getUserIdentity: jest.fn().mockResolvedValue({
+            subject: "user123",
+            email: "test@example.com",
+            entitlements: ["pro-plan"],
+          }),
+        },
+        runQuery: jest.fn().mockResolvedValue(mockFile),
+      } as any;
+
+      await expect(
+        getFileUrlAction.handler(mockCtx, { fileId: mockFileId }),
+      ).resolves.toBeNull();
+    });
+
+    it("should return null for file with no S3 storage reference", async () => {
+      const { getFileUrlAction } = await import("../s3Actions");
+
+      const mockFileId = "file123" as any;
+      const mockFile = {
+        _id: mockFileId,
+        s3_key: undefined,
+        user_id: "user123",
+        name: "test.pdf",
+        media_type: "application/pdf",
+        size: 1024,
+        file_token_size: 100,
+        is_attached: true,
+        _creationTime: Date.now(),
+      };
+
+      const mockCtx = {
+        auth: {
+          getUserIdentity: jest.fn().mockResolvedValue({
+            subject: "user123",
+            email: "test@example.com",
+            entitlements: ["pro-plan"],
+          }),
+        },
+        runQuery: jest.fn().mockResolvedValue(mockFile),
+      } as any;
+
+      await expect(
+        getFileUrlAction.handler(mockCtx, { fileId: mockFileId }),
+      ).resolves.toBeNull();
+    });
+
+    it("should handle S3 download URL generation errors", async () => {
+      const { generateS3DownloadUrl } = await import("../s3Utils");
+      const mockGenerateS3DownloadUrl =
+        generateS3DownloadUrl as jest.MockedFunction<
+          typeof generateS3DownloadUrl
+        >;
+
+      mockGenerateS3DownloadUrl.mockRejectedValue(
+        new Error("S3 service unavailable"),
+      );
+
+      const { getFileUrlAction } = await import("../s3Actions");
+
+      const mockFileId = "file123" as any;
+      const mockFile = {
+        _id: mockFileId,
+        s3_key: "users/user123/123-uuid-test.pdf",
+        user_id: "user123",
+        name: "test.pdf",
+        media_type: "application/pdf",
+        size: 1024,
+        file_token_size: 100,
+        is_attached: true,
+        _creationTime: Date.now(),
+      };
+
+      const mockCtx = {
+        auth: {
+          getUserIdentity: jest.fn().mockResolvedValue({
+            subject: "user123",
+            email: "test@example.com",
+            entitlements: ["pro-plan"],
+          }),
+        },
+        runQuery: jest.fn().mockResolvedValue(mockFile),
+      } as any;
+
+      await expect(
+        getFileUrlAction.handler(mockCtx, { fileId: mockFileId }),
+      ).rejects.toThrow("Failed to get file URL");
+    });
+
+    it("does not expose return-validation values to logs or callers", async () => {
+      const privateValue = "private auxiliary description";
+      const validationError = new Error(
+        `ReturnsValidationError: Value does not match validator: ${privateValue}`,
+      );
+      const consoleError = jest
+        .spyOn(console, "error")
+        .mockImplementation(() => {});
+      const { getFileUrlAction } = await import("../s3Actions");
+      const mockCtx = {
+        auth: {
+          getUserIdentity: jest.fn().mockResolvedValue({
+            subject: "user123",
+          }),
+        },
+        runQuery: jest.fn().mockRejectedValue(validationError),
+      } as any;
+
+      try {
+        await expect(
+          getFileUrlAction.handler(mockCtx, { fileId: "file123" as any }),
+        ).rejects.toThrow(/^Failed to get file URL$/);
+
+        const serializedLog = consoleError.mock.calls
+          .flat()
+          .map(String)
+          .join("\n");
+        expect(serializedLog).toContain('"reason":"returns_validation"');
+        expect(serializedLog).not.toContain(privateValue);
+        expect(serializedLog).not.toContain("Value does not match validator");
+      } finally {
+        consoleError.mockRestore();
+      }
+    });
+  });
+
+  describe("getFileUrlsBatchAction", () => {
+    it("should generate URLs for multiple S3 files", async () => {
+      const { generateS3DownloadUrl } = await import("../s3Utils");
+      const mockGenerateS3DownloadUrl =
+        generateS3DownloadUrl as jest.MockedFunction<
+          typeof generateS3DownloadUrl
+        >;
+
+      mockGenerateS3DownloadUrl
+        .mockResolvedValueOnce("https://s3.amazonaws.com/file1-url")
+        .mockResolvedValueOnce("https://s3.amazonaws.com/file2-url")
+        .mockResolvedValueOnce("https://s3.amazonaws.com/file3-url");
+
+      const { getFileUrlsBatchAction } = await import("../s3Actions");
+
+      const mockFile1Id = "file1" as any;
+      const mockFile2Id = "file2" as any;
+      const mockFile3Id = "file3" as any;
+
+      const mockFile1 = {
+        _id: mockFile1Id,
+        s3_key: "users/user123/file1.pdf",
+        user_id: "user123",
+        name: "file1.pdf",
+        media_type: "application/pdf",
+        size: 1024,
+        file_token_size: 100,
+        is_attached: true,
+        _creationTime: Date.now(),
+      };
+
+      const mockFile2 = {
+        _id: mockFile2Id,
+        s3_key: "users/user123/file2.pdf",
+        user_id: "user123",
+        name: "file2.pdf",
+        media_type: "application/pdf",
+        size: 2048,
+        file_token_size: 200,
+        is_attached: true,
+        _creationTime: Date.now(),
+      };
+
+      const mockFile3 = {
+        _id: mockFile3Id,
+        s3_key: "users/user123/file3.pdf",
+        user_id: "user123",
+        name: "file3.pdf",
+        media_type: "application/pdf",
+        size: 3072,
+        file_token_size: 300,
+        is_attached: true,
+        _creationTime: Date.now(),
+      };
+
+      const mockCtx = {
+        auth: {
+          getUserIdentity: jest.fn().mockResolvedValue({
+            subject: "user123",
+            email: "test@example.com",
+            entitlements: ["pro-plan"],
+          }),
+        },
+        runQuery: jest
+          .fn()
+          .mockResolvedValue([mockFile1, mockFile2, mockFile3]),
+      } as any;
+
+      const result = await getFileUrlsBatchAction.handler(mockCtx, {
+        fileIds: [mockFile1Id, mockFile2Id, mockFile3Id],
+      });
+
+      expect(result).toEqual({
+        file1: "https://s3.amazonaws.com/file1-url",
+        file2: "https://s3.amazonaws.com/file2-url",
+        file3: "https://s3.amazonaws.com/file3-url",
+      });
+      expect(mockCtx.runQuery).toHaveBeenCalledTimes(1);
+    });
+
+    it("should skip files without S3 keys", async () => {
+      const { generateS3DownloadUrl } = await import("../s3Utils");
+      const mockGenerateS3DownloadUrl =
+        generateS3DownloadUrl as jest.MockedFunction<
+          typeof generateS3DownloadUrl
+        >;
+
+      mockGenerateS3DownloadUrl.mockResolvedValue(
+        "https://s3.amazonaws.com/file1-url",
+      );
+
+      const { getFileUrlsBatchAction } = await import("../s3Actions");
+
+      const mockFile1Id = "file1" as any;
+      const mockFile2Id = "file2" as any;
+
+      const mockFile1 = {
+        _id: mockFile1Id,
+        s3_key: "users/user123/file1.pdf",
+        user_id: "user123",
+        name: "file1.pdf",
+        media_type: "application/pdf",
+        size: 1024,
+        file_token_size: 100,
+        is_attached: true,
+        _creationTime: Date.now(),
+      };
+
+      const mockFile2 = {
+        _id: mockFile2Id,
+        s3_key: undefined,
+        user_id: "user123",
+        name: "file2.pdf",
+        media_type: "application/pdf",
+        size: 2048,
+        file_token_size: 200,
+        is_attached: true,
+        _creationTime: Date.now(),
+      };
+
+      const mockCtx = {
+        auth: {
+          getUserIdentity: jest.fn().mockResolvedValue({
+            subject: "user123",
+            email: "test@example.com",
+            entitlements: ["pro-plan"],
+          }),
+        },
+        runQuery: jest.fn().mockResolvedValue([mockFile1, mockFile2]),
+      } as any;
+
+      const result = await getFileUrlsBatchAction.handler(mockCtx, {
+        fileIds: [mockFile1Id, mockFile2Id],
+      });
+
+      expect(result).toEqual({
+        file1: "https://s3.amazonaws.com/file1-url",
+      });
+    });
+
+    it("should skip files user doesn't own (access control)", async () => {
+      const { generateS3DownloadUrl } = await import("../s3Utils");
+      const mockGenerateS3DownloadUrl =
+        generateS3DownloadUrl as jest.MockedFunction<
+          typeof generateS3DownloadUrl
+        >;
+
+      mockGenerateS3DownloadUrl.mockResolvedValue(
+        "https://s3.amazonaws.com/file1-url",
+      );
+
+      const { getFileUrlsBatchAction } = await import("../s3Actions");
+
+      const mockFile1Id = "file1" as any;
+      const mockFile2Id = "file2" as any;
+
+      const mockFile1 = {
+        _id: mockFile1Id,
+        s3_key: "users/user123/file1.pdf",
+        user_id: "user123",
+        name: "file1.pdf",
+        media_type: "application/pdf",
+        size: 1024,
+        file_token_size: 100,
+        is_attached: true,
+        _creationTime: Date.now(),
+      };
+
+      const mockFile2 = {
+        _id: mockFile2Id,
+        s3_key: "users/user456/file2.pdf",
+        user_id: "user456", // Different owner
+        name: "file2.pdf",
+        media_type: "application/pdf",
+        size: 2048,
+        file_token_size: 200,
+        is_attached: true,
+        _creationTime: Date.now(),
+      };
+
+      const mockCtx = {
+        auth: {
+          getUserIdentity: jest.fn().mockResolvedValue({
+            subject: "user123",
+            email: "test@example.com",
+            entitlements: ["pro-plan"],
+          }),
+        },
+        runQuery: jest.fn().mockResolvedValue([mockFile1, mockFile2]),
+      } as any;
+
+      const result = await getFileUrlsBatchAction.handler(mockCtx, {
+        fileIds: [mockFile1Id, mockFile2Id],
+      });
+
+      // Only file1 should be in the result (user owns it)
+      expect(result).toEqual({
+        file1: "https://s3.amazonaws.com/file1-url",
+      });
+      expect(result.file2).toBeUndefined();
+    });
+
+    it("should skip files not found", async () => {
+      const { generateS3DownloadUrl } = await import("../s3Utils");
+      const mockGenerateS3DownloadUrl =
+        generateS3DownloadUrl as jest.MockedFunction<
+          typeof generateS3DownloadUrl
+        >;
+
+      mockGenerateS3DownloadUrl.mockResolvedValue(
+        "https://s3.amazonaws.com/file1-url",
+      );
+
+      const { getFileUrlsBatchAction } = await import("../s3Actions");
+
+      const mockFile1Id = "file1" as any;
+      const mockFile2Id = "file2" as any;
+
+      const mockFile1 = {
+        _id: mockFile1Id,
+        s3_key: "users/user123/file1.pdf",
+        user_id: "user123",
+        name: "file1.pdf",
+        media_type: "application/pdf",
+        size: 1024,
+        file_token_size: 100,
+        is_attached: true,
+        _creationTime: Date.now(),
+      };
+
+      const mockCtx = {
+        auth: {
+          getUserIdentity: jest.fn().mockResolvedValue({
+            subject: "user123",
+            email: "test@example.com",
+            entitlements: ["pro-plan"],
+          }),
+        },
+        runQuery: jest.fn().mockResolvedValue([mockFile1, null]), // File not found
+      } as any;
+
+      const result = await getFileUrlsBatchAction.handler(mockCtx, {
+        fileIds: [mockFile1Id, mockFile2Id],
+      });
+
+      // Only file1 should be in the result
+      expect(result).toEqual({
+        file1: "https://s3.amazonaws.com/file1-url",
+      });
+      expect(result.file2).toBeUndefined();
+    });
+
+    it("should skip files with no S3 key", async () => {
+      const { getFileUrlsBatchAction } = await import("../s3Actions");
+
+      const mockFile1Id = "file1" as any;
+
+      const mockFile1 = {
+        _id: mockFile1Id,
+        s3_key: undefined,
+        user_id: "user123",
+        name: "file1.pdf",
+        media_type: "application/pdf",
+        size: 1024,
+        file_token_size: 100,
+        is_attached: true,
+        _creationTime: Date.now(),
+      };
+
+      const mockCtx = {
+        auth: {
+          getUserIdentity: jest.fn().mockResolvedValue({
+            subject: "user123",
+            email: "test@example.com",
+            entitlements: ["pro-plan"],
+          }),
+        },
+        runQuery: jest.fn().mockResolvedValue([mockFile1]),
+      } as any;
+
+      const result = await getFileUrlsBatchAction.handler(mockCtx, {
+        fileIds: [mockFile1Id],
+      });
+
+      expect(result).toEqual({});
+    });
+
+    it("should handle partial failures gracefully", async () => {
+      const { generateS3DownloadUrl } = await import("../s3Utils");
+      const mockGenerateS3DownloadUrl =
+        generateS3DownloadUrl as jest.MockedFunction<
+          typeof generateS3DownloadUrl
+        >;
+
+      mockGenerateS3DownloadUrl
+        .mockResolvedValueOnce("https://s3.amazonaws.com/file1-url")
+        .mockRejectedValueOnce(new Error("S3 service unavailable"))
+        .mockResolvedValueOnce("https://s3.amazonaws.com/file3-url");
+
+      const { getFileUrlsBatchAction } = await import("../s3Actions");
+
+      const mockFile1Id = "file1" as any;
+      const mockFile2Id = "file2" as any;
+      const mockFile3Id = "file3" as any;
+
+      const mockFile1 = {
+        _id: mockFile1Id,
+        s3_key: "users/user123/file1.pdf",
+        user_id: "user123",
+        name: "file1.pdf",
+        media_type: "application/pdf",
+        size: 1024,
+        file_token_size: 100,
+        is_attached: true,
+        _creationTime: Date.now(),
+      };
+
+      const mockFile2 = {
+        _id: mockFile2Id,
+        s3_key: "users/user123/file2.pdf",
+        user_id: "user123",
+        name: "file2.pdf",
+        media_type: "application/pdf",
+        size: 2048,
+        file_token_size: 200,
+        is_attached: true,
+        _creationTime: Date.now(),
+      };
+
+      const mockFile3 = {
+        _id: mockFile3Id,
+        s3_key: "users/user123/file3.pdf",
+        user_id: "user123",
+        name: "file3.pdf",
+        media_type: "application/pdf",
+        size: 3072,
+        file_token_size: 300,
+        is_attached: true,
+        _creationTime: Date.now(),
+      };
+
+      const mockCtx = {
+        auth: {
+          getUserIdentity: jest.fn().mockResolvedValue({
+            subject: "user123",
+            email: "test@example.com",
+            entitlements: ["pro-plan"],
+          }),
+        },
+        runQuery: jest
+          .fn()
+          .mockResolvedValue([mockFile1, mockFile2, mockFile3]),
+      } as any;
+
+      const result = await getFileUrlsBatchAction.handler(mockCtx, {
+        fileIds: [mockFile1Id, mockFile2Id, mockFile3Id],
+      });
+
+      // File2 should be skipped due to error, but file1 and file3 should be returned
+      expect(result).toEqual({
+        file1: "https://s3.amazonaws.com/file1-url",
+        file3: "https://s3.amazonaws.com/file3-url",
+      });
+      expect(result.file2).toBeUndefined();
+    });
+
+    it("should throw error for unauthenticated user", async () => {
+      const { getFileUrlsBatchAction } = await import("../s3Actions");
+
+      const mockCtx = {
+        auth: {
+          getUserIdentity: jest.fn().mockResolvedValue(null),
+        },
+      } as any;
+
+      await expect(
+        getFileUrlsBatchAction.handler(mockCtx, { fileIds: ["file1" as any] }),
+      ).rejects.toThrow("Unauthenticated");
+    });
+
+    it("should throw error for batch size exceeding limit", async () => {
+      const { getFileUrlsBatchAction } = await import("../s3Actions");
+
+      const mockCtx = {
+        auth: {
+          getUserIdentity: jest.fn().mockResolvedValue({
+            subject: "user123",
+            email: "test@example.com",
+            entitlements: ["pro-plan"],
+          }),
+        },
+      } as any;
+
+      // Create array with 51 file IDs (exceeds limit of 50)
+      const fileIds = Array.from({ length: 51 }, (_, i) => `file${i}` as any);
+
+      await expect(
+        getFileUrlsBatchAction.handler(mockCtx, { fileIds }),
+      ).rejects.toThrow("Batch size exceeds limit");
+    });
+
+    it("should handle empty file IDs array", async () => {
+      const { getFileUrlsBatchAction } = await import("../s3Actions");
+
+      const mockCtx = {
+        auth: {
+          getUserIdentity: jest.fn().mockResolvedValue({
+            subject: "user123",
+            email: "test@example.com",
+            entitlements: ["pro-plan"],
+          }),
+        },
+      } as any;
+
+      const result = await getFileUrlsBatchAction.handler(mockCtx, {
+        fileIds: [],
+      });
+
+      expect(result).toEqual({});
+    });
+
+    it("should return empty map when all files are inaccessible", async () => {
+      const { getFileUrlsBatchAction } = await import("../s3Actions");
+
+      const mockFile1Id = "file1" as any;
+      const mockFile2Id = "file2" as any;
+
+      const mockFile1 = {
+        _id: mockFile1Id,
+        s3_key: "users/user456/file1.pdf",
+        user_id: "user456", // Different owner
+        name: "file1.pdf",
+        media_type: "application/pdf",
+        size: 1024,
+        file_token_size: 100,
+        is_attached: true,
+        _creationTime: Date.now(),
+      };
+
+      const mockFile2 = {
+        _id: mockFile2Id,
+        s3_key: "users/user789/file2.pdf",
+        user_id: "user789", // Different owner
+        name: "file2.pdf",
+        media_type: "application/pdf",
+        size: 2048,
+        file_token_size: 200,
+        is_attached: true,
+        _creationTime: Date.now(),
+      };
+
+      const mockCtx = {
+        auth: {
+          getUserIdentity: jest.fn().mockResolvedValue({
+            subject: "user123",
+            email: "test@example.com",
+            entitlements: ["pro-plan"],
+          }),
+        },
+        runQuery: jest.fn().mockResolvedValue([mockFile1, mockFile2]),
+      } as any;
+
+      const result = await getFileUrlsBatchAction.handler(mockCtx, {
+        fileIds: [mockFile1Id, mockFile2Id],
+      });
+
+      expect(result).toEqual({});
+    });
+  });
+
+  describe("getFileUrlsByFileIdsAction", () => {
+    const serviceUrlInfo = (
+      url: string,
+      file: {
+        size: number;
+        media_type: string;
+        name: string;
+        auxiliary_vision_description?: string;
+        auxiliary_vision_model?: string;
+      },
+    ) => ({
+      url,
+      sizeBytes: file.size,
+      mediaType: file.media_type,
+      name: file.name,
+      auxiliaryVisionDescription: file.auxiliary_vision_description,
+      auxiliaryVisionModel: file.auxiliary_vision_model,
+    });
+
+    it("should generate URLs for multiple S3 files using service key", async () => {
+      const { generateS3DownloadUrl } = await import("../s3Utils");
+      const { validateServiceKey } = await import("../lib/utils");
+      const mockGenerateS3DownloadUrl =
+        generateS3DownloadUrl as jest.MockedFunction<
+          typeof generateS3DownloadUrl
+        >;
+      const mockValidateServiceKey = validateServiceKey as jest.MockedFunction<
+        typeof validateServiceKey
+      >;
+
+      mockGenerateS3DownloadUrl
+        .mockResolvedValueOnce("https://s3.amazonaws.com/file1-url")
+        .mockResolvedValueOnce("https://s3.amazonaws.com/file2-url");
+
+      const { getFileUrlsByFileIdsAction } = await import("../s3Actions");
+
+      const mockFile1Id = "file1" as any;
+      const mockFile2Id = "file2" as any;
+
+      const mockFile1 = {
+        _id: mockFile1Id,
+        s3_key: "users/user123/file1.pdf",
+        user_id: "user123",
+        name: "file1.pdf",
+        media_type: "application/pdf",
+        size: 1024,
+        file_token_size: 100,
+        is_attached: true,
+        auxiliary_vision_description: "Cached screenshot description",
+        auxiliary_vision_model: "google/gemini-3.6-flash",
+        _creationTime: Date.now(),
+      };
+
+      const mockFile2 = {
+        _id: mockFile2Id,
+        s3_key: "users/user123/file2.pdf",
+        user_id: "user123",
+        name: "file2.pdf",
+        media_type: "application/pdf",
+        size: 2048,
+        file_token_size: 200,
+        is_attached: true,
+        _creationTime: Date.now(),
+      };
+
+      const mockCtx = {
+        runQuery: jest.fn().mockResolvedValue([mockFile1, mockFile2]),
+      } as any;
+
+      const result = await getFileUrlsByFileIdsAction.handler(mockCtx, {
+        serviceKey: "test-service-key",
+        userId: "user123",
+        fileIds: [mockFile1Id, mockFile2Id],
+      });
+
+      expect(mockValidateServiceKey).toHaveBeenCalledWith("test-service-key");
+      expect(result).toEqual([
+        "https://s3.amazonaws.com/file1-url",
+        "https://s3.amazonaws.com/file2-url",
+      ]);
+      expect(mockCtx.runQuery).toHaveBeenCalledTimes(1);
+    });
+
+    it("should generate URL metadata for service callers that request file info", async () => {
+      const { generateS3DownloadUrl } = await import("../s3Utils");
+      const mockGenerateS3DownloadUrl =
+        generateS3DownloadUrl as jest.MockedFunction<
+          typeof generateS3DownloadUrl
+        >;
+
+      mockGenerateS3DownloadUrl.mockResolvedValue(
+        "https://s3.amazonaws.com/file1-url",
+      );
+
+      const { getFileUrlInfosByFileIdsAction } = await import("../s3Actions");
+      const mockFileId = "file1" as any;
+      const mockFile = {
+        _id: mockFileId,
+        s3_key: "users/user123/file1.pdf",
+        user_id: "user123",
+        name: "file1.pdf",
+        media_type: "application/pdf",
+        size: 1024,
+        file_token_size: 100,
+        is_attached: true,
+        _creationTime: Date.now(),
+      };
+
+      const mockCtx = {
+        runQuery: jest.fn().mockResolvedValue([mockFile]),
+      } as any;
+
+      const result = await getFileUrlInfosByFileIdsAction.handler(mockCtx, {
+        serviceKey: "test-service-key",
+        userId: "user123",
+        fileIds: [mockFileId],
+      });
+
+      expect(result).toEqual([
+        serviceUrlInfo("https://s3.amazonaws.com/file1-url", mockFile),
+      ]);
+    });
+
+    it("should not generate URLs for files owned by another user", async () => {
+      const { generateS3DownloadUrl } = await import("../s3Utils");
+      const mockGenerateS3DownloadUrl =
+        generateS3DownloadUrl as jest.MockedFunction<
+          typeof generateS3DownloadUrl
+        >;
+
+      const { getFileUrlsByFileIdsAction } = await import("../s3Actions");
+
+      const mockFileId = "file1" as any;
+      const mockFile = {
+        _id: mockFileId,
+        s3_key: "users/victim/file1.pdf",
+        user_id: "victim",
+        name: "file1.pdf",
+        media_type: "application/pdf",
+        size: 1024,
+        file_token_size: 100,
+        is_attached: true,
+        _creationTime: Date.now(),
+      };
+
+      const mockCtx = {
+        runQuery: jest.fn().mockResolvedValue([mockFile]),
+      } as any;
+
+      const result = await getFileUrlsByFileIdsAction.handler(mockCtx, {
+        serviceKey: "test-service-key",
+        userId: "attacker",
+        fileIds: [mockFileId],
+      });
+
+      expect(result).toEqual([null]);
+      expect(mockGenerateS3DownloadUrl).not.toHaveBeenCalled();
+    });
+
+    it("should return null for files without S3 keys", async () => {
+      const { generateS3DownloadUrl } = await import("../s3Utils");
+      const mockGenerateS3DownloadUrl =
+        generateS3DownloadUrl as jest.MockedFunction<
+          typeof generateS3DownloadUrl
+        >;
+
+      mockGenerateS3DownloadUrl.mockResolvedValue(
+        "https://s3.amazonaws.com/file1-url",
+      );
+
+      const { getFileUrlsByFileIdsAction } = await import("../s3Actions");
+
+      const mockFile1Id = "file1" as any;
+      const mockFile2Id = "file2" as any;
+
+      const mockFile1 = {
+        _id: mockFile1Id,
+        s3_key: "users/user123/file1.pdf",
+        user_id: "user123",
+        name: "file1.pdf",
+        media_type: "application/pdf",
+        size: 1024,
+        file_token_size: 100,
+        is_attached: true,
+        _creationTime: Date.now(),
+      };
+
+      const mockFile2 = {
+        _id: mockFile2Id,
+        s3_key: undefined,
+        user_id: "user123",
+        name: "file2.pdf",
+        media_type: "application/pdf",
+        size: 2048,
+        file_token_size: 200,
+        is_attached: true,
+        _creationTime: Date.now(),
+      };
+
+      const mockCtx = {
+        runQuery: jest.fn().mockResolvedValue([mockFile1, mockFile2]),
+      } as any;
+
+      const result = await getFileUrlsByFileIdsAction.handler(mockCtx, {
+        serviceKey: "test-service-key",
+        userId: "user123",
+        fileIds: [mockFile1Id, mockFile2Id],
+      });
+
+      expect(result).toEqual(["https://s3.amazonaws.com/file1-url", null]);
+    });
+
+    it("should return null for files not found", async () => {
+      const { getFileUrlsByFileIdsAction } = await import("../s3Actions");
+
+      const mockFile1Id = "file1" as any;
+      const mockFile2Id = "file2" as any;
+
+      const mockCtx = {
+        runQuery: jest.fn().mockResolvedValue([null, null]),
+      } as any;
+
+      const result = await getFileUrlsByFileIdsAction.handler(mockCtx, {
+        serviceKey: "test-service-key",
+        userId: "user123",
+        fileIds: [mockFile1Id, mockFile2Id],
+      });
+
+      expect(result).toEqual([null, null]);
+    });
+
+    it("should throw error for invalid service key", async () => {
+      const { validateServiceKey } = await import("../lib/utils");
+      const mockValidateServiceKey = validateServiceKey as jest.MockedFunction<
+        typeof validateServiceKey
+      >;
+
+      mockValidateServiceKey.mockImplementation(() => {
+        throw new Error("Invalid service key");
+      });
+
+      const { getFileUrlsByFileIdsAction } = await import("../s3Actions");
+
+      await expect(
+        getFileUrlsByFileIdsAction.handler({} as any, {
+          serviceKey: "invalid-key",
+          userId: "user123",
+          fileIds: ["file1" as any],
+        }),
+      ).rejects.toThrow("Invalid service key");
+    });
+
+    it("should throw error for batch size exceeding limit", async () => {
+      const { getFileUrlsByFileIdsAction } = await import("../s3Actions");
+
+      const mockCtx = {} as any;
+
+      // Create array with 51 file IDs (exceeds limit of 50)
+      const fileIds = Array.from({ length: 51 }, (_, i) => `file${i}` as any);
+
+      await expect(
+        getFileUrlsByFileIdsAction.handler(mockCtx, {
+          serviceKey: "test-service-key",
+          userId: "user123",
+          fileIds,
+        }),
+      ).rejects.toThrow("Batch size exceeds limit");
+    });
+
+    it("should handle partial failures gracefully", async () => {
+      const { generateS3DownloadUrl } = await import("../s3Utils");
+      const mockGenerateS3DownloadUrl =
+        generateS3DownloadUrl as jest.MockedFunction<
+          typeof generateS3DownloadUrl
+        >;
+
+      mockGenerateS3DownloadUrl
+        .mockResolvedValueOnce("https://s3.amazonaws.com/file1-url")
+        .mockRejectedValueOnce(new Error("S3 service unavailable"))
+        .mockResolvedValueOnce("https://s3.amazonaws.com/file3-url");
+
+      const { getFileUrlsByFileIdsAction } = await import("../s3Actions");
+
+      const mockFile1Id = "file1" as any;
+      const mockFile2Id = "file2" as any;
+      const mockFile3Id = "file3" as any;
+
+      const mockFile1 = {
+        _id: mockFile1Id,
+        s3_key: "users/user123/file1.pdf",
+        user_id: "user123",
+        name: "file1.pdf",
+        media_type: "application/pdf",
+        size: 1024,
+        file_token_size: 100,
+        is_attached: true,
+        _creationTime: Date.now(),
+      };
+
+      const mockFile2 = {
+        _id: mockFile2Id,
+        s3_key: "users/user123/file2.pdf",
+        user_id: "user123",
+        name: "file2.pdf",
+        media_type: "application/pdf",
+        size: 2048,
+        file_token_size: 200,
+        is_attached: true,
+        _creationTime: Date.now(),
+      };
+
+      const mockFile3 = {
+        _id: mockFile3Id,
+        s3_key: "users/user123/file3.pdf",
+        user_id: "user123",
+        name: "file3.pdf",
+        media_type: "application/pdf",
+        size: 3072,
+        file_token_size: 300,
+        is_attached: true,
+        _creationTime: Date.now(),
+      };
+
+      const mockCtx = {
+        runQuery: jest
+          .fn()
+          .mockResolvedValue([mockFile1, mockFile2, mockFile3]),
+      } as any;
+
+      const result = await getFileUrlsByFileIdsAction.handler(mockCtx, {
+        serviceKey: "test-service-key",
+        userId: "user123",
+        fileIds: [mockFile1Id, mockFile2Id, mockFile3Id],
+      });
+
+      // File2 should return null due to error
+      expect(result).toEqual([
+        "https://s3.amazonaws.com/file1-url",
+        null,
+        "https://s3.amazonaws.com/file3-url",
+      ]);
+    });
+
+    it("should return null for files not owned by the user", async () => {
+      const { generateS3DownloadUrl } = await import("../s3Utils");
+      const mockGenerateS3DownloadUrl =
+        generateS3DownloadUrl as jest.MockedFunction<
+          typeof generateS3DownloadUrl
+        >;
+
+      const { getFileUrlsByFileIdsAction } = await import("../s3Actions");
+      const mockFileId = "file1" as any;
+      const mockFile = {
+        _id: mockFileId,
+        s3_key: "users/victim/file1.pdf",
+        user_id: "victim-user",
+        name: "file1.pdf",
+        media_type: "application/pdf",
+        size: 1024,
+        file_token_size: 100,
+        is_attached: true,
+        _creationTime: Date.now(),
+      };
+
+      const mockCtx = {
+        runQuery: jest.fn().mockResolvedValue([mockFile]),
+      } as any;
+
+      const result = await getFileUrlsByFileIdsAction.handler(mockCtx, {
+        serviceKey: "test-service-key",
+        userId: "attacker-user",
+        fileIds: [mockFileId],
+      });
+
+      expect(result).toEqual([null]);
+      expect(mockGenerateS3DownloadUrl).not.toHaveBeenCalled();
+    });
+
+    it("should return null for unowned files without S3 keys", async () => {
+      const { generateS3DownloadUrl } = await import("../s3Utils");
+      const mockGenerateS3DownloadUrl =
+        generateS3DownloadUrl as jest.MockedFunction<
+          typeof generateS3DownloadUrl
+        >;
+
+      const { getFileUrlsByFileIdsAction } = await import("../s3Actions");
+      const mockFileId = "file1" as any;
+      const mockFile = {
+        _id: mockFileId,
+        s3_key: undefined,
+        user_id: "victim-user",
+        name: "file1.pdf",
+        media_type: "application/pdf",
+        size: 1024,
+        file_token_size: 100,
+        is_attached: true,
+        _creationTime: Date.now(),
+      };
+
+      const mockCtx = {
+        runQuery: jest.fn().mockResolvedValue([mockFile]),
+      } as any;
+
+      const result = await getFileUrlsByFileIdsAction.handler(mockCtx, {
+        serviceKey: "test-service-key",
+        userId: "attacker-user",
+        fileIds: [mockFileId],
+      });
+
+      expect(result).toEqual([null]);
+      expect(mockGenerateS3DownloadUrl).not.toHaveBeenCalled();
+    });
+
+    it("should handle empty file IDs array", async () => {
+      const { getFileUrlsByFileIdsAction } = await import("../s3Actions");
+
+      const mockCtx = {} as any;
+
+      const result = await getFileUrlsByFileIdsAction.handler(mockCtx, {
+        serviceKey: "test-service-key",
+        userId: "user123",
+        fileIds: [],
+      });
+
+      expect(result).toEqual([]);
+    });
+
+    it("should return null for files with no S3 key", async () => {
+      const { getFileUrlsByFileIdsAction } = await import("../s3Actions");
+
+      const mockFile1Id = "file1" as any;
+
+      const mockFile1 = {
+        _id: mockFile1Id,
+        s3_key: undefined,
+        user_id: "user123",
+        name: "file1.pdf",
+        media_type: "application/pdf",
+        size: 1024,
+        file_token_size: 100,
+        is_attached: true,
+        _creationTime: Date.now(),
+      };
+
+      const mockCtx = {
+        runQuery: jest.fn().mockResolvedValue([mockFile1]),
+      } as any;
+
+      const result = await getFileUrlsByFileIdsAction.handler(mockCtx, {
+        serviceKey: "test-service-key",
+        userId: "user123",
+        fileIds: [mockFile1Id],
+      });
+
+      expect(result).toEqual([null]);
+    });
+  });
+});

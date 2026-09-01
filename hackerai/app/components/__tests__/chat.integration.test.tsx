@@ -1,0 +1,721 @@
+import "@testing-library/jest-dom";
+import {
+  afterAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  jest,
+} from "@jest/globals";
+import {
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+  waitFor,
+} from "@testing-library/react";
+import { useEffect, useRef } from "react";
+import { useGlobalState } from "@/app/contexts/GlobalState";
+
+jest.mock("uuid", () => ({
+  v4: () => "queued-message-id",
+}));
+
+// ===== IMPORTANT: Mock all dependencies BEFORE importing Chat =====
+// These mocks are hoisted by Jest
+
+// Mock @ai-sdk/react
+const mockSendMessage = jest.fn();
+const mockSetMessages = jest.fn();
+const mockStop = jest.fn();
+const mockRegenerate = jest.fn();
+const mockResumeStream = jest.fn();
+let mockRouteParams: Record<string, string> = {};
+let mockComputerOverlayMedia = false;
+const originalMatchMedia = window.matchMedia;
+
+jest.mock("@ai-sdk/react", () => ({
+  useChat: jest.fn(() => ({
+    messages: [],
+    sendMessage: mockSendMessage,
+    setMessages: mockSetMessages,
+    status: "ready",
+    stop: mockStop,
+    error: null,
+    regenerate: mockRegenerate,
+    resumeStream: mockResumeStream,
+  })),
+}));
+
+jest.mock("next/navigation", () => ({
+  useParams: jest.fn(() => mockRouteParams),
+  usePathname: jest.fn(() => "/"),
+  useRouter: jest.fn(() => ({
+    push: jest.fn(),
+    replace: jest.fn(),
+    back: jest.fn(),
+    forward: jest.fn(),
+    refresh: jest.fn(),
+    prefetch: jest.fn(),
+  })),
+}));
+
+jest.mock("react-hotkeys-hook", () => ({
+  useHotkeys: jest.fn(),
+}));
+
+jest.mock("@/hooks/use-mobile", () => ({
+  useIsMobile: jest.fn(() => false),
+}));
+
+jest.mock("@/lib/utils/client-storage", () => ({
+  NULL_THREAD_DRAFT_ID: "null-thread",
+  getDraftContentById: jest.fn(() => null),
+  getDraftAttachmentsById: jest.fn(() => []),
+  hasDraftAttachmentsById: jest.fn(() => false),
+  upsertDraft: jest.fn(),
+  upsertDraftAttachments: jest.fn(),
+  removeDraftAttachments: jest.fn(),
+  removeDraft: jest.fn(),
+}));
+
+jest.mock("../../hooks/useFileUpload", () => ({
+  useFileUpload: () => ({
+    fileInputRef: { current: null },
+    handleFileUploadEvent: jest.fn(),
+    handleRemoveFile: jest.fn(),
+    handleAttachClick: jest.fn(),
+    handlePasteEvent: jest.fn(),
+    handlePastedTextAttachment: jest.fn(),
+    isDragOver: false,
+    showDragOverlay: false,
+    handleDragEnter: jest.fn(),
+    handleDragLeave: jest.fn(),
+    handleDragOver: jest.fn(),
+    handleDrop: jest.fn(),
+  }),
+}));
+
+jest.mock("../../hooks/useDocumentDragAndDrop", () => ({
+  useDocumentDragAndDrop: () => {},
+}));
+
+jest.mock("../../hooks/useChats", () => ({
+  useChats: () => ({
+    results: [],
+    status: "Exhausted",
+    loadMore: jest.fn(),
+  }),
+}));
+
+jest.mock("../../hooks/useChatHandlers", () => ({
+  useChatHandlers: () => ({
+    handleSubmit: jest.fn(),
+    handleStop: jest.fn(),
+    handleRegenerate: jest.fn(),
+    handleRetry: jest.fn(),
+    handleEditMessage: jest.fn(),
+  }),
+}));
+
+jest.mock("../../hooks/useMessageScroll", () => ({
+  useMessageScroll: () => ({
+    scrollRef: { current: null },
+    contentRef: { current: null },
+    scrollToBottom: jest.fn(),
+    isAtBottom: true,
+  }),
+}));
+
+jest.mock("../../hooks/useAutoResume", () => ({
+  useAutoResume: jest.fn(),
+}));
+
+jest.mock("../SidebarHeader", () => ({
+  __esModule: true,
+  default: () => <div data-testid="sidebar-header">Sidebar Header</div>,
+}));
+
+jest.mock("../SidebarUserNav", () => ({
+  __esModule: true,
+  default: () => <div data-testid="sidebar-user-nav">User Nav</div>,
+}));
+
+jest.mock("../SidebarHistory", () => ({
+  __esModule: true,
+  default: () => <div data-testid="sidebar-history">Sidebar History</div>,
+}));
+
+jest.mock("../MemoizedMarkdown", () => ({
+  MemoizedMarkdown: ({ children }: any) => (
+    <div data-testid="memoized-markdown">{children}</div>
+  ),
+}));
+
+jest.mock("../Messages", () => ({
+  Messages: ({ messages }: any) => (
+    <div data-testid="messages-component">{messages.length} messages</div>
+  ),
+}));
+
+jest.mock("../ChatInput", () => ({
+  ChatInput: () => <div data-testid="chat-input">ChatInput</div>,
+}));
+
+jest.mock("../ComputerSidebar", () => ({
+  ComputerSidebar: () => (
+    <div data-testid="computer-sidebar">
+      Sidebar
+      <button type="button">First computer action</button>
+      <button type="button">Last computer action</button>
+    </div>
+  ),
+}));
+
+jest.mock("../ChatHeader", () => ({
+  __esModule: true,
+  default: () => <div data-testid="chat-header">Chat Header</div>,
+}));
+
+jest.mock("../Sidebar", () => ({
+  __esModule: true,
+  default: () => <div data-testid="main-sidebar">Main Sidebar</div>,
+}));
+
+jest.mock("../Footer", () => ({
+  __esModule: true,
+  default: () => <div data-testid="footer">Footer</div>,
+}));
+
+jest.mock("../DragDropOverlay", () => ({
+  DragDropOverlay: ({ isVisible }: any) =>
+    isVisible ? <div data-testid="drag-overlay">Drag Overlay</div> : null,
+}));
+
+jest.mock("../ConvexErrorBoundary", () => ({
+  ConvexErrorBoundary: ({ children }: any) => <div>{children}</div>,
+}));
+
+jest.mock("@/components/ui/sidebar", () => ({
+  SidebarProvider: ({ children }: any) => <div>{children}</div>,
+}));
+
+// ===== NOW import components =====
+import {
+  Chat,
+  getExistingChatLoadState,
+  getStoredAgentApprovalRequest,
+  useStreamedChatTitle,
+  useServerMessages,
+} from "../chat";
+import { ChatLayout } from "../ChatLayout";
+import { TestWrapper } from "../testUtils";
+
+const QueueEditingHarness = () => {
+  const {
+    messageQueue,
+    queueMessage,
+    updateQueuedMessage,
+    setEditingQueuedMessageId,
+  } = useGlobalState();
+  const hasSetActualEditingId = useRef(false);
+
+  useEffect(() => {
+    queueMessage("original queued message");
+    setEditingQueuedMessageId("queued-message-id");
+  }, [queueMessage, setEditingQueuedMessageId]);
+
+  useEffect(() => {
+    if (messageQueue[0] && !hasSetActualEditingId.current) {
+      hasSetActualEditingId.current = true;
+      setEditingQueuedMessageId(messageQueue[0].id);
+    }
+  }, [messageQueue, setEditingQueuedMessageId]);
+
+  const saveEdit = () => {
+    const queuedMessage = messageQueue[0];
+    if (!queuedMessage) return;
+
+    updateQueuedMessage(queuedMessage.id, "updated queued message");
+    setEditingQueuedMessageId(null);
+  };
+
+  return (
+    <>
+      <div data-testid="queue-state">Queued: {messageQueue.length}</div>
+      <button type="button" onClick={saveEdit}>
+        Save queued edit
+      </button>
+    </>
+  );
+};
+
+const ChatTitleHandoffHarness = ({
+  persistedTitle,
+}: {
+  persistedTitle: string;
+}) => {
+  const [chatTitle, setStreamedTitle] = useStreamedChatTitle(persistedTitle);
+
+  return (
+    <>
+      <div data-testid="chat-title">{chatTitle}</div>
+      <button type="button" onClick={() => setStreamedTitle("Generated title")}>
+        Stream generated title
+      </button>
+    </>
+  );
+};
+
+const OpenComputerSidebarHarness = () => {
+  const { openSidebar, sidebarOpen } = useGlobalState();
+
+  return (
+    <>
+      <span data-testid="computer-open-state">
+        {sidebarOpen ? "open" : "closed"}
+      </span>
+      <button
+        type="button"
+        onClick={() =>
+          openSidebar({
+            command: "echo ready",
+            output: "ready",
+            isExecuting: false,
+            toolCallId: "responsive-layout-test",
+          })
+        }
+      >
+        Open Computer
+      </button>
+    </>
+  );
+};
+
+describe("Chat Component Integration", () => {
+  let mockUseChat: jest.Mock;
+
+  afterAll(() => {
+    window.matchMedia = originalMatchMedia;
+  });
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    const convexReact = require("convex/react");
+    convexReact.resetMockConvexAuth?.();
+    convexReact.resetMockConvexQueries?.();
+    mockRouteParams = {};
+    mockComputerOverlayMedia = false;
+    window.matchMedia = jest.fn(
+      (query: string) =>
+        ({
+          get matches() {
+            return query === "(max-width: 949px)" && mockComputerOverlayMedia;
+          },
+          media: query,
+          onchange: null,
+          addEventListener: jest.fn(),
+          removeEventListener: jest.fn(),
+          addListener: jest.fn(),
+          removeListener: jest.fn(),
+          dispatchEvent: jest.fn(),
+        }) as MediaQueryList,
+    );
+    const { useChat } = require("@ai-sdk/react");
+    mockUseChat = useChat as jest.Mock;
+
+    mockUseChat.mockReturnValue({
+      messages: [],
+      sendMessage: mockSendMessage,
+      setMessages: mockSetMessages,
+      status: "ready",
+      stop: mockStop,
+      error: null,
+      regenerate: mockRegenerate,
+      resumeStream: mockResumeStream,
+    });
+  });
+
+  describe("Basic Rendering", () => {
+    it("releases a persisted streamed title so later manual renames stay visible", () => {
+      const { rerender } = render(
+        <ChatTitleHandoffHarness persistedTitle="Original prompt" />,
+      );
+
+      fireEvent.click(
+        screen.getByRole("button", { name: "Stream generated title" }),
+      );
+      expect(screen.getByTestId("chat-title")).toHaveTextContent(
+        "Generated title",
+      );
+
+      rerender(<ChatTitleHandoffHarness persistedTitle="Generated title" />);
+      expect(screen.getByTestId("chat-title")).toHaveTextContent(
+        "Generated title",
+      );
+
+      rerender(<ChatTitleHandoffHarness persistedTitle="Renamed title" />);
+      expect(screen.getByTestId("chat-title")).toHaveTextContent(
+        "Renamed title",
+      );
+    });
+
+    it("should render new chat with welcome message", () => {
+      render(
+        <TestWrapper>
+          <Chat autoResume={false} />
+        </TestWrapper>,
+      );
+
+      expect(screen.getByRole("heading", { level: 1 })).toBeInTheDocument();
+    });
+
+    it("should render with provided chatId", () => {
+      mockRouteParams = { id: "test-chat-123" };
+
+      const { container } = render(
+        <TestWrapper>
+          <Chat autoResume={false} />
+        </TestWrapper>,
+      );
+
+      expect(
+        container.querySelector(".flex.bg-background"),
+      ).toBeInTheDocument();
+    });
+
+    it("keeps the useChat message snapshot stable across unrelated renders", () => {
+      const { result, rerender } = renderHook(() =>
+        useServerMessages(undefined),
+      );
+      const firstMessages = result.current;
+      expect(Array.isArray(firstMessages)).toBe(true);
+
+      rerender();
+
+      expect(result.current).toBe(firstMessages);
+    });
+
+    it("keeps an existing chat loading while Convex auth is still loading", () => {
+      expect(
+        getExistingChatLoadState({
+          isExistingChat: true,
+          hasMessages: false,
+          isConvexAuthLoading: true,
+          isConvexAuthenticated: false,
+          shouldFetchMessages: false,
+          chatData: null,
+          paginationStatus: "Exhausted",
+          hasPaginatedMessageResults: false,
+          awaitingServerChat: false,
+        }),
+      ).toEqual({
+        isInitialExistingChatLoad: true,
+        isChatNotFound: false,
+      });
+    });
+
+    it("keeps an existing chat loading while the first message page is loading", () => {
+      expect(
+        getExistingChatLoadState({
+          isExistingChat: true,
+          hasMessages: false,
+          isConvexAuthLoading: false,
+          isConvexAuthenticated: true,
+          shouldFetchMessages: true,
+          chatData: null,
+          paginationStatus: "LoadingFirstPage",
+          hasPaginatedMessageResults: false,
+          awaitingServerChat: false,
+        }),
+      ).toEqual({
+        isInitialExistingChatLoad: true,
+        isChatNotFound: false,
+      });
+    });
+
+    it("does not show not found when messages resolved before chat metadata recovers", () => {
+      expect(
+        getExistingChatLoadState({
+          isExistingChat: true,
+          hasMessages: false,
+          isConvexAuthLoading: false,
+          isConvexAuthenticated: true,
+          shouldFetchMessages: true,
+          chatData: null,
+          paginationStatus: "Exhausted",
+          hasPaginatedMessageResults: true,
+          awaitingServerChat: false,
+        }),
+      ).toEqual({
+        isInitialExistingChatLoad: false,
+        isChatNotFound: false,
+      });
+    });
+
+    it("shows chat not found after auth and messages resolve empty", () => {
+      expect(
+        getExistingChatLoadState({
+          isExistingChat: true,
+          hasMessages: false,
+          isConvexAuthLoading: false,
+          isConvexAuthenticated: true,
+          shouldFetchMessages: true,
+          chatData: null,
+          paginationStatus: "Exhausted",
+          hasPaginatedMessageResults: false,
+          awaitingServerChat: false,
+        }),
+      ).toEqual({
+        isInitialExistingChatLoad: false,
+        isChatNotFound: true,
+      });
+    });
+
+    it("derives a stored approval prompt from operation and target only", () => {
+      expect(
+        getStoredAgentApprovalRequest({
+          active_agent_approval_pending: true,
+          active_agent_approval_request: {
+            approvalId: "approval-1",
+            toolCallId: "tool-1",
+            operation: "terminal_execute",
+            target: "ping -c 4 hackerone.com",
+            justification: "Check whether the target host is reachable.",
+            prefixRule: ["ping", "-c", "4"],
+            createdAt: 123,
+            autoReview: {
+              verdict: "ask_user",
+              riskCategory: "scope_expansion",
+              rationale: "The referenced script contents are not visible.",
+              rolloutPhase: "enforce",
+            },
+          },
+        }),
+      ).toEqual({
+        approvalId: "approval-1",
+        toolCallId: "tool-1",
+        operation: "terminal_execute",
+        title: "Allow HackerAI to run this terminal command?",
+        target: "ping -c 4 hackerone.com",
+        justification: "Check whether the target host is reachable.",
+        prefixRule: ["ping", "-c", "4"],
+        detail: "Approve to continue, or deny to stop this command.",
+        kind: "terminal",
+        createdAt: 123,
+        autoReview: {
+          verdict: "ask_user",
+          riskCategory: "scope_expansion",
+          rationale: "The referenced script contents are not visible.",
+          rolloutPhase: "enforce",
+        },
+      });
+    });
+
+    it("drops a malformed stored Auto review summary", () => {
+      expect(
+        getStoredAgentApprovalRequest({
+          active_agent_approval_pending: true,
+          active_agent_approval_request: {
+            approvalId: "approval-1",
+            toolCallId: "tool-1",
+            operation: "terminal_execute",
+            autoReview: {
+              verdict: "approve_everything",
+              riskCategory: "routine",
+              rationale: "Invalid verdict.",
+              rolloutPhase: "enforce",
+            },
+          },
+        })?.autoReview,
+      ).toBeUndefined();
+    });
+  });
+
+  describe("Message Display", () => {
+    it("keeps an edited queued message pending, then resumes with updated text", async () => {
+      render(
+        <TestWrapper>
+          <QueueEditingHarness />
+          <Chat autoResume={false} />
+        </TestWrapper>,
+      );
+
+      await waitFor(() =>
+        expect(screen.getByTestId("queue-state")).toHaveTextContent(
+          "Queued: 1",
+        ),
+      );
+
+      expect(mockSendMessage).not.toHaveBeenCalled();
+
+      fireEvent.click(screen.getByRole("button", { name: "Save queued edit" }));
+
+      await waitFor(() => {
+        expect(screen.getByText("updated queued message")).toBeInTheDocument();
+        expect(screen.getByTestId("queue-state")).toHaveTextContent(
+          "Queued: 0",
+        );
+      });
+    });
+
+    it("should render with existing messages", () => {
+      mockUseChat.mockReturnValue({
+        messages: [
+          { id: "1", role: "user", content: "Hello" },
+          { id: "2", role: "assistant", content: "Hi there!" },
+        ],
+        sendMessage: mockSendMessage,
+        setMessages: mockSetMessages,
+        status: "ready",
+        stop: mockStop,
+        error: null,
+        regenerate: mockRegenerate,
+        resumeStream: mockResumeStream,
+      });
+
+      const { container } = render(
+        <TestWrapper>
+          <Chat autoResume={false} />
+        </TestWrapper>,
+      );
+
+      expect(
+        container.querySelector(".flex.bg-background"),
+      ).toBeInTheDocument();
+    });
+  });
+
+  describe("Streaming State", () => {
+    it("should handle streaming status", () => {
+      mockUseChat.mockReturnValue({
+        messages: [{ id: "1", role: "assistant", content: "Streaming..." }],
+        sendMessage: mockSendMessage,
+        setMessages: mockSetMessages,
+        status: "streaming",
+        stop: mockStop,
+        error: null,
+        regenerate: mockRegenerate,
+        resumeStream: mockResumeStream,
+      });
+
+      const { container } = render(
+        <TestWrapper>
+          <Chat autoResume={false} />
+        </TestWrapper>,
+      );
+
+      expect(
+        container.querySelector(".flex.bg-background"),
+      ).toBeInTheDocument();
+    });
+  });
+
+  describe("Error Handling", () => {
+    it("should render when error occurs", () => {
+      const testError = new Error("Test error");
+      mockUseChat.mockReturnValue({
+        messages: [],
+        sendMessage: mockSendMessage,
+        setMessages: mockSetMessages,
+        status: "ready",
+        stop: mockStop,
+        error: testError,
+        regenerate: mockRegenerate,
+        resumeStream: mockResumeStream,
+      });
+
+      render(
+        <TestWrapper>
+          <Chat autoResume={false} />
+        </TestWrapper>,
+      );
+
+      expect(screen.getByRole("heading", { level: 1 })).toBeInTheDocument();
+    });
+  });
+
+  describe("Sidebar Behavior", () => {
+    it("should render sidebar on desktop", () => {
+      render(
+        <TestWrapper>
+          <ChatLayout>
+            <Chat autoResume={false} />
+          </ChatLayout>
+        </TestWrapper>,
+      );
+
+      expect(screen.getByTestId("sidebar")).toBeInTheDocument();
+    });
+
+    it("uses a bounded split pane for Computer on wide workspaces", async () => {
+      render(
+        <TestWrapper>
+          <OpenComputerSidebarHarness />
+          <Chat autoResume={false} />
+        </TestWrapper>,
+      );
+
+      fireEvent.click(screen.getByRole("button", { name: "Open Computer" }));
+
+      await waitFor(() => {
+        expect(screen.getByTestId("computer-sidebar")).toBeInTheDocument();
+      });
+      expect(screen.getByTestId("computer-sidebar-container")).toHaveAttribute(
+        "data-layout",
+        "split",
+      );
+      expect(screen.getByTestId("computer-sidebar-container")).toHaveClass(
+        "w-1/2",
+      );
+    });
+
+    it("uses an accessible Computer overlay on narrow workspaces", async () => {
+      mockComputerOverlayMedia = true;
+
+      render(
+        <TestWrapper>
+          <OpenComputerSidebarHarness />
+          <Chat autoResume={false} />
+        </TestWrapper>,
+      );
+
+      const trigger = screen.getByRole("button", { name: "Open Computer" });
+      trigger.focus();
+      fireEvent.click(trigger);
+
+      expect(screen.getByTestId("computer-open-state")).toHaveTextContent(
+        "open",
+      );
+      expect(
+        await screen.findByTestId("computer-sidebar-container"),
+      ).toHaveAttribute("data-layout", "overlay");
+      expect(
+        screen.getByRole("dialog", { name: "HackerAI’s Computer" }),
+      ).toBeInTheDocument();
+      expect(screen.getByTestId("computer-sidebar")).toBeInTheDocument();
+
+      const firstAction = screen.getByRole("button", {
+        name: "First computer action",
+      });
+      const lastAction = screen.getByRole("button", {
+        name: "Last computer action",
+      });
+      await waitFor(() => expect(firstAction).toHaveFocus());
+
+      lastAction.focus();
+      fireEvent.keyDown(document, { key: "Tab" });
+      expect(firstAction).toHaveFocus();
+
+      fireEvent.keyDown(document, { key: "Escape" });
+      await waitFor(() => {
+        expect(
+          screen.queryByRole("dialog", { name: "HackerAI’s Computer" }),
+        ).not.toBeInTheDocument();
+      });
+      expect(trigger).toHaveFocus();
+    });
+
+    // Mobile task navigation is covered by ChatLayout accessibility tests.
+  });
+});

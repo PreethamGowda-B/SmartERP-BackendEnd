@@ -1,0 +1,979 @@
+import { RefObject } from "react";
+import { useMutation } from "convex/react";
+import { api } from "@/convex/_generated/api";
+import { useGlobalState } from "../contexts/GlobalState";
+import { useLatestRef } from "@/app/hooks/useLatestRef";
+import { isTauriEnvironment } from "@/app/hooks/useTauri";
+import { shouldUseAgentLongForAgent } from "@/lib/chat/agent-routing";
+import { AGENT_CANCEL_ENDPOINT } from "@/lib/api/agent-endpoints";
+import { isAgentMode } from "@/lib/utils/mode-helpers";
+import {
+  normalizeSelectedModelForSubscription,
+  type ChatMessage,
+  type ChatStatus,
+  type LimitRescueRequest,
+  type SelectedModel,
+} from "@/types";
+import { Id } from "@/convex/_generated/dataModel";
+import {
+  getMaxFileTokens,
+  getMaxTokensForSubscription,
+} from "@/lib/token-limits";
+import { getInputTokenLimitStatus } from "@/lib/utils/client-token-validation";
+import { toast } from "sonner";
+import { removeTodosBySourceMessages } from "@/lib/utils/todo-utils";
+import { useDataStreamDispatch } from "@/app/components/DataStreamProvider";
+import { getOnlineStatusSnapshot } from "@/app/hooks/useOnlineStatus";
+import { AUTO_CONTINUE_PROMPT } from "@/app/hooks/useAutoContinue";
+import { normalizeMessages } from "@/lib/utils/message-processor";
+import {
+  getAutoContinueChainAssistantIds,
+  getMessagesUpToLastRealUser,
+  findLastUserMessageIndex,
+} from "@/lib/utils/message-utils";
+import {
+  createFileMessagePartFromUploadedFile,
+  getMaxFilesLimitForMode,
+} from "@/lib/utils/file-utils";
+import { hasRestageableLocalDesktopAttachments } from "@/lib/utils/local-attachment-messages";
+import { isPastedTextAttachmentAvailableInMode } from "@/lib/utils/pasted-text-attachments";
+import { sanitizeForConvexValue } from "@/lib/db/convex-value-sanitizer";
+import { reconcileSidebarContentAfterRegeneration } from "@/lib/utils/sidebar-utils";
+import { v4 as uuidv4 } from "uuid";
+import { captureAuthenticatedEvent } from "@/lib/analytics/client";
+
+interface UseChatHandlersProps {
+  chatId: string;
+  messages: ChatMessage[];
+  sendMessage: (
+    message?: any,
+    options?: { body?: any },
+  ) => void | Promise<void>;
+  stop: () => void;
+  regenerate: (options?: { body?: any }) => void | Promise<void>;
+  setMessages: (
+    messages: ChatMessage[] | ((prev: ChatMessage[]) => ChatMessage[]),
+  ) => void;
+  isExistingChat: boolean;
+  status: ChatStatus;
+  isSendingNowRef: RefObject<boolean>;
+  hasManuallyStoppedRef: RefObject<boolean>;
+  activeTriggerRunRef?: RefObject<string | undefined>;
+  resumeActiveRun?: () => void | Promise<void>;
+  onStopCallback?: () => void;
+  resetAutoContinueCount?: () => void;
+}
+
+export type RetryOptions = {
+  limitRescue?: LimitRescueRequest;
+};
+
+const getConvexErrorCode = (error: unknown): string | undefined => {
+  if (!error || typeof error !== "object" || !("data" in error)) {
+    return undefined;
+  }
+
+  const data = (error as { data?: unknown }).data;
+  if (!data || typeof data !== "object" || !("code" in data)) {
+    return undefined;
+  }
+
+  const code = (data as { code?: unknown }).code;
+  return typeof code === "string" ? code : undefined;
+};
+
+export const useChatHandlers = ({
+  chatId,
+  messages,
+  sendMessage,
+  stop,
+  regenerate,
+  setMessages,
+  isExistingChat,
+  status,
+  isSendingNowRef,
+  hasManuallyStoppedRef,
+  activeTriggerRunRef,
+  resumeActiveRun,
+  onStopCallback,
+  resetAutoContinueCount,
+}: UseChatHandlersProps) => {
+  const { setIsAutoResuming } = useDataStreamDispatch();
+  const {
+    getInput,
+    uploadedFiles,
+    chatMode,
+    clearInput,
+    clearUploadedFiles,
+    todos,
+    setTodos,
+    isUploadingFiles,
+    subscription,
+    queueMessage,
+    messageQueue,
+    removeQueuedMessage,
+    queueBehavior,
+    sandboxPreference,
+    agentPermissionMode,
+    selectedModel,
+    sidebarOpen,
+    sidebarContent,
+    openSidebar,
+    closeSidebar,
+  } = useGlobalState();
+  const requestSelectedModel = normalizeSelectedModelForSubscription(
+    selectedModel,
+    subscription,
+  );
+  // MessageItem intentionally ignores callback identity in its memo comparator,
+  // so a rendered Regenerate button can retain an older handler closure.
+  const requestSelectedModelRef = useLatestRef(requestSelectedModel);
+
+  // Avoid stale closure on chatMode: on mobile, a tap on Regenerate can fire
+  // before React commits the new chatMode after a mode toggle, sending the
+  // previous mode in the request body. Reading from a ref always gets the
+  // latest value at the moment of the click.
+  const chatModeRef = useLatestRef(chatMode);
+  const sandboxPreferenceRef = useLatestRef(sandboxPreference);
+  const agentPermissionModeRef = useLatestRef(agentPermissionMode);
+  const subscriptionRef = useLatestRef(subscription);
+  const sidebarOpenRef = useLatestRef(sidebarOpen);
+  const sidebarContentRef = useLatestRef(sidebarContent);
+
+  const isSendableUploadedFile = (file: (typeof uploadedFiles)[number]) =>
+    file.uploaded &&
+    !file.uploading &&
+    !file.error &&
+    (file.storage === "local-desktop"
+      ? !!file.localAttachmentId && !!file.localPath
+      : !!file.fileId);
+
+  const runChatAction = (
+    description: string,
+    action: () => void | Promise<void>,
+  ): void => {
+    try {
+      void Promise.resolve(action()).catch((error) => {
+        console.error(`Failed to ${description}:`, error);
+      });
+    } catch (error) {
+      console.error(`Failed to ${description}:`, error);
+    }
+  };
+
+  const deleteLastAssistantMessage = useMutation(
+    api.messages.deleteLastAssistantMessage,
+  );
+  const saveAssistantMessage = useMutation(api.messages.saveAssistantMessage);
+  const regenerateWithNewContent = useMutation(
+    api.messages.regenerateWithNewContent,
+  );
+  const cancelStreamMutation = useMutation(
+    api.chatStreams.cancelStreamFromClient,
+  );
+  const getConvexSafeParts = (parts: ChatMessage["parts"]) =>
+    sanitizeForConvexValue(parts) as ChatMessage["parts"];
+
+  // A persisted active run takes precedence over the current UI mode. This
+  // matters while restoring an approval before mode initialization completes.
+  const shouldCancelTriggerRun = () =>
+    Boolean(activeTriggerRunRef?.current) ||
+    shouldUseAgentLongForAgent({
+      mode: chatModeRef.current,
+      subscription: subscriptionRef.current,
+      isTauri: isTauriEnvironment(),
+    });
+
+  type AgentCancellationResult =
+    | { outcome: "not_applicable" | "canceled" }
+    | {
+        outcome: "stale_run";
+        expectedTriggerRunId?: string;
+        activeTriggerRunId?: string | null;
+      };
+
+  const cancelTriggerRun = async (): Promise<AgentCancellationResult> => {
+    if (!shouldCancelTriggerRun()) return { outcome: "not_applicable" };
+    const expectedTriggerRunId = activeTriggerRunRef?.current;
+    const response = await fetch(AGENT_CANCEL_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chatId,
+        ...(expectedTriggerRunId ? { expectedTriggerRunId } : {}),
+      }),
+    });
+    if (response.status === 409) {
+      const payload = (await response.json().catch(() => null)) as {
+        reason?: unknown;
+        activeTriggerRunId?: unknown;
+      } | null;
+      if (payload?.reason === "stale_run") {
+        const hasActiveTriggerRunId = Object.prototype.hasOwnProperty.call(
+          payload,
+          "activeTriggerRunId",
+        );
+        return {
+          outcome: "stale_run",
+          expectedTriggerRunId,
+          ...(hasActiveTriggerRunId
+            ? {
+                activeTriggerRunId:
+                  typeof payload.activeTriggerRunId === "string"
+                    ? payload.activeTriggerRunId
+                    : null,
+              }
+            : {}),
+        };
+      }
+    }
+    if (!response.ok) {
+      throw new Error(
+        `Agent cancellation failed with status ${response.status}`,
+      );
+    }
+    return { outcome: "canceled" };
+  };
+
+  const recoverStaleAgentRun = async (
+    result: Extract<AgentCancellationResult, { outcome: "stale_run" }>,
+  ): Promise<void> => {
+    hasManuallyStoppedRef.current = false;
+    if (activeTriggerRunRef && result.activeTriggerRunId !== undefined) {
+      activeTriggerRunRef.current = result.activeTriggerRunId ?? undefined;
+    }
+
+    const hasNoActiveRun = result.activeTriggerRunId === null;
+
+    captureAuthenticatedEvent("agent_cancel_stale_recovery_started", {
+      chat_id: chatId,
+      expected_trigger_run_id: result.expectedTriggerRunId,
+      active_trigger_run_id: result.activeTriggerRunId,
+      recovery_action: hasNoActiveRun
+        ? "no_active_run"
+        : resumeActiveRun
+          ? "resume_stream"
+          : "persisted_state",
+      cancellation_applied: false,
+    });
+
+    if (hasNoActiveRun) {
+      setIsAutoResuming(false);
+      toast.info("Agent run already finished", {
+        description: "Nothing is running to cancel. Try the action again.",
+      });
+      return;
+    }
+
+    toast.info("Agent run changed", {
+      description: "Reconnecting to the current run instead of cancelling it.",
+    });
+
+    if (!resumeActiveRun) {
+      setIsAutoResuming(false);
+      return;
+    }
+
+    setIsAutoResuming(true);
+    try {
+      await resumeActiveRun();
+    } catch (error) {
+      setIsAutoResuming(false);
+      console.error("Failed to resume the current Agent run:", error);
+      toast.error("Could not reconnect to the current Agent run.");
+    }
+  };
+
+  /**
+   * Helper to stop an active stream, normalize messages, and persist state.
+   * Returns the normalized messages array.
+   * Should be called before any message management operation during streaming.
+   */
+  const stopActiveStream = async (options?: {
+    skipSave?: boolean;
+    requireCancelSuccess?: boolean;
+  }): Promise<ChatMessage[]> => {
+    // Stop the stream immediately (client-side abort)
+    stop();
+
+    // Early return if no messages to process
+    if (messages.length === 0) return messages;
+
+    // Normalize messages to mark incomplete tools as interrupted/completed
+    const { messages: normalizedMessages, hasChanges } =
+      normalizeMessages(messages);
+
+    const stopTime = Date.now();
+    const normalizedLastMessage =
+      normalizedMessages[normalizedMessages.length - 1];
+    const generationStartedAt =
+      typeof normalizedLastMessage?.metadata?.generationStartedAt === "number"
+        ? normalizedLastMessage.metadata.generationStartedAt
+        : undefined;
+    const generationTimeMs =
+      generationStartedAt !== undefined
+        ? Math.max(0, stopTime - generationStartedAt)
+        : undefined;
+    const stoppedMessages =
+      normalizedLastMessage?.role === "assistant" &&
+      generationTimeMs !== undefined
+        ? [
+            ...normalizedMessages.slice(0, -1),
+            {
+              ...normalizedLastMessage,
+              metadata: {
+                ...normalizedLastMessage.metadata,
+                mode:
+                  normalizedLastMessage.metadata?.mode ?? chatModeRef.current,
+                generationStartedAt,
+                generationTimeMs,
+              },
+            },
+          ]
+        : normalizedMessages;
+
+    // Update local state if changes were made
+    if (hasChanges || stoppedMessages !== normalizedMessages) {
+      setMessages(stoppedMessages);
+    }
+
+    // Run cancel and save in parallel - they're independent operations
+    const lastMessage = stoppedMessages[stoppedMessages.length - 1];
+    const savePromise =
+      !options?.skipSave && lastMessage?.role === "assistant"
+        ? saveAssistantMessage({
+            id: lastMessage.id,
+            chatId,
+            role: lastMessage.role,
+            parts: getConvexSafeParts(lastMessage.parts),
+            mode: lastMessage.metadata?.mode ?? chatModeRef.current,
+            generationStartedAt,
+            generationTimeMs,
+          }).catch((error) => {
+            console.error("Failed to save message on stop:", error);
+          })
+        : Promise.resolve();
+
+    const cancelPromise = cancelStreamMutation({
+      chatId,
+      skipSave: options?.skipSave || undefined,
+      todos,
+    });
+    await Promise.all([
+      options?.requireCancelSuccess
+        ? cancelPromise
+        : cancelPromise.catch((error) => {
+            console.error("Failed to cancel stream:", error);
+          }),
+      savePromise,
+    ]);
+
+    return normalizedMessages;
+  };
+
+  const stopActiveRunForReplacement = async (): Promise<boolean> => {
+    const [triggerCancelResult, streamStopResult] = await Promise.allSettled([
+      cancelTriggerRun(),
+      stopActiveStream({ skipSave: true }),
+    ]);
+
+    if (triggerCancelResult.status === "rejected") {
+      console.error(
+        "Failed to cancel trigger.dev run before replacement:",
+        triggerCancelResult.reason,
+      );
+      toast.error("Could not restart the Agent run. Please try again.");
+      throw triggerCancelResult.reason;
+    }
+    if (streamStopResult.status === "rejected") {
+      throw streamStopResult.reason;
+    }
+    if (triggerCancelResult.value.outcome === "stale_run") {
+      await recoverStaleAgentRun(triggerCancelResult.value);
+      return false;
+    }
+    return true;
+  };
+
+  const stopActiveRunForSteer = async (): Promise<boolean> => {
+    // Persist the latest message and todo snapshot before canceling the Trigger
+    // run. The next run reads the persisted todo snapshot.
+    await stopActiveStream({ requireCancelSuccess: true });
+    const cancelResult = await cancelTriggerRun();
+    if (cancelResult.outcome === "stale_run") {
+      await recoverStaleAgentRun(cancelResult);
+      return false;
+    }
+    return true;
+  };
+
+  const hasActiveRunToReplace = () =>
+    status === "streaming" ||
+    status === "submitted" ||
+    Boolean(activeTriggerRunRef?.current);
+
+  const handleSubmit = async (e: React.FormEvent): Promise<boolean> => {
+    e.preventDefault();
+
+    // Read the prompt only when the user submits. Keeping the live composer
+    // value out of this hook prevents each keystroke from rerendering Chat.
+    const input = getInput();
+
+    // The visible composer normally blocks this path while offline. Check the
+    // browser snapshot again here so a connectivity race cannot clear a draft.
+    if (!getOnlineStatusSnapshot()) {
+      toast.info("You're offline", {
+        description: "Your draft is saved. Reconnect before sending.",
+      });
+      return false;
+    }
+
+    setIsAutoResuming(false);
+
+    // Reset manual stop flag when user submits a new message
+    hasManuallyStoppedRef.current = false;
+    resetAutoContinueCount?.();
+
+    // Prevent submission if files are still uploading
+    if (isUploadingFiles) {
+      return false;
+    }
+    const currentChatMode = chatModeRef.current;
+    const hasUnavailableLocalFiles = uploadedFiles.some(
+      (file) =>
+        file.storage === "local-desktop" &&
+        (file.unavailable || !file.localAttachmentId || !file.localPath),
+    );
+    if (hasUnavailableLocalFiles) {
+      toast.error("Local attachment is unavailable", {
+        description:
+          "Open this draft on the Desktop device where the file was created, or remove the attachment before sending.",
+      });
+      return false;
+    }
+    const hasUnavailablePastedText = uploadedFiles.some(
+      (file) => !isPastedTextAttachmentAvailableInMode(file, currentChatMode),
+    );
+    if (hasUnavailablePastedText) {
+      toast.error("Pasted text is unavailable in Ask", {
+        description:
+          "Switch to Agent mode, show it in the text field, or remove the attachment.",
+      });
+      return false;
+    }
+    // Allow submission if there's text input or uploaded files
+    const hasValidFiles = uploadedFiles.some(isSendableUploadedFile);
+    if (!input.trim() && !hasValidFiles) {
+      return false;
+    }
+
+    const maxFilesLimit = getMaxFilesLimitForMode(chatMode);
+    if (uploadedFiles.length > maxFilesLimit) {
+      toast.error("Cannot send files in this mode", {
+        description: `Maximum ${maxFilesLimit} files allowed. Please remove some files or switch modes.`,
+      });
+      return false;
+    }
+
+    const hasLocalDesktopFiles = uploadedFiles.some(
+      (file) => file.storage === "local-desktop",
+    );
+    if (
+      hasLocalDesktopFiles &&
+      (!isAgentMode(currentChatMode) ||
+        sandboxPreferenceRef.current !== "desktop")
+    ) {
+      toast.error("Local attachments require desktop Agent mode", {
+        description:
+          "Switch back to Agent mode with the desktop sandbox or reattach the file for upload.",
+      });
+      return false;
+    }
+
+    // While an Agent run is starting or streaming, honor the queue behavior.
+    if (status === "streaming" || status === "submitted") {
+      const validFiles = uploadedFiles
+        .filter(isSendableUploadedFile)
+        .map(createFileMessagePartFromUploadedFile)
+        .filter((part): part is NonNullable<typeof part> => part !== null);
+
+      if (queueBehavior === "queue") {
+        // Queue the message - will auto-send after current response completes
+        queueMessage(input, validFiles);
+        clearInput();
+        clearUploadedFiles();
+        return true;
+      } else if (queueBehavior === "stop-and-send") {
+        try {
+          if (!(await stopActiveRunForSteer())) return false;
+        } catch (error) {
+          console.error(
+            "Failed to stop the active run before steering:",
+            error,
+          );
+          toast.error("Could not steer the Agent run. Please try again.");
+          return false;
+        }
+        // Continue to send the new message immediately below (don't return)
+      }
+    }
+    // Check token limit before sending based on user plan
+    const maxTokens = getMaxTokensForSubscription(subscription, {
+      mode: currentChatMode,
+    });
+
+    // Additional validation for Ask mode: ensure files don't exceed Ask mode token limits
+    // This prevents uploading files in Agent mode then switching to Ask mode to send them
+    if (currentChatMode === "ask" && uploadedFiles.length > 0) {
+      const fileTokens = uploadedFiles.reduce(
+        (total, file) => total + (file.tokens || 0),
+        0,
+      );
+      const maxFileTokens = getMaxFileTokens(subscription);
+      if (fileTokens > maxFileTokens) {
+        toast.error("Cannot send files in Ask mode", {
+          description: `Files exceed Ask mode token limit (${fileTokens.toLocaleString()}/${maxFileTokens.toLocaleString()} tokens). Tip: Switch to Agent mode or remove large files.`,
+        });
+        return false;
+      }
+    }
+
+    const tokenLimitStatus = await getInputTokenLimitStatus(
+      input,
+      uploadedFiles,
+      maxTokens,
+    );
+    if (tokenLimitStatus.exceedsLimit) {
+      const hasFiles = uploadedFiles.length > 0;
+      const planText = subscription !== "free" ? "" : " (Free plan limit)";
+      toast.error("Message is too long", {
+        description: `Your message is too large (${tokenLimitStatus.tokenCount.toLocaleString()} tokens). Please make it shorter${hasFiles ? " or remove some files" : ""}${planText}.`,
+      });
+      return false;
+    }
+    if (!isExistingChat) {
+      window.history.replaceState({}, "", `/c/${chatId}`);
+    }
+
+    try {
+      // Get file objects from uploaded files - URLs are already resolved in global state
+      const validFiles = uploadedFiles
+        .filter(isSendableUploadedFile)
+        .map(createFileMessagePartFromUploadedFile)
+        .filter((part): part is NonNullable<typeof part> => part !== null);
+
+      runChatAction("send message", () =>
+        sendMessage(
+          {
+            text: input.trim() || undefined,
+            files: validFiles.length > 0 ? validFiles : undefined,
+            metadata: { createdAt: Date.now() },
+          },
+          {
+            body: {
+              mode: currentChatMode,
+              todos,
+              sandboxPreference,
+              agentPermissionMode: agentPermissionModeRef.current,
+
+              selectedModel: requestSelectedModel,
+            },
+          },
+        ),
+      );
+    } catch (error) {
+      console.error("Failed to process files:", error);
+      // Fallback to text-only message if file processing fails
+      runChatAction("send fallback message", () =>
+        sendMessage(
+          { text: input, metadata: { createdAt: Date.now() } },
+          {
+            body: {
+              mode: currentChatMode,
+              todos,
+              sandboxPreference,
+              agentPermissionMode: agentPermissionModeRef.current,
+
+              selectedModel: requestSelectedModel,
+            },
+          },
+        ),
+      );
+    }
+
+    clearInput();
+    clearUploadedFiles();
+    return true;
+  };
+
+  const handleStop = async () => {
+    setIsAutoResuming(false);
+
+    // Set manual stop flag to prevent auto-processing of queue
+    hasManuallyStoppedRef.current = true;
+
+    // Clear any active status indicators immediately
+    onStopCallback?.();
+
+    const [triggerCancelResult, streamStopResult] = await Promise.allSettled([
+      cancelTriggerRun(),
+      stopActiveStream(),
+    ]);
+
+    if (triggerCancelResult.status === "rejected") {
+      console.error(
+        "Failed to cancel trigger.dev run:",
+        triggerCancelResult.reason,
+      );
+      toast.error("Could not stop the Agent run. Please try again.");
+    }
+    if (streamStopResult.status === "rejected") {
+      console.error("Error in handleStop:", streamStopResult.reason);
+    }
+
+    if (
+      triggerCancelResult.status === "fulfilled" &&
+      triggerCancelResult.value.outcome === "stale_run"
+    ) {
+      await recoverStaleAgentRun(triggerCancelResult.value);
+      return false;
+    }
+
+    return triggerCancelResult.status === "fulfilled";
+  };
+
+  const handleRegenerate = async () => {
+    setIsAutoResuming(false);
+    resetAutoContinueCount?.();
+
+    // Stop any active stream first to prevent message order issues and wasted tokens
+    if (hasActiveRunToReplace()) {
+      if (!(await stopActiveRunForReplacement())) return;
+    }
+    const agentRunRequestId = uuidv4();
+
+    // Remove todos from all assistant messages in the auto-continue chain.
+    const chainAssistantIds = getAutoContinueChainAssistantIds(messages);
+    const cleanedTodos =
+      chainAssistantIds.length > 0
+        ? removeTodosBySourceMessages(todos, chainAssistantIds)
+        : todos;
+    if (cleanedTodos !== todos) setTodos(cleanedTodos);
+
+    // Trim client-side message state to the last real user message.
+    // Without this, the SDK's regenerate() only removes the last assistant,
+    // leaving old auto-continue chain messages visible in the UI.
+    const trimmedMessages = getMessagesUpToLastRealUser(messages);
+
+    const currentSidebarContent = sidebarContentRef.current;
+    if (sidebarOpenRef.current && currentSidebarContent) {
+      const nextSidebarContent = reconcileSidebarContentAfterRegeneration(
+        trimmedMessages,
+        currentSidebarContent,
+      );
+
+      if (!nextSidebarContent) {
+        closeSidebar();
+      } else if (nextSidebarContent !== currentSidebarContent) {
+        openSidebar(nextSidebarContent);
+      }
+    }
+
+    setMessages(trimmedMessages);
+
+    const shouldSendClientMessagesForRegenerate =
+      hasRestageableLocalDesktopAttachments(trimmedMessages);
+    const persistentRegenerateMessages = shouldSendClientMessagesForRegenerate
+      ? trimmedMessages
+      : [];
+
+    // Delete the trailing response chain and clear summaries that may include
+    // that deleted work, so regeneration starts from the original request.
+    if (chainAssistantIds.length > 0) {
+      await deleteLastAssistantMessage({
+        chatId,
+        resetSummary: true,
+        todos: cleanedTodos,
+      });
+    }
+    runChatAction("regenerate response", () =>
+      regenerate({
+        body: {
+          mode: chatModeRef.current,
+          messages: persistentRegenerateMessages,
+          todos: cleanedTodos,
+          regenerate: true,
+          agentRunRequestId,
+          useClientMessagesForRegenerate: shouldSendClientMessagesForRegenerate,
+          sandboxPreference,
+          agentPermissionMode: agentPermissionModeRef.current,
+          selectedModel: requestSelectedModelRef.current,
+        },
+      }),
+    );
+  };
+
+  const handleRetry = async (options: RetryOptions = {}) => {
+    setIsAutoResuming(false);
+    resetAutoContinueCount?.();
+
+    // Stop any active stream first to prevent message order issues and wasted tokens
+    if (hasActiveRunToReplace()) {
+      if (!(await stopActiveRunForReplacement())) return;
+    }
+    const agentRunRequestId = uuidv4();
+
+    const chainAssistantIds = getAutoContinueChainAssistantIds(messages);
+    const cleanedTodos = removeTodosBySourceMessages(
+      todos,
+      todos
+        .filter((t) => t.sourceMessageId)
+        .map((t) => t.sourceMessageId as string),
+    );
+    if (cleanedTodos !== todos) setTodos(cleanedTodos);
+
+    const messagesToLastUser = getMessagesUpToLastRealUser(messages);
+    setMessages(messagesToLastUser);
+
+    const shouldSendClientMessagesForRegenerate =
+      hasRestageableLocalDesktopAttachments(messagesToLastUser);
+    const persistentRegenerateMessages = shouldSendClientMessagesForRegenerate
+      ? messagesToLastUser
+      : [];
+
+    // Delete any persisted partial/error response before retrying. The backend
+    // otherwise fetches that stale trailing chain when client messages are not
+    // needed to restage local desktop attachments.
+    if (chainAssistantIds.length > 0) {
+      await deleteLastAssistantMessage({
+        chatId,
+        resetSummary: true,
+        todos: cleanedTodos,
+      });
+    }
+
+    runChatAction("retry response", () =>
+      regenerate({
+        body: {
+          mode: chatModeRef.current,
+          messages: persistentRegenerateMessages,
+          todos: cleanedTodos,
+          regenerate: true,
+          agentRunRequestId,
+          useClientMessagesForRegenerate: shouldSendClientMessagesForRegenerate,
+          sandboxPreference,
+          agentPermissionMode: agentPermissionModeRef.current,
+          selectedModel: requestSelectedModel,
+          ...(options.limitRescue && { limitRescue: options.limitRescue }),
+        },
+      }),
+    );
+  };
+
+  const handleEditMessage = async (
+    messageId: string,
+    newContent: string,
+    remainingFileIds?: string[],
+  ) => {
+    const lastUserMessageIndex = findLastUserMessageIndex(messages);
+    if (
+      lastUserMessageIndex === undefined ||
+      messages[lastUserMessageIndex]?.id !== messageId
+    ) {
+      toast.error("Only the latest user message can be edited.");
+      return;
+    }
+
+    setIsAutoResuming(false);
+    resetAutoContinueCount?.();
+
+    // Stop any active stream first to prevent message order issues and wasted tokens
+    if (hasActiveRunToReplace()) {
+      if (!(await stopActiveRunForReplacement())) return;
+    }
+    const agentRunRequestId = uuidv4();
+
+    // Compute the todo snapshot before the edit mutation. Stopping a run
+    // persists its latest todos, so the same mutation that removes the old
+    // response must also replace that snapshot to avoid a reactive chat update
+    // restoring todos from the discarded response.
+    const editedMessageIndex = messages.findIndex((m) => m.id === messageId);
+    const discardedMessageIds =
+      editedMessageIndex === -1
+        ? []
+        : messages.slice(editedMessageIndex + 1).map((message) => message.id);
+    const cleanedTodosForEdit = removeTodosBySourceMessages(
+      todos,
+      discardedMessageIds,
+    );
+
+    try {
+      await regenerateWithNewContent({
+        messageId: messageId as Id<"messages">,
+        newContent,
+        fileIds: remainingFileIds,
+        todos: cleanedTodosForEdit,
+      });
+    } catch (error) {
+      if (getConvexErrorCode(error) === "MESSAGE_NOT_EDITABLE") {
+        toast.error("Only the latest user message can be edited.");
+        return;
+      }
+
+      throw error;
+    }
+
+    setTodos(cleanedTodosForEdit);
+
+    // Build updated parts: text + remaining file parts
+    const buildUpdatedParts = (currentParts: any[]) => {
+      const newParts: any[] = [];
+
+      // Add text part if there's content
+      if (newContent.trim()) {
+        newParts.push({ type: "text", text: newContent });
+      }
+
+      // Keep file parts that are in remainingFileIds
+      if (remainingFileIds && remainingFileIds.length > 0) {
+        const remainingFileParts = currentParts.filter(
+          (part) =>
+            part.type === "file" &&
+            part.fileId &&
+            remainingFileIds.includes(part.fileId),
+        );
+        newParts.push(...remainingFileParts);
+      }
+
+      return newParts;
+    };
+
+    // Update local state to reflect the edit and remove subsequent messages
+    setMessages((prevMessages) => {
+      const editedMessageIndex = prevMessages.findIndex(
+        (msg) => msg.id === messageId,
+      );
+
+      if (editedMessageIndex === -1) return prevMessages;
+
+      const updatedMessages = prevMessages.slice(0, editedMessageIndex + 1);
+      const currentMessage = updatedMessages[editedMessageIndex];
+      updatedMessages[editedMessageIndex] = {
+        ...currentMessage,
+        parts: buildUpdatedParts(currentMessage.parts),
+      };
+
+      return updatedMessages;
+    });
+
+    runChatAction("regenerate edited message", () =>
+      regenerate({
+        body: {
+          mode: chatModeRef.current,
+          messages: [],
+          todos: cleanedTodosForEdit,
+          regenerate: true,
+          agentRunRequestId,
+          sandboxPreference,
+          agentPermissionMode: agentPermissionModeRef.current,
+          selectedModel: requestSelectedModel,
+        },
+      }),
+    );
+  };
+
+  const handleContinue = (selectedModelOverride?: SelectedModel) => {
+    if (status === "streaming" || status === "submitted") return;
+    hasManuallyStoppedRef.current = false;
+    resetAutoContinueCount?.();
+    const continuationSelectedModel =
+      selectedModelOverride ?? requestSelectedModelRef.current;
+    runChatAction("continue response", () =>
+      sendMessage(
+        {
+          text: AUTO_CONTINUE_PROMPT,
+          metadata: { isAutoContinue: true },
+        },
+        {
+          body: {
+            mode: chatModeRef.current,
+            isAutoContinue: true,
+            todos,
+            sandboxPreference,
+            agentPermissionMode: agentPermissionModeRef.current,
+            selectedModel: continuationSelectedModel,
+          },
+        },
+      ),
+    );
+  };
+
+  const handleSendNow = async (messageId: string) => {
+    const message = messageQueue.find((m) => m.id === messageId);
+    if (!message) return;
+    resetAutoContinueCount?.();
+
+    // Set flag to prevent auto-processing from interfering
+    isSendingNowRef.current = true;
+
+    // Reset manual stop flag when using Send Now
+    hasManuallyStoppedRef.current = false;
+
+    try {
+      setIsAutoResuming(false);
+      if (hasActiveRunToReplace()) {
+        if (!(await stopActiveRunForSteer())) return;
+      }
+
+      // Keep the queued message available if stopping fails.
+      removeQueuedMessage(messageId);
+
+      // Send the queued message immediately
+      const validFiles = message.files || [];
+      const messagePayload: any = {};
+
+      // Only add text if it exists
+      if (message.text) {
+        messagePayload.text = message.text;
+      }
+
+      // Only add files if they exist
+      if (validFiles.length > 0) {
+        messagePayload.files = validFiles;
+      }
+
+      messagePayload.metadata = { createdAt: message.timestamp };
+
+      runChatAction("send queued message", () =>
+        sendMessage(messagePayload, {
+          body: {
+            mode: chatModeRef.current,
+            todos,
+            sandboxPreference,
+            agentPermissionMode: agentPermissionModeRef.current,
+
+            selectedModel: requestSelectedModel,
+          },
+        }),
+      );
+    } catch (error) {
+      console.error("Failed to send queued message:", error);
+      toast.error("Could not steer the Agent run. Please try again.");
+    } finally {
+      // Clear flag after a brief delay to allow status to change
+      setTimeout(() => {
+        isSendingNowRef.current = false;
+      }, 200);
+    }
+  };
+
+  return {
+    handleSubmit,
+    handleStop,
+    handleRegenerate,
+    handleRetry,
+    handleEditMessage,
+    handleSendNow,
+    handleContinue,
+  };
+};

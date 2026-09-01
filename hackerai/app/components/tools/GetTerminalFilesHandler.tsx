@@ -1,0 +1,172 @@
+import React, { memo, useMemo } from "react";
+import ToolBlock from "@/components/ui/tool-block";
+import { FileDown } from "lucide-react";
+import { useToolSidebar } from "@/app/hooks/useToolSidebar";
+import {
+  isSidebarSharedFiles,
+  type ChatStatus,
+  type SidebarSharedFiles,
+} from "@/types/chat";
+import type { FileDetails } from "@/types/file";
+import { isUserStoppedToolError } from "@/lib/chat/tool-abort-utils";
+
+interface TerminalFilesPart {
+  toolCallId: string;
+  state:
+    | "input-streaming"
+    | "input-available"
+    | "output-available"
+    | "output-error";
+  input?: { files: string[]; brief?: string };
+  errorText?: string;
+  output?: {
+    result: string;
+    files?: Array<{ path: string }>;
+    failedFiles?: Array<{ path: string; reason?: string }>;
+    // Legacy support for old messages
+    fileUrls?: Array<{ path: string; downloadUrl?: string }>;
+  };
+}
+
+export interface GetTerminalFilesHandlerProps {
+  part: TerminalFilesPart;
+  status: ChatStatus;
+  sharedFileDetails?: FileDetails[];
+}
+
+export const GetTerminalFilesHandler = memo(function GetTerminalFilesHandler({
+  part,
+  status,
+  sharedFileDetails,
+}: GetTerminalFilesHandlerProps) {
+  const { toolCallId, state, input, output } = part;
+  const isStoppedByUser = isUserStoppedToolError(part.errorText);
+
+  // Memoize requestedPaths to prevent unstable references from triggering
+  // infinite re-render loops via useToolSidebar's updateSidebarContent effect.
+  const requestedPaths = useMemo(() => input?.files || [], [input?.files]);
+
+  const getFileNames = (paths: string[]) => {
+    return paths.map((path) => path.split("/").pop() || path).join(", ");
+  };
+
+  const isExecuting =
+    state === "input-streaming" ||
+    (state === "input-available" && status === "streaming");
+
+  // Build sidebar content from streamed file details
+  const sidebarContent = useMemo((): SidebarSharedFiles | null => {
+    if (state === "input-streaming" && status !== "streaming") return null;
+
+    const files: SidebarSharedFiles["files"] = (sharedFileDetails || []).map(
+      (f) => ({
+        name: f.name,
+        mediaType: f.mediaType,
+        fileId: f.fileId as string,
+        s3Key: f.s3Key,
+        sizeBytes: f.sizeBytes,
+      }),
+    );
+
+    return {
+      files,
+      requestedPaths,
+      isExecuting,
+      toolCallId,
+    };
+  }, [
+    sharedFileDetails,
+    requestedPaths,
+    isExecuting,
+    toolCallId,
+    state,
+    status,
+  ]);
+
+  const { handleOpenInSidebar, handleKeyDown } = useToolSidebar({
+    toolCallId,
+    content: sidebarContent,
+    typeGuard: isSidebarSharedFiles,
+  });
+
+  const isClickable = !!sidebarContent && sidebarContent.files.length > 0;
+
+  // Mirror the shell/file pattern: when the model supplies a `brief` and the
+  // call didn't error, the brief stands alone as the block label.
+  const briefText = input?.brief?.trim() || "";
+  const failedFileCount = output?.failedFiles?.length || 0;
+  const useBriefOnly =
+    !!briefText && state !== "output-error" && failedFileCount === 0;
+  const briefLabel = (fallback: string) =>
+    useBriefOnly ? briefText : fallback;
+  const briefTarget = (fallback: string | undefined) =>
+    useBriefOnly ? undefined : fallback;
+
+  switch (state) {
+    case "input-streaming":
+      return status === "streaming" ? (
+        <ToolBlock
+          key={toolCallId}
+          icon={<FileDown />}
+          action={briefLabel("Preparing")}
+          isShimmer={true}
+        />
+      ) : null;
+
+    case "input-available":
+      return (
+        <ToolBlock
+          key={toolCallId}
+          icon={<FileDown />}
+          action={briefLabel(status === "streaming" ? "Sharing" : "Shared")}
+          target={briefTarget(getFileNames(requestedPaths))}
+          isShimmer={status === "streaming"}
+          isClickable={isClickable}
+          onClick={handleOpenInSidebar}
+          onKeyDown={handleKeyDown}
+        />
+      );
+
+    case "output-available": {
+      const successfulPaths = [
+        ...(output?.files?.map((file) => file.path) || []),
+        ...(output?.fileUrls?.map((file) => file.path) || []),
+      ];
+      const fileCount = successfulPaths.length;
+      const totalFileCount = fileCount + failedFileCount;
+      const displayPaths = fileCount > 0 ? successfulPaths : requestedPaths;
+      const fileNames = getFileNames(displayPaths);
+      const fallbackAction =
+        failedFileCount > 0
+          ? fileCount > 0
+            ? `Shared ${fileCount} of ${totalFileCount} files`
+            : "Failed to share"
+          : `Shared ${fileCount} file${fileCount !== 1 ? "s" : ""}`;
+
+      return (
+        <ToolBlock
+          key={toolCallId}
+          icon={<FileDown />}
+          action={briefLabel(fallbackAction)}
+          target={briefTarget(fileNames)}
+          isClickable={isClickable}
+          onClick={handleOpenInSidebar}
+          onKeyDown={handleKeyDown}
+        />
+      );
+    }
+
+    case "output-error":
+      return (
+        <ToolBlock
+          key={toolCallId}
+          icon={<FileDown />}
+          action={isStoppedByUser ? "Stopped sharing" : "Failed to share"}
+          target={getFileNames(requestedPaths)}
+        />
+      );
+
+    default:
+      return null;
+  }
+});

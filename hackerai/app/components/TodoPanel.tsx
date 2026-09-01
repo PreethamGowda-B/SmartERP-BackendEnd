@@ -1,0 +1,143 @@
+"use client";
+
+import { useEffect } from "react";
+import { ChevronDown, ChevronUp } from "lucide-react";
+import type { ChatStatus } from "@/types";
+import { useGlobalState } from "@/app/contexts/GlobalState";
+import {
+  SharedTodoItem,
+  getStatusIcon,
+} from "@/components/ui/shared-todo-item";
+import { getTodoPanelViewState } from "@/lib/utils/todo-utils";
+
+interface TodoPanelProps {
+  status?: ChatStatus;
+  placement?: "chat" | "sidebar";
+}
+
+export const TodoPanel = ({ status, placement = "chat" }: TodoPanelProps) => {
+  const {
+    todos,
+    isTodoPanelExpanded: isExpanded,
+    setIsTodoPanelExpanded,
+    sidebarOpen,
+  } = useGlobalState();
+
+  const viewState = getTodoPanelViewState(todos, status);
+  const {
+    todos: uniqueTodos,
+    stats,
+    hasTodos,
+    hasActiveTodos,
+    currentTodoIndex,
+    currentTodo,
+    isPaused,
+    currentTodoDisplayStatus,
+  } = viewState;
+
+  // If panel is not visible, ensure global state is reset
+  useEffect(() => {
+    if (!hasTodos || !hasActiveTodos) {
+      setIsTodoPanelExpanded(false);
+    }
+  }, [hasTodos, hasActiveTodos, setIsTodoPanelExpanded]);
+
+  if (!hasTodos) {
+    return null;
+  }
+
+  if (!hasActiveTodos) {
+    return null;
+  }
+
+  if (placement === "chat" && sidebarOpen) {
+    return null;
+  }
+
+  if (placement === "sidebar" && !sidebarOpen) {
+    return null;
+  }
+
+  const handleToggleExpand = () => {
+    setIsTodoPanelExpanded(!isExpanded);
+  };
+
+  const headerText = isExpanded
+    ? "Task progress"
+    : currentTodo
+      ? currentTodo.content
+      : stats.done === 0
+        ? `${stats.total} To-dos`
+        : `${stats.done} of ${stats.total} To-dos`;
+
+  const headerCounter = currentTodo
+    ? `${currentTodoIndex + 1} / ${stats.total}`
+    : null;
+
+  const panelClassName =
+    placement === "sidebar"
+      ? "rounded-[16px] shadow-[0px_4px_32px_0px_rgba(0,0,0,0.04)] border border-black/8 dark:border-border bg-input-chat overflow-hidden"
+      : "mx-4 rounded-[22px_22px_0px_0px] shadow-[0px_12px_32px_0px_rgba(0,0,0,0.02)] border border-black/8 dark:border-border border-b-0 bg-input-chat";
+
+  const listMaxHeightClass =
+    placement === "sidebar"
+      ? "max-h-[min(calc(100vh-360px),400px)]"
+      : "max-h-[200px]";
+
+  const panel = (
+    <div className={panelClassName}>
+      {/* Header */}
+      <button
+        onClick={handleToggleExpand}
+        className="flex items-center w-full gap-2 pl-3 pr-4 py-2 hover:opacity-80 transition-opacity cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+        aria-label={isExpanded ? "Collapse todos" : "Expand todos"}
+      >
+        {!isExpanded && currentTodo && currentTodoDisplayStatus ? (
+          <span className="flex-shrink-0">
+            {getStatusIcon(currentTodoDisplayStatus)}
+          </span>
+        ) : null}
+        <h3
+          className="text-muted-foreground text-sm font-medium truncate text-left flex-1 min-w-0"
+          title={headerText}
+        >
+          {headerText}
+        </h3>
+        {headerCounter && (
+          <span className="text-xs text-muted-foreground flex-shrink-0">
+            {headerCounter}
+          </span>
+        )}
+        {isExpanded ? (
+          <ChevronDown className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+        ) : (
+          <ChevronUp className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+        )}
+      </button>
+
+      {/* Todo List - Collapsible */}
+      {isExpanded && (
+        <div
+          className={`border-t border-border px-4 py-3 space-y-2 overflow-y-auto ${listMaxHeightClass}`}
+        >
+          {uniqueTodos.map((todo) => (
+            <SharedTodoItem key={todo.id} todo={todo} isPaused={isPaused} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+
+  // In the computer sidebar, anchor the panel to the bottom of a fixed-height
+  // placeholder so the expanded list overlays the timeline above it instead of
+  // pushing the timeline up.
+  if (placement === "sidebar") {
+    return (
+      <div className="relative z-50 mt-3 min-h-[40px]">
+        <div className="absolute bottom-0 left-0 right-0">{panel}</div>
+      </div>
+    );
+  }
+
+  return panel;
+};

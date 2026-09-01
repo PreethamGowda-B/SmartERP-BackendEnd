@@ -427,17 +427,22 @@ router.post("/exchange-code", async (req, res) => {
 
 
 
+// Helper: Compute keyed HMAC-SHA256 for OTPs and Reset Tokens
+function computeHmacToken(data, secretSalt = process.env.JWT_SECRET || 'smarterp_default_sec_salt') {
+  return crypto.createHmac("sha256", secretSalt).update(String(data)).digest("hex");
+}
+
 // ---------------------------------------------
-// ✅ Send OTP for email verification / password reset / security actions
+// ✅ Send OTP for general email verification
 // ---------------------------------------------
 router.post("/send-otp", async (req, res) => {
   const { email, type, purpose } = req.body;
   if (!email) return res.status(400).json({ message: "Email is required" });
 
   const normalizedEmail = String(email).toLowerCase().trim();
-  const actionType = String(type || purpose || "").toLowerCase().trim();
+  const actionType = String(type || purpose || "general").toLowerCase().trim();
 
-  // 🛡️ OTP Rate Limiting (5 requests per 10 minutes)
+  // 🛡️ Rate Limiting (5 requests per 10 minutes)
   const otpLimitKey = `otp_attempts:${normalizedEmail}`;
   if (redisClient && redisClient.status === 'ready') {
     try {
@@ -445,9 +450,8 @@ router.post("/send-otp", async (req, res) => {
       if (attempts && parseInt(attempts, 10) >= 5) {
         const ttl = await redisClient.ttl(otpLimitKey);
         const minutesLeft = Math.ceil(ttl / 60);
-        console.warn(`🛡️  OTP Blocked for ${normalizedEmail}. Too many requests.`);
         return res.status(429).json({
-          message: `You have reached the OTP request limit. Please try again after ${minutesLeft} minutes.`,
+          message: `You have reached the request limit. Please try again after ${minutesLeft} minutes.`,
           retryAfter: ttl
         });
       }
@@ -462,54 +466,31 @@ router.post("/send-otp", async (req, res) => {
   }
 
   try {
-    // Increment OTP attempts in Redis
     if (redisClient && redisClient.status === 'ready') {
       try {
         const multi = redisClient.multi();
         multi.incr(otpLimitKey);
-        multi.expire(otpLimitKey, 600); // 10 minutes TTL
+        multi.expire(otpLimitKey, 600);
         await multi.exec();
-      } catch (err) {
-        console.warn("⚠️ Redis incr failed:", err.message);
-      }
+      } catch (err) {}
     }
 
-    // Generate 6-digit OTP
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const otp = crypto.randomInt(100000, 999999).toString();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
 
-    // Old OTP cleanup and storage
-    await pool.query("DELETE FROM email_otps WHERE LOWER(email) = $1", [normalizedEmail]);
+    await pool.query("DELETE FROM email_otps WHERE LOWER(email) = $1 AND account_type = 'staff'", [normalizedEmail]);
 
-    // Hash OTP before storage — plaintext OTPs in DB are a breach risk
-    const otpHash = crypto.createHash("sha256").update(otp + normalizedEmail).digest("hex");
+    const otpHash = computeHmacToken(otp + normalizedEmail);
     await pool.query(
-      "INSERT INTO email_otps (email, otp_code, expires_at) VALUES ($1, $2, $3)",
+      "INSERT INTO email_otps (email, otp_code, account_type, expires_at) VALUES ($1, $2, 'staff', $3)",
       [normalizedEmail, otpHash, expiresAt]
     );
 
-    // Determine custom email copy based on request type
-    let emailSubject = `SmartERP Verification Code: ${otp}`;
-    let emailTitle = "Email Verification";
-    let emailDescription = "Use the verification code below to verify your email address and access your SmartERP workspace.";
-
-    if (actionType.includes("password") || actionType.includes("reset")) {
-      emailSubject = `SmartERP Password Reset Code: ${otp}`;
-      emailTitle = "Password Reset Request";
-      emailDescription = "We received a request to reset your password. Use the verification code below to set a new password for your SmartERP account.";
-    } else if (actionType.includes("delete") || actionType.includes("security")) {
-      emailSubject = `SmartERP Security Action Code: ${otp}`;
-      emailTitle = "Security Action Authorization";
-      emailDescription = "Use the verification code below to authorize this critical account action.";
-    }
-
-    // Send email via Resend with a 10s timeout safety
     const resend = new Resend(process.env.RESEND_API_KEY);
-
-    const sendPromise = resend.emails.send({
-      from: "SmartERP <noreply@prozync.in>",
+    await resend.emails.send({
+      from: process.env.RESEND_FROM_EMAIL || "SmartERP <noreply@prozync.in>",
       to: normalizedEmail,
-      subject: emailSubject,
+      subject: `SmartERP Verification Code: ${otp}`,
       html: `
         <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 32px; background: #f8fafc; border-radius: 12px; border: 1px solid #e2e8f0;">
           <div style="text-align: center; margin-bottom: 24px;">
@@ -517,27 +498,17 @@ router.post("/send-otp", async (req, res) => {
               <span style="color: white; font-size: 20px; font-weight: 800; letter-spacing: 0.5px;">SmartERP</span>
             </div>
           </div>
-          <h2 style="color: #0f172a; text-align: center; margin-bottom: 8px; font-size: 22px; font-weight: 700;">${emailTitle}</h2>
-          <p style="color: #475569; text-align: center; margin-bottom: 28px; font-size: 14px; line-height: 1.5;">${emailDescription}</p>
+          <h2 style="color: #0f172a; text-align: center; margin-bottom: 8px; font-size: 22px; font-weight: 700;">Email Verification</h2>
+          <p style="color: #475569; text-align: center; margin-bottom: 28px; font-size: 14px; line-height: 1.5;">Use the verification code below to verify your email address.</p>
           <div style="background: #ffffff; border: 2px solid #cbd5e1; border-radius: 12px; padding: 20px; text-align: center; margin-bottom: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.05);">
             <div style="font-size: 38px; font-weight: 800; letter-spacing: 8px; color: #4F46E5; font-family: 'Courier New', Courier, monospace;">${otp}</div>
           </div>
           <p style="color: #64748b; text-align: center; font-size: 13px; margin-bottom: 8px;">This code expires in <strong>10 minutes</strong>. Do not share it with anyone.</p>
-          <p style="color: #94a3b8; text-align: center; font-size: 12px; margin-top: 20px; border-top: 1px solid #e2e8f0; pt-3;">If you didn't request this action, you can safely ignore this email.</p>
+          <p style="color: #94a3b8; text-align: center; font-size: 12px; margin-top: 20px; border-top: 1px solid #e2e8f0; pt-3;">If you didn't request this code, you can safely ignore this email.</p>
         </div>
       `,
     });
 
-    const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Email service timeout')), 12000));
-
-    const sendResult = await Promise.race([sendPromise, timeoutPromise]);
-
-    if (sendResult.error) {
-      console.error("Resend error:", sendResult.error);
-      return res.status(500).json({ message: "Failed to send OTP: " + sendResult.error.message });
-    }
-
-    console.log(`✅ OTP (${actionType || "general"}) sent to ${normalizedEmail}`, sendResult.data?.id);
     res.json({ ok: true, message: "Verification code sent to your email." });
   } catch (err) {
     console.error("Send OTP error:", err.message);
@@ -545,163 +516,337 @@ router.post("/send-otp", async (req, res) => {
   }
 });
 
-
 // ---------------------------------------------
-// ✅ Verify OTP (rate-limited + hash-compared)
+// 🔐 Forgot Password (Anti-Enumeration + Staff Scoped)
 // ---------------------------------------------
-const rateLimit = require("express-rate-limit");
-const { ipKeyGenerator } = require("express-rate-limit");
-const otpVerifyLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 5,
-  keyGenerator: (req) => {
-    const email = req.body?.email;
-    if (email) return email.toLowerCase();
-    return ipKeyGenerator(req);
-  },
-  message: { message: "Too many OTP attempts. Please request a new code." },
-  standardHeaders: true,
-  legacyHeaders: false,
-});
+router.post("/forgot-password", async (req, res) => {
+  const { email } = req.body;
+  const normalizedEmail = String(email || "").toLowerCase().trim();
 
-router.post("/verify-otp", otpVerifyLimiter, async (req, res) => {
-  const { email, otp } = req.body;
-  if (!email || !otp) return res.status(400).json({ message: "Email and OTP are required" });
+  // Generic anti-enumeration response message
+  const GENERIC_RESPONSE = "If an account exists for this email, we've sent verification instructions.";
 
-  // Per-email Redis attempt counter (belt-and-suspenders alongside the IP limiter)
+  if (!normalizedEmail || !normalizedEmail.includes("@")) {
+    return res.status(200).json({ ok: true, message: GENERIC_RESPONSE });
+  }
+
+  // Rate Limiting per email/IP (5 requests per 15 minutes)
+  const rateLimitKey = `forgot_pw_limit:${normalizedEmail}`;
   if (redisClient && redisClient.status === "ready") {
     try {
-      const attemptKey = `otp_verify_attempts:${email.toLowerCase()}`;
-      const attempts = await redisClient.incr(attemptKey);
-      if (attempts === 1) await redisClient.expire(attemptKey, 900); // 15 min TTL
-      if (attempts > 5) {
-        return res.status(429).json({ message: "Too many OTP attempts. Please request a new code." });
+      const count = await redisClient.incr(rateLimitKey);
+      if (count === 1) await redisClient.expire(rateLimitKey, 900);
+      if (count > 5) {
+        const { emitSecurityEvent, SECURITY_EVENT_TYPES } = require("../utils/securityEmitter");
+        emitSecurityEvent({
+          eventType: SECURITY_EVENT_TYPES.AUTH_RATE_LIMITED || 'AUTH_RATE_LIMITED',
+          severity: 'medium',
+          ipAddress: req.ip || req.headers['x-forwarded-for'],
+          userAgent: req.headers['user-agent'],
+          endpoint: '/api/auth/forgot-password',
+          httpMethod: 'POST',
+          statusCode: 429,
+          metadata: { email: normalizedEmail, reason: 'excessive_forgot_password_requests' }
+        });
+        return res.status(429).json({ message: "Too many password reset requests. Please try again later." });
       }
-    } catch (redisErr) {
-      console.warn("⚠️ OTP attempt counter Redis error:", redisErr.message);
+    } catch (rErr) {
+      console.warn("⚠️ Forgot password rate limit error:", rErr.message);
     }
   }
 
   try {
-    // Compute hash of submitted OTP (same algorithm used during storage)
-    const submittedHash = crypto.createHash("sha256").update(otp.toString().trim() + email.toLowerCase()).digest("hex");
-
-    const result = await pool.query(
-      "SELECT * FROM email_otps WHERE email = $1 AND otp_code = $2 AND used = FALSE AND expires_at > NOW() ORDER BY created_at DESC LIMIT 1",
-      [email.toLowerCase(), submittedHash]
+    // Check if staff user exists
+    const userRes = await pool.query(
+      "SELECT id, name, email, role, is_active FROM users WHERE LOWER(email) = $1 AND role IN ('owner', 'employee', 'hr', 'super_admin')",
+      [normalizedEmail]
     );
 
-    if (result.rows.length === 0) {
+    if (userRes.rows.length > 0 && userRes.rows[0].is_active !== false) {
+      const user = userRes.rows[0];
+      const otp = crypto.randomInt(100000, 999999).toString();
+      const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 min
+
+      await pool.query("DELETE FROM email_otps WHERE LOWER(email) = $1 AND account_type = 'staff'", [normalizedEmail]);
+
+      const otpHash = computeHmacToken(otp + normalizedEmail);
+      await pool.query(
+        "INSERT INTO email_otps (email, otp_code, account_type, expires_at) VALUES ($1, $2, 'staff', $3)",
+        [normalizedEmail, otpHash, expiresAt]
+      );
+
+      if (process.env.RESEND_API_KEY) {
+        const resend = new Resend(process.env.RESEND_API_KEY);
+        await resend.emails.send({
+          from: process.env.RESEND_FROM_EMAIL || "SmartERP <noreply@prozync.in>",
+          to: normalizedEmail,
+          subject: `SmartERP Password Reset Code: ${otp}`,
+          html: `
+            <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 32px; background: #f8fafc; border-radius: 12px; border: 1px solid #e2e8f0;">
+              <div style="text-align: center; margin-bottom: 24px;">
+                <div style="background: #4F46E5; display: inline-block; padding: 10px 22px; border-radius: 8px;">
+                  <span style="color: white; font-size: 20px; font-weight: 800; letter-spacing: 0.5px;">SmartERP</span>
+                </div>
+              </div>
+              <h2 style="color: #0f172a; text-align: center; margin-bottom: 8px; font-size: 22px; font-weight: 700;">Password Reset Request</h2>
+              <p style="color: #475569; text-align: center; margin-bottom: 28px; font-size: 14px; line-height: 1.5;">We received a request to reset your password. Use the verification code below to set a new password for your SmartERP workspace account.</p>
+              <div style="background: #ffffff; border: 2px solid #cbd5e1; border-radius: 12px; padding: 20px; text-align: center; margin-bottom: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.05);">
+                <div style="font-size: 38px; font-weight: 800; letter-spacing: 8px; color: #4F46E5; font-family: 'Courier New', Courier, monospace;">${otp}</div>
+              </div>
+              <p style="color: #64748b; text-align: center; font-size: 13px; margin-bottom: 8px;">This code expires in <strong>10 minutes</strong>. Single-use only.</p>
+              <p style="color: #ef4444; text-align: center; font-size: 12px; margin-top: 12px; font-weight: 600;">Security Warning: Never share this code with anyone. SmartERP staff will never ask for your code.</p>
+              <p style="color: #94a3b8; text-align: center; font-size: 12px; margin-top: 20px; border-top: 1px solid #e2e8f0; padding-top: 16px;">If you didn't request a password reset, you can safely ignore this email — your account remains secure.</p>
+            </div>
+          `,
+        }).catch(err => console.error("Resend reset email failed:", err.message));
+      }
+
       const { emitSecurityEvent, SECURITY_EVENT_TYPES } = require("../utils/securityEmitter");
       emitSecurityEvent({
-        eventType: SECURITY_EVENT_TYPES.AUTH_FAILED,
+        eventType: SECURITY_EVENT_TYPES.AUTH_PASSWORD_RESET_REQUESTED || 'AUTH_PASSWORD_RESET_REQUESTED',
         severity: 'low',
         ipAddress: req.ip || req.headers['x-forwarded-for'],
         userAgent: req.headers['user-agent'],
-        endpoint: '/api/auth/verify-otp',
+        endpoint: '/api/auth/forgot-password',
         httpMethod: 'POST',
-        statusCode: 400,
-        metadata: {
-          reason: 'invalid_or_expired_otp',
-          email: email.toLowerCase(),
-        }
+        statusCode: 200,
+        metadata: { email: normalizedEmail }
       });
-      return res.status(400).json({ message: "Invalid or expired OTP. Please request a new one." });
     }
 
-    // Mark OTP as used — single-use enforcement
-    await pool.query("UPDATE email_otps SET used = TRUE WHERE id = $1", [result.rows[0].id]);
-
-    // Clear the attempt counter on success
-    if (redisClient && redisClient.status === "ready") {
-      await redisClient.del(`otp_verify_attempts:${email.toLowerCase()}`).catch(() => {});
-    }
-
-    res.json({ ok: true, verified: true, message: "Email verified successfully" });
+    return res.status(200).json({ ok: true, message: GENERIC_RESPONSE });
   } catch (err) {
-    console.error("Verify OTP error:", err.message);
-    res.status(500).json({ message: "Verification failed. Please try again." });
+    console.error("Forgot password error:", err.message);
+    return res.status(200).json({ ok: true, message: GENERIC_RESPONSE });
   }
 });
 
 // ---------------------------------------------
-// ✅ Reset Password via Email OTP (For all users including Google OAuth accounts)
+// 🔐 Verify Reset OTP & Issue Single-Use Reset Token
 // ---------------------------------------------
-router.post("/reset-password", [
-  body("email").isEmail().withMessage("Valid email is required").normalizeEmail(),
-  body("otp").trim().notEmpty().withMessage("OTP is required"),
-  body("new_password")
-    .isLength({ min: 6 }).withMessage("Password must be at least 6 characters long"),
-], async (req, res) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) {
-    return res.status(400).json({ message: errors.array()[0].msg, errors: errors.array() });
+router.post("/verify-reset-otp", async (req, res) => {
+  const { email, otp } = req.body;
+  const normalizedEmail = String(email || "").toLowerCase().trim();
+  const plainOtp = String(otp || "").trim();
+
+  if (!normalizedEmail || !plainOtp) {
+    return res.status(400).json({ message: "Email and verification code are required." });
   }
 
-  const { email, otp, new_password } = req.body;
-  const normalizedEmail = String(email || "").toLowerCase().trim();
+  // Rate Limiting per email (max 5 verification attempts)
+  const attemptKey = `pw_reset_otp_attempts:${normalizedEmail}`;
+  if (redisClient && redisClient.status === "ready") {
+    try {
+      const attempts = await redisClient.incr(attemptKey);
+      if (attempts === 1) await redisClient.expire(attemptKey, 900);
+      if (attempts > 5) {
+        return res.status(429).json({ message: "Too many verification attempts. Please request a new code." });
+      }
+    } catch (rErr) {}
+  }
 
   try {
-    // 1. Verify OTP Hash (supporting salted SHA-256 and fallback direct hash)
-    const hashWithEmail = crypto.createHash("sha256").update(otp.toString().trim() + normalizedEmail).digest("hex");
-    const plainOtp = otp.toString().trim();
+    const submittedHmac = computeHmacToken(plainOtp + normalizedEmail);
+    const fallbackSha = crypto.createHash("sha256").update(plainOtp + normalizedEmail).digest("hex");
 
-    const otpResult = await pool.query(
-      `SELECT * FROM email_otps 
+    const otpRes = await pool.query(
+      `SELECT id, otp_code, attempts, expires_at 
+       FROM email_otps 
        WHERE LOWER(email) = $1 
-         AND (otp_code = $2 OR otp_code = $3) 
+         AND account_type = 'staff' 
          AND used = FALSE 
          AND expires_at > NOW() 
        ORDER BY created_at DESC LIMIT 1`,
-      [normalizedEmail, hashWithEmail, plainOtp]
+      [normalizedEmail]
     );
 
-    if (otpResult.rows.length === 0) {
-      return res.status(400).json({ message: "Invalid or expired OTP. Please request a new code." });
+    if (otpRes.rows.length === 0) {
+      return res.status(400).json({ message: "Invalid or expired verification code. Please request a new code." });
     }
 
-    // 2. Fetch User
-    const userResult = await pool.query("SELECT id, name, email, role, company_id FROM users WHERE LOWER(email) = $1", [normalizedEmail]);
-    if (userResult.rows.length === 0) {
-      return res.status(404).json({ message: "Account not found for this email address." });
-    }
-    const user = userResult.rows[0];
+    const record = otpRes.rows[0];
+    const currentAttempts = (record.attempts || 0) + 1;
 
-    // 3. Hash New Password
-    const newHash = await bcrypt.hash(new_password, 10);
-
-    // 4. Update Password Hash in Database
-    await pool.query(
-      "UPDATE users SET password_hash = $1 WHERE id = $2",
-      [newHash, user.id]
-    );
-
-    // 5. Invalidate OTP (single-use enforcement)
-    await pool.query("UPDATE email_otps SET used = TRUE WHERE id = $1", [otpResult.rows[0].id]).catch(() => {});
-
-    // 6. Clear Redis attempt counter if active
-    if (redisClient && redisClient.status === "ready") {
-      await redisClient.del(`otp_attempts:${normalizedEmail}`).catch(() => {});
-      await redisClient.del(`otp_verify_attempts:${normalizedEmail}`).catch(() => {});
-    }
-
-    // 7. Track password changes in backend audit logs
+    // Check if code matches either keyed HMAC or legacy hash using constant-time comparison
+    let isMatch = false;
     try {
-      await logActivity(user.id, "password_reset", req);
-    } catch (actErr) {
-      console.warn("⚠️ logActivity warning in reset-password:", actErr.message);
+      const expectedBuffer = Buffer.from(record.otp_code);
+      const hmacBuffer = Buffer.from(submittedHmac);
+      const shaBuffer = Buffer.from(fallbackSha);
+      if (expectedBuffer.length === hmacBuffer.length && crypto.timingSafeEqual(expectedBuffer, hmacBuffer)) {
+        isMatch = true;
+      } else if (expectedBuffer.length === shaBuffer.length && crypto.timingSafeEqual(expectedBuffer, shaBuffer)) {
+        isMatch = true;
+      }
+    } catch (e) {
+      isMatch = false;
     }
 
-    console.log(`✅ Password successfully reset for user ${user.email} (ID: ${user.id})`);
+    if (!isMatch) {
+      await pool.query("UPDATE email_otps SET attempts = $1 WHERE id = $2", [currentAttempts, record.id]);
+      if (currentAttempts >= 5) {
+        await pool.query("UPDATE email_otps SET used = TRUE WHERE id = $1", [record.id]);
+      }
+      return res.status(400).json({ message: "Invalid verification code. Please check and try again." });
+    }
+
+    // Invalidate OTP (single-use)
+    await pool.query("UPDATE email_otps SET used = TRUE WHERE id = $1", [record.id]);
+
+    // Lookup user to associate single-use token
+    const userRes = await pool.query(
+      "SELECT id, email FROM users WHERE LOWER(email) = $1 AND role IN ('owner', 'employee', 'hr', 'super_admin')",
+      [normalizedEmail]
+    );
+
+    if (userRes.rows.length === 0) {
+      return res.status(400).json({ message: "Invalid reset session. Please try again." });
+    }
+
+    const user = userRes.rows[0];
+
+    // Generate high-entropy 32-byte cryptographic single-use reset authorization token
+    const rawResetToken = crypto.randomBytes(32).toString("hex");
+    const tokenHash = computeHmacToken(rawResetToken);
+    const tokenExpiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
+
+    await pool.query(
+      `INSERT INTO password_reset_tokens 
+         (account_type, user_id, email, token_hash, expires_at, ip_address, user_agent)
+       VALUES ('staff', $1, $2, $3, $4, $5, $6)`,
+      [user.id, normalizedEmail, tokenHash, tokenExpiresAt, req.ip || null, req.headers['user-agent'] || null]
+    );
+
+    // Set HttpOnly, Secure, SameSite=None session cookie as primary secure transport
+    res.cookie("reset_session_token", rawResetToken, {
+      httpOnly: true,
+      secure: true,
+      sameSite: "none",
+      path: "/",
+      maxAge: 15 * 60 * 1000
+    });
+
+    if (redisClient && redisClient.status === "ready") {
+      await redisClient.del(attemptKey).catch(() => {});
+    }
+
+    return res.json({
+      ok: true,
+      verified: true,
+      reset_token: rawResetToken, // Held in memory only by caller for next POST
+      message: "Verification successful. You can now set your new password."
+    });
+  } catch (err) {
+    console.error("Verify reset OTP error:", err.message);
+    return res.status(500).json({ message: "Verification failed. Please try again." });
+  }
+});
+
+// ---------------------------------------------
+// 🔐 Reset Password (Token Verification + Session Revocation + Policy Enforcement)
+// ---------------------------------------------
+router.post("/reset-password", async (req, res) => {
+  const { email, reset_token, new_password } = req.body;
+  const rawToken = reset_token || req.cookies?.reset_session_token;
+  const normalizedEmail = String(email || "").toLowerCase().trim();
+  const rawPassword = String(new_password || "");
+
+  if (!rawToken) {
+    return res.status(400).json({ message: "Reset authorization token is missing or expired. Please verify your email again." });
+  }
+
+  // Password Policy: Min 8 chars, 1 uppercase, 1 lowercase, 1 number, 1 special char
+  if (rawPassword.length < 8) {
+    return res.status(400).json({ message: "Password must be at least 8 characters long." });
+  }
+  if (!/[A-Z]/.test(rawPassword)) {
+    return res.status(400).json({ message: "Password must contain at least one uppercase letter." });
+  }
+  if (!/[a-z]/.test(rawPassword)) {
+    return res.status(400).json({ message: "Password must contain at least one lowercase letter." });
+  }
+  if (!/[0-9]/.test(rawPassword)) {
+    return res.status(400).json({ message: "Password must contain at least one number." });
+  }
+  if (!/[^A-Za-z0-9]/.test(rawPassword)) {
+    return res.status(400).json({ message: "Password must contain at least one special character." });
+  }
+
+  try {
+    const tokenHash = computeHmacToken(rawToken);
+
+    // Verify token exists, is valid, unconsumed, and for staff account
+    let tokenQuery = `
+      SELECT id, user_id, email, expires_at, used 
+      FROM password_reset_tokens 
+      WHERE token_hash = $1 
+        AND account_type = 'staff' 
+        AND used = FALSE 
+        AND expires_at > NOW()
+    `;
+    const params = [tokenHash];
+
+    if (normalizedEmail) {
+      tokenQuery += " AND LOWER(email) = $2";
+      params.push(normalizedEmail);
+    }
+    tokenQuery += " ORDER BY created_at DESC LIMIT 1";
+
+    const tokenRes = await pool.query(tokenQuery, params);
+
+    if (tokenRes.rows.length === 0) {
+      return res.status(400).json({ message: "Invalid or already-used reset authorization token. Please request a new verification code." });
+    }
+
+    const tokenRecord = tokenRes.rows[0];
+    const targetUserId = tokenRecord.user_id;
+
+    // 1. Invalidate the single-use reset authorization token immediately
+    await pool.query("UPDATE password_reset_tokens SET used = TRUE WHERE id = $1", [tokenRecord.id]);
+
+    // 2. Hash New Password with bcrypt (cost 10)
+    const newHash = await bcrypt.hash(rawPassword, 10);
+
+    // 3. Update Password in users table
+    await pool.query(
+      "UPDATE users SET password_hash = $1, password_set = TRUE WHERE id = $2",
+      [newHash, targetUserId]
+    );
+
+    // 4. Invalidate all existing refresh tokens / active session families for security
+    await pool.query("DELETE FROM refresh_tokens WHERE user_id = $1", [targetUserId]).catch(() => {});
+
+    // 5. Clear reset cookie
+    res.clearCookie("reset_session_token", { path: "/" });
+
+    // 6. Security Event & Activity Log
+    try {
+      await logActivity(targetUserId, "password_reset_success", req);
+    } catch (_) {}
+
+    const { emitSecurityEvent, SECURITY_EVENT_TYPES } = require("../utils/securityEmitter");
+    emitSecurityEvent({
+      eventType: SECURITY_EVENT_TYPES.AUTH_PASSWORD_RESET_SUCCESS || 'AUTH_PASSWORD_RESET_SUCCESS',
+      severity: 'medium',
+      userId: targetUserId,
+      ipAddress: req.ip || req.headers['x-forwarded-for'],
+      userAgent: req.headers['user-agent'],
+      endpoint: '/api/auth/reset-password',
+      httpMethod: 'POST',
+      statusCode: 200,
+      metadata: { email: tokenRecord.email }
+    });
+
+    console.log(`✅ Password successfully reset & active sessions revoked for staff user ID: ${targetUserId}`);
 
     return res.json({
       ok: true,
       success: true,
-      message: "Password reset successfully! You can now use your new password to sign in or confirm sensitive actions."
+      message: "Password reset successful! Your SmartERP password has been updated."
     });
   } catch (err) {
-    console.error("❌ Reset password error:", err.stack || err.message);
-    res.status(500).json({ message: err.message || "Failed to reset password. Please try again." });
+    console.error("Reset password execution error:", err.message);
+    return res.status(500).json({ message: "Failed to reset password. Please try again." });
   }
 });
 

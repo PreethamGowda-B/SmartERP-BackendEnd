@@ -6,6 +6,13 @@ const { cacheMiddleware } = require('../middleware/cache');
 
 // ─── GET /api/dashboard/owner/metrics ────────────────────────────────────────
 router.get('/owner/metrics', authenticateToken, cacheMiddleware(300), async (req, res) => {
+    // 🛡️ H-1 Fix: Server-side authorization check (owner / super_admin only)
+    if (req.user.role !== 'owner' && req.user.role !== 'super_admin') {
+        return res.status(403).json({ 
+            message: "Access Denied: Owner administrative privileges required to view company financial metrics." 
+        });
+    }
+
     try {
         const companyId = req.user.companyId;
 

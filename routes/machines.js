@@ -47,7 +47,17 @@ router.get('/', authenticateToken, async (req, res) => {
       console.warn("⚠️ Query customer_machines with joins failed, falling back to simple query:", err.message);
       return pool.query(`SELECT * FROM customer_machines WHERE company_id::text = $1::text ORDER BY created_at DESC`, [companyId]).catch(() => ({ rows: [] }));
     });
-    res.json({ success: true, machines: result.rows || [] });
+
+    // 🛡️ M-1 Fix: Strip machine serial numbers for non-owner/technician roles
+    const machines = (result.rows || []).map(m => {
+      if (req.user.role === 'employee') {
+        const { serial_number, ...safeMachine } = m;
+        return safeMachine;
+      }
+      return m;
+    });
+
+    res.json({ success: true, machines });
   } catch (err) {
     console.error('❌ Error fetching machines:', err.message);
     res.json({ success: true, machines: [] });

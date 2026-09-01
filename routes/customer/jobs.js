@@ -74,16 +74,14 @@ router.get('/', async (req, res) => {
            j.id, j.title, j.description,
            j.status,
            j.approval_status,
-           j.employee_status,
-           j.priority, j.ai_suggested_priority,
-           j.progress, j.assigned_to,
-           j.created_at, j.approved_at, j.assigned_at,
-           j.started_at, j.accepted_at, j.completed_at,
-           j.arrived_at, j.source,
-           j.sla_accept_breached, j.sla_completion_breached,
-           u.name AS assigned_employee_name
+           j.priority,
+           j.progress,
+           j.scheduled_at,
+           j.machine_id,
+           j.service_type,
+           j.created_at, j.approved_at,
+           j.started_at, j.completed_at
          FROM jobs j
-         LEFT JOIN users u ON u.id = j.assigned_to
          WHERE j.customer_id = $1
            AND j.company_id = $2
          ORDER BY j.created_at DESC
@@ -287,16 +285,14 @@ router.get('/:id', async (req, res) => {
          j.id, j.title, j.description,
          j.status,
          j.approval_status,
-         j.priority, j.ai_suggested_priority,
-         j.employee_status, j.progress, j.assigned_to,
-         j.created_at, j.approved_at, j.assigned_at,
-         j.started_at, j.accepted_at, j.completed_at,
-         j.arrived_at, j.declined_at,
-         j.source, j.customer_id,
-         j.sla_accept_breached, j.sla_completion_breached,
-         u.name AS assigned_employee_name
+         j.priority,
+         j.progress,
+         j.scheduled_at,
+         j.machine_id,
+         j.service_type,
+         j.created_at, j.approved_at,
+         j.started_at, j.completed_at
        FROM jobs j
-       LEFT JOIN users u ON u.id = j.assigned_to
        WHERE j.id = $1
          AND j.customer_id = $2
          AND j.company_id = $3`,

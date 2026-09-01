@@ -37,6 +37,13 @@ router.post('/', authenticateToken, loadPlan, checkPlanLimit('job'), [
   body('priority').optional().isIn(['low', 'medium', 'high', 'urgent']).withMessage('Invalid priority value'),
   body('status').optional().isIn(['open', 'pending', 'in_progress', 'active', 'completed', 'closed', 'cancelled']).withMessage('Invalid status value')
 ], async (req, res) => {
+  // 🛡️ H-3 Fix: Restrict job creation to owner / super_admin role server-side
+  if (req.user.role !== 'owner' && req.user.role !== 'super_admin') {
+    return res.status(403).json({ 
+      message: "Access Denied: Only company owners or platform administrators can create jobs directly." 
+    });
+  }
+
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
     return res.status(400).json({ message: "Validation failed", errors: errors.array() });
@@ -210,11 +217,10 @@ router.get('/', authenticateToken, async (req, res) => {
         [String(companyId), limit, offset]
       );
     } else if (userRole === 'employee') {
-      // Employees see jobs where:
+      // 🛡️ H-2 Fix: Employees strictly only see jobs where:
       //   1. visible_to_all = true (broadcast to all employees)
-      //   2. assigned_to = this employee (directly assigned, accepted, working, completed)
-      //   3. employee_status = 'assigned'/'pending' with no specific assignee (open pool)
-      //   4. approved customer jobs (visible_to_all=true after approval)
+      //   2. assigned_to = this employee (directly assigned)
+      //   3. created_by = this employee
       // Exclude cancelled jobs unless assigned to this employee.
       const userId = String(req.user.id || req.user.userId || '');
       const empWhere = `
@@ -222,8 +228,7 @@ router.get('/', authenticateToken, async (req, res) => {
         AND (
           j.visible_to_all = true
           OR j.assigned_to::text = $2
-          OR (j.employee_status IN ('assigned', 'pending') AND j.assigned_to IS NULL)
-          OR (j.source = 'customer' AND j.approval_status = 'approved' AND j.assigned_to IS NULL)
+          OR j.created_by::text = $2
         )
         AND (j.source IS NULL OR j.source != 'customer' OR j.approval_status = 'approved')
         AND (j.status NOT IN ('cancelled') OR j.assigned_to::text = $2)
@@ -236,7 +241,7 @@ router.get('/', authenticateToken, async (req, res) => {
         `SELECT * FROM (
            SELECT DISTINCT ON (j.id) j.*, u.name as assigned_employee_name,
                   inv.id AS invoice_id, inv.invoice_number, inv.status AS invoice_status,
-                  inv.total_amount AS invoice_total_amount,
+                  NULL AS invoice_total_amount,
                   inv.version_number AS invoice_version_number,
                   inv.edited_count AS invoice_edited_count
            FROM jobs j

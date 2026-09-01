@@ -891,8 +891,52 @@ router.post("/login", async (req, res) => {
   }
 
   const identifier = rawIdentifier.toLowerCase();
-
   const { emitSecurityEvent, SECURITY_EVENT_TYPES } = require("../utils/securityEmitter");
+
+  // 🛡️ M-2 Fix: Brute-Force Rate Limiting (Max 10 attempts per 10 minutes per IP/Account)
+  const clientIp = req.ip || req.headers?.['x-forwarded-for'] || '127.0.0.1';
+  const ipThrottleKey = `login_ip_limit:${clientIp}`;
+  const accThrottleKey = `login_acc_limit:${identifier}`;
+
+  if (redisClient && redisClient.status === 'ready') {
+    try {
+      const [ipAttempts, accAttempts] = await Promise.all([
+        redisClient.get(ipThrottleKey),
+        redisClient.get(accThrottleKey)
+      ]);
+
+      if (parseInt(ipAttempts || '0', 10) >= 10 || parseInt(accAttempts || '0', 10) >= 10) {
+        emitSecurityEvent({
+          eventType: SECURITY_EVENT_TYPES.AUTH_FAILED,
+          severity: 'high',
+          ipAddress: clientIp,
+          userAgent: req.headers?.['user-agent'],
+          endpoint: '/api/auth/login',
+          httpMethod: 'POST',
+          statusCode: 429,
+          metadata: { reason: 'rate_limited_brute_force', identifier }
+        });
+        return res.status(429).json({ 
+          message: "Too many login attempts. Please wait a few minutes before trying again." 
+        });
+      }
+    } catch (redisErr) {
+      console.warn("Login rate limit check non-fatal warning:", redisErr.message);
+    }
+  }
+
+  const recordFailedAttempt = async () => {
+    if (redisClient && redisClient.status === 'ready') {
+      try {
+        const multi = redisClient.multi();
+        multi.incr(ipThrottleKey);
+        multi.expire(ipThrottleKey, 600);
+        multi.incr(accThrottleKey);
+        multi.expire(accThrottleKey, 600);
+        await multi.exec();
+      } catch (_) {}
+    }
+  };
 
   try {
     const result = await pool.query(
@@ -900,11 +944,12 @@ router.post("/login", async (req, res) => {
       [identifier]
     );
     if (result.rows.length === 0) {
+      await recordFailedAttempt();
       emitSecurityEvent({
         eventType: SECURITY_EVENT_TYPES.AUTH_FAILED,
         severity: 'low',
-        ipAddress: req.ip || req.headers['x-forwarded-for'],
-        userAgent: req.headers['user-agent'],
+        ipAddress: clientIp,
+        userAgent: req.headers?.['user-agent'],
         endpoint: '/api/auth/login',
         httpMethod: 'POST',
         statusCode: 401,
@@ -952,13 +997,14 @@ router.post("/login", async (req, res) => {
 
     const valid = await bcrypt.compare(password, user.password_hash);
     if (!valid) {
+      await recordFailedAttempt();
       emitSecurityEvent({
         companyId: String(user.company_id),
         userId: String(user.id),
         eventType: SECURITY_EVENT_TYPES.AUTH_FAILED,
         severity: 'medium',
-        ipAddress: req.ip || req.headers['x-forwarded-for'],
-        userAgent: req.headers['user-agent'],
+        ipAddress: clientIp,
+        userAgent: req.headers?.['user-agent'],
         endpoint: '/api/auth/login',
         httpMethod: 'POST',
         statusCode: 401,
@@ -968,6 +1014,13 @@ router.post("/login", async (req, res) => {
         }
       });
       return res.status(401).json({ message: "Invalid email or password" });
+    }
+
+    // Reset failed counter on successful login
+    if (redisClient && redisClient.status === 'ready') {
+      try {
+        await redisClient.del(accThrottleKey);
+      } catch (_) {}
     }
 
     await logActivity(user.id, "login", req);

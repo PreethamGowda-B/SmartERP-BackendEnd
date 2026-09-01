@@ -61,7 +61,7 @@ function securityTelemetryMiddleware(req, res, next) {
           if (count === 1) {
             redisClient.expire(scanKey, 180); // 3-minute sliding window
           }
-          if (count === 15) {
+          if (count === 15 || (count > 15 && count % 15 === 0)) {
             emitSecurityEvent({
               eventType: SECURITY_EVENT_TYPES.ROUTE_SCAN,
               severity: 'medium',

@@ -21,8 +21,8 @@ const REDIS_URL = process.env.REDIS_URL;
 
 // ─── Shared options ────────────────────────────────────────────────────────────
 const BASE_OPTS = {
-  maxRetriesPerRequest: 1,
-  enableOfflineQueue: false,
+  maxRetriesPerRequest: 3,
+  enableOfflineQueue: true,
   retryStrategy(times) {
     if (times > 3) return null; // stop retrying quickly to release slot
     return Math.min(times * 500, 2000);

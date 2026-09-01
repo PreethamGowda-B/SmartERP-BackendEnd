@@ -890,6 +890,11 @@ app.use("/api/v1/customer", require("./routes/customer/index")); // v1 alias
 app.use("/api/v1/customer-jobs", require("./routes/customerJobApproval"));
 app.use("/api/customer-jobs", require("./routes/customerJobApproval")); // alias
 
+// ✅ Super Admin Defensive Security AI Center Routes (Protected by authenticateToken + authenticateSuperAdmin)
+const securityRoutes = require("./routes/security");
+app.use("/api/v1/superadmin/security", securityRoutes);
+app.use("/api/superadmin/security", securityRoutes);
+
 // ✅ Global Error Handler (MUST BE LAST)
 if (process.env.SENTRY_DSN) {
   Sentry.setupExpressErrorHandler(app);

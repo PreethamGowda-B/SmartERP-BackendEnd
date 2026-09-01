@@ -243,6 +243,22 @@ async function processSecurityIncident(data) {
     logger.info(`[SecurityWorker] Created new incident ${incident.id} (Category: ${threatCategory}, Risk: ${riskScore})`);
   }
 
+  // 7. Deterministic Remediation Policy Evaluation & Safe Automation
+  try {
+    const { applyRemediationPolicy } = require('../utils/securityPolicyEngine');
+    const { executeSecurityAction } = require('../utils/securityActionExecutor');
+    const actions = await applyRemediationPolicy(incident);
+
+    // Auto-execute ONLY safe, non-destructive actions
+    for (const act of actions) {
+      if (act.is_automated && act.approval_status !== 'executed') {
+        await executeSecurityAction(act.id, 'security-policy-engine');
+      }
+    }
+  } catch (policyErr) {
+    logger.warn(`[SecurityWorker] Policy application non-fatal warning: ${policyErr.message}`);
+  }
+
   return incident;
 }
 

@@ -81,13 +81,33 @@ async function enqueueWebhookRetry(data) {
   });
 }
 
+const securityQueue = connection
+  ? new Queue('security-detection', QUEUE_OPTS)
+  : null;
+
+/**
+ * Offload a security incident triage task to the background queue.
+ */
+async function enqueueSecurityEvent(data) {
+  if (!securityQueue) {
+    return;
+  }
+  return securityQueue.add('analyze_incident', data, {
+    removeOnComplete: true,
+    attempts: 2,
+    backoff: { type: 'exponential', delay: 2000 },
+  });
+}
+
 module.exports = {
   notificationQueue,
   auditQueue,
   webhookRetryQueue,
+  securityQueue,
   enqueueNotification,
   enqueueAudit,
   enqueueWebhookRetry,
+  enqueueSecurityEvent,
   // Expose so callers that previously used redisConnection can migrate
   redisConnection: connection,
 };

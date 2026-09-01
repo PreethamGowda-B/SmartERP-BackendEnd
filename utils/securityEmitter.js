@@ -58,9 +58,25 @@ function emitSecurityEvent(eventData) {
       const userAgent = eventData.userAgent ? String(eventData.userAgent).slice(0, 500) : null;
       const endpoint = eventData.endpoint ? String(eventData.endpoint).slice(0, 255) : null;
       const httpMethod = eventData.httpMethod ? String(eventData.httpMethod).toUpperCase().slice(0, 10) : null;
-      const statusCode = Number.isInteger(eventData.statusCode) ? eventData.statusCode : null;
-      const metadata = typeof eventData.metadata === 'object' && eventData.metadata !== null
-        ? eventData.metadata
+      // Sanitize metadata to remove any passwords, tokens, or credentials
+      const sanitizeMetadata = (obj) => {
+        if (!obj || typeof obj !== 'object') return {};
+        const redactedKeys = ['password', 'password_hash', 'token', 'access_token', 'refresh_token', 'secret', 'authorization', 'otp', 'credit_card', 'cvv', 'api_key'];
+        const clean = {};
+        for (const [k, v] of Object.entries(obj)) {
+          if (redactedKeys.some((bad) => k.toLowerCase().includes(bad))) {
+            clean[k] = '[REDACTED]';
+          } else if (typeof v === 'object' && v !== null) {
+            clean[k] = sanitizeMetadata(v);
+          } else {
+            clean[k] = v;
+          }
+        }
+        return clean;
+      };
+
+      const cleanMetadata = typeof eventData.metadata === 'object' && eventData.metadata !== null
+        ? sanitizeMetadata(eventData.metadata)
         : {};
 
       // 1. Direct Asynchronous Insert to security_events table
@@ -79,7 +95,7 @@ function emitSecurityEvent(eventData) {
             endpoint,
             httpMethod,
             statusCode,
-            JSON.stringify(metadata),
+            JSON.stringify(cleanMetadata),
           ]
         ).catch((dbErr) => {
           logger.warn(`SecurityEmitter DB Insert Warning: ${dbErr.message}`);

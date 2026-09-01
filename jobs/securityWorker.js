@@ -259,6 +259,20 @@ async function processSecurityIncident(data) {
     logger.warn(`[SecurityWorker] Policy application non-fatal warning: ${policyErr.message}`);
   }
 
+  // 8. Out-of-band Critical Incident Notification (Super Admin Only)
+  if (incident.severity === 'critical') {
+    try {
+      const { notifySuperAdminCriticalIncident } = require('../utils/securityNotifier');
+      setImmediate(() => {
+        notifySuperAdminCriticalIncident({ incident }).catch((err) => {
+          logger.warn(`[SecurityWorker] Notification dispatch warning: ${err.message}`);
+        });
+      });
+    } catch (notifErr) {
+      logger.warn(`[SecurityWorker] Notification helper warning: ${notifErr.message}`);
+    }
+  }
+
   return incident;
 }
 

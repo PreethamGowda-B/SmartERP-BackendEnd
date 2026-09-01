@@ -11,6 +11,7 @@ const GSTReconciliationPlugin = require("./gstReconciliation.plugin");
 const CrmPlugin = require("./crm.plugin");
 const LiveSummaryPlugin = require("./liveSummary.plugin");
 const CncPlugin = require("./cnc.plugin");
+const SecurityPlugin = require("./security.plugin");
 
 // Pro-only plugin list
 const PRO_ONLY_PLUGINS = [
@@ -30,6 +31,7 @@ const BASIC_ALLOWED_PLUGINS = [
   "CustomerPlugin",
   "OCRPlugin",
   "CncPlugin",
+  "SecurityPlugin",
 ];
 
 class PluginRegistry {
@@ -48,6 +50,7 @@ class PluginRegistry {
       new GSTReconciliationPlugin(),
       new CrmPlugin(),
       new CncPlugin(),
+      new SecurityPlugin(),
     ];
   }
 

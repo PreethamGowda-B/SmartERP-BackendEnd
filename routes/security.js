@@ -65,10 +65,56 @@ router.get('/dashboard', async (req, res) => {
       LIMIT 6
     `);
 
+    const rawStats = statsRes.rows[0] || {};
+    const rawActions = actionsRes.rows[0] || {};
+
+    const openCount = parseInt(rawStats.open_incidents || '0', 10);
+    const investigatingCount = parseInt(rawStats.investigating_incidents || '0', 10);
+    const criticalCount = parseInt(rawStats.critical_incidents || '0', 10);
+    const highCount = parseInt(rawStats.high_incidents || '0', 10);
+    const pendingApprovals = parseInt(rawActions.pending_approvals || '0', 10);
+    const totalCount = parseInt(rawStats.total_incidents || '0', 10);
+
+    let threatLevel = 'NORMAL';
+    if (criticalCount > 0) threatLevel = 'CRITICAL';
+    else if (highCount > 0) threatLevel = 'HIGH';
+    else if (openCount > 0) threatLevel = 'ELEVATED';
+
+    const formattedStats = {
+      healthStatus: {
+        threatLevel,
+        activeIncidents: openCount + investigatingCount,
+        criticalCount,
+        highCount,
+        pendingApprovals,
+      },
+      incidentBreakdown: {
+        bySeverity: {
+          critical: criticalCount,
+          high: highCount,
+          medium: 0,
+          low: 0,
+        },
+        byCategory: {},
+        byStatus: {
+          open: openCount,
+          investigating: investigatingCount,
+        }
+      },
+      metrics24h: {
+        eventsIngested: parseInt(rawStats.incidents_last_24h || '0', 10),
+        automatedActionsExecuted: parseInt(rawActions.executed_actions || '0', 10),
+        mitigatedThreats: Math.max(0, totalCount - (openCount + investigatingCount)),
+      },
+      total_incidents: totalCount,
+      open_incidents: openCount,
+      critical_incidents: criticalCount,
+    };
+
     return res.json({
       success: true,
-      stats: statsRes.rows[0] || {},
-      actionsSummary: actionsRes.rows[0] || {},
+      stats: formattedStats,
+      actionsSummary: rawActions,
       recentIncidents: redactSensitiveData(recentIncidents.rows),
     });
   } catch (err) {

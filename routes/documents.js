@@ -81,16 +81,10 @@ router.post('/', authenticateToken, upload.single('file'), async (req, res) => {
             }
         }
 
-        // If Cloudinary wasn't configured or failed, store securely on local disk
+        // If Cloudinary wasn't configured or failed, persist document buffer as base64 data URI
         if (!fileUrl) {
-            const ext = req.file.originalname.split('.').pop() || (isImage ? 'png' : 'pdf');
-            const filename = `doc-${Date.now()}-${Math.round(Math.random() * 1e9)}.${ext}`;
-            const uploadsDir = path.join(__dirname, '..', 'uploads', 'documents');
-            if (!fs.existsSync(uploadsDir)) {
-                fs.mkdirSync(uploadsDir, { recursive: true });
-            }
-            fs.writeFileSync(path.join(uploadsDir, filename), req.file.buffer);
-            fileUrl = `/uploads/documents/${filename}`;
+            const mimeType = req.file.mimetype || (isImage ? 'image/png' : 'application/pdf');
+            fileUrl = `data:${mimeType};base64,${req.file.buffer.toString('base64')}`;
         }
 
         const result = await pool.query(

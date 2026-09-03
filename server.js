@@ -79,7 +79,19 @@ const corsOptions = {
   },
   credentials: true,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "X-CSRF-Token", "X-Requested-With", "Accept"],
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "X-CSRF-Token",
+    "X-Requested-With",
+    "Accept",
+    "sentry-trace",
+    "baggage",
+    "X-Request-Id",
+    "Cache-Control",
+    "Pragma",
+    "Origin"
+  ],
   exposedHeaders: ["Set-Cookie"],
   optionsSuccessStatus: 200,
 };

@@ -19,8 +19,16 @@ const redisClient = require('../utils/redis');
 
 // ─── POST /api/location/update ────────────────────────────────────────────────
 // Employee pushes GPS. Validates assigned job, publishes SSE to customer.
-router.post('/update', authenticateToken, loadPlan, requireFeature('location_tracking'), async (req, res) => {
+router.post('/update', authenticateToken, loadPlan, async (req, res) => {
     try {
+        if (!req.plan?.features?.location_tracking) {
+            return res.status(200).json({
+                success: false,
+                disabled: true,
+                message: 'Location tracking is not included in current company plan',
+                data: null
+            });
+        }
         const userId = req.user.userId || req.user.id;
         const companyId = req.user.companyId;
         const { latitude, longitude } = req.body;

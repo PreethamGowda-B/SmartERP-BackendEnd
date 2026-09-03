@@ -63,10 +63,13 @@ const corsOptions = {
       "https://client.prozync.in",
     ];
 
+    // Only allow specific authorized origins, *.prozync.in subdomains, or exact SmartERP vercel deployments
+    const isAllowedVercelPreview = /^https:\/\/smart-erp-front-end(-[a-z0-9-]+)?\.vercel\.app$/.test(cleanOrigin);
+
     if (
       allowedOrigins.includes(cleanOrigin) ||
       cleanOrigin.endsWith(".prozync.in") ||
-      cleanOrigin.endsWith(".vercel.app")
+      isAllowedVercelPreview
     ) {
       return callback(null, true);
     }

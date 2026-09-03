@@ -81,10 +81,11 @@ router.post('/', authenticateToken, upload.single('file'), async (req, res) => {
             }
         }
 
-        // If Cloudinary wasn't configured or failed, persist document buffer as base64 data URI
+        // Reject if cloud storage upload failed — never store megabytes of base64 in PostgreSQL rows
         if (!fileUrl) {
-            const mimeType = req.file.mimetype || (isImage ? 'image/png' : 'application/pdf');
-            fileUrl = `data:${mimeType};base64,${req.file.buffer.toString('base64')}`;
+            return res.status(502).json({ 
+                message: 'Failed to upload document to secure cloud storage. Please verify file format and try again.' 
+            });
         }
 
         const result = await pool.query(

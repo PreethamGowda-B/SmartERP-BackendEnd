@@ -65,69 +65,77 @@ router.post('/razorpay', async (req, res) => {
 
     console.log(`[Razorpay Webhook] Processing capture | Company ID: ${companyId} | Plan ID: ${planId} | Payment ID: ${paymentId}`);
 
-    await pool.query('BEGIN');
+    const dbClient = await pool.connect();
 
-    // Advisory lock per company ID ensures strict serial execution per company
-    await pool.query(`SELECT pg_advisory_xact_lock(hashtext('sub_upgrade_' || $1))`, [String(companyId)]);
+    try {
+      await dbClient.query('BEGIN');
 
-    // Row-level lock on companies table
-    const compCheck = await pool.query(
-      `SELECT id, plan_id FROM companies WHERE id = $1 FOR UPDATE`,
-      [companyId]
-    );
+      // Advisory lock per company ID ensures strict serial execution per company
+      await dbClient.query(`SELECT pg_advisory_xact_lock(hashtext('sub_upgrade_' || $1))`, [String(companyId)]);
 
-    if (compCheck.rows.length === 0) {
-      await pool.query('ROLLBACK');
-      console.error(`❌ [Razorpay Webhook] Company ID ${companyId} not found in DB`);
-      return res.status(404).send('Company record not found');
+      // Row-level lock on companies table
+      const compCheck = await dbClient.query(
+        `SELECT id, plan_id FROM companies WHERE id = $1 FOR UPDATE`,
+        [companyId]
+      );
+
+      if (compCheck.rows.length === 0) {
+        await dbClient.query('ROLLBACK');
+        console.error(`❌ [Razorpay Webhook] Company ID ${companyId} not found in DB`);
+        return res.status(404).send('Company record not found');
+      }
+
+      // Duplicate Check
+      const duplicateCheck = await dbClient.query(
+        `SELECT id FROM subscription_events WHERE metadata->>'razorpay_payment_id' = $1`,
+        [paymentId]
+      );
+
+      if (duplicateCheck.rows.length > 0) {
+        await dbClient.query('ROLLBACK');
+        console.log(`[Razorpay Webhook] Payment ${paymentId} already processed.`);
+        invalidatePlanCache(companyId);
+        return res.json({ status: 'ok', message: 'Already processed' });
+      }
+
+      // Update Company Plan & Subscription Expiry Dates
+      await dbClient.query(
+        `UPDATE companies 
+         SET plan_id = $1, 
+             subscription_status = 'active', 
+             is_on_trial = FALSE, 
+             subscription_expires_at = COALESCE(GREATEST(subscription_expires_at, NOW()), NOW()) + (CASE WHEN $2 = 'yearly' THEN INTERVAL '1 year' ELSE INTERVAL '1 month' END),
+             updated_at = NOW()
+         WHERE id = $3`,
+        [planId, billingCycle, companyId]
+      );
+
+      // Log Event
+      await dbClient.query(
+        `INSERT INTO subscription_events (company_id, event_type, new_plan_id, metadata, created_at)
+         VALUES ($1, 'upgrade', $2, $3, NOW())`,
+        [companyId, planId, JSON.stringify({ 
+          razorpay_payment_id: paymentId, 
+          razorpay_order_id: orderId, 
+          billingCycle,
+          source: 'webhook'
+        })]
+      );
+
+      await dbClient.query('COMMIT');
+      console.log(`[Razorpay Webhook] Transaction Committed Successfully for Company ID: ${companyId}`);
+    } catch (txErr) {
+      await dbClient.query('ROLLBACK').catch(() => {});
+      throw txErr;
+    } finally {
+      dbClient.release();
     }
-
-    // Duplicate Check
-    const duplicateCheck = await pool.query(
-      `SELECT id FROM subscription_events WHERE metadata->>'razorpay_payment_id' = $1`,
-      [paymentId]
-    );
-
-    if (duplicateCheck.rows.length > 0) {
-      await pool.query('ROLLBACK');
-      console.log(`[Razorpay Webhook] Payment ${paymentId} already processed.`);
-      invalidatePlanCache(companyId);
-      return res.json({ status: 'ok', message: 'Already processed' });
-    }
-
-    // Update Company Plan & Subscription Expiry Dates
-    const updateResult = await pool.query(
-      `UPDATE companies 
-       SET plan_id = $1, 
-           subscription_status = 'active', 
-           is_on_trial = FALSE, 
-           subscription_expires_at = COALESCE(GREATEST(subscription_expires_at, NOW()), NOW()) + (CASE WHEN $2 = 'yearly' THEN INTERVAL '1 year' ELSE INTERVAL '1 month' END),
-           updated_at = NOW()
-       WHERE id = $3`,
-      [planId, billingCycle, companyId]
-    );
-
-    // Log Event
-    await pool.query(
-      `INSERT INTO subscription_events (company_id, event_type, new_plan_id, metadata, created_at)
-       VALUES ($1, 'upgrade', $2, $3, NOW())`,
-      [companyId, planId, JSON.stringify({ 
-        razorpay_payment_id: paymentId, 
-        razorpay_order_id: orderId, 
-        billingCycle,
-        source: 'webhook'
-      })]
-    );
-
-    await pool.query('COMMIT');
-    console.log(`[Razorpay Webhook] Transaction Committed Successfully for Company ID: ${companyId}`);
 
     // Invalidate Redis Plan Cache
     invalidatePlanCache(companyId);
 
     res.json({ status: 'ok', message: 'Subscription activated via webhook' });
   } catch (err) {
-    await pool.query('ROLLBACK').catch(() => {});
     console.error('❌ [Razorpay Webhook] Error:', err);
 
     // Enqueue background retry job with BullMQ (3 attempts with exponential backoff)

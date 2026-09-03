@@ -262,9 +262,9 @@ router.post('/verify-payment', requireOwner, async (req, res) => {
     console.log(`[Razorpay] Payment Verified | Order ID: ${razorpay_order_id} | Payment ID: ${razorpay_payment_id}`);
     console.log(`[Subscription] Starting Activation | Company ID = ${companyId} | Target Plan Input = ${planIdInput}`);
 
-    if (!razorpay_order_id || !razorpay_payment_id) {
-      console.warn(`[Subscription] Activation Rejected: Missing order_id or payment_id`);
-      return res.status(400).json({ message: 'Missing order ID or payment ID.' });
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+      console.warn(`[Subscription] Activation Rejected: Missing order_id, payment_id, or signature`);
+      return res.status(400).json({ message: 'Missing order ID, payment ID, or signature.' });
     }
 
     const planId = parseInt(planIdInput, 10);
@@ -273,25 +273,23 @@ router.post('/verify-payment', requireOwner, async (req, res) => {
       return res.status(400).json({ message: 'Invalid plan selected.' });
     }
 
-    // 1. Signature Check
-    if (razorpay_signature) {
-      const body = razorpay_order_id + "|" + razorpay_payment_id;
-      const expectedSignature = crypto
-        .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
-        .update(body.toString())
-        .digest("hex");
+    // 1. Mandatory Signature Check (Timing-safe HMAC SHA-256)
+    const body = razorpay_order_id + "|" + razorpay_payment_id;
+    const expectedSignature = crypto
+      .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
+      .update(body.toString())
+      .digest("hex");
 
-      const sigBufExpected = Buffer.from(expectedSignature, 'utf8');
-      const sigBufActual = Buffer.from(razorpay_signature, 'utf8');
-      const signaturesMatch = sigBufExpected.length === sigBufActual.length &&
-        crypto.timingSafeEqual(sigBufExpected, sigBufActual);
+    const sigBufExpected = Buffer.from(expectedSignature, 'utf8');
+    const sigBufActual = Buffer.from(razorpay_signature, 'utf8');
+    const signaturesMatch = sigBufExpected.length === sigBufActual.length &&
+      crypto.timingSafeEqual(sigBufExpected, sigBufActual);
 
-      if (!signaturesMatch) {
-        console.error(`[Razorpay] Signature Check Failed for Order ${razorpay_order_id}`);
-        return res.status(400).json({ message: 'Invalid payment signature' });
-      }
-      console.log(`[Razorpay] Signature Valid for Payment ID: ${razorpay_payment_id}`);
+    if (!signaturesMatch) {
+      console.error(`[Razorpay] Signature Check Failed for Order ${razorpay_order_id}`);
+      return res.status(400).json({ message: 'Invalid payment signature' });
     }
+    console.log(`[Razorpay] Signature Valid for Payment ID: ${razorpay_payment_id}`);
 
     // 2. Order Lookup & Plan Verification from Razorpay API
     let verifiedPlanId = planId;
@@ -310,75 +308,84 @@ router.post('/verify-payment', requireOwner, async (req, res) => {
       console.warn(`[Razorpay] Order Lookup Notice: ${fetchErr.message}`);
     }
 
-    // 3. Transaction Isolation & Row-Level Lock (FOR UPDATE + Advisory Lock)
-    console.log(`[Concurrency] Acquiring Transaction Advisory Lock & Row Lock for Company ${companyId}...`);
-    await pool.query('BEGIN');
+    // 3. Transaction Isolation & Row-Level Lock on dedicated connection client
+    console.log(`[Concurrency] Acquiring Dedicated Client, Transaction Advisory Lock & Row Lock for Company ${companyId}...`);
+    const dbClient = await pool.connect();
 
-    // Advisory lock per company ID ensures strict serial execution per company
-    await pool.query(`SELECT pg_advisory_xact_lock(hashtext('sub_upgrade_' || $1))`, [String(companyId)]);
+    try {
+      await dbClient.query('BEGIN');
 
-    // Row-level lock on companies table
-    const compCheck = await pool.query(
-      `SELECT id, plan_id, subscription_status FROM companies WHERE id = $1 FOR UPDATE`,
-      [companyId]
-    );
+      // Advisory lock per company ID ensures strict serial execution per company
+      await dbClient.query(`SELECT pg_advisory_xact_lock(hashtext('sub_upgrade_' || $1))`, [String(companyId)]);
 
-    if (compCheck.rows.length === 0) {
-      await pool.query('ROLLBACK');
-      console.error(`[Subscription] ERROR: Company ID ${companyId} not found in DB`);
-      return res.status(404).json({ message: 'Company record not found for activation.' });
+      // Row-level lock on companies table
+      const compCheck = await dbClient.query(
+        `SELECT id, plan_id, subscription_status FROM companies WHERE id = $1 FOR UPDATE`,
+        [companyId]
+      );
+
+      if (compCheck.rows.length === 0) {
+        await dbClient.query('ROLLBACK');
+        console.error(`[Subscription] ERROR: Company ID ${companyId} not found in DB`);
+        return res.status(404).json({ message: 'Company record not found for activation.' });
+      }
+
+      const currentPlanId = compCheck.rows[0].plan_id;
+      console.log(`[Subscription] Company ID = ${companyId} | Current Plan = ${currentPlanId}`);
+
+      // Duplicate Check
+      const duplicateCheck = await dbClient.query(
+        `SELECT id FROM subscription_events WHERE metadata->>'razorpay_payment_id' = $1`,
+        [razorpay_payment_id]
+      );
+
+      if (duplicateCheck.rows.length > 0) {
+        await dbClient.query('ROLLBACK');
+        console.log(`[Subscription] Idempotency Match: Payment ID ${razorpay_payment_id} already processed.`);
+        invalidatePlanCache(companyId);
+        return res.json({ 
+          ok: true,
+          success: true,
+          message: 'Subscription already activated.',
+          is_duplicate: true 
+        });
+      }
+
+      // 4. Update Company Plan & Subscription Expiry Dates
+      console.log(`[Subscription] Updating Companies Table... Target Plan = ${verifiedPlanId}`);
+      const updateResult = await dbClient.query(
+        `UPDATE companies 
+         SET plan_id = $1, 
+             subscription_status = 'active', 
+             is_on_trial = FALSE, 
+             subscription_expires_at = COALESCE(GREATEST(subscription_expires_at, NOW()), NOW()) + (CASE WHEN $2 = 'yearly' THEN INTERVAL '1 year' ELSE INTERVAL '1 month' END),
+             updated_at = NOW()
+         WHERE id = $3`,
+        [verifiedPlanId, billingCycle, companyId]
+      );
+
+      console.log(`[Subscription] Updating Companies Table... Rows Updated = ${updateResult.rowCount}`);
+      console.log(`[Subscription] Updating Billing Dates... Billing Cycle = ${billingCycle}`);
+
+      // 5. Insert Subscription Log Event
+      await dbClient.query(
+        `INSERT INTO subscription_events (company_id, event_type, new_plan_id, metadata, created_at)
+         VALUES ($1, 'upgrade', $2, $3, NOW())`,
+        [companyId, verifiedPlanId, JSON.stringify({ 
+          razorpay_payment_id, 
+          razorpay_order_id, 
+          billingCycle
+        })]
+      );
+
+      await dbClient.query('COMMIT');
+      console.log(`[Subscription] Commit Successful`);
+    } catch (txErr) {
+      await dbClient.query('ROLLBACK').catch(() => {});
+      throw txErr;
+    } finally {
+      dbClient.release();
     }
-
-    const currentPlanId = compCheck.rows[0].plan_id;
-    console.log(`[Subscription] Company ID = ${companyId} | Current Plan = ${currentPlanId}`);
-
-    // Duplicate Check
-    const duplicateCheck = await pool.query(
-      `SELECT id FROM subscription_events WHERE metadata->>'razorpay_payment_id' = $1`,
-      [razorpay_payment_id]
-    );
-
-    if (duplicateCheck.rows.length > 0) {
-      await pool.query('ROLLBACK');
-      console.log(`[Subscription] Idempotency Match: Payment ID ${razorpay_payment_id} already processed.`);
-      invalidatePlanCache(companyId);
-      return res.json({ 
-        ok: true,
-        success: true,
-        message: 'Subscription already activated.',
-        is_duplicate: true 
-      });
-    }
-
-    // 4. Update Company Plan & Subscription Expiry Dates
-    console.log(`[Subscription] Updating Companies Table... Target Plan = ${verifiedPlanId}`);
-    const updateResult = await pool.query(
-      `UPDATE companies 
-       SET plan_id = $1, 
-           subscription_status = 'active', 
-           is_on_trial = FALSE, 
-           subscription_expires_at = COALESCE(GREATEST(subscription_expires_at, NOW()), NOW()) + (CASE WHEN $2 = 'yearly' THEN INTERVAL '1 year' ELSE INTERVAL '1 month' END),
-           updated_at = NOW()
-       WHERE id = $3`,
-      [verifiedPlanId, billingCycle, companyId]
-    );
-
-    console.log(`[Subscription] Updating Companies Table... Rows Updated = ${updateResult.rowCount}`);
-    console.log(`[Subscription] Updating Billing Dates... Billing Cycle = ${billingCycle}`);
-
-    // 5. Insert Subscription Log Event
-    await pool.query(
-      `INSERT INTO subscription_events (company_id, event_type, new_plan_id, metadata, created_at)
-       VALUES ($1, 'upgrade', $2, $3, NOW())`,
-      [companyId, verifiedPlanId, JSON.stringify({ 
-        razorpay_payment_id, 
-        razorpay_order_id, 
-        billingCycle
-      })]
-    );
-
-    await pool.query('COMMIT');
-    console.log(`[Subscription] Commit Successful`);
 
     // 6. Invalidate Plan Cache & Update AI Permissions
     console.log(`[Subscription] Updating AI Permissions... Invalidating Redis Plan Cache for Company ${companyId}`);

@@ -14,6 +14,7 @@ const crypto = require("crypto");
 // ✅ Required at top-level — used in Google OAuth callback and all OTP/exchange routes
 const { redisClient } = require("../utils/redis");
 const { storage } = require("../middleware/als");
+const { hashToken } = require("../utils/tokenHash");
 
 // ✅ RLS bypass — auth routes query users/companies by email BEFORE any company
 // context is known (login lookup, OTP, Google OAuth). They explicitly opt-in to
@@ -292,7 +293,7 @@ router.get('/google/callback', (req, res, next) => {
           `INSERT INTO customer_refresh_tokens
              (customer_id, token, token_family, expires_at, user_agent, ip_address)
            VALUES ($1, $2, $3, NOW() + INTERVAL '30 days', $4, $5)`,
-          [user.id, custRefresh, crypto.randomUUID(), req.get('user-agent') || null, req.ip || null]
+          [user.id, hashToken(custRefresh), crypto.randomUUID(), req.get('user-agent') || null, req.ip || null]
         );
 
         const cOpts = { httpOnly: true, sameSite: 'none', secure: true, path: '/' };
@@ -325,7 +326,7 @@ router.get('/google/callback', (req, res, next) => {
       await pool.query(
         `INSERT INTO refresh_tokens (user_id, token, token_family, expires_at, created_at, user_agent, ip_address)
          VALUES ($1::uuid, $2, $3::uuid, NOW() + INTERVAL '30 days', NOW(), $4, $5)`,
-        [user.id, staffRefresh, tokenFamily, req.headers['user-agent'], req.ip]
+        [user.id, hashToken(staffRefresh), tokenFamily, req.headers['user-agent'], req.ip]
       );
 
       const isSuperAdmin = user.role === 'super_admin';
@@ -1189,12 +1190,12 @@ router.post("/login", async (req, res) => {
       [user.id]
     );
 
-    // Save Refresh Token to DB
+    // Save Refresh Token to DB (Hashed at rest)
     const tokenFamily = crypto.randomUUID();
     await pool.query(
       `INSERT INTO refresh_tokens (user_id, token, token_family, expires_at, created_at, user_agent, ip_address)
        VALUES ($1::uuid, $2, $3::uuid, NOW() + INTERVAL '30 days', NOW(), $4, $5)`,
-      [user.id, refreshToken, tokenFamily, req.headers["user-agent"], req.ip]
+      [user.id, hashToken(refreshToken), tokenFamily, req.headers["user-agent"], req.ip]
     );
 
     // Set Cookies based on role
@@ -1230,7 +1231,7 @@ router.post("/login", async (req, res) => {
 });
 
 // ---------------------------------------------
-// ✅ Refresh Token Route (Secure Rotation)
+// ✅ Refresh Token Route (Secure Single-Use Rotation & Replay Protection)
 // ---------------------------------------------
 router.post("/refresh", async (req, res) => {
   // Try dual-context cookies first, then generic fallback, then body
@@ -1244,76 +1245,94 @@ router.post("/refresh", async (req, res) => {
     return res.status(401).json({ message: "No refresh token provided" });
   }
 
+  const client = await pool.connect();
+
   try {
-    // 1. Check DB for the token
-    const tokenResult = await pool.query("SELECT * FROM refresh_tokens WHERE token = $1", [token]);
+    await client.query("BEGIN");
+
+    const tokenHash = hashToken(token);
+
+    // 1. Row-level lock on the refresh token record to serialize concurrent refresh requests
+    //    Supports hashed tokens primarily, with temporary plaintext lookup migration fallback.
+    const tokenResult = await client.query(
+      "SELECT * FROM refresh_tokens WHERE token = $1 OR token = $2 FOR UPDATE",
+      [tokenHash, token]
+    );
 
     if (tokenResult.rows.length === 0) {
+      await client.query("ROLLBACK");
       console.warn("⚠️ Refresh attempt failed: Token not found in database.");
       return res.status(401).json({ message: "Invalid refresh token" });
     }
 
     const refreshTokenData = tokenResult.rows[0];
+    const userId = refreshTokenData.user_id;
 
-    // 2. REPLAY & TAB-SWITCH CONCURRENCY PROTECTION
+    // 2. REUSE / REPLAY DETECTION
+    // If an already-revoked refresh token is presented, this indicates a potential replay/theft.
+    // Immediately revoke the entire token family strictly scoped to this user.
     if (refreshTokenData.revoked) {
       if (refreshTokenData.token_family) {
-        const activeFamilyRes = await pool.query(
-          `SELECT token FROM refresh_tokens 
-           WHERE token_family = $1::uuid AND revoked = FALSE AND expires_at > NOW()
-           ORDER BY created_at DESC LIMIT 1`,
-          [refreshTokenData.token_family]
+        await client.query(
+          "UPDATE refresh_tokens SET revoked = TRUE, updated_at = NOW() WHERE user_id = $1::uuid AND token_family = $2::uuid",
+          [userId, refreshTokenData.token_family]
         );
+      }
+      await client.query("COMMIT");
 
-        if (activeFamilyRes.rows.length > 0) {
-          try {
-            const payload = jwt.verify(activeFamilyRes.rows[0].token, REFRESH_SECRET);
-            const userId = payload.userId || payload.id;
-            const userRes = await pool.query("SELECT id, role, email, company_id FROM users WHERE id = $1", [userId]);
-            if (userRes.rows.length > 0) {
-              const user = userRes.rows[0];
-              const newAccessToken = jwt.sign(
-                { id: user.id, userId: user.id, role: user.role, email: user.email, companyId: user.company_id },
-                ACCESS_SECRET,
-                { expiresIn: ACCESS_EXPIRY }
-              );
-              return res.json({
-                ok: true,
-                accessToken: newAccessToken,
-                refreshToken: activeFamilyRes.rows[0].token,
-                isSuperAdmin: user.role === 'super_admin'
-              });
-            }
-          } catch (_) { /* fallback */ }
-        }
+      // Invalidate active session cache in Redis
+      if (redisClient && redisClient.status === "ready") {
+        await redisClient.del(`session:${userId}`).catch(() => {});
       }
 
-      console.warn(`⚠️ Token ${token.substring(0, 10)}... was previously revoked.`);
-      return res.status(401).json({ message: "Refresh token superseded. Please log in again." });
+      const { emitSecurityEvent, SECURITY_EVENT_TYPES } = require("../utils/securityEmitter");
+      emitSecurityEvent({
+        userId: String(userId),
+        eventType: SECURITY_EVENT_TYPES.AUTH_TOKEN_REPLAY || 'AUTH_TOKEN_REPLAY',
+        severity: 'high',
+        ipAddress: req.ip || req.headers['x-forwarded-for'],
+        userAgent: req.headers['user-agent'],
+        endpoint: '/api/auth/refresh',
+        httpMethod: 'POST',
+        statusCode: 401,
+        metadata: { reason: 'refresh_token_reuse_detected', family: refreshTokenData.token_family }
+      });
+
+      console.warn(`🚨 Refresh token replay detected for user ${userId}. Token family ${refreshTokenData.token_family} revoked.`);
+      return res.status(401).json({ message: "Security alert: Token reuse detected. Session revoked." });
     }
 
-    // 3. Verify JWT (Synchronous check inside try-catch)
-    let payload;
+    // 3. Verify JWT with dual-secret support (primary secret + optional fallback _OLD secret)
+    let payload = null;
     try {
       payload = jwt.verify(token, REFRESH_SECRET);
-    } catch (jwtErr) {
-      console.warn(`⚠️ Refresh attempt failed: JWT verification error: ${jwtErr.message}`);
+    } catch (err1) {
+      if (process.env.JWT_REFRESH_SECRET_OLD) {
+        try {
+          payload = jwt.verify(token, process.env.JWT_REFRESH_SECRET_OLD);
+        } catch (_) {}
+      }
+    }
+
+    if (!payload) {
+      await client.query("ROLLBACK");
+      console.warn("⚠️ Refresh attempt failed: JWT verification error");
       return res.status(401).json({ message: "Invalid or expired refresh token" });
     }
 
-    const userId = payload.userId || payload.id;
-
     // 4. Fetch User Data
-    const userRes = await pool.query("SELECT id, role, email, company_id FROM users WHERE id = $1", [userId]);
+    const userRes = await client.query("SELECT id, role, email, company_id FROM users WHERE id = $1", [userId]);
     if (userRes.rows.length === 0) {
+      await client.query("ROLLBACK");
       return res.status(401).json({ message: "User not found" });
     }
     const user = userRes.rows[0];
 
     // 5. Check Suspension
     if (user.role !== 'super_admin' && user.company_id) {
-      const compRes = await pool.query("SELECT status FROM companies WHERE id = $1", [user.company_id]);
+      const compRes = await client.query("SELECT status FROM companies WHERE id = $1", [user.company_id]);
       if (compRes.rows.length > 0 && compRes.rows[0].status === 'suspended') {
+        await client.query("ROLLBACK");
         return res.status(403).json({
           message: "Account Suspended/Disabled",
           error: "company_suspended",
@@ -1322,25 +1341,35 @@ router.post("/refresh", async (req, res) => {
       }
     }
 
-    // 6. ROTATION: Mark old token as revoked
-    await pool.query("UPDATE refresh_tokens SET revoked = TRUE WHERE id = $1", [refreshTokenData.id]);
+    // 6. SINGLE-USE ROTATION: Invalidate the current token immediately
+    await client.query(
+      "UPDATE refresh_tokens SET revoked = TRUE, updated_at = NOW() WHERE id = $1",
+      [refreshTokenData.id]
+    );
 
-    // 7. Issue NEW tokens
+    // 7. Issue NEW tokens (always signed using active primary secrets)
     const newAccessToken = jwt.sign(
       { id: user.id, userId: user.id, role: user.role, email: user.email, companyId: user.company_id },
       ACCESS_SECRET,
       { expiresIn: ACCESS_EXPIRY }
     );
-    const newRefreshToken = jwt.sign({ id: user.id, userId: user.id }, REFRESH_SECRET, { expiresIn: REFRESH_EXPIRY });
+    const newRefreshToken = jwt.sign(
+      { id: user.id, userId: user.id },
+      REFRESH_SECRET,
+      { expiresIn: REFRESH_EXPIRY }
+    );
 
     const familyToUse = refreshTokenData.token_family || crypto.randomUUID();
+    const newHashedToken = hashToken(newRefreshToken);
 
-    // Save new token to DB
-    await pool.query(
+    // Save NEW token's SHA-256 HASH to DB (Never store raw token)
+    await client.query(
       `INSERT INTO refresh_tokens (user_id, token, token_family, expires_at, created_at, user_agent, ip_address)
        VALUES ($1::uuid, $2, $3::uuid, NOW() + INTERVAL '30 days', NOW(), $4, $5)`,
-      [user.id, newRefreshToken, familyToUse, req.headers["user-agent"] || null, req.ip || null]
+      [user.id, newHashedToken, familyToUse, req.headers["user-agent"] || null, req.ip || null]
     );
+
+    await client.query("COMMIT");
 
     // 8. Set Cookies based on role
     const isSuperAdmin = user.role === 'super_admin';
@@ -1366,11 +1395,14 @@ router.post("/refresh", async (req, res) => {
       isSuperAdmin
     });
   } catch (err) {
+    if (client) await client.query("ROLLBACK").catch(() => {});
     console.error("❌ Refresh route error:", err.message || err);
     return res.status(401).json({
       message: "Server error during refresh",
       error: "Unauthorized"
     });
+  } finally {
+    if (client) client.release();
   }
 });
 
@@ -1399,7 +1431,7 @@ router.get("/me", authenticateToken, async (req, res) => {
 });
 
 // ---------------------------------------------
-// ✅ Logout Route
+// ✅ Logout Route (Revokes active token and family)
 // ---------------------------------------------
 router.post("/logout", async (req, res) => {
   try {
@@ -1411,12 +1443,32 @@ router.post("/logout", async (req, res) => {
       req.body?.refreshToken;
 
     if (token) {
-      const rt = await pool.query("SELECT * FROM refresh_tokens WHERE token = $1", [token]);
+      const tokenHash = hashToken(token);
+      const rt = await pool.query(
+        "SELECT * FROM refresh_tokens WHERE token = $1 OR token = $2",
+        [tokenHash, token]
+      );
       if (rt.rows.length) {
-        const userId = rt.rows[0].user_id;
-        await logActivity(userId, "logout", req);
+        const row = rt.rows[0];
+        const userId = row.user_id;
+        const family = row.token_family;
+
+        await logActivity(userId, "logout", req).catch(() => {});
+
+        // Revoke active token family strictly scoped to this user
+        if (family) {
+          await pool.query(
+            "UPDATE refresh_tokens SET revoked = TRUE, updated_at = NOW() WHERE user_id = $1::uuid AND token_family = $2::uuid",
+            [userId, family]
+          );
+        } else {
+          await pool.query("UPDATE refresh_tokens SET revoked = TRUE, updated_at = NOW() WHERE id = $1", [row.id]);
+        }
+
+        if (redisClient && redisClient.status === "ready") {
+          await redisClient.del(`session:${userId}`).catch(() => {});
+        }
       }
-      await pool.query("DELETE FROM refresh_tokens WHERE token = $1", [token]);
     }
 
     // ✅ Clear ALL possible cookie names (role-specific + legacy generic)

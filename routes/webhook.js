@@ -24,16 +24,25 @@ router.post('/razorpay', async (req, res) => {
       return res.status(500).send('Webhook secret not configured');
     }
 
-    // Verify webhook signature (constant-time)
-    const expectedSignature = crypto
-      .createHmac('sha256', secret)
-      .update(req.rawBody)
-      .digest('hex');
+    // Verify webhook signature (constant-time) with dual-secret rotation support
+    const verifySignatureAgainstSecret = (sec) => {
+      if (!sec) return false;
+      const expected = crypto.createHmac('sha256', sec).update(req.rawBody).digest('hex');
+      const sigBufExpected = Buffer.from(expected, 'utf8');
+      const sigBufActual = Buffer.from(signature, 'utf8');
+      return sigBufExpected.length === sigBufActual.length &&
+        crypto.timingSafeEqual(sigBufExpected, sigBufActual);
+    };
 
-    const sigBufExpected = Buffer.from(expectedSignature, 'utf8');
-    const sigBufActual = Buffer.from(signature, 'utf8');
-    const signaturesMatch = sigBufExpected.length === sigBufActual.length &&
-      crypto.timingSafeEqual(sigBufExpected, sigBufActual);
+    let signaturesMatch = verifySignatureAgainstSecret(secret);
+
+    // If primary secret failed and an OLD secret is configured during rotation grace period, check fallback
+    if (!signaturesMatch && process.env.RAZORPAY_WEBHOOK_SECRET_OLD) {
+      signaturesMatch = verifySignatureAgainstSecret(process.env.RAZORPAY_WEBHOOK_SECRET_OLD);
+      if (signaturesMatch) {
+        console.log('ℹ️ [Razorpay Webhook] Signature verified using fallback RAZORPAY_WEBHOOK_SECRET_OLD');
+      }
+    }
 
     if (!signaturesMatch) {
       console.error('❌ [Razorpay Webhook] Invalid signature match');

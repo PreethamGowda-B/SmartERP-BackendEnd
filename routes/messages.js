@@ -7,6 +7,7 @@ const { createNotification, broadcastToUser } = require('../utils/notificationHe
 const { loadPlan } = require('../middleware/planMiddleware');
 const redisClient = require('../utils/redis');
 const { cloudinary, hasCloudinaryConfig } = require('../config/cloudinary');
+const { requireValidFileSignature } = require('../utils/fileValidation');
 
 // Multer setup for message attachments (in-memory, then we upload manually)
 const uploadMiddleware = multer({
@@ -840,7 +841,15 @@ router.post('/typing', async (req, res) => {
 
 // ─── POST /api/messages/upload ────────────────────────────────────────────────
 // Upload a file attachment for a message. Returns file metadata.
-router.post('/upload', uploadMiddleware.single('attachment'), async (req, res) => {
+router.post(
+  '/upload',
+  uploadMiddleware.single('attachment'),
+  requireValidFileSignature({
+    allowedMimes: ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'application/pdf'],
+    fieldName: 'attachment',
+    required: true
+  }),
+  async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ message: 'No file provided' });

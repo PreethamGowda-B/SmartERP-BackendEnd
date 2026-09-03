@@ -3,15 +3,39 @@ const router = express.Router();
 const multer = require('multer');
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
-const { storage, hasCloudinaryConfig } = require('../config/cloudinary');
+const { cloudinary, hasCloudinaryConfig } = require('../config/cloudinary');
 const { trackCreation, trackAllChanges, trackDeletion, trackRestoration, getItemHistory } = require('../utils/inventoryHistory');
 const { checkPermission } = require('../middleware/rbac');
+const { requireValidFileSignature } = require('../utils/fileValidation');
 
-// Configure multer with Cloudinary storage or memory storage as fallback
+// Configure multer with memory storage for server-side magic byte inspection
 const upload = multer({
-    storage: storage || multer.memoryStorage(),
+    storage: multer.memoryStorage(),
     limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
 });
+
+async function uploadInventoryImage(file, companyId) {
+    if (!file || !hasCloudinaryConfig || !file.buffer) return null;
+    return new Promise((resolve) => {
+        const stream = cloudinary.uploader.upload_stream(
+            {
+                folder: `smarterp/inventory/${companyId}`,
+                resource_type: 'image',
+                public_id: `inv_${Date.now()}`,
+                transformation: [{ width: 1200, crop: 'limit' }]
+            },
+            (error, result) => {
+                if (error) {
+                    console.warn('⚠️ Cloudinary inventory upload failed:', error.message);
+                    resolve(null);
+                } else {
+                    resolve(result.secure_url);
+                }
+            }
+        );
+        stream.end(file.buffer);
+    });
+}
 
 // Predefined categories and units
 const VALID_CATEGORIES = ['Raw Materials', 'Finished Goods', 'Tools', 'Supplies', 'Uncategorized'];
@@ -21,7 +45,16 @@ const { body, validationResult } = require('express-validator');
 
 // ─── POST /api/inventory ─────────────────────────────────────────────────────
 // Create inventory item (both owner and employee can add)
-router.post('/', authenticateToken, upload.single('image'), [
+router.post(
+  '/',
+  authenticateToken,
+  upload.single('image'),
+  requireValidFileSignature({
+    allowedMimes: ['image/jpeg', 'image/png', 'image/webp'],
+    fieldName: 'image',
+    required: false
+  }),
+  [
   body('name').trim().notEmpty().withMessage('Item name is required').escape(),
   body('description').optional({ checkFalsy: true }).trim().escape(),
   body('quantity').optional({ checkFalsy: true }).isInt().toInt(),
@@ -53,12 +86,7 @@ router.post('/', authenticateToken, upload.single('image'), [
         // Get image URL from Cloudinary if file was uploaded
         let imageUrl = null;
         if (req.file) {
-            if (hasCloudinaryConfig && req.file.path) {
-                imageUrl = req.file.path; // Cloudinary URL
-            } else if (req.file && !hasCloudinaryConfig) {
-                console.warn('⚠️  Image uploaded but Cloudinary not configured. Skipping image.');
-                imageUrl = null;
-            }
+            imageUrl = await uploadInventoryImage(req.file, req.user.companyId);
         }
 
         // Get employee name
@@ -244,7 +272,17 @@ router.delete('/:id', authenticateToken, checkPermission('inventory:write'), asy
 
 // ─── PUT /api/inventory/:id ──────────────────────────────────────────────────
 // Update inventory item
-router.put('/:id', authenticateToken, checkPermission('inventory:write'), upload.single('image'), [
+router.put(
+  '/:id',
+  authenticateToken,
+  checkPermission('inventory:write'),
+  upload.single('image'),
+  requireValidFileSignature({
+    allowedMimes: ['image/jpeg', 'image/png', 'image/webp'],
+    fieldName: 'image',
+    required: false
+  }),
+  [
   body('name').optional({ checkFalsy: true }).trim().escape(),
   body('description').optional({ checkFalsy: true }).trim().escape(),
   body('quantity').optional({ checkFalsy: true }).isInt().toInt(),
@@ -285,9 +323,8 @@ router.put('/:id', authenticateToken, checkPermission('inventory:write'), upload
         // Handle image upload
         let imageUrl = oldItem.image_url;
         if (req.file) {
-            if (hasCloudinaryConfig && req.file.path) {
-                imageUrl = req.file.path;
-            }
+            const uploadedUrl = await uploadInventoryImage(req.file, req.user.companyId);
+            if (uploadedUrl) imageUrl = uploadedUrl;
         }
 
         // Get user name

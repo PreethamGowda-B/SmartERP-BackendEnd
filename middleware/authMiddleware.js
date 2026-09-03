@@ -37,7 +37,7 @@ async function isCompanySuspended(companyId) {
   return suspended;
 }
 
-function authenticateToken(req, res, next) {
+async function authenticateToken(req, res, next) {
   let token = null;
 
   const isAdminRoute = req.originalUrl?.startsWith('/api/admin') || 
@@ -79,22 +79,41 @@ function authenticateToken(req, res, next) {
 
   const { emitSecurityEvent, SECURITY_EVENT_TYPES } = require("../utils/securityEmitter");
 
-  jwt.verify(token, process.env.JWT_SECRET, async (err, payload) => {
-    if (err) {
-      emitSecurityEvent({
-        eventType: SECURITY_EVENT_TYPES.AUTH_TOKEN_INVALID,
-        severity: 'low',
-        ipAddress: req.ip || req.headers['x-forwarded-for'],
-        userAgent: req.headers['user-agent'],
-        endpoint: req.originalUrl || req.path,
-        httpMethod: req.method,
-        statusCode: 401,
-        metadata: {
-          errorName: err.name,
-        }
-      });
-      return res.status(401).json({ message: "Invalid or expired token" });
+  // Dual-secret support for zero-downtime secret rotation
+  let verifiedPayload = null;
+  let verificationError = null;
+
+  try {
+    verifiedPayload = jwt.verify(token, process.env.JWT_SECRET);
+  } catch (err1) {
+    verificationError = err1;
+    if (process.env.JWT_SECRET_OLD) {
+      try {
+        verifiedPayload = jwt.verify(token, process.env.JWT_SECRET_OLD);
+        verificationError = null;
+      } catch (_) {
+        // failed with both current and old secret
+      }
     }
+  }
+
+  if (!verifiedPayload) {
+    emitSecurityEvent({
+      eventType: SECURITY_EVENT_TYPES.AUTH_TOKEN_INVALID,
+      severity: 'low',
+      ipAddress: req.ip || req.headers['x-forwarded-for'],
+      userAgent: req.headers['user-agent'],
+      endpoint: req.originalUrl || req.path,
+      httpMethod: req.method,
+      statusCode: 401,
+      metadata: {
+        errorName: verificationError ? verificationError.name : 'JsonWebTokenError',
+      }
+    });
+    return res.status(401).json({ message: "Invalid or expired token" });
+  }
+
+  const payload = verifiedPayload;
 
     if (payload.role === 'customer') {
       emitSecurityEvent({
@@ -170,7 +189,6 @@ function authenticateToken(req, res, next) {
     // ✅ Activate RLS tenant context immediately after auth so all downstream
     // DB queries run inside the correct company scope.
     setTenantContext(req, res, next);
-  });
 }
 
 module.exports = { authenticateToken };

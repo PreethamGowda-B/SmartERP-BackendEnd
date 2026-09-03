@@ -1,4 +1,4 @@
-﻿/**
+/**
  * routes/customer/auth.js
  *
  * Customer Portal authentication routes:
@@ -29,6 +29,7 @@ const { pool } = require('../../db');
 const redisClient = require('../../utils/redis');
 const { validateCompanyCode } = require('../../utils/companyIdGenerator');
 const { storage } = require('../../middleware/als');
+const { hashToken } = require('../../utils/tokenHash');
 
 // âœ… RLS bypass â€” customer auth routes look up customers/companies by email before
 // any company context is known. Explicitly opt-in to cross-tenant access.
@@ -78,14 +79,14 @@ async function issueTokens(res, req, customer) {
     { expiresIn: '30d' }
   );
 
-  // Store refresh token in dedicated customer_refresh_tokens table
+  // Store refresh token in dedicated customer_refresh_tokens table (Hashed at rest)
   await pool.query(
     `INSERT INTO customer_refresh_tokens
        (customer_id, token, token_family, expires_at, user_agent, ip_address)
      VALUES ($1, $2, $3, NOW() + INTERVAL '30 days', $4, $5)`,
     [
       customer.id,
-      refreshToken,
+      hashToken(refreshToken),
       crypto.randomUUID(),
       req.get('user-agent') || null,
       req.ip || null,
@@ -514,7 +515,7 @@ router.post('/login', [
       return res.status(403).json({ message: 'Please verify your email before logging in.' });
     }
 
-    // Check company status â€” suspended OR inactive subscription
+    // Check company status — suspended OR inactive subscription
     if (customer.company_id) {
       const companyCheck = await pool.query(
         "SELECT status, subscription_status FROM companies WHERE id = $1",
@@ -565,7 +566,7 @@ router.post('/login', [
   }
 });
 
-// â”€â”€â”€ POST /refresh â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─── POST /refresh ────────────────────────────────────────────────────────────
 router.post('/refresh', async (req, res) => {
   const refreshToken = req.cookies && req.cookies['customer_refresh_token'];
 

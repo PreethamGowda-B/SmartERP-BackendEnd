@@ -6,16 +6,17 @@ const path = require('path');
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 const { cloudinary, hasCloudinaryConfig } = require('../config/cloudinary');
+const { requireValidFileSignature } = require('../utils/fileValidation');
 
 // Use in-memory storage — we upload directly to Cloudinary, no local disk needed
 const upload = multer({
     storage: multer.memoryStorage(),
     limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
     fileFilter: (req, file, cb) => {
-        const allowed = ['image/jpeg', 'image/png', 'image/pdf', 'application/pdf'];
-        // Also allow by extension for edge cases
-        const ext = file.originalname.toLowerCase();
-        if (allowed.includes(file.mimetype) || ext.endsWith('.jpg') || ext.endsWith('.jpeg') || ext.endsWith('.png') || ext.endsWith('.pdf')) {
+        const allowed = ['image/jpeg', 'image/png', 'application/pdf'];
+        const ext = (file.originalname || '').toLowerCase();
+        const hasAllowedExt = ext.endsWith('.jpg') || ext.endsWith('.jpeg') || ext.endsWith('.png') || ext.endsWith('.pdf');
+        if (allowed.includes(file.mimetype) || hasAllowedExt) {
             return cb(null, true);
         }
         cb(new Error('Only images (JPG, PNG) and PDFs are allowed'));
@@ -24,7 +25,16 @@ const upload = multer({
 
 // ─── POST /api/documents ─────────────────────────────────────────────────────
 // Upload a document to Cloudinary (Owner/Admin only)
-router.post('/', authenticateToken, upload.single('file'), async (req, res) => {
+router.post(
+    '/',
+    authenticateToken,
+    upload.single('file'),
+    requireValidFileSignature({
+        allowedMimes: ['image/jpeg', 'image/png', 'application/pdf'],
+        fieldName: 'file',
+        required: true
+    }),
+    async (req, res) => {
     try {
         const { role, companyId, userId } = req.user;
         const { employee_id, document_type, notes } = req.body;

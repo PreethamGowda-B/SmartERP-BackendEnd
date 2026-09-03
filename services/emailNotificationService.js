@@ -238,10 +238,112 @@ async function sendFeedbackReplyEmail({ email, name, subject, originalMessage, r
   }
 }
 
+// ─── 6. Subscription Invoice & Receipt Email (to Owner) ────────────────────
+async function sendSubscriptionInvoiceEmail({
+  ownerEmail,
+  ownerName,
+  companyName,
+  planName,
+  billingCycle,
+  amount,
+  invoiceNumber,
+  paymentId,
+  orderId,
+  expiryDate
+}) {
+  try {
+    const formattedAmount = Number(amount || 0).toLocaleString('en-IN', {
+      style: 'currency',
+      currency: 'INR',
+      maximumFractionDigits: 2
+    });
+    const formattedDate = new Date().toLocaleDateString('en-IN', {
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric'
+    });
+    const formattedExpiry = expiryDate
+      ? new Date(expiryDate).toLocaleDateString('en-IN', {
+          year: 'numeric',
+          month: 'long',
+          day: 'numeric'
+        })
+      : 'Active (Auto-Renewing)';
+
+    const body = `
+      <div style="margin-bottom:24px;">
+        <span style="background:#e0e7ff;color:#4338ca;font-size:12px;font-weight:700;padding:4px 10px;border-radius:9999px;text-transform:uppercase;letter-spacing:0.5px;">Paid Invoice / Receipt</span>
+        <h2 style="margin:12px 0 6px;font-size:24px;font-weight:700;color:#1e293b;">Subscription Invoice: ${invoiceNumber}</h2>
+        <p style="margin:0;color:#64748b;font-size:14px;">Thank you for your subscription, ${ownerName || 'Valued Customer'}. Your payment was successful.</p>
+      </div>
+
+      <!-- Invoice Summary Card -->
+      <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:20px;margin-bottom:24px;">
+        <tr>
+          <td style="padding-bottom:12px;border-bottom:1px solid #e2e8f0;">
+            <p style="margin:0;color:#64748b;font-size:12px;text-transform:uppercase;letter-spacing:0.5px;font-weight:600;">Billed To</p>
+            <p style="margin:4px 0 0;font-size:15px;font-weight:700;color:#1e293b;">${companyName || 'Your Company'}</p>
+            <p style="margin:2px 0 0;font-size:13px;color:#64748b;">${ownerName || ''} (${ownerEmail})</p>
+          </td>
+          <td style="padding-bottom:12px;border-bottom:1px solid #e2e8f0;text-align:right;">
+            <p style="margin:0;color:#64748b;font-size:12px;text-transform:uppercase;letter-spacing:0.5px;font-weight:600;">Invoice Date</p>
+            <p style="margin:4px 0 0;font-size:14px;font-weight:600;color:#1e293b;">${formattedDate}</p>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding-top:16px;">
+            <p style="margin:0;font-size:16px;font-weight:700;color:#1e293b;">SmartERP ${planName} Plan (${billingCycle === 'yearly' ? 'Annual' : 'Monthly'})</p>
+            <p style="margin:4px 0 0;font-size:12px;color:#64748b;">Valid until: <strong>${formattedExpiry}</strong></p>
+          </td>
+          <td style="padding-top:16px;text-align:right;">
+            <span style="font-size:22px;font-weight:800;color:#16a34a;">${formattedAmount}</span>
+            <span style="display:block;font-size:11px;color:#16a34a;font-weight:600;">PAID IN FULL</span>
+          </td>
+        </tr>
+      </table>
+
+      <!-- Transaction Details -->
+      <table width="100%" cellpadding="8" cellspacing="0" border="0" style="background:#ffffff;border:1px solid #e2e8f0;border-radius:8px;font-size:13px;margin-bottom:24px;">
+        <tr style="background:#f1f5f9;">
+          <th align="left" style="color:#475569;font-weight:600;padding:8px 12px;">Transaction Field</th>
+          <th align="right" style="color:#475569;font-weight:600;padding:8px 12px;">Details</th>
+        </tr>
+        <tr>
+          <td style="color:#64748b;padding:8px 12px;border-bottom:1px solid #f1f5f9;">Payment ID</td>
+          <td align="right" style="font-family:monospace;color:#1e293b;padding:8px 12px;border-bottom:1px solid #f1f5f9;">${paymentId}</td>
+        </tr>
+        <tr>
+          <td style="color:#64748b;padding:8px 12px;border-bottom:1px solid #f1f5f9;">Order ID</td>
+          <td align="right" style="font-family:monospace;color:#1e293b;padding:8px 12px;border-bottom:1px solid #f1f5f9;">${orderId}</td>
+        </tr>
+        <tr>
+          <td style="color:#64748b;padding:8px 12px;">Payment Gateway</td>
+          <td align="right" style="color:#1e293b;font-weight:600;padding:8px 12px;">Razorpay Secure</td>
+        </tr>
+      </table>
+
+      <div style="text-align:center;margin-top:28px;">
+        <a href="${APP_URL}/owner/billing" style="display:inline-block;background:linear-gradient(135deg,#4f46e5,#7c3aed);color:#fff;text-decoration:none;padding:12px 32px;border-radius:8px;font-weight:600;font-size:15px;box-shadow:0 4px 12px rgba(79,70,229,0.25);">Go to Billing & Subscription →</a>
+      </div>
+    `;
+
+    await resend.emails.send({
+      from: FROM_EMAIL,
+      to: ownerEmail,
+      subject: `🧾 Subscription Invoice ${invoiceNumber} – SmartERP ${planName}`,
+      html: htmlWrapper(`Subscription Invoice: ${invoiceNumber}`, body)
+    });
+    console.log(`✅ [EmailService] Subscription invoice email sent to ${ownerEmail} for plan ${planName}`);
+  } catch (err) {
+    console.error(`❌ [EmailService] Failed to send subscription invoice email:`, err.message);
+  }
+}
+
 module.exports = {
   sendJobAssignedEmail,
   sendPayrollReleasedEmail,
   sendWelcomeEmail,
   sendJobCompletedEmail,
-  sendFeedbackReplyEmail
+  sendFeedbackReplyEmail,
+  sendSubscriptionInvoiceEmail
 };

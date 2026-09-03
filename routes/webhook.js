@@ -134,6 +134,46 @@ router.post('/razorpay', async (req, res) => {
     // Invalidate Redis Plan Cache
     invalidatePlanCache(companyId);
 
+    // Generate Invoice & Email Owner
+    try {
+      const planNameMap = { 1: 'Free', 2: 'Basic', 3: 'Pro' };
+      const planName = planNameMap[planId] || 'Pro';
+      const companyInfo = await pool.query(
+        `SELECT c.company_name, c.subscription_expires_at, u.name as owner_name, u.email as owner_email, p.price_monthly, p.price_yearly
+         FROM companies c
+         LEFT JOIN users u ON u.company_id = c.id AND u.role = 'owner'
+         LEFT JOIN plans p ON p.id = $1
+         WHERE c.id = $2
+         LIMIT 1`,
+        [planId, companyId]
+      );
+      if (companyInfo.rows.length > 0) {
+        const info = companyInfo.rows[0];
+        const ownerEmail = info.owner_email;
+        if (ownerEmail) {
+          const ownerName = info.owner_name || 'Owner';
+          const invoiceNumber = `INV-SUB-${new Date().getFullYear()}-${String(companyId).padStart(4, '0')}-${Date.now().toString().slice(-4)}`;
+          const paidAmount = billingCycle === 'yearly' ? info.price_yearly : info.price_monthly;
+
+          const { sendSubscriptionInvoiceEmail } = require('../services/emailNotificationService');
+          sendSubscriptionInvoiceEmail({
+            ownerEmail,
+            ownerName,
+            companyName: info.company_name,
+            planName,
+            billingCycle,
+            amount: paidAmount,
+            invoiceNumber,
+            paymentId,
+            orderId,
+            expiryDate: info.subscription_expires_at
+          }).catch(e => console.error('[Webhook] Error sending invoice email:', e.message));
+        }
+      }
+    } catch (invErr) {
+      console.error('⚠️ [Webhook] Failed to generate/send invoice email:', invErr.message);
+    }
+
     res.json({ status: 'ok', message: 'Subscription activated via webhook' });
   } catch (err) {
     console.error('❌ [Razorpay Webhook] Error:', err);

@@ -92,7 +92,7 @@ const corsOptions = {
     "Pragma",
     "Origin"
   ],
-  exposedHeaders: ["Set-Cookie"],
+  exposedHeaders: ["Set-Cookie", "x-rtb-fingerprint-id", "request-id", "X-Request-Id"],
   optionsSuccessStatus: 200,
 };
 

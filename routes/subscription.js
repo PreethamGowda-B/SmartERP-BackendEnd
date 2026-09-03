@@ -395,7 +395,41 @@ router.post('/verify-payment', requireOwner, async (req, res) => {
     const planName = planNameMap[verifiedPlanId] || 'Pro';
 
     const durationMs = Date.now() - startTime;
-    console.log(`[Subscription] Activation Completed in ${durationMs}ms | Company ID: ${companyId} | New Plan = ${planName}`);
+    // 7. Generate Invoice & Email Owner
+    try {
+      const companyInfo = await pool.query(
+        `SELECT c.company_name, c.subscription_expires_at, u.name as owner_name, u.email as owner_email, p.price_monthly, p.price_yearly
+         FROM companies c
+         LEFT JOIN users u ON u.company_id = c.id AND u.role = 'owner'
+         LEFT JOIN plans p ON p.id = $1
+         WHERE c.id = $2
+         LIMIT 1`,
+        [verifiedPlanId, companyId]
+      );
+      if (companyInfo.rows.length > 0) {
+        const info = companyInfo.rows[0];
+        const ownerEmail = info.owner_email || req.user.email;
+        const ownerName = info.owner_name || req.user.name || 'Owner';
+        const invoiceNumber = `INV-SUB-${new Date().getFullYear()}-${String(companyId).padStart(4, '0')}-${Date.now().toString().slice(-4)}`;
+        const paidAmount = billingCycle === 'yearly' ? info.price_yearly : info.price_monthly;
+
+        const { sendSubscriptionInvoiceEmail } = require('../services/emailNotificationService');
+        sendSubscriptionInvoiceEmail({
+          ownerEmail,
+          ownerName,
+          companyName: info.company_name,
+          planName,
+          billingCycle,
+          amount: paidAmount,
+          invoiceNumber,
+          paymentId: razorpay_payment_id,
+          orderId: razorpay_order_id,
+          expiryDate: info.subscription_expires_at
+        }).catch(e => console.error('Error sending invoice email:', e.message));
+      }
+    } catch (invErr) {
+      console.error('⚠️ [Subscription] Failed to generate/send invoice email:', invErr.message);
+    }
 
     // Push notification (async, non-blocking)
     try {

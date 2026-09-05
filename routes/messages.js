@@ -21,7 +21,35 @@ const uploadMiddleware = multer({
       'text/plain',
       'audio/webm', 'audio/ogg', 'audio/mpeg', 'audio/mp4', 'audio/wav', 'audio/x-m4a', 'audio/aac'
     ];
-    cb(null, allowed.includes(file.mimetype));
+    const baseMime = (file.mimetype || '').split(';')[0].trim().toLowerCase();
+    cb(null, allowed.includes(baseMime));
+  }
+});
+
+// ─── GET /api/messages/media/:id ─────────────────────────────────────────────
+// Stream public/inline message media (photos, voice notes, attachments)
+// Defined before authentication middleware so <img> and <audio> tags render without auth headers.
+router.get('/media/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query(
+      `SELECT file_name, file_type, file_size, data FROM message_media_files WHERE id = $1`,
+      [id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Media not found' });
+    }
+    const file = result.rows[0];
+    res.setHeader('Content-Type', file.file_type || 'application/octet-stream');
+    if (file.file_size) {
+      res.setHeader('Content-Length', file.file_size);
+    }
+    res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(file.file_name || 'media')}"`);
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    return res.send(file.data);
+  } catch (err) {
+    console.error('Error fetching media:', err);
+    res.status(500).json({ message: 'Error retrieving media' });
   }
 });
 
@@ -873,56 +901,80 @@ router.post(
   requireValidFileSignature({
     allowedMimes: [
       'image/jpeg', 'image/png', 'image/webp', 'image/gif', 'application/pdf',
-      'audio/webm', 'audio/ogg', 'audio/mpeg', 'audio/mp4', 'audio/wav', 'audio/x-m4a'
+      'audio/webm', 'audio/ogg', 'audio/mpeg', 'audio/mp4', 'audio/wav', 'audio/x-m4a', 'audio/aac'
     ],
     fieldName: 'attachment',
     required: true
   }),
   async (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({ message: 'No file provided' });
-    }
+    try {
+      if (!req.file) {
+        return res.status(400).json({ message: 'No file provided' });
+      }
 
-    if (!hasCloudinaryConfig) {
-      return res.status(503).json({ message: 'File upload is not configured' });
-    }
+      const { originalname, mimetype, size, buffer } = req.file;
+      const cleanMime = (mimetype || '').split(';')[0].trim().toLowerCase();
+      const isImage = cleanMime.startsWith('image/');
+      const isAudio = cleanMime.startsWith('audio/');
+      const folder = 'smarterp/messages';
 
-    const { originalname, mimetype, size, buffer } = req.file;
-    const isImage = mimetype.startsWith('image/');
-    const isAudio = mimetype.startsWith('audio/');
-    const folder = 'smarterp/messages';
+      let fileUrl = null;
 
-    // Upload buffer to Cloudinary
-    const uploadResult = await new Promise((resolve, reject) => {
-      const stream = cloudinary.uploader.upload_stream(
-        {
-          folder,
-          resource_type: isImage ? 'image' : isAudio ? 'video' : 'auto',
-          public_id: `msg_${Date.now()}`,
-          ...(isImage && { transformation: [{ width: 1200, crop: 'limit' }] })
-        },
-        (error, result) => {
-          if (error) reject(error);
-          else resolve(result);
+      // 1. Attempt upload to Cloudinary if credentials are configured
+      if (hasCloudinaryConfig) {
+        try {
+          const uploadResult = await new Promise((resolve, reject) => {
+            const stream = cloudinary.uploader.upload_stream(
+              {
+                folder,
+                resource_type: isImage ? 'image' : isAudio ? 'video' : 'auto',
+                public_id: `msg_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+                ...(isImage && { transformation: [{ width: 1200, crop: 'limit' }] })
+              },
+              (error, result) => {
+                if (error) reject(error);
+                else resolve(result);
+              }
+            );
+            stream.end(buffer);
+          });
+          if (uploadResult && uploadResult.secure_url) {
+            fileUrl = uploadResult.secure_url;
+          }
+        } catch (cloudErr) {
+          console.warn('⚠️ Cloudinary upload failed, falling back to database media storage:', cloudErr.message);
         }
-      );
-      stream.end(buffer);
-    });
+      }
 
-    res.json({
-      file_url: uploadResult.secure_url,
-      media_url: uploadResult.secure_url,
-      file_name: originalname,
-      file_type: mimetype,
-      media_type: isImage ? 'image' : isAudio ? 'audio' : 'document',
-      file_size: size
-    });
-  } catch (err) {
-    console.error('Error uploading message attachment:', err);
-    res.status(500).json({ message: 'File upload failed' });
+      // 2. High-performance, resilient fallback: store binary buffer in PostgreSQL message_media_files
+      if (!fileUrl) {
+        const insertRes = await pool.query(
+          `INSERT INTO message_media_files (file_name, file_type, file_size, data)
+           VALUES ($1, $2, $3, $4)
+           RETURNING id`,
+          [originalname || (isAudio ? 'voicenote.webm' : 'attachment'), cleanMime, size, buffer]
+        );
+        const mediaId = insertRes.rows[0].id;
+        const reqHost = req.get('host') || 'api.prozync.in';
+        const protocol = req.protocol === 'http' && !req.secure ? 'http' : 'https';
+        fileUrl = `${protocol}://${reqHost}/api/messages/media/${mediaId}`;
+      }
+
+      res.json({
+        url: fileUrl,
+        file_url: fileUrl,
+        media_url: fileUrl,
+        file_name: originalname || (isAudio ? 'Voice Note' : 'Attachment'),
+        file_type: cleanMime,
+        media_type: isImage ? 'image' : isAudio ? 'audio' : 'document',
+        file_size: size
+      });
+    } catch (err) {
+      console.error('Error uploading message attachment:', err);
+      res.status(500).json({ message: 'File upload failed: ' + (err.message || 'Server error') });
+    }
   }
-});
+);
 
 module.exports = router;
 

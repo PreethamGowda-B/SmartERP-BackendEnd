@@ -114,6 +114,7 @@ app.use(helmet({
         "https://*.googleapis.com",
       ],
       imgSrc: ["'self'", "data:", "https:", "https://res.cloudinary.com"],
+      mediaSrc: ["'self'", "data:", "blob:", "https:", "https://res.cloudinary.com"],
       styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
       fontSrc: ["'self'", "https://fonts.gstatic.com"],
       upgradeInsecureRequests: [],

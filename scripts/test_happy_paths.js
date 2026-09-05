@@ -7,7 +7,7 @@ const { cloudinary, hasCloudinaryConfig } = require('../config/cloudinary');
 
 async function test1_DocumentUpload() {
   console.log('\n--- 1. REAL DOCUMENT UPLOAD TEST ---');
-  const cloudName = process.env.CLOUDINARY_CLOUD_NAME || 'dvqnrmdbo';
+  const cloudName = process.env.CLOUDINARY_CLOUD_NAME || 'dvqnrmbdo';
   console.log('📌 Configured CLOUDINARY_CLOUD_NAME in .env:', cloudName);
 
   const empRes = await pool.query("SELECT id, company_id FROM users LIMIT 1");
@@ -122,7 +122,7 @@ async function test2_WebhookRetry() {
 
 async function test3_InvoiceGeneration() {
   console.log('\n--- 3. REAL INVOICE GENERATION TEST ---');
-  const cloudName = process.env.CLOUDINARY_CLOUD_NAME || 'dvqnrmdbo';
+  const cloudName = process.env.CLOUDINARY_CLOUD_NAME || 'dvqnrmbdo';
   console.log('📌 Configured CLOUDINARY_CLOUD_NAME in .env:', cloudName);
 
   let jobRes = await pool.query("SELECT * FROM jobs WHERE status = 'completed' LIMIT 1");

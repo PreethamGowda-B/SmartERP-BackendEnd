@@ -920,7 +920,7 @@ const handleJobAccept = async (req, res) => {
       // Cloudinary upload for invoice PDF
       let pdfUrl = null;
       const { cloudinary, hasCloudinaryConfig } = require('../config/cloudinary');
-      const cloudName = process.env.CLOUDINARY_CLOUD_NAME || 'dvqnrmdbo';
+      const cloudName = process.env.CLOUDINARY_CLOUD_NAME || 'dvqnrmbdo';
       if (hasCloudinaryConfig) {
         try {
           const invoiceContent = `Invoice #${invoiceNumber} for Job ${job.title} - Total: ₹${amount}`;

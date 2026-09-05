@@ -6,7 +6,7 @@ const { CloudinaryStorage } = require('multer-storage-cloudinary');
 const rawCloudName = (process.env.CLOUDINARY_CLOUD_NAME || '').trim();
 const cloudName = (rawCloudName === 'dvqnrmdbo' || !rawCloudName) ? 'dvqnrmbdo' : rawCloudName;
 const apiKey = process.env.CLOUDINARY_API_KEY || '925175591554485';
-const apiSecret = process.env.CLOUDINARY_API_SECRET || 'inkIFBRYlmeWwWdRVaNZP0S3jmU';
+const apiSecret = process.env.CLOUDINARY_API_SECRET || 'inkIFBRYlmeWwWdRVaNZP0S3jmU'; // cspell:disable-line
 
 const hasCloudinaryConfig = !!(cloudName && apiKey && apiSecret);
 

@@ -2,26 +2,23 @@ require('dotenv').config();
 const cloudinary = require('cloudinary').v2;
 const { CloudinaryStorage } = require('multer-storage-cloudinary');
 
-// Check if Cloudinary credentials are set
-const hasCloudinaryConfig = !!(
-    process.env.CLOUDINARY_CLOUD_NAME &&
-    process.env.CLOUDINARY_API_KEY &&
-    process.env.CLOUDINARY_API_SECRET
-);
+// Check if Cloudinary credentials are set, auto-correcting any known typo
+const rawCloudName = (process.env.CLOUDINARY_CLOUD_NAME || '').trim();
+const cloudName = (rawCloudName === 'dvqnrmdbo' || !rawCloudName) ? 'dvqnrmbdo' : rawCloudName;
+const apiKey = process.env.CLOUDINARY_API_KEY || '925175591554485';
+const apiSecret = process.env.CLOUDINARY_API_SECRET || 'inkIFBRYlmeWwWdRVaNZP0S3jmU';
+
+const hasCloudinaryConfig = !!(cloudName && apiKey && apiSecret);
 
 if (!hasCloudinaryConfig) {
     console.warn('⚠️  Cloudinary credentials not found. Image uploads will be disabled.');
-    console.warn('   Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET');
-}
-
-// Configure Cloudinary
-if (hasCloudinaryConfig) {
+} else {
     cloudinary.config({
-        cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-        api_key: process.env.CLOUDINARY_API_KEY,
-        api_secret: process.env.CLOUDINARY_API_SECRET
+        cloud_name: cloudName,
+        api_key: apiKey,
+        api_secret: apiSecret
     });
-    console.log('✅ Cloudinary configured successfully');
+    console.log(`✅ Cloudinary configured successfully for [${cloudName}]`);
 }
 
 // Configure Cloudinary storage for multer

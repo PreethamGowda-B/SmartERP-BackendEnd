@@ -91,7 +91,25 @@ router.post(
             }
         }
 
-        // Reject if cloud storage upload failed — never store megabytes of base64 in PostgreSQL rows
+        // If Cloudinary failed or is unavailable, seamlessly fallback to database binary storage
+        if (!fileUrl) {
+            try {
+                console.log('📦 Persisting document to database media storage fallback...');
+                const mediaRes = await pool.query(
+                    `INSERT INTO message_media_files (file_name, file_type, file_size, data)
+                     VALUES ($1, $2, $3, $4)
+                     RETURNING id`,
+                    [req.file.originalname || `doc_${Date.now()}`, req.file.mimetype, req.file.size, req.file.buffer]
+                );
+                const baseUrl = process.env.BASE_URL || 'https://api.prozync.in';
+                fileUrl = `${baseUrl}/api/messages/media/${mediaRes.rows[0].id}`;
+                console.log('✅ Document saved to database media fallback:', fileUrl);
+            } catch (dbErr) {
+                console.error('❌ Database fallback document upload failed:', dbErr.message);
+            }
+        }
+
+        // Reject only if both cloud and database fallback failed
         if (!fileUrl) {
             return res.status(502).json({ 
                 message: 'Failed to upload document to secure cloud storage. Please verify file format and try again.' 

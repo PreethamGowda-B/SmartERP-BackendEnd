@@ -393,6 +393,12 @@ async function fixDatabaseConstraints() {
       END $$;
     `).catch(() => {});
 
+    // Ensure refresh_tokens and customer_refresh_tokens have updated_at column
+    await client.query(`
+      ALTER TABLE refresh_tokens ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
+      ALTER TABLE customer_refresh_tokens ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
+    `).catch(() => {});
+
     console.log('✅ Database constraints fixed');
 
     // Step 4: Setup Periodic Refresh Token Cleanup (Every 24 hours)

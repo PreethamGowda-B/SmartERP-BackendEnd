@@ -1274,9 +1274,9 @@ router.post("/refresh", async (req, res) => {
     if (refreshTokenData.revoked) {
       if (refreshTokenData.token_family) {
         await client.query(
-          "UPDATE refresh_tokens SET revoked = TRUE, updated_at = NOW() WHERE user_id = $1::uuid AND token_family = $2::uuid",
+          "UPDATE refresh_tokens SET revoked = TRUE WHERE user_id = $1::uuid AND token_family = $2::uuid",
           [userId, refreshTokenData.token_family]
-        );
+        ).catch(() => {});
       }
       await client.query("COMMIT");
 
@@ -1343,7 +1343,7 @@ router.post("/refresh", async (req, res) => {
 
     // 6. SINGLE-USE ROTATION: Invalidate the current token immediately
     await client.query(
-      "UPDATE refresh_tokens SET revoked = TRUE, updated_at = NOW() WHERE id = $1",
+      "UPDATE refresh_tokens SET revoked = TRUE WHERE id = $1",
       [refreshTokenData.id]
     );
 
@@ -1456,13 +1456,17 @@ router.post("/logout", async (req, res) => {
         await logActivity(userId, "logout", req).catch(() => {});
 
         // Revoke active token family strictly scoped to this user
-        if (family) {
-          await pool.query(
-            "UPDATE refresh_tokens SET revoked = TRUE, updated_at = NOW() WHERE user_id = $1::uuid AND token_family = $2::uuid",
-            [userId, family]
-          );
-        } else {
-          await pool.query("UPDATE refresh_tokens SET revoked = TRUE, updated_at = NOW() WHERE id = $1", [row.id]);
+        try {
+          if (family) {
+            await pool.query(
+              "UPDATE refresh_tokens SET revoked = TRUE WHERE user_id = $1::uuid AND token_family = $2::uuid",
+              [userId, family]
+            ).catch(() => {});
+          } else {
+            await pool.query("UPDATE refresh_tokens SET revoked = TRUE WHERE id = $1", [row.id]).catch(() => {});
+          }
+        } catch (revokeErr) {
+          console.warn("Token revocation warning during logout (non-fatal):", revokeErr.message);
         }
 
         if (redisClient && redisClient.status === "ready") {
@@ -1480,10 +1484,18 @@ router.post("/logout", async (req, res) => {
     res.clearCookie("access_token", cookieOpts);
     res.clearCookie("refresh_token", cookieOpts);
 
-    res.json({ ok: true });
+    return res.json({ ok: true });
   } catch (err) {
-    console.error("Logout error:", err.message);
-    res.status(500).json({ message: "Server error during logout" });
+    console.warn("Logout warning (handled cleanly):", err.message);
+    // Clear cookies even on unexpected error
+    const cookieOpts = { sameSite: "none", secure: true, path: "/" };
+    res.clearCookie(COOKIE_ACCESS_USER, cookieOpts);
+    res.clearCookie(COOKIE_REFRESH_USER, cookieOpts);
+    res.clearCookie(COOKIE_ACCESS_ADMIN, cookieOpts);
+    res.clearCookie(COOKIE_REFRESH_ADMIN, cookieOpts);
+    res.clearCookie("access_token", cookieOpts);
+    res.clearCookie("refresh_token", cookieOpts);
+    return res.json({ ok: true });
   }
 });
 

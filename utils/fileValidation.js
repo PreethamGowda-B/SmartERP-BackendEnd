@@ -61,6 +61,42 @@ const MIME_SIGNATURES = {
       buf.length >= 6 &&
       buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x38 && // GIF8
       (buf[4] === 0x37 || buf[4] === 0x39) && buf[5] === 0x61                      // 7a or 9a
+  },
+  WEBM_AUDIO: {
+    mime: 'audio/webm',
+    extensions: ['webm'],
+    check: (buf) =>
+      buf.length >= 4 &&
+      buf[0] === 0x1a && buf[1] === 0x45 && buf[2] === 0xdf && buf[3] === 0xa3
+  },
+  OGG_AUDIO: {
+    mime: 'audio/ogg',
+    extensions: ['ogg', 'oga'],
+    check: (buf) =>
+      buf.length >= 4 &&
+      buf[0] === 0x4f && buf[1] === 0x67 && buf[2] === 0x67 && buf[3] === 0x53 // OggS
+  },
+  WAV_AUDIO: {
+    mime: 'audio/wav',
+    extensions: ['wav'],
+    check: (buf) =>
+      buf.length >= 12 &&
+      buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46 && // RIFF
+      buf[8] === 0x57 && buf[9] === 0x41 && buf[10] === 0x56 && buf[11] === 0x45  // WAVE
+  },
+  MP3_AUDIO: {
+    mime: 'audio/mpeg',
+    extensions: ['mp3'],
+    check: (buf) =>
+      (buf.length >= 3 && buf[0] === 0x49 && buf[1] === 0x44 && buf[2] === 0x33) || // ID3
+      (buf.length >= 2 && buf[0] === 0xff && (buf[1] & 0xe0) === 0xe0)              // MPEG sync frame
+  },
+  MP4_AUDIO: {
+    mime: 'audio/mp4',
+    extensions: ['m4a', 'mp4'],
+    check: (buf) =>
+      buf.length >= 8 &&
+      buf[4] === 0x66 && buf[5] === 0x74 && buf[6] === 0x79 && buf[7] === 0x70      // ftyp
   }
 };
 

@@ -14,10 +14,13 @@ const uploadMiddleware = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB
   fileFilter: (_req, file, cb) => {
-    const allowed = ['image/jpeg', 'image/png', 'image/gif', 'image/webp',
-                     'application/pdf', 'application/msword',
-                     'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-                     'text/plain'];
+    const allowed = [
+      'image/jpeg', 'image/png', 'image/gif', 'image/webp',
+      'application/pdf', 'application/msword',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      'text/plain',
+      'audio/webm', 'audio/ogg', 'audio/mpeg', 'audio/mp4', 'audio/wav', 'audio/x-m4a', 'audio/aac'
+    ];
     cb(null, allowed.includes(file.mimetype));
   }
 });
@@ -81,33 +84,33 @@ router.post('/conversations/start', async (req, res) => {
       return res.status(400).json({ message: 'other_user_id is required' });
     }
 
-    // Verify both users belong to the same company
-    const companyCheck = await pool.query(
-      `SELECT u1.company_id AS c1, u2.company_id AS c2
-       FROM users u1, users u2
-       WHERE u1.id::text = $1 AND u2.id::text = $2`,
+    // Verify both users belong to the same company with indexed lookup
+    const usersCheck = await pool.query(
+      `SELECT id, company_id FROM users WHERE id IN ($1::uuid, $2::uuid)`,
       [String(currentUserId), String(other_user_id)]
     );
 
-    if (companyCheck.rows.length === 0) {
+    if (usersCheck.rows.length === 0) {
       return res.status(403).json({ message: 'One or both users not found' });
     }
 
-    const { c1, c2 } = companyCheck.rows[0];
-    if (String(c1) !== String(c2)) {
+    const c1 = usersCheck.rows.find(u => String(u.id) === String(currentUserId))?.company_id;
+    const c2 = usersCheck.rows.find(u => String(u.id) === String(other_user_id))?.company_id;
+
+    if (!c1 || !c2 || String(c1) !== String(c2)) {
       return res.status(403).json({ message: 'Users do not belong to the same company' });
     }
 
     const companyId = c1;
 
-    // Check if a conversation already exists between the two users
+    // Check if a conversation already exists between the two users using indexed lookup
     const existing = await pool.query(
       `SELECT c.id FROM conversations c
-       JOIN conversation_participants cp1 ON cp1.conversation_id = c.id AND cp1.user_id::text = $1
-       JOIN conversation_participants cp2 ON cp2.conversation_id = c.id AND cp2.user_id::text = $2
-       WHERE c.company_id::text = $3
+       JOIN conversation_participants cp1 ON cp1.conversation_id = c.id AND cp1.user_id = $1::uuid
+       JOIN conversation_participants cp2 ON cp2.conversation_id = c.id AND cp2.user_id = $2::uuid
+       WHERE c.company_id = $3
        LIMIT 1`,
-      [String(currentUserId), String(other_user_id), String(companyId)]
+      [String(currentUserId), String(other_user_id), companyId]
     );
 
     if (existing.rows.length > 0) {
@@ -258,35 +261,37 @@ router.post('/', async (req, res) => {
         console.warn('⚠️ broadcastToUser failed:', broadcastErr.message);
       }
 
-      // Push notification to recipient
-      try {
-        const recipientInfo = await pool.query(
-          `SELECT role FROM users WHERE id::text = $1`,
-          [String(recipientId)]
-        );
-        const recipientRole = recipientInfo.rows[0]?.role ?? 'employee';
-        const targetUrl = recipientRole === 'owner' || recipientRole === 'admin'
-          ? '/owner/messages'
-          : '/employee/messages';
+      // Push notification to recipient (asynchronous background worker to eliminate sending delay)
+      (async () => {
+        try {
+          const recipientInfo = await pool.query(
+            `SELECT role FROM users WHERE id = $1::uuid`,
+            [String(recipientId)]
+          );
+          const recipientRole = recipientInfo.rows[0]?.role ?? 'employee';
+          const targetUrl = recipientRole === 'owner' || recipientRole === 'admin'
+            ? '/owner/messages'
+            : '/employee/messages';
 
-        await createNotification({
-          user_id: recipientId,
-          company_id: companyId,
-          type: 'message',
-          title: 'New Message',
-          message: `New message from ${senderName}`,
-          priority: senderRole === 'owner' ? 'high' : 'medium',
-          actor_id: senderId,
-          data: {
-            message_id: sentMessage.id,
-            sender_id: senderId,
-            conversation_id,
-            url: targetUrl
-          }
-        });
-      } catch (notifErr) {
-        console.error('❌ Failed to send message notification:', notifErr);
-      }
+          await createNotification({
+            user_id: recipientId,
+            company_id: companyId,
+            type: 'message',
+            title: 'New Message',
+            message: `New message from ${senderName}`,
+            priority: senderRole === 'owner' ? 'high' : 'medium',
+            actor_id: senderId,
+            data: {
+              message_id: sentMessage.id,
+              sender_id: senderId,
+              conversation_id,
+              url: targetUrl
+            }
+          });
+        } catch (notifErr) {
+          console.error('❌ Failed to send message notification in background:', notifErr);
+        }
+      })().catch(err => console.error('❌ Async notification worker failed:', err));
     }
 
     res.status(201).json({
@@ -347,7 +352,28 @@ router.get('/conversation/:conversationId', async (req, res) => {
 
     const fetched = result.rows;
     const hasMore = fetched.length > pageSize;
-    const messages = hasMore ? fetched.slice(0, pageSize) : fetched;
+    const sliced = hasMore ? fetched.slice(0, pageSize) : fetched;
+
+    const messages = sliced.map((row) => {
+      const mediaUrl = row.media_url;
+      const isImg = row.message_type === 'image' || (row.media_type && row.media_type.startsWith('image'));
+      const isAud = row.message_type === 'audio' || (row.media_type && row.media_type.startsWith('audio'));
+      const mediaType = isImg ? 'image' : isAud ? 'audio' : (row.media_type || (mediaUrl ? 'document' : null));
+
+      const attachment = mediaUrl ? {
+        file_url: mediaUrl,
+        media_url: mediaUrl,
+        file_name: row.file_name || (isAud ? 'Voice Note' : isImg ? 'Photo' : 'Attachment'),
+        file_type: isImg ? 'image/jpeg' : isAud ? 'audio/webm' : 'application/octet-stream',
+        media_type: mediaType,
+        file_size: row.file_size || 0,
+      } : undefined;
+
+      return {
+        ...row,
+        attachment
+      };
+    });
 
     res.json({ messages, has_more: hasMore });
   } catch (err) {
@@ -845,7 +871,10 @@ router.post(
   '/upload',
   uploadMiddleware.single('attachment'),
   requireValidFileSignature({
-    allowedMimes: ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'application/pdf'],
+    allowedMimes: [
+      'image/jpeg', 'image/png', 'image/webp', 'image/gif', 'application/pdf',
+      'audio/webm', 'audio/ogg', 'audio/mpeg', 'audio/mp4', 'audio/wav', 'audio/x-m4a'
+    ],
     fieldName: 'attachment',
     required: true
   }),
@@ -861,6 +890,7 @@ router.post(
 
     const { originalname, mimetype, size, buffer } = req.file;
     const isImage = mimetype.startsWith('image/');
+    const isAudio = mimetype.startsWith('audio/');
     const folder = 'smarterp/messages';
 
     // Upload buffer to Cloudinary
@@ -868,7 +898,7 @@ router.post(
       const stream = cloudinary.uploader.upload_stream(
         {
           folder,
-          resource_type: isImage ? 'image' : 'raw',
+          resource_type: isImage ? 'image' : isAudio ? 'video' : 'auto',
           public_id: `msg_${Date.now()}`,
           ...(isImage && { transformation: [{ width: 1200, crop: 'limit' }] })
         },
@@ -882,8 +912,10 @@ router.post(
 
     res.json({
       file_url: uploadResult.secure_url,
+      media_url: uploadResult.secure_url,
       file_name: originalname,
       file_type: mimetype,
+      media_type: isImage ? 'image' : isAudio ? 'audio' : 'document',
       file_size: size
     });
   } catch (err) {

@@ -124,7 +124,8 @@ router.get('/editor-data/:jobId', authenticate, async (req, res) => {
     return res.json({ success: true, ...editorData });
   } catch (err) {
     console.error('GET /api/invoices/editor-data/:jobId error:', err.message);
-    return res.status(500).json({ error: err.message });
+    const status = err.statusCode || (err.message && err.message.includes('not found') ? 404 : 500);
+    return res.status(status).json({ error: err.message });
   }
 });
 

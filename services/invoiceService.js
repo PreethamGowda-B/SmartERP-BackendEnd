@@ -17,18 +17,44 @@ class InvoiceService {
    * Fetches pre-populated data for the Dedicated Invoice Editor Page.
    * Pulls job details, labor hours, material requests, customer info, and company rates.
    */
-  static async prepareInvoiceDataForJob(jobId, companyId) {
-    const jobRes = await pool.query(
+  static async prepareInvoiceDataForJob(identifier, companyId) {
+    if (!identifier) {
+      const err = new Error('Job or Invoice identifier is required');
+      err.statusCode = 400;
+      throw err;
+    }
+
+    let jobRes = await pool.query(
       `SELECT j.*, 
               c.name AS customer_name, c.email AS customer_email, c.phone AS customer_phone
        FROM jobs j
        LEFT JOIN customers c ON j.customer_id::text = c.id::text
-       WHERE j.id = $1 AND j.company_id = $2`,
-      [jobId, companyId]
+       WHERE j.id::text = $1::text AND j.company_id::text = $2::text`,
+      [String(identifier), String(companyId)]
     );
 
+    // If not found by job ID, check if identifier is actually an invoice ID
     if (jobRes.rows.length === 0) {
-      throw new Error(`Job ${jobId} not found`);
+      const invCheck = await pool.query(
+        `SELECT job_id FROM invoices WHERE id::text = $1::text AND company_id::text = $2::text`,
+        [String(identifier), String(companyId)]
+      );
+      if (invCheck.rows.length > 0 && invCheck.rows[0].job_id) {
+        jobRes = await pool.query(
+          `SELECT j.*, 
+                  c.name AS customer_name, c.email AS customer_email, c.phone AS customer_phone
+           FROM jobs j
+           LEFT JOIN customers c ON j.customer_id::text = c.id::text
+           WHERE j.id::text = $1::text AND j.company_id::text = $2::text`,
+          [String(invCheck.rows[0].job_id), String(companyId)]
+        );
+      }
+    }
+
+    if (jobRes.rows.length === 0) {
+      const err = new Error(`Job or Invoice ${identifier} not found`);
+      err.statusCode = 404;
+      throw err;
     }
 
     const job = jobRes.rows[0];
@@ -47,8 +73,8 @@ class InvoiceService {
     let hourlyRate = parseFloat(job.hourly_rate) || 500.0;
     try {
       const rateRes = await pool.query(
-        `SELECT setting_value FROM company_settings WHERE company_id = $1 AND setting_key = 'hourly_rate'`,
-        [companyId]
+        `SELECT setting_value FROM company_settings WHERE company_id::text = $1::text AND setting_key = 'hourly_rate'`,
+        [String(companyId)]
       );
       if (rateRes.rows.length > 0) {
         hourlyRate = parseFloat(rateRes.rows[0].setting_value) || hourlyRate;
@@ -56,20 +82,83 @@ class InvoiceService {
     } catch (_) {}
 
     // Pull materials used from material_requests approved for this company/job
-    const materialsRes = await pool.query(
-      `SELECT item_name, quantity, description 
-       FROM material_requests 
-       WHERE company_id = $1 AND status = 'approved'
-       ORDER BY created_at DESC`,
-      [companyId]
-    );
+    let materialsUsed = [];
+    try {
+      const materialsRes = await pool.query(
+        `SELECT item_name, quantity, description 
+         FROM material_requests 
+         WHERE company_id::text = $1::text AND status = 'approved'
+         ORDER BY created_at DESC`,
+        [String(companyId)]
+      );
 
-    const materialsUsed = materialsRes.rows.map((m) => ({
-      item_name: m.item_name,
-      quantity: parseFloat(m.quantity || 1),
-      unit_cost: 150.0, // Default estimate
-      total_cost: parseFloat((m.quantity || 1) * 150.0),
-    }));
+      materialsUsed = materialsRes.rows.map((m) => ({
+        item_name: m.item_name,
+        quantity: parseFloat(m.quantity || 1),
+        unit_cost: 150.0, // Default estimate
+        total_cost: parseFloat(((m.quantity || 1) * 150.0).toFixed(2)),
+      }));
+    } catch (mErr) {
+      console.warn('[invoiceService] material_requests query non-fatal warning:', mErr.message);
+    }
+
+    // Check if an existing invoice already exists for this job or was queried via invoice ID
+    let existingInvoice = null;
+    let existingLineItems = [];
+    try {
+      const invQuery = await pool.query(
+        `SELECT * FROM invoices 
+         WHERE (job_id::text = $1::text OR id::text = $2::text) AND company_id::text = $3::text 
+         ORDER BY created_at DESC LIMIT 1`,
+        [String(job.id), String(identifier), String(companyId)]
+      );
+      if (invQuery.rows.length > 0) {
+        existingInvoice = invQuery.rows[0];
+        const itemsRes = await pool.query(
+          `SELECT item_type, description, hsn_code, quantity, unit_price, total_amount 
+           FROM invoice_items WHERE invoice_id::text = $1::text ORDER BY id ASC`,
+          [String(existingInvoice.id)]
+        );
+        existingLineItems = itemsRes.rows;
+      }
+    } catch (e) {
+      console.warn('[invoiceService] existing invoice fetch non-fatal warning:', e.message);
+    }
+
+    if (existingInvoice) {
+      return {
+        job: {
+          id: job.id,
+          title: job.title,
+          description: job.description,
+          status: job.status,
+          started_at: job.started_at,
+          completed_at: job.completed_at,
+          customer_id: job.customer_id,
+          customer_name: job.customer_name || 'Direct Customer',
+          customer_email: job.customer_email || '',
+          customer_phone: job.customer_phone || '',
+          is_billable: job.is_billable,
+        },
+        existingInvoice,
+        prefilled: {
+          labour_hours: parseFloat(existingInvoice.labour_hours || laborHours),
+          labour_rate: parseFloat(existingInvoice.labour_rate || hourlyRate),
+          materials_used: materialsUsed,
+          line_items: existingLineItems,
+          equipment_charges: parseFloat(existingInvoice.equipment_charges || 0),
+          transport_charges: parseFloat(existingInvoice.transport_charges || 0),
+          additional_charges: parseFloat(existingInvoice.additional_charges || 0),
+          discount_amount: parseFloat(existingInvoice.discount_amount || 0),
+          gst_rate: parseFloat(existingInvoice.gst_rate || 18.0),
+          is_inter_state: Boolean(existingInvoice.is_inter_state),
+          payment_terms: existingInvoice.payment_terms || 'Net 15 Days',
+          customer_notes: existingInvoice.customer_notes || 'Thank you for your business!',
+          internal_notes: existingInvoice.internal_notes || '',
+          due_days: 15,
+        },
+      };
+    }
 
     return {
       job: {
@@ -109,26 +198,49 @@ class InvoiceService {
     try {
       await client.query('BEGIN');
 
-      // 1. Fetch job with lock
-      const jobRes = await client.query(
-        `SELECT j.*, c.name AS customer_name, c.email AS customer_email, c.phone AS customer_phone
+      // 1. Fetch job with lock (supporting jobId or invoiceId identifier)
+      let jobRes = await client.query(
+        `SELECT j.*, 
+                c.name AS customer_name, c.email AS customer_email, c.phone AS customer_phone
          FROM jobs j
          LEFT JOIN customers c ON j.customer_id::text = c.id::text
-         WHERE j.id = $1 AND j.company_id::text = $2::text
+         WHERE j.id::text = $1::text AND j.company_id::text = $2::text
          FOR UPDATE OF j`,
-        [jobId, companyId]
+        [String(jobId), String(companyId)]
       );
+
+      if (jobRes.rows.length === 0) {
+        // Check if jobId is actually an invoice ID
+        const invCheck = await client.query(
+          `SELECT job_id FROM invoices WHERE id::text = $1::text AND company_id::text = $2::text`,
+          [String(jobId), String(companyId)]
+        );
+        if (invCheck.rows.length > 0 && invCheck.rows[0].job_id) {
+          jobRes = await client.query(
+            `SELECT j.*, 
+                    c.name AS customer_name, c.email AS customer_email, c.phone AS customer_phone
+             FROM jobs j
+             LEFT JOIN customers c ON j.customer_id::text = c.id::text
+             WHERE j.id::text = $1::text AND j.company_id::text = $2::text
+             FOR UPDATE OF j`,
+            [String(invCheck.rows[0].job_id), String(companyId)]
+          );
+        }
+      }
 
       if (jobRes.rows.length === 0) {
         throw new Error(`Job ${jobId} not found`);
       }
 
       const job = jobRes.rows[0];
+      const actualJobId = job.id;
 
       // 2. Check if invoice is already issued/paid/draft for this job — if so, update & increment edited_count
       const existingIssuedInv = await client.query(
-        `SELECT id, invoice_number, edited_count FROM invoices WHERE job_id::text = $1::text AND company_id::text = $2::text ORDER BY created_at DESC LIMIT 1`,
-        [String(jobId), String(companyId)]
+        `SELECT id, invoice_number, edited_count FROM invoices 
+         WHERE (job_id::text = $1::text OR id::text = $2::text) AND company_id::text = $3::text 
+         ORDER BY created_at DESC LIMIT 1`,
+        [String(actualJobId), String(jobId), String(companyId)]
       );
 
       if (existingIssuedInv.rows.length > 0) {
@@ -227,12 +339,6 @@ class InvoiceService {
           ).catch(() => {});
         }
 
-        // Ensure jobs table links to updated invoice
-        await client.query(
-          `UPDATE jobs SET invoice_id = $1, updated_at = NOW() WHERE id::text = $2::text`,
-          [String(updatedInvoice.id), String(jobId)]
-        ).catch(() => {});
-
         await client.query('COMMIT');
         return { success: true, invoice: updatedInvoice, reason: 'invoice_updated', edited_count: updatedInvoice.edited_count };
       }
@@ -296,8 +402,8 @@ class InvoiceService {
       // Generate Invoice Number
       const year = new Date().getFullYear();
       const invoiceNumRes = await client.query(
-        `SELECT COUNT(*) AS count FROM invoices WHERE company_id = $1`,
-        [companyId]
+        `SELECT COUNT(*) AS count FROM invoices WHERE company_id::text = $1::text`,
+        [String(companyId)]
       );
       const count = parseInt(invoiceNumRes.rows[0].count, 10) + 1;
       const invoiceNumber = `INV-${year}-${String(count).padStart(4, '0')}`;
@@ -320,7 +426,7 @@ class InvoiceService {
          RETURNING *`,
         [
           companyId,
-          jobId,
+          actualJobId,
           job.customer_id || null,
           invoiceData.customer_name || job.customer_name || 'Customer',
           invoiceData.customer_email || job.customer_email || '',
@@ -405,7 +511,9 @@ class InvoiceService {
           totalAmount,
           dueDate,
         ]
-      );
+      ).catch((e) => {
+        console.warn('[invoiceService] ar_collection_schedules non-fatal warning:', e.message);
+      });
 
       // Record Manual Adjustment Audit Log if enabled
       if (isManualAdjustment) {
@@ -599,9 +707,11 @@ class InvoiceService {
       await client.query(
         `UPDATE ar_collection_schedules
          SET invoice_id = $1, invoice_amount = $2, amount_outstanding = $2, is_paused = FALSE, updated_at = NOW()
-         WHERE company_id = $3 AND invoice_id = $4`,
-        [newInvoice.id, totalAmount, companyId, parentInvoiceId]
-      );
+         WHERE company_id::text = $3::text AND invoice_id::text = $4::text`,
+        [newInvoice.id, totalAmount, String(companyId), String(parentInvoiceId)]
+      ).catch((e) => {
+        console.warn('[invoiceService] ar_collection_schedules update non-fatal warning:', e.message);
+      });
 
       await client.query('COMMIT');
 

@@ -208,9 +208,9 @@ router.get('/', authenticateToken, async (req, res) => {
                   inv.edited_count AS invoice_edited_count
            FROM jobs j
            LEFT JOIN users u ON COALESCE(j.assigned_to, j.assigned_employee_id, j.accepted_by)::text = u.id::text
-           LEFT JOIN invoices inv ON inv.job_id::text = j.id::text
+           LEFT JOIN invoices inv ON inv.job_id::text = j.id::text AND (inv.is_latest = TRUE OR inv.is_latest IS NULL)
            WHERE ${ownerWhere}
-           ORDER BY j.id
+           ORDER BY j.id, inv.created_at DESC NULLS LAST
          ) sub
          ORDER BY sub.created_at DESC
          LIMIT $2 OFFSET $3`,
@@ -894,21 +894,15 @@ const handleJobAccept = async (req, res) => {
   router.post('/:id/invoice', authenticateToken, async (req, res) => {
     try {
       const { id } = req.params;
-      const userCompanyId = req.user.companyId;
+      const userCompanyId = req.user.companyId || req.user.company_id;
 
-      // Fetch job record
-      const jobRes = await pool.query('SELECT * FROM jobs WHERE id = $1', [id]);
+      // Fetch job record with strict tenant isolation
+      const jobRes = await pool.query('SELECT * FROM jobs WHERE id::text = $1::text AND company_id::text = $2::text', [id, String(userCompanyId)]);
       if (jobRes.rows.length === 0) {
         return res.status(404).json({ message: 'Job not found' });
       }
 
       const job = jobRes.rows[0];
-
-      // STRICT VERIFICATION REQUIREMENT:
-      // Verify job's company_id matches requesting user's company_id AND job status is 'completed'
-      if (String(job.company_id) !== String(userCompanyId)) {
-        return res.status(400).json({ message: 'Company mismatch: Job does not belong to your company' });
-      }
 
       if (job.status !== 'completed') {
         return res.status(400).json({ message: 'Invalid status: Invoices can only be generated for completed jobs' });

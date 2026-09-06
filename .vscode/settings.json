@@ -17,6 +17,11 @@
     "ifsc",
     "cgst",
     "sgst",
-    "igst"
+    "igst",
+    "hgetall",
+    "conv",
+    "Conv",
+    "Convs",
+    "ILIKE"
   ]
 }

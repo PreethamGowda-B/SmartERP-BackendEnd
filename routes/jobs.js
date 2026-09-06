@@ -143,8 +143,8 @@ router.post('/', authenticateToken, loadPlan, checkPlanLimit('job'), [
           }
         });
       }
-    } catch (notifErr) {
-      console.error('❌ Failed to send job notification:', notifErr);
+    } catch (notificationErr) {
+      console.error('❌ Failed to send job notification:', notificationErr);
     }
 
     // Auto-spawn job conversation thread (Enterprise Communication Backbone)
@@ -536,8 +536,8 @@ const handleJobAccept = async (req, res) => {
         priority: 'medium',
         data: { job_id: acceptedJob.id, employee_id: req.user.id, url: '/owner/notifications' }
       });
-    } catch (notifErr) {
-      console.error('❌ Failed to send job acceptance notification:', notifErr.message);
+    } catch (notificationErr) {
+      console.error('❌ Failed to send job acceptance notification:', notificationErr.message);
     }
 
     if (acceptedJob?.machine_id) {
@@ -609,8 +609,8 @@ const handleJobAccept = async (req, res) => {
           data: { job_id: declinedJob.id, employee_id: req.user.id, url: '/owner/notifications' }
         });
         console.log(`✅ Notified owner about job decline`);
-      } catch (notifErr) {
-        console.error('❌ Failed to send job decline notification:', notifErr);
+      } catch (notificationErr) {
+        console.error('❌ Failed to send job decline notification:', notificationErr);
       }
 
       res.json(declinedJob);
@@ -771,8 +771,8 @@ const handleJobAccept = async (req, res) => {
               jobTitle: updatedJob.title
             });
           }
-        } catch (notifErr) {
-          console.error('❌ Failed to send job completion notification:', notifErr);
+        } catch (notificationErr) {
+          console.error('❌ Failed to send job completion notification:', notificationErr);
         }
       }
 

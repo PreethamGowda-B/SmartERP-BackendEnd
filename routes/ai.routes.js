@@ -137,26 +137,32 @@ router.post(
         promptLower.includes("who is present") ||
         promptLower.includes("present today") ||
         promptLower.includes("absent today") ||
-        promptLower.includes("today's attendance")
+        promptLower.includes("today's attendance") ||
+        promptLower.includes("clocked in") ||
+        promptLower.includes("late arrival") ||
+        promptLower.includes("who is late")
       ) {
         if (!companyId) {
           return res.status(401).json({ message: 'Unauthorized: Missing company context.' });
         }
         const ownerSummary = await AIDataService.getOwnerDashboardSummary({ companyId });
-        const presentCount = ownerSummary.attendance?.present || 0;
-        const absentCount = ownerSummary.attendance?.absent || 0;
-        const onLeaveCount = ownerSummary.attendance?.on_leave || 0;
-        const totalEmployees = ownerSummary.employees?.active_count || 0;
+        const presentCount = ownerSummary.attendance?.present ?? 0;
+        const absentCount = ownerSummary.attendance?.absent ?? 0;
+        const onLeaveCount = ownerSummary.attendance?.on_leave ?? 0;
+        const lateCount = ownerSummary.attendance?.late ?? 0;
+        const totalEmployees = ownerSummary.attendance?.total ?? ownerSummary.employees?.active_count ?? 0;
+
+        const lateDetail = lateCount > 0 ? ` (${lateCount} late)` : '';
 
         return res.json({
-          text: `Today's Attendance Summary: **${presentCount}** employee(s) present, **${absentCount}** absent, and **${onLeaveCount}** on approved leave (out of **${totalEmployees}** total active staff).`,
+          text: `Today's Attendance Summary: **${presentCount}** employee(s) present${lateDetail}, **${absentCount}** absent, and **${onLeaveCount}** on approved leave (out of **${totalEmployees}** total active staff).`,
           widget: {
             type: "KPI_SUMMARY",
             title: "Today's Attendance Overview",
             metrics: [
               { label: "Present", value: presentCount },
               { label: "Absent", value: absentCount },
-              { label: "On Leave", value: onLeaveCount },
+              { label: "Late Arrivals", value: lateCount },
               { label: "Total Staff", value: totalEmployees }
             ]
           },

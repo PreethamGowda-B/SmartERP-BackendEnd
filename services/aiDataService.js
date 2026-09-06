@@ -11,10 +11,10 @@ class AIDataService {
       jobsRes,
       revenueRes,
       invoiceRes,
-      employeesRes,
       attendanceRes,
       inventoryRes,
       leavesRes,
+      leavesTodayRes,
     ] = await Promise.all([
       // Jobs breakdown
       pool.query(
@@ -46,22 +46,29 @@ class AIDataService {
         [cid]
       ).catch(() => ({ rows: [{ total_invoices: 0, pending_amount: 0, overdue_count: 0 }] })),
 
-      // Active employees
+      // Today's attendance overview & active employees (mirroring canonical routes/attendance.js)
       pool.query(
-        `SELECT COUNT(*) as active_count 
-         FROM users 
-         WHERE company_id::text = $1 AND role = 'employee'`,
+        `SELECT 
+           u.id as user_id,
+           u.name as employee_name,
+           u.email as employee_email,
+           a.id as attendance_id,
+           a.date,
+           a.check_in_time,
+           a.check_out_time,
+           a.working_hours,
+           a.status,
+           a.is_late
+         FROM users u
+         LEFT JOIN attendance a ON u.id = a.user_id AND (a.date = CURRENT_DATE OR a.date::text = CURRENT_DATE::text)
+         WHERE (u.role = 'employee' OR (u.role != 'owner' AND u.role != 'admin' AND u.role != 'customer'))
+           AND (u.company_id = $1 OR u.company_id::text = $1::text)
+         ORDER BY u.name ASC`,
         [cid]
-      ).catch(() => ({ rows: [{ active_count: 0 }] })),
-
-      // Attendance summary for today
-      pool.query(
-        `SELECT status, COUNT(*) as count 
-         FROM attendance 
-         WHERE company_id::text = $1 AND date = CURRENT_DATE 
-         GROUP BY status`,
-        [cid]
-      ).catch(() => ({ rows: [] })),
+      ).catch((err) => {
+        console.error("❌ AIDataService attendance overview query error:", err.message);
+        return { rows: [] };
+      }),
 
       // Low stock inventory items
       pool.query(
@@ -79,13 +86,33 @@ class AIDataService {
          WHERE company_id::text = $1 AND status = 'pending'`,
         [cid]
       ).catch(() => ({ rows: [{ pending_leaves: 0 }] })),
+
+      // Approved leaves for today
+      pool.query(
+        `SELECT COUNT(*) as on_leave_count
+         FROM leave_requests
+         WHERE (company_id = $1 OR company_id::text = $1::text)
+           AND status = 'approved'
+           AND CURRENT_DATE BETWEEN start_date AND end_date`,
+        [cid]
+      ).catch(() => ({ rows: [{ on_leave_count: 0 }] })),
     ]);
 
     const jobCounts = {};
     jobsRes.rows.forEach((r) => (jobCounts[r.status] = parseInt(r.count, 10)));
 
-    const attendanceCounts = {};
-    attendanceRes.rows.forEach((r) => (attendanceCounts[r.status] = parseInt(r.count, 10)));
+    const attendanceRows = attendanceRes.rows || [];
+    const totalStaff = attendanceRows.length;
+    const presentStaff = attendanceRows.filter(
+      (r) => r.check_in_time || ["present", "late", "half_day"].includes(r.status)
+    ).length;
+    const absentStaff = attendanceRows.filter(
+      (r) => !r.check_in_time && !["present", "late", "half_day"].includes(r.status)
+    ).length;
+    const lateStaff = attendanceRows.filter(
+      (r) => r.is_late || r.status === "late"
+    ).length;
+    const onLeaveStaff = parseInt(leavesTodayRes.rows[0]?.on_leave_count || 0, 10);
 
     return {
       jobs: {
@@ -102,9 +129,22 @@ class AIDataService {
         pending_amount: Number(invoiceRes.rows[0]?.pending_amount || 0),
         overdue_count: parseInt(invoiceRes.rows[0]?.overdue_count || 0, 10),
       },
+      attendance: {
+        total: totalStaff,
+        present: presentStaff,
+        absent: absentStaff,
+        late: lateStaff,
+        on_leave: onLeaveStaff,
+        records: attendanceRows,
+      },
       employees: {
-        active_count: parseInt(employeesRes.rows[0]?.active_count || 0, 10),
-        today_attendance: attendanceCounts,
+        active_count: totalStaff,
+        today_attendance: {
+          total: totalStaff,
+          present: presentStaff,
+          absent: absentStaff,
+          late: lateStaff,
+        },
       },
       inventory: {
         low_stock_items: inventoryRes.rows,
@@ -112,6 +152,7 @@ class AIDataService {
       },
       leaves: {
         pending_requests: parseInt(leavesRes.rows[0]?.pending_leaves || 0, 10),
+        on_leave_today: onLeaveStaff,
       },
     };
   }
@@ -135,9 +176,9 @@ class AIDataService {
 
       // Attendance history for this month
       pool.query(
-        `SELECT date, clock_in, clock_out, status 
+        `SELECT date, check_in_time as clock_in, check_out_time as clock_out, check_in_time, check_out_time, status, working_hours, is_late 
          FROM attendance 
-         WHERE user_id::text = $1 AND DATE_TRUNC('month', date) = DATE_TRUNC('month', CURRENT_DATE)
+         WHERE (user_id = $1 OR user_id::text = $1) AND DATE_TRUNC('month', date) = DATE_TRUNC('month', CURRENT_DATE)
          ORDER BY date DESC LIMIT 10`,
         [uid]
       ).catch(() => ({ rows: [] })),
@@ -192,12 +233,19 @@ class AIDataService {
         [cid]
       ).catch(() => ({ rows: [] })),
 
-      // Today's attendance anomalies (late or absent)
+      // Today's attendance anomalies (late arrivals or absent staff)
       pool.query(
-        `SELECT a.user_id, u.name, a.clock_in, a.status 
-         FROM attendance a
-         LEFT JOIN users u ON a.user_id::text = u.id::text
-         WHERE a.company_id::text = $1 AND a.date = CURRENT_DATE AND a.status IN ('late', 'absent')`,
+        `SELECT 
+           u.id as user_id, 
+           u.name, 
+           a.check_in_time as clock_in, 
+           COALESCE(a.status, 'absent') as status,
+           a.is_late
+         FROM users u
+         LEFT JOIN attendance a ON u.id = a.user_id AND (a.date = CURRENT_DATE OR a.date::text = CURRENT_DATE::text)
+         WHERE (u.company_id = $1 OR u.company_id::text = $1::text)
+           AND (u.role = 'employee' OR (u.role != 'owner' AND u.role != 'admin' AND u.role != 'customer'))
+           AND (a.is_late = true OR a.status = 'late' OR a.check_in_time IS NULL)`,
         [cid]
       ).catch(() => ({ rows: [] })),
 

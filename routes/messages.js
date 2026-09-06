@@ -674,18 +674,28 @@ router.get('/owner', async (req, res) => {
 
 
 // ─── GET /api/messages/job/:jobId ─────────────────────────────────────────────
-// Get full message history for a specific job (employee side)
+// Get full message history for a specific job (employee and owner/admin)
 router.get('/job/:jobId', async (req, res) => {
   try {
     const employeeId = req.user.userId || req.user.id;
     const companyId = req.user.companyId;
+    const userRole = req.user.role;
+    const isOwnerOrAdmin = ['owner', 'admin', 'super_admin'].includes(userRole);
     const { jobId } = req.params;
 
-    // Verify employee is assigned to this job
-    const jobCheck = await pool.query(
-      'SELECT id FROM jobs WHERE id = $1 AND assigned_to::text = $2 AND company_id::text = $3',
-      [jobId, String(employeeId), String(companyId)]
-    );
+    // Verify employee is assigned to this job or owner/admin of the company
+    let jobCheck;
+    if (isOwnerOrAdmin) {
+      jobCheck = await pool.query(
+        'SELECT id FROM jobs WHERE id = $1 AND company_id::text = $2',
+        [jobId, String(companyId)]
+      );
+    } else {
+      jobCheck = await pool.query(
+        'SELECT id FROM jobs WHERE id = $1 AND assigned_to::text = $2 AND company_id::text = $3',
+        [jobId, String(employeeId), String(companyId)]
+      );
+    }
     if (jobCheck.rows.length === 0) {
       return res.status(403).json({ message: 'Access denied' });
     }
@@ -699,7 +709,7 @@ router.get('/job/:jobId', async (req, res) => {
       [jobId]
     );
 
-    // Mark customer messages as read by employee
+    // Mark customer messages as read by employee/staff
     pool.query(
       `UPDATE job_messages SET read_by_employee = TRUE
        WHERE job_id = $1 AND sender_type = 'customer' AND read_by_employee = FALSE`,
@@ -714,11 +724,13 @@ router.get('/job/:jobId', async (req, res) => {
 });
 
 // ─── POST /api/messages/job/:jobId ────────────────────────────────────────────
-// Employee sends a message in a job chat
+// Employee or Owner/Admin sends a message in a job chat
 router.post('/job/:jobId', async (req, res) => {
   try {
     const employeeId = req.user.userId || req.user.id;
     const companyId = req.user.companyId;
+    const userRole = req.user.role;
+    const isOwnerOrAdmin = ['owner', 'admin', 'super_admin'].includes(userRole);
     const { jobId } = req.params;
     const { message } = req.body;
 
@@ -726,20 +738,31 @@ router.post('/job/:jobId', async (req, res) => {
       return res.status(400).json({ message: 'Message cannot be empty' });
     }
 
-    // Verify employee is assigned to this job
-    const jobCheck = await pool.query(
-      `SELECT j.id, j.customer_id, u.name AS employee_name
-       FROM jobs j
-       LEFT JOIN users u ON u.id = j.assigned_to
-       WHERE j.id = $1 AND j.assigned_to::text = $2 AND j.company_id::text = $3`,
-      [jobId, String(employeeId), String(companyId)]
-    );
+    // Verify access
+    let jobCheck;
+    if (isOwnerOrAdmin) {
+      jobCheck = await pool.query(
+        `SELECT j.id, j.customer_id, u.name AS employee_name
+         FROM jobs j
+         LEFT JOIN users u ON u.id::text = $2
+         WHERE j.id = $1 AND j.company_id::text = $3`,
+        [jobId, String(employeeId), String(companyId)]
+      );
+    } else {
+      jobCheck = await pool.query(
+        `SELECT j.id, j.customer_id, u.name AS employee_name
+         FROM jobs j
+         LEFT JOIN users u ON u.id = j.assigned_to
+         WHERE j.id = $1 AND j.assigned_to::text = $2 AND j.company_id::text = $3`,
+        [jobId, String(employeeId), String(companyId)]
+      );
+    }
     if (jobCheck.rows.length === 0) {
-      return res.status(403).json({ message: 'Access denied — you are not assigned to this job' });
+      return res.status(403).json({ message: 'Access denied — you do not have permission for this job' });
     }
 
     const job = jobCheck.rows[0];
-    const senderName = job.employee_name || 'Technician';
+    const senderName = job.employee_name || (isOwnerOrAdmin ? 'Owner' : 'Technician');
 
     const isUUID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/i.test(String(companyId));
     const safeCompanyId = isUUID ? String(companyId) : null;
@@ -773,7 +796,7 @@ router.post('/job/:jobId', async (req, res) => {
           user_id: job.customer_id,
           company_id: String(companyId),
           type: 'chat_message',
-          title: 'New Message from Technician',
+          title: isOwnerOrAdmin ? 'New Message from Management' : 'New Message from Technician',
           message: `${senderName}: ${message.trim().substring(0, 60)}${message.length > 60 ? '…' : ''}`,
           priority: 'medium',
           actor_id: employeeId,
@@ -791,15 +814,52 @@ router.post('/job/:jobId', async (req, res) => {
 });
 
 // ─── GET /api/messages/job-conversations ─────────────────────────────────────
-// Employee: returns list of all job conversations where they are assigned_to
+// Returns list of job conversations:
+// - Employee: where they are assigned_to
+// - Owner/Admin: all company job conversations with customers
 // Each item includes last_message, unread_count, customer name
 router.get('/job-conversations', async (req, res) => {
   try {
     const employeeId = req.user.userId || req.user.id;
     const companyId = req.user.companyId;
+    const userRole = req.user.role;
+    const isOwnerOrAdmin = ['owner', 'admin', 'super_admin'].includes(userRole);
 
-    const result = await pool.query(
-      `SELECT
+    let query;
+    let queryParams;
+
+    if (isOwnerOrAdmin) {
+      query = `SELECT
+          j.id              AS job_id,
+          j.title           AS job_title,
+          j.status          AS job_status,
+          j.employee_status,
+          j.customer_id,
+          c.name            AS customer_name,
+          c.email           AS customer_email,
+          MAX(jm.created_at) AS last_message_time,
+          (SELECT message FROM job_messages jm2
+            WHERE jm2.job_id = j.id
+            ORDER BY jm2.created_at DESC LIMIT 1) AS last_message,
+          COUNT(DISTINCT jm.id)      AS total_messages,
+          -- Unread count: messages from customer that staff haven't read
+          COUNT(DISTINCT jm_unread.id) AS unread_count
+       FROM jobs j
+       LEFT JOIN customers c ON c.id = j.customer_id
+       LEFT JOIN job_messages jm ON jm.job_id = j.id
+       LEFT JOIN job_messages jm_unread ON (
+             jm_unread.job_id = j.id
+         AND jm_unread.sender_type = 'customer'
+         AND jm_unread.read_by_employee = false
+       )
+       WHERE j.company_id::text = $1
+         AND j.customer_id IS NOT NULL
+       GROUP BY j.id, j.title, j.status, j.employee_status, j.customer_id,
+                c.name, c.email
+       ORDER BY last_message_time DESC NULLS LAST`;
+      queryParams = [String(companyId)];
+    } else {
+      query = `SELECT
           j.id              AS job_id,
           j.title           AS job_title,
           j.status          AS job_status,
@@ -827,10 +887,11 @@ router.get('/job-conversations', async (req, res) => {
          AND j.customer_id IS NOT NULL
        GROUP BY j.id, j.title, j.status, j.employee_status, j.customer_id,
                 c.name, c.email
-       ORDER BY last_message_time DESC NULLS LAST`,
-      [String(employeeId), String(companyId)]
-    );
+       ORDER BY last_message_time DESC NULLS LAST`;
+      queryParams = [String(employeeId), String(companyId)];
+    }
 
+    const result = await pool.query(query, queryParams);
     res.json(result.rows);
   } catch (err) {
     console.error('GET /messages/job-conversations error:', err.message);

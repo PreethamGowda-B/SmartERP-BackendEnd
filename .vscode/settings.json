@@ -11,6 +11,12 @@
     "notif",
     "notifs",
     "BYTEA",
-    "bytea"
+    "bytea",
+    "pincode",
+    "gstin",
+    "ifsc",
+    "cgst",
+    "sgst",
+    "igst"
   ]
 }

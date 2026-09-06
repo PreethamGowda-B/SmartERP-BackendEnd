@@ -488,7 +488,44 @@ class CncPlugin extends BasePlugin {
           };
         }
 
-        // 2. Match against verified knowledge base
+        // 2. CNC ALARM DECODER POLICY: EX/EXT/Custom Machine Alarms & Codes >= 1000
+        // Never treat an EX/EXT/custom machine alarm as a universal FANUC alarm.
+        const isExAlarm = rawCode.startsWith("EX") || rawCode.startsWith("EXT");
+        const numericVal = parseInt(rawCode.replace(/\D/g, ""), 10);
+        const isHighCode = !isNaN(numericVal) && numericVal >= 1000;
+
+        if (isExAlarm || isHighCode) {
+          const matchKey = params.machineManufacturer ? `${String(params.machineManufacturer).toUpperCase()}_${rawCode}` : null;
+          if (!matchKey || !VERIFIED_CNC_KNOWLEDGE[matchKey]) {
+            return {
+              success: true,
+              isVerified: false,
+              confidenceLevel: "UNKNOWN",
+              notice: "Machine-specific alarm — exact meaning cannot be confirmed from the alarm code alone.",
+              recommendation: "Please provide:\n- Machine manufacturer\n- Machine model\n- Controller model\n- Controller series/version\n- Screenshot of the alarm if available\n- Machine manual/documentation if available",
+              data: {
+                alarmCode: params.alarmCode,
+                controller: params.controllerType || "Machine Builder PLC / Machine Alarm",
+                title: `Machine-Specific Alarm: ${params.alarmCode}`,
+                severity: "UNKNOWN",
+                category: "Machine-Builder PLC/Machine Alarm",
+                description: "Machine-specific alarm — exact meaning cannot be confirmed from the alarm code alone. This is an OEM machine-builder ladder/PLC alarm, not a universal CNC controller alarm.",
+                safetyWarning: "Do not proceed with machine-specific repair based solely on this code. Consult the machine manufacturer's alarm documentation.",
+                diagnosticSteps: [
+                  "Do not proceed with machine-specific repair based solely on this code.",
+                  "Consult the machine manufacturer's alarm documentation.",
+                  "Check machine nameplate to identify exact manufacturer, model, and controller series.",
+                  "Inspect non-invasive external conditions (air pressure, lube level, door interlocks, chip conveyors)."
+                ],
+                verifiedCitations: [
+                  "[Policy] CNC Alarm Decoder — Source-Verified Response Policy"
+                ]
+              }
+            };
+          }
+        }
+
+        // 3. Match against verified knowledge base
         let matchKey = null;
         if (controller.includes("haas") && VERIFIED_CNC_KNOWLEDGE[`HAAS_${rawCode}`]) {
           matchKey = `HAAS_${rawCode}`;
@@ -513,31 +550,26 @@ class CncPlugin extends BasePlugin {
           return {
             success: true,
             isVerified: true,
-            confidenceLevel: "HIGH",
+            confidenceLevel: "CONFIRMED",
             data: entry
           };
         }
 
-        // 3. Unverified / Unknown Alarm Code
+        // 4. Unverified / Unknown Alarm Code
         return {
           success: true,
           isVerified: false,
-          confidenceLevel: "LOW",
-          notice: `Alarm code '${params.alarmCode}' was not found in the verified manufacturer documentation cache.`,
-          recommendation: "Please provide the exact controller model (e.g. Haas NGC, Fanuc 0i-MF, Siemens 840D) and the exact text description displayed on the control screen.",
+          confidenceLevel: "UNKNOWN",
+          notice: "Machine-specific alarm — exact meaning cannot be confirmed from the alarm code alone.",
+          recommendation: "Please provide:\n- Machine manufacturer\n- Machine model\n- Controller model\n- Controller series/version\n- Screenshot of the alarm if available\n- Machine manual/documentation if available",
           data: {
             alarmCode: params.alarmCode,
             controller: params.controllerType || "Unspecified Controller",
             title: `Unverified Alarm: ${params.alarmCode}`,
-            severity: "warning",
+            severity: "UNKNOWN",
             category: "General Troubleshooting",
             description: `No authoritative manufacturer documentation found for code '${params.alarmCode}' under controller '${params.controllerType || "Generic"}'.`,
-            causes: [
-              "Controller-specific manufacturer alarm (OEM custom M-code or ladder alarm).",
-              "External interlock condition (air pressure, lube pressure, chiller flow, door safety).",
-              "Sensor contact bounce or 24V DC I/O power supply fluctuation."
-            ],
-            safetyWarning: "ELECTRICAL & MECHANICAL SAFETY: Always disconnect and lockout main power before opening electrical cabinets. Service must be performed by qualified personnel.",
+            safetyWarning: "Do not proceed with machine-specific repair based solely on this code. Consult the machine manufacturer's alarm documentation.",
             diagnosticSteps: [
               "Record the full error message and any accompanying secondary alarms displayed on the screen.",
               "Check non-invasive external conditions: Air pressure (85 PSI), Way lube reservoir level, Chiller status, Door interlock.",
@@ -545,7 +577,7 @@ class CncPlugin extends BasePlugin {
               "If the issue persists, escalate for certified field service."
             ],
             verifiedCitations: [
-              "[AI Diagnostic Inference] SmartERP Universal CNC Diagnostic Guidelines"
+              "[Policy] CNC Alarm Decoder — Source-Verified Response Policy"
             ]
           }
         };

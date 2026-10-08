@@ -213,13 +213,14 @@ router.get('/', authenticateToken, async (req, res) => {
         if (category) { countQuery += ' AND category = $' + cIdx++; countParams.push(category); }
         if (supplier) { countQuery += ' AND supplier_name ILIKE $' + cIdx++; countParams.push(`%${supplier}%`); }
         
-        const countResult = await pool.query(countQuery, countParams);
-        const total = parseInt(countResult.rows[0].count);
-
         query += ' ORDER BY created_at DESC LIMIT $' + paramIndex + ' OFFSET $' + (paramIndex + 1);
         params.push(limit, offset);
 
-        const result = await pool.query(query, params);
+        const [result, countResult] = await Promise.all([
+            pool.query(query, params),
+            pool.query(countQuery, countParams)
+        ]);
+        const total = parseInt(countResult.rows[0]?.count || 0);
 
         // Set pagination header
         res.set('X-Total-Count', total);

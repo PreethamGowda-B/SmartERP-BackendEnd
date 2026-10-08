@@ -17,7 +17,15 @@ async function optimizeDatabase() {
       
       // Attendance (Growth table)
       'CREATE INDEX IF NOT EXISTS idx_attendance_user_id ON attendance(user_id)',
-      'CREATE INDEX IF NOT EXISTS idx_attendance_clock_in ON attendance(check_in_time)',
+      'CREATE INDEX IF NOT EXISTS idx_attendance_clock_in ON attendance(clock_in)',
+      'CREATE INDEX IF NOT EXISTS idx_attendance_comp_date ON attendance(company_id, date)',
+      
+      // Composite indexes for sub-second tenant dashboard and operations queries
+      'CREATE INDEX IF NOT EXISTS idx_jobs_comp_status ON jobs(company_id, status)',
+      'CREATE INDEX IF NOT EXISTS idx_jobs_comp_created ON jobs(company_id, created_at DESC)',
+      'CREATE INDEX IF NOT EXISTS idx_inventory_comp_deleted ON inventory_items(company_id, is_deleted)',
+      'CREATE INDEX IF NOT EXISTS idx_users_comp_role ON users(company_id, role)',
+      'CREATE INDEX IF NOT EXISTS idx_hr_requests_comp_status ON hr_employee_requests(company_id, status)',
       
       // Notifications (High volume)
       'CREATE INDEX IF NOT EXISTS idx_notifications_user_id_read ON notifications(user_id, read)',

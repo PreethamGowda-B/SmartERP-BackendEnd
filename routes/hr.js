@@ -38,12 +38,22 @@ router.get('/analytics', authenticateToken, async (req, res) => {
   try {
     const companyId = req.user.companyId;
 
-    const headcountRes = await pool.query(`SELECT COUNT(*) as total FROM users WHERE company_id = $1 AND is_active = true`, [companyId]);
-    const presentRes = await pool.query(`SELECT COUNT(DISTINCT user_id) as count FROM attendance WHERE company_id = $1 AND date = CURRENT_DATE AND status IN ('present', 'arrived')`, [companyId]);
-    const lateRes = await pool.query(`SELECT COUNT(DISTINCT user_id) as count FROM attendance WHERE company_id = $1 AND date = CURRENT_DATE AND is_late = true`, [companyId]);
-    const pendingReqRes = await pool.query(`SELECT COUNT(*) as count FROM hr_employee_requests WHERE company_id = $1 AND status = 'pending'`, [companyId]);
-    const recruitmentRes = await pool.query(`SELECT COUNT(*) as count FROM hr_recruitment_candidates WHERE company_id = $1 AND stage NOT IN ('joined', 'rejected')`, [companyId]);
-    const assetRes = await pool.query(`SELECT COUNT(*) as count FROM hr_assets WHERE company_id = $1 AND return_status = 'assigned'`, [companyId]);
+    // 🚀 Parallelize all 6 independent HR metrics queries
+    const [
+      headcountRes,
+      presentRes,
+      lateRes,
+      pendingReqRes,
+      recruitmentRes,
+      assetRes
+    ] = await Promise.all([
+      pool.query(`SELECT COUNT(*) as total FROM users WHERE company_id = $1 AND is_active = true`, [companyId]),
+      pool.query(`SELECT COUNT(DISTINCT user_id) as count FROM attendance WHERE company_id = $1 AND date = CURRENT_DATE AND status IN ('present', 'arrived')`, [companyId]),
+      pool.query(`SELECT COUNT(DISTINCT user_id) as count FROM attendance WHERE company_id = $1 AND date = CURRENT_DATE AND is_late = true`, [companyId]),
+      pool.query(`SELECT COUNT(*) as count FROM hr_employee_requests WHERE company_id = $1 AND status = 'pending'`, [companyId]),
+      pool.query(`SELECT COUNT(*) as count FROM hr_recruitment_candidates WHERE company_id = $1 AND stage NOT IN ('joined', 'rejected')`, [companyId]),
+      pool.query(`SELECT COUNT(*) as count FROM hr_assets WHERE company_id = $1 AND return_status = 'assigned'`, [companyId]),
+    ]);
 
     res.json({
       success: true,

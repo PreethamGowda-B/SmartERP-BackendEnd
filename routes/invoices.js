@@ -243,6 +243,158 @@ router.get('/:id', authenticate, async (req, res) => {
 });
 
 /**
+ * GET /api/invoices/customers/search
+ * Lists/searches customers for the walk-in invoice customer dropdown.
+ */
+router.get('/customers/search', authenticate, async (req, res) => {
+  try {
+    const companyId = req.user.companyId || req.user.company_id;
+    const { q } = req.query;
+
+    let query = `
+      SELECT id, name, email, phone 
+      FROM customers 
+      WHERE company_id = $1 AND is_deleted = FALSE
+    `;
+    const params = [companyId];
+
+    if (q && q.trim()) {
+      params.push(`%${q.trim()}%`);
+      query += ` AND (name ILIKE $2 OR email ILIKE $2 OR phone ILIKE $2)`;
+    }
+
+    query += ` ORDER BY name ASC LIMIT 50`;
+
+    const result = await pool.query(query, params);
+    return res.json({ success: true, customers: result.rows });
+  } catch (err) {
+    console.error('GET /api/invoices/customers/search error:', err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/invoices/customers/quick-create
+ * Inline creates a customer during walk-in invoice generation.
+ */
+router.post('/customers/quick-create', authenticate, async (req, res) => {
+  try {
+    const companyId = req.user.companyId || req.user.company_id;
+    const { name, phone, email, address, gstin } = req.body;
+
+    if (!name || !name.trim()) {
+      return res.status(400).json({ error: 'Customer name is required' });
+    }
+
+    const emailVal = email && email.trim() ? email.trim() : `counter_client_${Date.now()}@counter.local`;
+
+    const result = await pool.query(
+      `INSERT INTO customers (company_id, name, email, phone)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id, name, email, phone`,
+      [companyId, name.trim(), emailVal, phone ? phone.trim() : null]
+    );
+
+    return res.status(201).json({
+      success: true,
+      customer: {
+        ...result.rows[0],
+        address: address || '',
+        gstin: gstin || ''
+      }
+    });
+  } catch (err) {
+    console.error('POST /api/invoices/customers/quick-create error:', err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * GET /api/invoices/inventory/search
+ * Lists inventory items for quick line-item addition.
+ */
+router.get('/inventory/search', authenticate, async (req, res) => {
+  try {
+    const companyId = req.user.companyId || req.user.company_id;
+    const { q } = req.query;
+
+    let query = `
+      SELECT id, name, category, unit, quantity
+      FROM inventory_items
+      WHERE company_id = $1 AND is_deleted = FALSE AND quantity > 0
+    `;
+    const params = [companyId];
+
+    if (q && q.trim()) {
+      params.push(`%${q.trim()}%`);
+      query += ` AND name ILIKE $2`;
+    }
+
+    query += ` ORDER BY name ASC LIMIT 50`;
+
+    const result = await pool.query(query, params);
+    return res.json({ success: true, items: result.rows });
+  } catch (err) {
+    console.error('GET /api/invoices/inventory/search error:', err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/invoices/direct-create
+ * Issues a Direct / Walk-in Invoice for counter customer sales.
+ */
+router.post('/direct-create', authenticate, async (req, res) => {
+  try {
+    const companyId = req.user.companyId || req.user.company_id;
+    const userId = req.user.id || req.user.userId;
+
+    const result = await invoiceService.createDirectInvoice({
+      companyId,
+      userId,
+      invoiceData: req.body,
+    });
+
+    return res.status(201).json(result);
+  } catch (err) {
+    console.error('POST /api/invoices/direct-create error:', err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/invoices/:id/record-payment
+ * Records counter / office payment (Cash, POS Card, UPI QR, Bank Transfer, Cheque).
+ */
+router.post('/:id/record-payment', authenticate, async (req, res) => {
+  try {
+    const companyId = req.user.companyId || req.user.company_id;
+    const userId = req.user.id || req.user.userId;
+    const { id } = req.params;
+    const { paymentMethod, transactionReference, amount, notes } = req.body;
+
+    if (!paymentMethod || !amount) {
+      return res.status(400).json({ error: 'Payment method and amount are required' });
+    }
+
+    const result = await invoiceService.recordPayment({
+      invoiceId: id,
+      companyId,
+      paymentMethod,
+      transactionReference,
+      amount,
+      notes,
+      recordedBy: userId,
+    });
+
+    return res.json(result);
+  } catch (err) {
+    console.error('POST /api/invoices/:id/record-payment error:', err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
  * POST /api/invoices/finalize
  * Finalizes an invoice submitted from the Dedicated Invoice Editor Page.
  */

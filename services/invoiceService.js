@@ -36,7 +36,7 @@ class InvoiceService {
     // If not found by job ID, check if identifier is actually an invoice ID
     if (jobRes.rows.length === 0) {
       const invCheck = await pool.query(
-        `SELECT job_id FROM invoices WHERE id::text = $1::text AND company_id::text = $2::text`,
+        `SELECT id, job_id FROM invoices WHERE id::text = $1::text AND company_id::text = $2::text`,
         [String(identifier), String(companyId)]
       );
       if (invCheck.rows.length > 0 && invCheck.rows[0].job_id) {
@@ -48,6 +48,51 @@ class InvoiceService {
            WHERE j.id::text = $1::text AND j.company_id::text = $2::text`,
           [String(invCheck.rows[0].job_id), String(companyId)]
         );
+      } else if (invCheck.rows.length > 0 && !invCheck.rows[0].job_id) {
+        // Direct / Walk-in invoice without a linked job
+        const invRowRes = await pool.query(
+          `SELECT * FROM invoices WHERE id::text = $1::text AND company_id::text = $2::text`,
+          [String(identifier), String(companyId)]
+        );
+        const invRow = invRowRes.rows[0];
+        const itemsRes = await pool.query(
+          `SELECT item_type, description, hsn_code, quantity, unit_price, total_amount 
+           FROM invoice_items WHERE invoice_id::text = $1::text ORDER BY id ASC`,
+          [String(invRow.id)]
+        );
+
+        return {
+          job: {
+            id: invRow.id,
+            title: `Direct Invoice (${invRow.invoice_number})`,
+            description: invRow.customer_notes || 'Walk-in / Direct Sale',
+            status: 'completed',
+            started_at: invRow.created_at,
+            completed_at: invRow.created_at,
+            customer_id: invRow.customer_id,
+            customer_name: invRow.customer_name || 'Walk-in Customer',
+            customer_email: invRow.customer_email || '',
+            customer_phone: invRow.customer_phone || '',
+            is_billable: true,
+          },
+          existingInvoice: invRow,
+          prefilled: {
+            labour_hours: parseFloat(invRow.labour_hours || 0),
+            labour_rate: parseFloat(invRow.labour_rate || 0),
+            materials_used: [],
+            line_items: itemsRes.rows,
+            equipment_charges: parseFloat(invRow.equipment_charges || 0),
+            transport_charges: parseFloat(invRow.transport_charges || 0),
+            additional_charges: parseFloat(invRow.additional_charges || 0),
+            discount_amount: parseFloat(invRow.discount_amount || 0),
+            gst_rate: parseFloat(invRow.gst_rate || 18.0),
+            is_inter_state: Boolean(invRow.is_inter_state),
+            payment_terms: invRow.payment_terms || 'Due on receipt',
+            customer_notes: invRow.customer_notes || 'Thank you for your business!',
+            internal_notes: invRow.internal_notes || '',
+            due_days: 15,
+          },
+        };
       }
     }
 
@@ -212,7 +257,7 @@ class InvoiceService {
       if (jobRes.rows.length === 0) {
         // Check if jobId is actually an invoice ID
         const invCheck = await client.query(
-          `SELECT job_id FROM invoices WHERE id::text = $1::text AND company_id::text = $2::text`,
+          `SELECT id, job_id FROM invoices WHERE id::text = $1::text AND company_id::text = $2::text`,
           [String(jobId), String(companyId)]
         );
         if (invCheck.rows.length > 0 && invCheck.rows[0].job_id) {
@@ -225,6 +270,26 @@ class InvoiceService {
              FOR UPDATE OF j`,
             [String(invCheck.rows[0].job_id), String(companyId)]
           );
+        } else if (invCheck.rows.length > 0 && !invCheck.rows[0].job_id) {
+          const directInvRes = await client.query(
+            `SELECT * FROM invoices WHERE id::text = $1::text AND company_id::text = $2::text FOR UPDATE`,
+            [String(jobId), String(companyId)]
+          );
+          if (directInvRes.rows.length > 0) {
+            const directInv = directInvRes.rows[0];
+            jobRes = {
+              rows: [{
+                id: null,
+                direct_invoice_id: directInv.id,
+                title: `Direct Invoice (${directInv.invoice_number})`,
+                customer_id: directInv.customer_id,
+                customer_name: directInv.customer_name,
+                customer_email: directInv.customer_email,
+                customer_phone: directInv.customer_phone,
+                is_direct_invoice: true,
+              }]
+            };
+          }
         }
       }
 
@@ -233,14 +298,14 @@ class InvoiceService {
       }
 
       const job = jobRes.rows[0];
-      const actualJobId = job.id;
+      const actualJobId = job.id || null;
 
       // 2. Check if invoice is already issued/paid/draft for this job — if so, update & increment edited_count
       const existingIssuedInv = await client.query(
         `SELECT id, invoice_number, edited_count FROM invoices 
-         WHERE (job_id::text = $1::text OR id::text = $2::text) AND company_id::text = $3::text 
+         WHERE ((job_id IS NOT NULL AND job_id::text = $1::text) OR id::text = $2::text) AND company_id::text = $3::text 
          ORDER BY created_at DESC LIMIT 1`,
-        [String(actualJobId), String(jobId), String(companyId)]
+        [actualJobId ? String(actualJobId) : '', String(jobId), String(companyId)]
       );
 
       if (existingIssuedInv.rows.length > 0) {
@@ -812,11 +877,13 @@ class InvoiceService {
           [invoiceId, companyId]
         );
 
-        // Update Job to billed_and_closed
-        await client.query(
-          `UPDATE jobs SET status = 'billed_and_closed' WHERE id = $1 AND company_id::text = $2::text`,
-          [invoice.job_id, companyId]
-        );
+        // Update Job to billed_and_closed if tied to a job
+        if (invoice.job_id) {
+          await client.query(
+            `UPDATE jobs SET status = 'billed_and_closed' WHERE id = $1 AND company_id::text = $2::text`,
+            [invoice.job_id, companyId]
+          );
+        }
       }
 
       await client.query('COMMIT');
@@ -876,6 +943,251 @@ class InvoiceService {
     } catch (err) {
       await client.query('ROLLBACK').catch(() => {});
       console.error('invoiceService.submitDispute error:', err.message);
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Issues a Direct / Walk-in Invoice for over-the-counter or ad-hoc sales.
+   * Completely decoupled from jobs.
+   * Handles customer creation/lookup, line items, inventory deduction, GST + discount,
+   * atomic invoice number generation, immediate counter payment or AR scheduling,
+   * and PDF generation.
+   */
+  static async createDirectInvoice({ companyId, userId, invoiceData }) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // 1. Customer resolution (existing or walk-in inline)
+      let customerId = invoiceData.customer_id || null;
+      let customerName = (invoiceData.customer_name || 'Walk-in Customer').trim();
+      let customerPhone = (invoiceData.customer_phone || '').trim();
+      let customerEmail = (invoiceData.customer_email || '').trim();
+      let customerAddress = (invoiceData.customer_address || '').trim();
+      let customerGstin = (invoiceData.customer_gstin || '').trim();
+
+      if (customerId) {
+        const customerResult = await client.query(
+          `SELECT id, name, email, phone FROM customers WHERE id = $1 AND company_id = $2`,
+          [customerId, companyId]
+        );
+        if (customerResult.rows.length > 0) {
+          customerName = customerResult.rows[0].name || customerName;
+          customerEmail = customerResult.rows[0].email || customerEmail;
+          customerPhone = customerResult.rows[0].phone || customerPhone;
+        }
+      } else if (customerName && customerEmail) {
+        // Try to match or auto-link customer by email for this company
+        const existingCustomer = await client.query(
+          `SELECT id FROM customers WHERE LOWER(email) = LOWER($1) AND company_id = $2 AND is_deleted = FALSE LIMIT 1`,
+          [customerEmail, companyId]
+        );
+        if (existingCustomer.rows.length > 0) {
+          customerId = existingCustomer.rows[0].id;
+        } else if (invoiceData.auto_create_customer) {
+          const newCustomer = await client.query(
+            `INSERT INTO customers (name, email, phone, company_id) VALUES ($1, $2, $3, $4) RETURNING id`,
+            [customerName, customerEmail, customerPhone, companyId]
+          );
+          customerId = newCustomer.rows[0].id;
+        }
+      }
+
+      // 2. Line Items Breakdown & Cost Calculation
+      const rawLineItems = Array.isArray(invoiceData.lineItems) ? invoiceData.lineItems : [];
+      if (rawLineItems.length === 0) {
+        throw new Error('At least one line item is required to generate an invoice');
+      }
+
+      let materialsCost = 0;
+      let labourCost = 0;
+      let itemsTotal = 0;
+
+      const processedLineItems = rawLineItems.map((item) => {
+        const qty = Math.max(0.01, parseFloat(item.quantity) || 1);
+        const unitPrice = Math.max(0, parseFloat(item.unit_price) || 0);
+        const lineTotal = parseFloat((qty * unitPrice).toFixed(2));
+        const itemType = item.item_type === 'material' ? 'material' : 'service';
+
+        if (itemType === 'material') {
+          materialsCost += lineTotal;
+        } else {
+          labourCost += lineTotal;
+        }
+        itemsTotal += lineTotal;
+
+        return {
+          item_type: itemType,
+          description: (item.description || 'Item Description').trim(),
+          hsn_code: (item.hsn_code || (itemType === 'material' ? '847990' : '998311')).trim(),
+          quantity: qty,
+          unit_price: unitPrice,
+          total_amount: lineTotal,
+          inventory_item_id: item.inventory_item_id || null,
+        };
+      });
+
+      // Additional charges & discounts
+      const equipmentCharges = parseFloat(invoiceData.equipment_charges || 0);
+      const transportCharges = parseFloat(invoiceData.transport_charges || 0);
+      const additionalCharges = parseFloat(invoiceData.additional_charges || 0);
+      const discountAmount = Math.max(0, parseFloat(invoiceData.discount_amount || 0));
+
+      const subtotalBeforeDiscount = itemsTotal + equipmentCharges + transportCharges + additionalCharges;
+      const subtotal = Math.max(0, parseFloat((subtotalBeforeDiscount - discountAmount).toFixed(2)));
+
+      // 3. GST Calculation
+      const isInterState = Boolean(invoiceData.is_inter_state);
+      const gstRateVal = parseFloat(invoiceData.gst_rate !== undefined ? invoiceData.gst_rate : 18.0);
+      const gstRateFrac = gstRateVal / 100.0;
+      const totalTax = parseFloat((subtotal * gstRateFrac).toFixed(2));
+
+      let cgst = 0;
+      let sgst = 0;
+      let igst = 0;
+
+      if (isInterState) {
+        igst = totalTax;
+      } else {
+        cgst = parseFloat((totalTax / 2).toFixed(2));
+        sgst = parseFloat((totalTax / 2).toFixed(2));
+      }
+
+      const totalAmount = parseFloat((subtotal + totalTax).toFixed(2));
+
+      // 4. Due Date
+      const dueDays = parseInt(invoiceData.due_days || 0, 10);
+      const dueDate = new Date();
+      dueDate.setDate(dueDate.getDate() + dueDays);
+
+      // 5. Atomic Sequential Invoice Number Generation
+      const year = new Date().getFullYear();
+      const invoiceCountRes = await client.query(
+        `SELECT COUNT(*) AS count FROM invoices WHERE company_id = $1`,
+        [companyId]
+      );
+      const nextSequence = parseInt(invoiceCountRes.rows[0].count, 10) + 1;
+      const invoiceNumber = `INV-${year}-${String(nextSequence).padStart(4, '0')}`;
+
+      // 6. Payment Status Handling
+      const isPaidNow = invoiceData.payment_status === 'paid';
+      const paymentMethod = invoiceData.payment_method || (isPaidNow ? 'cash' : null);
+      const amountPaid = isPaidNow ? totalAmount : 0;
+      const amountDue = isPaidNow ? 0 : totalAmount;
+      const status = isPaidNow ? 'paid' : 'issued';
+
+      // 7. Insert Invoice Row
+      const insertInvRes = await client.query(
+        `INSERT INTO invoices
+         (company_id, job_id, customer_id, customer_name, customer_email, customer_phone,
+          customer_address, customer_gstin, invoice_type, invoice_number, version_number,
+          is_latest, status, payment_method, labour_hours, labour_rate, labour_cost,
+          materials_cost, equipment_charges, transport_charges, additional_charges,
+          discount_amount, subtotal, is_inter_state, gst_rate, cgst, sgst, igst,
+          total_tax, total_amount, amount_paid, amount_due, due_date, payment_terms,
+          customer_notes, internal_notes, created_at, updated_at)
+         VALUES
+         ($1, NULL, $2, $3, $4, $5,
+          $6, $7, $8, $9, 1,
+          TRUE, $10, $11, 0, 0, $12,
+          $13, $14, $15, $16,
+          $17, $18, $19, $20, $21, $22, $23,
+          $24, $25, $26, $27, $28, $29,
+          $30, $31, NOW(), NOW())
+         RETURNING *`,
+        [
+          companyId, customerId, customerName, customerEmail, customerPhone,
+          customerAddress, customerGstin, invoiceData.invoice_type || 'walk_in', invoiceNumber,
+          status, paymentMethod, labourCost,
+          materialsCost, equipmentCharges, transportCharges, additionalCharges,
+          discountAmount, subtotal, isInterState, gstRateVal, cgst, sgst, igst,
+          totalTax, totalAmount, amountPaid, amountDue, dueDate, invoiceData.payment_terms || (isPaidNow ? 'Immediate Payment' : 'Due on receipt'),
+          invoiceData.customer_notes || 'Thank you for your business!', invoiceData.internal_notes || ''
+        ]
+      );
+
+      const invoice = insertInvRes.rows[0];
+
+      // 8. Insert Line Items & Auto-Deduct Inventory
+      for (const item of processedLineItems) {
+        await client.query(
+          `INSERT INTO invoice_items
+           (invoice_id, company_id, item_type, description, hsn_code, quantity, unit_price, total_amount)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+          [invoice.id, companyId, item.item_type, item.description, item.hsn_code, item.quantity, item.unit_price, item.total_amount]
+        );
+
+        // Deduct from inventory if linked
+        if (item.inventory_item_id) {
+          await client.query(
+            `UPDATE inventory_items 
+             SET quantity = GREATEST(0, quantity - $1), updated_at = NOW() 
+             WHERE id = $2 AND company_id = $3`,
+            [Math.round(item.quantity), item.inventory_item_id, companyId]
+          ).catch((invErr) => console.warn('Inventory deduction notice:', invErr.message));
+        }
+      }
+
+      // 9. Payment Record (if paid at counter) or AR Schedule (if unpaid)
+      let paymentRecord = null;
+      if (isPaidNow) {
+        const payRes = await client.query(
+          `INSERT INTO invoice_payments
+           (invoice_id, company_id, payment_method, transaction_reference, amount, notes, recorded_by, payment_date)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+           RETURNING *`,
+          [
+            invoice.id, companyId, paymentMethod,
+            invoiceData.transaction_reference || 'COUNTER_SALE',
+            totalAmount, invoiceData.payment_notes || 'Immediate counter payment',
+            userId || null
+          ]
+        );
+        paymentRecord = payRes.rows[0];
+      } else {
+        // Insert into AR schedule for unpaid walk-in
+        await client.query(
+          `INSERT INTO ar_collection_schedules
+           (company_id, invoice_id, customer_id, customer_name, customer_phone, customer_email,
+            invoice_amount, amount_outstanding, due_date, current_stage, is_paused)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, 'pre_due_3d', FALSE)
+           ON CONFLICT (company_id, invoice_id) DO UPDATE
+           SET invoice_amount = EXCLUDED.invoice_amount, amount_outstanding = EXCLUDED.amount_outstanding`,
+          [
+            companyId, invoice.id, customerId, customerName,
+            customerPhone, customerEmail, totalAmount, dueDate
+          ]
+        ).catch((arErr) => console.warn('AR schedule notice:', arErr.message));
+      }
+
+      // 10. Generate PDF link
+      const pdfUrl = `/api/invoices/${invoice.id}/pdf`;
+      await client.query(`UPDATE invoices SET pdf_url = $1 WHERE id = $2`, [pdfUrl, invoice.id]);
+      invoice.pdf_url = pdfUrl;
+
+      // 11. Log Activity
+      await client.query(
+        `INSERT INTO invoice_activity_logs
+         (invoice_id, company_id, action_type, performed_by_type, performed_by_id, performed_by_name, created_at)
+         VALUES ($1, $2, 'created', 'owner', $3, 'Owner', NOW())`,
+        [invoice.id, companyId, userId || null]
+      ).catch(() => {});
+
+      await client.query('COMMIT');
+
+      return {
+        success: true,
+        invoice,
+        lineItems: processedLineItems,
+        payment: paymentRecord,
+        pdfUrl
+      };
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      console.error('invoiceService.createDirectInvoice error:', err.message);
       throw err;
     } finally {
       client.release();

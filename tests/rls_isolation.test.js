@@ -12,9 +12,8 @@ test.describe('PostgreSQL Core Tables Row-Level Security (RLS) & Tenant Isolatio
 
       await client.query('BEGIN');
 
-      // Set session context to Company A
-      await client.query(`SET LOCAL app.current_company_id = '${companyA}'`);
-      await client.query(`SET LOCAL app.current_role = 'owner'`);
+      // Set session context to Company A using set_config (avoids SQL keyword conflict on current_role)
+      await client.query(`SELECT set_config('app.current_company_id', $1, true), set_config('app.current_role', $2, true)`, [companyA, 'owner']);
 
       // Query core & AI tables
       const coreTables = [
@@ -46,8 +45,7 @@ test.describe('PostgreSQL Core Tables Row-Level Security (RLS) & Tenant Isolatio
     try {
       await client.query('BEGIN');
       // Intentionally set app.current_company_id to empty string
-      await client.query(`SET LOCAL app.current_company_id = ''`);
-      await client.query(`SET LOCAL app.current_role = 'employee'`);
+      await client.query(`SELECT set_config('app.current_company_id', '', true), set_config('app.current_role', $1, true)`, ['employee']);
 
       const coreTables = [
         'users', 'jobs', 'attendance', 'payroll', 'inventory_items',
@@ -76,8 +74,7 @@ test.describe('PostgreSQL Core Tables Row-Level Security (RLS) & Tenant Isolatio
     try {
       await client.query('BEGIN');
       // Set role to super_admin without company_id
-      await client.query(`SET LOCAL app.current_company_id = ''`);
-      await client.query(`SET LOCAL app.current_role = 'super_admin'`);
+      await client.query(`SELECT set_config('app.current_company_id', '', true), set_config('app.current_role', $1, true)`, ['super_admin']);
 
       const res = await client.query(`SELECT COUNT(*)::int AS cnt FROM users`);
       assert.ok(res.rows[0].cnt >= 0, 'Super admin role policy must allow querying across tables');

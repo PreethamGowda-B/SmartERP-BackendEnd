@@ -62,15 +62,6 @@ router.get('/', authenticateToken, async (req, res) => {
       return res.status(400).json({ message: 'No company associated with your account' });
     }
 
-    // Debug: log what companyId we're querying with
-    console.log(`🔍 [GET /employees] companyId from JWT: "${companyId}" (type: ${typeof companyId})`);
-
-    // Count all users in this company for debugging
-    const countCheck = await pool.query(
-      `SELECT COUNT(*) as total, array_agg(role) as roles FROM users WHERE company_id = $1`,
-      [companyId]
-    );
-    console.log(`🔍 [GET /employees] users with company_id="${companyId}":`, countCheck.rows[0]);
     const result = await pool.query(
       `SELECT u.id, u.name, u.email, u.role, u.created_at,
               p.phone, p.position, p.department, p.hire_date, p.is_active,

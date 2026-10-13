@@ -1,42 +1,16 @@
 const cron = require('node-cron');
-const { pool } = require("../db");
+const NotificationRoutingService = require('../services/notificationRoutingService');
 
-// We fetch these inside the function to avoid circular dependencies during startup if any
 function startSmartNotificationProcessor() {
-  console.log("⏰ Starting Smart Notification CRON (Runs every 6 hours)...");
-  
-  // Runs at minute 0 past every 6th hour (e.g. 00:00, 06:00, 12:00, 18:00)
-  cron.schedule('0 */6 * * *', async () => {
+  console.log("⏰ Starting Scheduled Smart Notification Processor...");
+
+  // Runs Monday through Saturday at 10:00 AM IST (04:30 UTC)
+  // Sends a single, idempotent attendance reminder strictly to unclocked employees.
+  // NEVER sends reminders or fake tips/pokes to owners.
+  cron.schedule('30 4 * * 1-6', async () => {
     try {
-      console.log("🔔 Running scheduled Smart Notifications...");
-      const { sendRandomTip, sendRandomPoke, sendSmartNotification } = require("../services/smartNotificationService");
-      
-      const result = await pool.query(
-        "SELECT id, company_id FROM users WHERE push_token IS NOT NULL AND role = 'owner' ORDER BY RANDOM() LIMIT 5"
-      );
-
-      for (const user of result.rows) {
-        const attendanceCheck = await pool.query(
-          "SELECT id FROM attendance WHERE company_id = $1 AND date = CURRENT_DATE LIMIT 1",
-          [user.company_id]
-        );
-
-        if (attendanceCheck.rows.length === 0) {
-          await sendSmartNotification(user.id, user.company_id, {
-            title: "📅 Attendance Reminder",
-            message: "Attendance hasn't been marked today. Don't forget to check!",
-            type: "reminder_attendance",
-            priority: "medium",
-            data: { url: "/owner/attendance" }
-          });
-        }
-
-        if (Math.random() > 0.5) {
-          await sendRandomTip(user.id, user.company_id);
-        } else {
-          await sendRandomPoke(user.id, user.company_id);
-        }
-      }
+      console.log("🔔 [SmartNotificationProcessor] Running morning employee attendance check...");
+      await NotificationRoutingService.dispatchDailyAttendanceReminders();
     } catch (err) {
       console.error("❌ Smart Notification CRON Error:", err.message);
     }

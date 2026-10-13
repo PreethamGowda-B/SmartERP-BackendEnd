@@ -195,15 +195,17 @@ router.get('/sse', authenticateToken, async (req, res) => {
 // ⚠️  Must come BEFORE /:id/read so Express doesn't treat "mark-all-read" as an :id param
 router.patch('/mark-all-read', authenticateToken, async (req, res) => {
   try {
-    const userId = req.user.userId || req.user.id;
-    const companyId = req.user.companyId;
+    const userId = String(req.user.userId || req.user.id || '');
+    const companyId = req.user.companyId ? String(req.user.companyId) : '';
 
     const result = await pool.query(
       `UPDATE notifications 
        SET read = TRUE 
-       WHERE user_id = $1 AND company_id::text = $2 AND read = FALSE 
+       WHERE user_id::text = $1::text 
+         AND ($2::text = '' OR company_id::text = $2::text OR company_id IS NULL) 
+         AND read = FALSE 
        RETURNING id`,
-      [userId, String(companyId)]
+      [userId, companyId]
     );
 
     console.log(`✅ Marked ${result.rows.length} notifications as read`);

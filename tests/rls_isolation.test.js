@@ -25,9 +25,9 @@ test.describe('PostgreSQL Core Tables Row-Level Security (RLS) & Tenant Isolatio
       ];
 
       for (const table of coreTables) {
-        const res = await client.query(`SELECT * FROM ${table} WHERE company_id = $1 OR company_id = $2`, [companyA, companyB]);
+        const res = await client.query(`SELECT * FROM ${table} WHERE company_id::text = $1::text OR company_id::text = $2::text`, [companyA, companyB]);
         for (const row of res.rows) {
-          assert.equal(row.company_id, companyA, `Table ${table} leaked row from another tenant!`);
+          assert.equal(String(row.company_id), String(companyA), `Table ${table} leaked row from another tenant!`);
         }
       }
 

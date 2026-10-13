@@ -75,7 +75,7 @@ router.get('/owner/metrics', authenticateToken, cacheMiddleware(300), async (req
 });
 
 // ─── GET /api/dashboard/owner/recent-activity ────────────────────────────────
-router.get('/owner/recent-activity', authenticateToken, async (req, res) => {
+router.get('/owner/recent-activity', authenticateToken, cacheMiddleware(60), async (req, res) => {
     try {
         const userId = req.user.userId || req.user.id;
         const companyId = req.user.companyId;

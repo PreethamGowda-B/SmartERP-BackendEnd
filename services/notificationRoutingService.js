@@ -174,10 +174,10 @@ class NotificationRoutingService {
       params.push(String(companyId));
     }
 
-    const unclocked = await pool.query(query, params);
+    const pendingEmployees = await pool.query(query, params);
     let sentCount = 0;
 
-    for (const emp of unclocked.rows) {
+    for (const emp of pendingEmployees.rows) {
       const res = await this.sendAttendanceReminder({
         employeeId: emp.id,
         companyId: emp.company_id,
@@ -187,7 +187,7 @@ class NotificationRoutingService {
     }
 
     console.log(`✅ Dispatched attendance reminders: ${sentCount} employees notified for ${today}`);
-    return { notifiedCount: sentCount, totalUnclocked: unclocked.rows.length };
+    return { notifiedCount: sentCount, totalPending: pendingEmployees.rows.length };
   }
 
   /**
@@ -256,13 +256,13 @@ class NotificationRoutingService {
     if (!customerUserId || !companyId) return null;
 
     // Verify user is a customer and belongs to the company context
-    const custRes = await pool.query(
+    const customerRes = await pool.query(
       `SELECT id, role FROM users WHERE id::text = $1::text`,
       [String(customerUserId)]
     );
-    const cust = custRes.rows[0];
-    if (!cust || cust.role !== 'customer') {
-      console.warn(`⚠️ Target user ${customerUserId} is not a customer (role=${cust?.role})`);
+    const customerUser = customerRes.rows[0];
+    if (!customerUser || customerUser.role !== 'customer') {
+      console.warn(`⚠️ Target user ${customerUserId} is not a customer (role=${customerUser?.role})`);
       return null;
     }
 

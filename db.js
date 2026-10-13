@@ -58,24 +58,32 @@ function buildRlsConfig() {
 async function applyRlsToClient(client) {
   const { bypassRls, role, companyId } = buildRlsConfig();
 
-  if (companyId) {
-    // Authenticated tenant request — set tenant context session variables
+  // Always reset role back to session user (postgres) first
+  await client.query('RESET ROLE').catch(() => {});
+
+  if (bypassRls) {
+    // Explicit bypass context (migrations, background jobs, auth routes)
     await client.query(
       `SELECT
-         set_config('app.bypass_rls',         'on', true),
-         set_config('app.current_company_id', $1,   true),
-         set_config('app.current_role',       $2,   true)`,
-      [companyId, role]
+         set_config('app.bypass_rls',         'on', false),
+         set_config('app.current_company_id', $1,   false),
+         set_config('app.current_role',       $2,   false)`,
+      [companyId || '', role || '']
     ).catch(() => {});
   } else {
-    // No specific company context (login, health check, cron, admin) — enable bypass
+    // Set session variables for row-level security (persists on client for current checkout)
     await client.query(
       `SELECT
-         set_config('app.bypass_rls',         'on', true),
-         set_config('app.current_company_id', '',   true),
-         set_config('app.current_role',       $1,   true)`,
-      [role || '']
+         set_config('app.bypass_rls',         'off', false),
+         set_config('app.current_company_id', $1,    false),
+         set_config('app.current_role',       $2,    false)`,
+      [companyId || '', role || '']
     ).catch(() => {});
+
+    // Structurally enforce RLS by assuming smarterp_app (which lacks BYPASSRLS)
+    await client.query('SET ROLE smarterp_app').catch((err) => {
+      console.warn('⚠️ Failed to SET ROLE smarterp_app:', err.message);
+    });
   }
 }
 

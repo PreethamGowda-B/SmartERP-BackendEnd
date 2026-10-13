@@ -458,9 +458,13 @@ router.post('/:id/track', async (req, res) => {
     const { actionType, performedByType, performedById, performedByName } = req.body;
 
     // Securely resolve company_id and customer_id directly from the database
-    const invRow = await pool.query(`SELECT company_id, customer_id FROM invoices WHERE id = $1`, [id]);
+    const invRow = await pool.query(`SELECT id, company_id, customer_id FROM invoices WHERE id = $1`, [id]);
     if (invRow.rows.length === 0) {
       return res.status(404).json({ error: 'Invoice not found' });
+    }
+
+    if (!verifyInvoiceAccess(req, invRow.rows[0])) {
+      return res.status(403).json({ error: 'Forbidden: Access denied to this invoice' });
     }
 
     const { company_id: companyId, customer_id: customerId } = invRow.rows[0];
@@ -502,9 +506,13 @@ router.post('/:id/dispute', async (req, res) => {
     }
 
     // Securely resolve company_id and customer_id directly from the database
-    const invRow = await pool.query(`SELECT company_id, customer_id FROM invoices WHERE id = $1`, [id]);
+    const invRow = await pool.query(`SELECT id, company_id, customer_id FROM invoices WHERE id = $1`, [id]);
     if (invRow.rows.length === 0) {
       return res.status(404).json({ error: 'Invoice not found' });
+    }
+
+    if (!verifyInvoiceAccess(req, invRow.rows[0])) {
+      return res.status(403).json({ error: 'Forbidden: Access denied to this invoice' });
     }
 
     const { company_id: companyId, customer_id: customerId } = invRow.rows[0];

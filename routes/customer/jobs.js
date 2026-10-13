@@ -374,47 +374,98 @@ router.get('/:id/tracking', async (req, res) => {
   }
 });
 
-// ─── GET /:id/invoice — invoice for completed job ─────────────────────────────
+// ─── GET /:id/invoice — invoice for completed job or invoice detail ───────────
 router.get('/:id/invoice', async (req, res) => {
+  const customerId = req.customer.id;
+  const companyId = req.customer.companyId;
   const { id } = req.params;
 
   try {
-    // Fetch latest invoice for this job directly by job_id
+    // 1. Try finding invoice by job_id owned by this customer & company
     let invoiceResult = await pool.query(
-      `SELECT id, invoice_number, 
-              COALESCE(labour_hours, 0) AS labor_hours, 
-              COALESCE(labour_cost, 0) AS labor_cost, 
-              COALESCE(materials_cost, 0) AS materials_cost, 
-              COALESCE(additional_charges + transport_charges + equipment_charges, 0) AS service_charge, 
-              total_amount, status, created_at AS generated_at
-       FROM invoices
-       WHERE job_id = $1 AND is_latest = TRUE
-       ORDER BY created_at DESC
+      `SELECT i.*, j.title AS job_title
+       FROM invoices i
+       LEFT JOIN jobs j ON i.job_id = j.id
+       WHERE i.job_id::text = $1::text 
+         AND (i.customer_id::text = $2::text OR j.customer_id::text = $2::text)
+         AND i.company_id::text = $3::text
+         AND i.is_latest = TRUE
+       ORDER BY i.created_at DESC
        LIMIT 1`,
-      [id]
+      [id, String(customerId), String(companyId)]
     );
 
+    // 2. If not found by job_id, check if :id is the invoice ID itself owned by this customer & company
     if (invoiceResult.rows.length === 0) {
       invoiceResult = await pool.query(
-        `SELECT id, invoice_number, 
-                COALESCE(labour_hours, 0) AS labor_hours, 
-                COALESCE(labour_cost, 0) AS labor_cost, 
-                COALESCE(materials_cost, 0) AS materials_cost, 
-                COALESCE(additional_charges + transport_charges + equipment_charges, 0) AS service_charge, 
-                total_amount, status, created_at AS generated_at
-         FROM invoices
-         WHERE job_id = $1
-         ORDER BY created_at DESC
+        `SELECT i.*, j.title AS job_title
+         FROM invoices i
+         LEFT JOIN jobs j ON i.job_id = j.id
+         WHERE i.id::text = $1::text 
+           AND (i.customer_id::text = $2::text OR j.customer_id::text = $2::text)
+           AND i.company_id::text = $3::text
          LIMIT 1`,
-        [id]
+        [id, String(customerId), String(companyId)]
       );
     }
 
     if (invoiceResult.rows.length === 0) {
-      return ok(res, null); // No invoice yet
+      return ok(res, null); // No invoice found or access denied
     }
 
-    return ok(res, invoiceResult.rows[0]);
+    const invoice = invoiceResult.rows[0];
+
+    // Fetch line items
+    const itemsRes = await pool.query(
+      `SELECT * FROM invoice_items WHERE invoice_id = $1 ORDER BY id ASC`,
+      [invoice.id]
+    );
+
+    // Fetch company branding
+    const compRes = await pool.query(
+      `SELECT id, company_name, address, phone, contact_email, settings FROM companies WHERE id = $1`,
+      [invoice.company_id]
+    );
+    const compRow = compRes.rows[0] || {};
+    const s = compRow.settings || {};
+
+    const companyProfile = {
+      name: compRow.company_name || 'Business Enterprise',
+      legal_name: s.legal_name || compRow.company_name || 'Business Enterprise',
+      address: compRow.address || s.address || '',
+      city: s.city || '',
+      state: s.state || '',
+      country: s.country || 'India',
+      pincode: s.pincode || '',
+      phone: compRow.phone || s.phone || '',
+      contact_email: compRow.contact_email || s.contact_email || '',
+      website: s.website || '',
+      gstin: s.gstin || '',
+      pan: s.pan || '',
+      bank_name: s.bank_name || '',
+      account_number: s.account_number || '',
+      ifsc_code: s.ifsc_code || '',
+      upi_id: s.upi_id || '',
+    };
+
+    // Synthesize legacy fields for backward-compatibility with job tracking view
+    const legacyCompatibleInvoice = {
+      ...invoice,
+      labor_hours: parseFloat(invoice.labour_hours || 0),
+      labor_cost: parseFloat(invoice.labour_cost || 0),
+      materials_cost: parseFloat(invoice.materials_cost || 0),
+      service_charge: parseFloat(invoice.additional_charges || 0) + parseFloat(invoice.transport_charges || 0) + parseFloat(invoice.equipment_charges || 0),
+      generated_at: invoice.created_at,
+    };
+
+    return res.json({
+      success: true,
+      data: legacyCompatibleInvoice,
+      invoice: legacyCompatibleInvoice,
+      lineItems: itemsRes.rows,
+      company: companyProfile,
+      error: null,
+    });
   } catch (err) {
     console.error('GET /:id/invoice error:', err.message);
     errorLogger.logFromRequest(req, err, { context: 'customer/jobs.GET /:id/invoice' });

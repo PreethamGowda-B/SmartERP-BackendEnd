@@ -240,38 +240,81 @@ router.post('/', async (req, res) => {
       }
     }
 
-    // Insert message — production messages table has both 'message' (old, NOT NULL) and 'content' (new) columns
-    const safeRecipientId = recipientId ? String(recipientId) : null;
-    const safeCompanyId = messageCompanyId ? String(messageCompanyId) : null;
+    // Helper to safely detect UUID format
+    const isUUID = (val) => Boolean(val && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(val)));
 
-    const result = await pool.query(
-      `INSERT INTO messages (
-         conversation_id, sender_id, receiver_id, company_id,
-         message, content, message_type,
-         media_url, media_type, file_name, file_size, created_at
-       )
-       VALUES (
-         $1,
-         $2::UUID,
-         CASE WHEN $3::text IS NULL OR $3::text = '' OR $3::text = 'null' THEN NULL ELSE $3::UUID END,
-         CASE WHEN $4::text IS NULL OR $4::text = '' OR $4::text = 'null' THEN NULL ELSE $4::UUID END,
-         $5, $5, COALESCE($6, 'text'),
-         $7, $8, $9, $10, NOW()
-       )
-       RETURNING id, conversation_id, sender_id, content, message, message_type, media_url, media_type, file_name, file_size, created_at`,
-      [
-        conversation_id,
-        String(senderId),
-        safeRecipientId,
-        safeCompanyId,
-        trimmedContent || (fileName || 'Attachment'),
-        msgType,
-        mediaUrl,
-        mediaType,
-        fileName,
-        fileSize
-      ]
-    );
+    // Insert message — production messages table has both 'message' (old, NOT NULL) and 'content' (new) columns
+    const safeSenderId = isUUID(senderId) ? String(senderId) : null;
+    const safeRecipientId = isUUID(recipientId) ? String(recipientId) : null;
+    // In SmartERP, company_id is an integer (e.g. 1) or text — NEVER cast it to UUID!
+    const safeCompanyId = messageCompanyId != null && messageCompanyId !== '' && messageCompanyId !== 'null'
+      ? messageCompanyId
+      : null;
+
+    let result;
+    try {
+      result = await pool.query(
+        `INSERT INTO messages (
+           conversation_id, sender_id, receiver_id, company_id,
+           message, content, message_type,
+           media_url, media_type, file_name, file_size, created_at
+         )
+         VALUES (
+           $1::uuid,
+           CASE WHEN $2::text IS NULL OR $2::text = '' THEN NULL ELSE $2::uuid END,
+           CASE WHEN $3::text IS NULL OR $3::text = '' THEN NULL ELSE $3::uuid END,
+           $4,
+           $5, $5, COALESCE($6, 'text'),
+           $7, $8, $9, $10, NOW()
+         )
+         RETURNING id, conversation_id, sender_id, content, message, message_type, media_url, media_type, file_name, file_size, created_at`,
+        [
+          conversation_id,
+          safeSenderId,
+          safeRecipientId,
+          safeCompanyId,
+          trimmedContent || (fileName || 'Attachment'),
+          msgType,
+          mediaUrl,
+          mediaType,
+          fileName,
+          fileSize
+        ]
+      );
+    } catch (insertErr) {
+      // Fallback: if company_id column causes type error, retry without company_id
+      if (insertErr.message && (insertErr.message.includes('company_id') || insertErr.message.includes('column') || insertErr.code === '42703')) {
+        console.warn('⚠️ Retrying message insert without company_id:', insertErr.message);
+        result = await pool.query(
+          `INSERT INTO messages (
+             conversation_id, sender_id, receiver_id,
+             message, content, message_type,
+             media_url, media_type, file_name, file_size, created_at
+           )
+           VALUES (
+             $1::uuid,
+             CASE WHEN $2::text IS NULL OR $2::text = '' THEN NULL ELSE $2::uuid END,
+             CASE WHEN $3::text IS NULL OR $3::text = '' THEN NULL ELSE $3::uuid END,
+             $4, $4, COALESCE($5, 'text'),
+             $6, $7, $8, $9, NOW()
+           )
+           RETURNING id, conversation_id, sender_id, content, message, message_type, media_url, media_type, file_name, file_size, created_at`,
+          [
+            conversation_id,
+            safeSenderId,
+            safeRecipientId,
+            trimmedContent || (fileName || 'Attachment'),
+            msgType,
+            mediaUrl,
+            mediaType,
+            fileName,
+            fileSize
+          ]
+        );
+      } else {
+        throw insertErr;
+      }
+    }
 
     const sentMessage = result.rows[0];
 

@@ -42,18 +42,20 @@ router.get('/owner/metrics', authenticateToken, cacheMiddleware(300), async (req
                 [today, companyId]
             ),
             pool.query(
-                `SELECT id, title, description, status,
-                  COALESCE(employee_status, 'pending') AS employee_status,
-                  COALESCE(priority, 'medium') AS priority,
-                  COALESCE(progress, 0) AS progress,
-                  created_at, assigned_to
-                 FROM jobs
+                `SELECT j.id, j.title, j.description, j.status,
+                  COALESCE(j.employee_status, 'pending') AS employee_status,
+                  COALESCE(j.priority, 'medium') AS priority,
+                  COALESCE(j.progress, 0) AS progress,
+                  j.created_at, j.assigned_to,
+                  u.name AS assignee_name
+                 FROM jobs j
+                 LEFT JOIN users u ON u.id = j.assigned_to
                  WHERE (
-                     status IN ('active', 'in_progress', 'open')
-                     OR COALESCE(employee_status, '') = 'accepted'
+                     j.status IN ('active', 'in_progress', 'open')
+                     OR COALESCE(j.employee_status, '') = 'accepted'
                    )
-                   AND company_id = $1
-                 ORDER BY created_at DESC
+                   AND j.company_id = $1
+                 ORDER BY j.created_at DESC
                  LIMIT 5`,
                 [companyId]
             ),
@@ -80,17 +82,27 @@ router.get('/owner/recent-activity', authenticateToken, cacheMiddleware(60), asy
         const userId = req.user.userId || req.user.id;
         const companyId = req.user.companyId;
 
-        // Pull from notifications first
+        // Pull notifications targeted to this owner or company-wide notifications (excluding other users' private reminders)
         let activities = [];
         try {
             const notifResult = await pool.query(
                 `SELECT id, type, title, message, priority, created_at
                  FROM notifications
-                 WHERE (user_id = $1 OR company_id = $2)
-                 ORDER BY created_at DESC LIMIT 10`,
+                 WHERE (user_id = $1 OR (company_id = $2 AND user_id IS NULL))
+                 ORDER BY created_at DESC LIMIT 25`,
                 [userId, companyId]
             );
-            activities = notifResult.rows;
+            
+            // Deduplicate consecutive or identical events (e.g. repeated creation bursts)
+            const seen = new Set();
+            activities = (notifResult.rows || []).filter(item => {
+                const cleanTitle = (item.title || '').trim().toLowerCase();
+                const cleanMsg = (item.message || '').trim().toLowerCase();
+                const key = `${cleanTitle}:${cleanMsg}`;
+                if (seen.has(key)) return false;
+                seen.add(key);
+                return true;
+            }).slice(0, 10);
         } catch (e) { /* notifications table may vary */ }
 
         // If no notifications, synthesize from recent job + attendance events concurrently

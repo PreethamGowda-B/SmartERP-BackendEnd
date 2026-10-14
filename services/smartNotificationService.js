@@ -39,9 +39,9 @@ const FUN_MESSAGES = [
         type: "fun_growth"
     },
     {
-        title: "👀 Just Checking In",
-        message: "We noticed you haven't checked attendance today. Your employees might be watching!",
-        type: "fun_attendance"
+        title: "📋 Attendance Review Reminder",
+        message: "Attendance has not been reviewed for today. Please verify employee clock-in records.",
+        type: "attendance_review"
     }
 ];
 

@@ -229,12 +229,48 @@ router.post('/', async (req, res) => {
     const fileName = attachment?.file_name || null;
     const fileSize = attachment?.file_size || null;
 
+    // Resolve company_id for strict multi-tenant isolation and RLS compliance
+    let messageCompanyId = companyId || null;
+    if (!messageCompanyId) {
+      try {
+        const convRow = await pool.query('SELECT company_id FROM conversations WHERE id = $1', [conversation_id]);
+        messageCompanyId = convRow.rows[0]?.company_id || null;
+      } catch (cErr) {
+        // fallback
+      }
+    }
+
     // Insert message — production messages table has both 'message' (old, NOT NULL) and 'content' (new) columns
+    const safeRecipientId = recipientId ? String(recipientId) : null;
+    const safeCompanyId = messageCompanyId ? String(messageCompanyId) : null;
+
     const result = await pool.query(
-      `INSERT INTO messages (conversation_id, sender_id, receiver_id, message, content, message_type, media_url, media_type, file_name, file_size, created_at)
-       VALUES ($1, $2::UUID, $3::UUID, $4, $4, COALESCE($5, 'text'), $6, $7, $8, $9, NOW())
+      `INSERT INTO messages (
+         conversation_id, sender_id, receiver_id, company_id,
+         message, content, message_type,
+         media_url, media_type, file_name, file_size, created_at
+       )
+       VALUES (
+         $1,
+         $2::UUID,
+         CASE WHEN $3::text IS NULL OR $3::text = '' OR $3::text = 'null' THEN NULL ELSE $3::UUID END,
+         CASE WHEN $4::text IS NULL OR $4::text = '' OR $4::text = 'null' THEN NULL ELSE $4::UUID END,
+         $5, $5, COALESCE($6, 'text'),
+         $7, $8, $9, $10, NOW()
+       )
        RETURNING id, conversation_id, sender_id, content, message, message_type, media_url, media_type, file_name, file_size, created_at`,
-      [conversation_id, String(senderId), String(recipientId), trimmedContent || (fileName || 'Attachment'), msgType, mediaUrl, mediaType, fileName, fileSize]
+      [
+        conversation_id,
+        String(senderId),
+        safeRecipientId,
+        safeCompanyId,
+        trimmedContent || (fileName || 'Attachment'),
+        msgType,
+        mediaUrl,
+        mediaType,
+        fileName,
+        fileSize
+      ]
     );
 
     const sentMessage = result.rows[0];
@@ -293,7 +329,7 @@ router.post('/', async (req, res) => {
       (async () => {
         try {
           const recipientInfo = await pool.query(
-            `SELECT role FROM users WHERE id = $1::uuid`,
+            `SELECT role FROM users WHERE id::text = $1`,
             [String(recipientId)]
           );
           const recipientRole = recipientInfo.rows[0]?.role ?? 'employee';
@@ -341,15 +377,22 @@ router.post('/', async (req, res) => {
 });
 
 // ─── GET /api/messages/conversation/:conversationId ──────────────────────────
-// Get paginated messages in a conversation (newest-first, page size 50)
+// Get paginated messages in a conversation (newest-first).
+// Uses cursor-based pagination: pass ?before=<ISO timestamp> to page back.
+// Returns up to 30 messages per request. Falls back to OFFSET only if no cursor given.
 router.get('/conversation/:conversationId', async (req, res) => {
   try {
     const currentUserId = req.user.userId || req.user.id;
     const { conversationId } = req.params;
-    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
-    const pageSize = 50;
-    const offset = (page - 1) * pageSize;
+    const pageSize = 30;
     const historyDays = req.plan?.messages_history_days ?? 30;
+
+    // cursor = ISO timestamp of the oldest message the client already has.
+    // When omitted, fetch the very latest messages.
+    const before = req.query.before ? new Date(req.query.before) : null;
+    // Legacy page-based fallback (page=1 → no offset, page=2+ → offset)
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const legacyOffset = before ? 0 : (page - 1) * pageSize;
 
     // Verify requester is a participant
     const participantCheck = await pool.query(
@@ -360,23 +403,45 @@ router.get('/conversation/:conversationId', async (req, res) => {
       return res.status(403).json({ message: 'Access denied — you are not a participant in this conversation' });
     }
 
-    // Fetch one extra row to determine has_more
-    const result = await pool.query(
-      `SELECT m.id, m.conversation_id, m.sender_id, u.name AS sender_name,
-              COALESCE(m.content, m.message) AS content,
-              COALESCE(m.message_type, 'text') AS message_type,
-              m.media_url, m.media_type, m.file_name, m.file_size, m.duration,
-              m.erp_record_type, m.erp_record_id,
-              m.created_at,
-              CASE WHEN m.sender_id::text = $1 THEN true ELSE false END AS is_mine
-       FROM messages m
-       JOIN users u ON u.id = m.sender_id
-       WHERE m.conversation_id = $2
-         AND m.created_at >= NOW() - ($3 * INTERVAL '1 day')
-       ORDER BY m.created_at DESC
-       LIMIT 51 OFFSET $4`,
-      [String(currentUserId), conversationId, historyDays, offset]
-    );
+    // Cursor-based: WHERE created_at < :before (uses index on conversation_id, created_at)
+    // Legacy OFFSET fallback when no cursor is provided (page 1 is equivalent)
+    let queryText, queryParams;
+    if (before && !isNaN(before.getTime())) {
+      queryText = `
+        SELECT m.id, m.conversation_id, m.sender_id, u.name AS sender_name,
+               COALESCE(m.content, m.message) AS content,
+               COALESCE(m.message_type, 'text') AS message_type,
+               m.media_url, m.media_type, m.file_name, m.file_size, m.duration,
+               m.erp_record_type, m.erp_record_id,
+               m.created_at,
+               CASE WHEN m.sender_id::text = $1 THEN true ELSE false END AS is_mine
+         FROM messages m
+         JOIN users u ON u.id = m.sender_id
+        WHERE m.conversation_id = $2
+          AND m.created_at >= NOW() - ($3 * INTERVAL '1 day')
+          AND m.created_at < $5
+        ORDER BY m.created_at DESC
+        LIMIT $4`;
+      queryParams = [String(currentUserId), conversationId, historyDays, pageSize + 1, before.toISOString()];
+    } else {
+      queryText = `
+        SELECT m.id, m.conversation_id, m.sender_id, u.name AS sender_name,
+               COALESCE(m.content, m.message) AS content,
+               COALESCE(m.message_type, 'text') AS message_type,
+               m.media_url, m.media_type, m.file_name, m.file_size, m.duration,
+               m.erp_record_type, m.erp_record_id,
+               m.created_at,
+               CASE WHEN m.sender_id::text = $1 THEN true ELSE false END AS is_mine
+         FROM messages m
+         JOIN users u ON u.id = m.sender_id
+        WHERE m.conversation_id = $2
+          AND m.created_at >= NOW() - ($3 * INTERVAL '1 day')
+        ORDER BY m.created_at DESC
+        LIMIT $4 OFFSET $5`;
+      queryParams = [String(currentUserId), conversationId, historyDays, pageSize + 1, legacyOffset];
+    }
+
+    const result = await pool.query(queryText, queryParams);
 
     const fetched = result.rows;
     const hasMore = fetched.length > pageSize;
@@ -397,13 +462,15 @@ router.get('/conversation/:conversationId', async (req, res) => {
         file_size: row.file_size || 0,
       } : undefined;
 
-      return {
-        ...row,
-        attachment
-      };
+      return { ...row, attachment };
     });
 
-    res.json({ messages, has_more: hasMore });
+    // Return the oldest message timestamp as the next cursor for the frontend
+    const nextCursor = hasMore && sliced.length > 0
+      ? sliced[sliced.length - 1].created_at
+      : null;
+
+    res.json({ messages, has_more: hasMore, next_cursor: nextCursor });
   } catch (err) {
     console.error('Error fetching conversation:', err);
     res.status(500).json({ message: 'Server error fetching conversation' });

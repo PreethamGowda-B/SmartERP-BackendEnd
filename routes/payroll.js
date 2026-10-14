@@ -51,10 +51,13 @@ router.post('/', authenticateToken, loadPlan, requireFeature('payroll'), checkPe
       return res.status(400).json({ message: 'base_salary must be a non-negative number' });
     }
 
-    // Validate employee exists within the same company
+    // Validate employee exists within the same company (case-insensitive, trims, includes all non-owner company staff)
     const employeeResult = await pool.query(
-      `SELECT id, name, email FROM users WHERE email = $1 AND role = 'employee' AND company_id = $2`,
-      [employee_email, req.user.companyId]
+      `SELECT id, name, email FROM users 
+       WHERE LOWER(TRIM(email)) = LOWER(TRIM($1)) 
+         AND role NOT IN ('owner', 'super_admin') 
+         AND company_id::text = $2::text`,
+      [employee_email, String(req.user.companyId)]
     );
 
     if (employeeResult.rows.length === 0) {

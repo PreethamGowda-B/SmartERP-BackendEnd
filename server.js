@@ -75,7 +75,9 @@ const corsOptions = {
     }
 
     console.warn("🚫 Blocked CORS request from:", origin);
-    callback(null, false);
+    // Pass an error so the cors package still sets the response headers
+    // (using `false` results in a headerless response which the browser reports as CORS failure)
+    callback(new Error(`CORS: Origin not allowed: ${origin}`), false);
   },
   credentials: true,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
@@ -223,7 +225,11 @@ const generalApiLimiter = rateLimit({
     );
   }
 });
-app.use("/api", generalApiLimiter);
+// General API rate limiter — skip OPTIONS (preflight) so CORS headers are not stripped
+app.use("/api", (req, _res, next) => {
+  if (req.method === 'OPTIONS') return next();
+  return generalApiLimiter(req, _res, next);
+});
 
 // ✅ Security Telemetry & Route Enumeration Detection (SmartERP Defensive Security AI)
 const { securityTelemetryMiddleware } = require("./middleware/securityTelemetry");

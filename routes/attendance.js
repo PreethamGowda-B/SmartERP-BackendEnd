@@ -103,38 +103,40 @@ router.post('/clock-in', authenticateToken, async (req, res) => {
     const userId = req.user.userId || req.user.id;
     const companyId = safeCompanyId(req.user.companyId);
     const { biometric_device_id, method = 'manual' } = req.body;
-    const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
     const clockInTime = new Date();
-
     const istClockIn = getISTTime(clockInTime);
     const clockHour = istClockIn.getHours();
+    // Consistent IST date format YYYY-MM-DD
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
 
     // ── Attendance window rules (IST) ───────────────────────────────────────
     // Before 9:00 AM  → Present (on time / early)
     // 9:01 – 12:59    → Late
     // 13:00 – 18:59   → Half Day (came in after 1 PM)
-    // 19:00+          → Blocked (shift is over)
+    // 19:00+          → Overtime / Evening shift (allowed for CNC emergency repairs)
     // ────────────────────────────────────────────────────────────────────────
 
-    // Shift over: at or after 7:00 PM IST
-    if (clockHour >= 19) {
-      return res.status(400).json({
-        message: 'Clock-in is unavailable after shift hours (7:00 PM IST). Shift clock-in will resume tomorrow at 8:00 AM. Please contact HR or submit a regularization request if you require manual attendance approval.',
-        code: 'SHIFT_OVER',
-        current_time: istClockIn.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true })
-      });
-    }
-
-    const isLate = isLateCheckIn(clockInTime);           // 9:01 AM – 12:59 PM
-    const isHalfDay = isHalfDayClockIn(clockInTime);    // 1:00 PM+
+    const isOvertime = clockHour >= 19;
+    const isLate = !isOvertime && isLateCheckIn(clockInTime);
+    const isHalfDay = !isOvertime && isHalfDayClockIn(clockInTime);
 
     // Check if already clocked in today
     const existing = await pool.query(
-      'SELECT * FROM attendance WHERE user_id = $1 AND date = $2',
+      'SELECT * FROM attendance WHERE user_id = $1 AND (date::text = $2 OR date = CURRENT_DATE)',
       [userId, today]
     );
 
     if (existing.rows.length > 0 && existing.rows[0].check_in_time) {
+      // If the technician was auto clocked out by system cron (7 PM), allow them to resume for overtime
+      if (existing.rows[0].is_auto_clocked_out) {
+        const resumed = await pool.query(
+          `UPDATE attendance 
+           SET check_out_time = NULL, is_auto_clocked_out = FALSE, updated_at = NOW()
+           WHERE id = $1 RETURNING *`,
+          [existing.rows[0].id]
+        );
+        return res.json({ ...resumed.rows[0], status_label: 'Present (Overtime)' });
+      }
       return res.status(400).json({
         message: 'Already clocked in today',
         attendance: existing.rows[0]
@@ -143,7 +145,8 @@ router.post('/clock-in', authenticateToken, async (req, res) => {
 
     // Determine provisional status at clock-in time
     let provisionalStatus = 'present';
-    if (isHalfDay) provisionalStatus = 'half_day';
+    if (isOvertime) provisionalStatus = 'overtime';
+    else if (isHalfDay) provisionalStatus = 'half_day';
     else if (isLate) provisionalStatus = 'late';
 
     // Create or update attendance record
@@ -393,16 +396,20 @@ router.get('/me', authenticateToken, async (req, res) => {
 router.get('/today', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId || req.user.id;
-    const today = new Date().toISOString().split('T')[0];
+    const todayIST = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+    const todayUTC = new Date().toISOString().split('T')[0];
 
     const result = await pool.query(
-      'SELECT * FROM attendance WHERE user_id = $1 AND date = $2',
-      [userId, today]
+      `SELECT * FROM attendance 
+       WHERE user_id = $1 
+         AND (date::text = $2 OR date::text = $3 OR date = CURRENT_DATE)
+       ORDER BY date DESC, check_in_time DESC LIMIT 1`,
+      [userId, todayIST, todayUTC]
     );
 
     if (result.rows.length === 0) {
       return res.json({
-        date: today,
+        date: todayIST,
         check_in_time: null,
         check_out_time: null,
         working_hours: null,

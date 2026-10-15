@@ -41,7 +41,13 @@ const CUSTOMER_PORTAL_ORIGIN = process.env.CUSTOMER_PORTAL_ORIGIN || 'http://loc
 const JWT_SECRET = process.env.JWT_SECRET;
 const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || process.env.JWT_SECRET;
 
-const cookieOpts = { httpOnly: true, sameSite: 'none', secure: true, path: '/' };
+const cookieOpts = {
+  httpOnly: true,
+  sameSite: 'none',
+  secure: true,
+  path: '/',
+  ...(process.env.COOKIE_DOMAIN ? { domain: process.env.COOKIE_DOMAIN } : (process.env.NODE_ENV === 'production' ? { domain: '.prozync.in' } : {}))
+};
 const ACCESS_MAX_AGE = 60 * 60 * 1000;        // 1 hour
 const REFRESH_MAX_AGE = 30 * 24 * 60 * 60 * 1000; // 30 days
 
@@ -626,12 +632,12 @@ router.post('/refresh', async (req, res) => {
     );
 
     // Issue new tokens
-    await issueTokens(res, req, customer);
+    const { accessToken } = await issueTokens(res, req, customer);
 
     // Non-blocking audit log
     auditLog(req, customer.id, 'customer_token_refresh', {}, customer.company_id);
 
-    return res.json({ ok: true });
+    return res.json({ ok: true, token: accessToken });
   } catch (err) {
     console.error('refresh error:', err.message);
     return res.status(500).json({ message: 'Server error' });

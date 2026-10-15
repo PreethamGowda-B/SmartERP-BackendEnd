@@ -115,6 +115,7 @@ router.post('/', [
     .withMessage('Invalid priority value'),
   body('description').optional({ checkFalsy: true }).trim(),
   body('scheduled_at').optional({ checkFalsy: true }).isISO8601().withMessage('Invalid scheduled_at date'),
+  body('service_type').optional().isIn(['breakdown', 'maintenance', 'installation', 'general', 'other']).withMessage('Invalid service_type'),
 ], async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
@@ -122,9 +123,37 @@ router.post('/', [
     return fail(res, firstError.msg, 400);
   }
 
-  const customerId = req.customer.id;
-  const companyId = req.customer.companyId;
+  const rawCustomerId = req.customer?.id || req.customer?.customerId || req.customer?.userId;
+  let rawCompanyId = req.customer?.companyId || req.customer?.company_id;
   const { title, description, priority, scheduled_at, machine_id, alarm_code, service_type } = req.body;
+
+  // Resolve valid customer ID from customers table to prevent foreign key errors
+  let resolvedCustomerId = null;
+  if (rawCustomerId) {
+    try {
+      const custCheck = await pool.query('SELECT id, company_id FROM customers WHERE id::text = $1::text', [String(rawCustomerId)]);
+      if (custCheck.rows.length > 0) {
+        resolvedCustomerId = custCheck.rows[0].id;
+        if (!rawCompanyId) rawCompanyId = custCheck.rows[0].company_id;
+      } else if (req.customer?.email) {
+        const emailCheck = await pool.query('SELECT id, company_id FROM customers WHERE email = $1', [req.customer.email]);
+        if (emailCheck.rows.length > 0) {
+          resolvedCustomerId = emailCheck.rows[0].id;
+          if (!rawCompanyId) rawCompanyId = emailCheck.rows[0].company_id;
+        }
+      }
+    } catch (cErr) {
+      console.warn('Customer verification warning (non-fatal):', cErr.message);
+    }
+  }
+
+  // Ensure companyId is a valid integer matching companies.id (or default 1)
+  let resolvedCompanyId = rawCompanyId ? parseInt(rawCompanyId, 10) : null;
+  if (!resolvedCompanyId || isNaN(resolvedCompanyId)) {
+    resolvedCompanyId = 1;
+  }
+  const companyId = resolvedCompanyId;
+  const customerId = resolvedCustomerId || rawCustomerId;
 
   // Section 10: Redis-based rate limiting — max 10 job creations per minute per customer
   try {
@@ -204,23 +233,22 @@ router.post('/', [
                $11, $12, $13, $14)
        RETURNING *`,
       [
-        title,
-        description || null,
-        finalPriority,
-        aiSuggestedPriority,
-        priorityOverridden,
-        approvalStatus,
-        approvedAt,
-        customerId,
-        companyId,
-        autoApprove,
-        scheduled_at || null,
-        machine_id || null,
-        alarm_code || null,
+        title ? title.trim() : 'Customer Service Request',
+        description ? description.trim() : null,
+        finalPriority || 'medium',
+        aiSuggestedPriority || null,
+        Boolean(priorityOverridden),
+        approvalStatus || 'pending_approval',
+        approvedAt || null,
+        resolvedCustomerId || null,
+        resolvedCompanyId,
+        Boolean(autoApprove),
+        (scheduled_at && !isNaN(Date.parse(scheduled_at))) ? new Date(scheduled_at) : null,
+        machine_id ? String(machine_id) : null,
+        alarm_code ? String(alarm_code).trim() : null,
         service_type || 'breakdown',
       ]
     );
-
 
     const createdJob = result.rows[0];
 
@@ -261,8 +289,9 @@ router.post('/', [
       approval_status: approvalStatus,
     }, 201);
   } catch (err) {
+    console.error('❌ customer/jobs.POST / failed:', err);
     errorLogger.logFromRequest(req, err, { context: 'customer/jobs.POST /' });
-    return fail(res, 'Server error');
+    return fail(res, err.message || 'Server error', 500);
   }
 });
 

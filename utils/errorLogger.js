@@ -72,6 +72,16 @@ function log(err, meta = {}) {
   // Always write to console immediately
   console.error(`[ERROR] ${meta.context || 'unknown'}: ${message}`);
 
+  // Safe UUID check for Postgres UUID columns
+  const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const safeCompanyId = (meta.companyId && UUID_REGEX.test(String(meta.companyId))) ? meta.companyId : null;
+  const safeUserId    = (meta.userId && UUID_REGEX.test(String(meta.userId))) ? meta.userId : null;
+  const extraData = {
+    ...(meta.extra || {}),
+    ...(meta.companyId && !safeCompanyId ? { raw_company_id: meta.companyId } : {}),
+    ...(meta.userId && !safeUserId ? { raw_user_id: meta.userId } : {})
+  };
+
   // Write to DB non-blocking
   pool.query(
     `INSERT INTO error_logs
@@ -81,9 +91,9 @@ function log(err, meta = {}) {
       meta.context   || null,
       message,
       stack          || null,
-      meta.extra     ? JSON.stringify(meta.extra) : null,
-      meta.companyId || null,
-      meta.userId    || null,
+      Object.keys(extraData).length > 0 ? JSON.stringify(extraData) : null,
+      safeCompanyId,
+      safeUserId,
       meta.ipAddress || null,
       meta.userAgent || null,
     ]

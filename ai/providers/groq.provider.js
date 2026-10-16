@@ -63,7 +63,7 @@ class GroqProvider extends BaseAIProvider {
     this.defaultModel = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
   }
 
-  async generateCompletion({ messages, tools = [], temperature = 0.2 }) {
+  async generateCompletion({ messages, tools = [], temperature = 0.2, model = null }) {
     return groqConcurrencyLimiter.run(async () => {
       // Clean up previous assistant messages in trajectory to strip raw pseudo-XML tags
       const sanitizedMessages = messages.map((m) => {
@@ -74,7 +74,7 @@ class GroqProvider extends BaseAIProvider {
         return m;
       });
 
-      const candidateModels = [this.defaultModel, ...FALLBACK_MODELS.filter(m => m !== this.defaultModel)];
+      const candidateModels = model ? [model] : [this.defaultModel, ...FALLBACK_MODELS.filter(m => m !== this.defaultModel)];
       let lastError = null;
 
       for (const modelToTry of candidateModels) {

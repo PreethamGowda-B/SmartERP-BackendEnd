@@ -100,8 +100,8 @@ router.post(
         const result = await pool.query(
             `INSERT INTO inventory_items 
        (name, description, quantity, image_url, created_by, employee_name, 
-        category, unit, min_quantity, supplier_name, supplier_contact, supplier_email, company_id, created_at) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW()) 
+        category, unit, min_quantity, supplier_name, supplier_contact, supplier_email, company_id, source_type, source_reference, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'manual_inventory_entry', 'MANUAL', NOW())
        RETURNING *`,
             [
                 name.trim(),
@@ -123,6 +123,19 @@ router.post(
         // Track creation in history
         const newItem = result.rows[0];
         await trackCreation(newItem.id, newItem, userId, employeeName);
+        if (Number(newItem.quantity) > 0) {
+            try {
+                await pool.query(
+                    `INSERT INTO inventory_stock_transactions
+                      (company_id, inventory_item_id, transaction_type, source_type, source_reference, quantity, unit, performed_by)
+                     VALUES ($1,$2,'receipt','manual_inventory_entry',$3,$4,$5,$6)`,
+                    [req.user.companyId, newItem.id, `MANUAL-${newItem.id}`, Number(newItem.quantity), newItem.unit, userId]
+                );
+            } catch (ledgerError) {
+                // Preserve the established manual inventory operation if transaction-history storage is unavailable.
+                console.warn('Manual inventory stock history could not be recorded:', ledgerError.code || ledgerError.name || 'ledger_error');
+            }
+        }
 
         // Send notification to all employees and owner about new inventory
         try {
@@ -177,7 +190,7 @@ router.get('/', authenticateToken, async (req, res) => {
             return res.status(401).json({ message: 'Not authenticated or no company associated' });
         }
         let query = `SELECT 
-        id, name, description, quantity, image_url, employee_name, office_name,
+        id, name, description, quantity, image_url, employee_name, office_name, source_type, source_reference,
         created_by, created_at, updated_at, updated_by,
         category, unit, min_quantity,
         supplier_name, supplier_contact, supplier_email,
@@ -489,6 +502,30 @@ router.patch('/:id/restore', authenticateToken, async (req, res) => {
 
 // ─── GET /api/inventory/:id/history ──────────────────────────────────────────
 // Get history for a specific inventory item
+router.get('/:id/stock-transactions', authenticateToken, async (req, res) => {
+    try {
+        const companyId = req.user?.companyId || req.user?.company_id;
+        if (!companyId) return res.status(401).json({ message: 'Not authenticated or no company associated' });
+        if (!['owner', 'admin'].includes(String(req.user?.role || '').toLowerCase())) {
+            return res.status(403).json({ message: 'Only owners can view stock transaction history' });
+        }
+        const result = await pool.query(
+            `SELECT t.id, t.transaction_type, t.source_type, t.source_reference, t.material_request_id,
+                    t.purchase_bill_id, t.quantity, t.unit, t.invoice_number, t.performed_by,
+                    u.name AS performed_by_name, t.created_at
+               FROM inventory_stock_transactions t
+               LEFT JOIN users u ON u.id = t.performed_by
+              WHERE t.inventory_item_id::text = $1::text AND t.company_id::text = $2::text
+              ORDER BY t.created_at DESC`,
+            [req.params.id, String(companyId)]
+        );
+        return res.json(result.rows);
+    } catch (error) {
+        console.error('Inventory stock transaction history failed:', error.code || error.name || 'db_error');
+        return res.status(500).json({ message: 'Unable to retrieve stock transaction history' });
+    }
+});
+
 router.get('/:id/history', authenticateToken, async (req, res) => {
     try {
         const { id } = req.params;

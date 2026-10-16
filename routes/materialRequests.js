@@ -4,11 +4,13 @@ const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 const { createNotification, createNotificationForOwners } = require('../utils/notificationHelpers');
 
+router.use('/:requestId/purchase-bills', require('./materialPurchaseWorkflow'));
+
 // ─── POST /api/material-requests ─────────────────────────────────────────────
 // Create new material request (employee)
 router.post('/', authenticateToken, async (req, res) => {
     try {
-        const { item_name, quantity, urgency, description } = req.body;
+        const { item_name, quantity, urgency, description, unit } = req.body;
         // Support both `id` (old) and `userId` (new) field names in JWT payload
         const userId = req.user.userId || req.user.id;
 
@@ -20,13 +22,17 @@ router.post('/', authenticateToken, async (req, res) => {
             return res.status(400).json({ message: 'Item name is required' });
         }
 
-        if (!quantity || quantity <= 0) {
+        if (!Number.isFinite(Number(quantity)) || Number(quantity) <= 0) {
             return res.status(400).json({ message: 'Valid quantity is required' });
+        }
+
+        if (!['employee', 'staff', 'technician'].includes(String(req.user.role || '').toLowerCase())) {
+            return res.status(403).json({ message: 'Only employees can create material requests' });
         }
 
         // Get user name — cast both sides to text to support UUID and integer PKs
         const userResult = await pool.query(
-            'SELECT name, email FROM users WHERE id::text = $1::text',
+            'SELECT name, email, company_id FROM users WHERE id::text = $1::text',
             [String(userId)]
         );
 
@@ -42,17 +48,18 @@ router.post('/', authenticateToken, async (req, res) => {
 
         const result = await pool.query(
             `INSERT INTO material_requests 
-       (item_name, quantity, urgency, description, requested_by, requested_by_name, company_id, created_at) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW()) 
+       (item_name, quantity, unit, urgency, description, requested_by, requested_by_name, company_id, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
        RETURNING *`,
             [
                 item_name.trim(),
-                parseInt(quantity),
+                Number(quantity),
+                typeof unit === 'string' ? unit.trim().slice(0, 50) || null : null,
                 urgency || 'Medium',
                 description?.trim() || null,
                 safeRequestedBy,
                 userName,
-                companyId
+                companyId,
             ]
         );
 
@@ -60,15 +67,13 @@ router.post('/', authenticateToken, async (req, res) => {
 
         // Send notification to all owners about new material request
         try {
-            const companyId = req.user.companyId;
-
             await createNotificationForOwners({
                 company_id: companyId,
                 type: 'material_request_created',
                 title: 'New Material Request',
                 message: `${userName} requested ${quantity} ${item_name}`,
                 priority: urgency === 'High' ? 'high' : 'medium',
-                data: { request_id: createdRequest.id, item_name, quantity, urgency, url: '/owner/notifications' }
+                data: { request_id: createdRequest.id, item_name, quantity, urgency, url: '/owner/inventory?tab=materials' }
             });
 
             console.log(`✅ Notified owners about new material request`);
@@ -102,45 +107,42 @@ router.get('/', authenticateToken, async (req, res) => {
             });
         }
 
-        console.log('🔍 Fetching material requests for:', { userId, role, userIdType: typeof userId });
+        let companyId = req.user.companyId || req.user.company_id;
+        if (!companyId) return res.status(403).json({ message: 'A company account is required to view material requests.' });
 
         let query;
         let params;
 
         if (role === 'owner' || role === 'admin') {
             // Owner sees all requests for their company
-            const companyId = req.user.companyId;
+            const scopedCompanyId = companyId;
             query = `
                 SELECT 
-                    id, item_name, quantity, urgency, description, status,
+                    id, item_name, quantity, unit, urgency, description, status, purchase_status,
                     requested_by, requested_by_name, created_at, updated_at,
-                    reviewed_by, reviewed_at
-                FROM material_requests 
-                WHERE company_id::text = $1::text OR company_id IS NULL
+                    reviewed_by, reviewed_at,
+                    (SELECT reviewer.name FROM users reviewer WHERE reviewer.id = material_requests.reviewed_by) AS reviewed_by_name
+                FROM material_requests
+                WHERE company_id::text = $1::text
                 ORDER BY created_at DESC
             `;
-            params = [String(companyId || '')];
+            params = [String(scopedCompanyId)];
         } else {
-            // Employee sees their own requests by user ID or name
-            const userRes = await pool.query('SELECT name FROM users WHERE id::text = $1::text', [String(userId)]);
-            const userName = userRes.rows[0]?.name || '';
-
+            // Employees can only see their own requests in their current company.
             query = `
                 SELECT 
-                    id, item_name, quantity, urgency, description, status,
+                    id, item_name, quantity, unit, urgency, description, status, purchase_status,
                     requested_by, requested_by_name, created_at, updated_at,
-                    reviewed_by, reviewed_at
-                FROM material_requests 
-                WHERE requested_by::text = $1::text OR ($2 != '' AND requested_by_name = $2)
+                    reviewed_by, reviewed_at,
+                    (SELECT reviewer.name FROM users reviewer WHERE reviewer.id = material_requests.reviewed_by) AS reviewed_by_name
+                FROM material_requests
+                WHERE requested_by::text = $1::text AND company_id::text = $2::text
                 ORDER BY created_at DESC
             `;
-            params = [String(userId), userName];
+            params = [String(userId), String(companyId)];
         }
 
-        console.log('📝 Executing query with params:', params);
-
         const result = await pool.query(query, params);
-        console.log(`✅ Found ${result.rows.length} material requests for user ${userId}`);
         res.json(result.rows);
     } catch (err) {
         console.error('❌ Error fetching material requests:', err);
@@ -162,13 +164,15 @@ router.patch('/:id/accept', authenticateToken, async (req, res) => {
 
         const { id } = req.params;
         const userId = req.user.userId || req.user.id;
+        const companyId = req.user.companyId || req.user.company_id;
+        if (!companyId || !userId) return res.status(403).json({ message: 'A company account is required to review requests.' });
 
         const result = await pool.query(
             `UPDATE material_requests 
        SET status = 'accepted', reviewed_by = $1, reviewed_at = NOW(), updated_at = NOW()
-       WHERE id = $2 AND status = 'pending' AND company_id = $3
+       WHERE id::text = $2::text AND status = 'pending' AND company_id::text = $3::text
        RETURNING *`,
-            [userId, id, req.user.companyId]
+            [userId, id, companyId]
         );
 
         if (result.rows.length === 0) {
@@ -178,14 +182,6 @@ router.patch('/:id/accept', authenticateToken, async (req, res) => {
         const request = result.rows[0];
 
         // Ensure we have company_id (fetch from DB if missing in token)
-        let companyId = req.user.companyId;
-        if (!companyId) {
-            const userRes = await pool.query('SELECT company_id FROM users WHERE id = $1', [userId]);
-            if (userRes.rows.length > 0) {
-                companyId = userRes.rows[0].company_id;
-            }
-        }
-
         // Send notification to employee
         if (companyId) {
             try {
@@ -196,7 +192,7 @@ router.patch('/:id/accept', authenticateToken, async (req, res) => {
                     title: 'Material Request Approved',
                     message: `Your request for ${request.item_name} has been approved`,
                     priority: 'medium',
-                    data: { request_id: request.id, item_name: request.item_name, url: '/employee/notifications' }
+                    data: { request_id: request.id, item_name: request.item_name, url: '/employee/materials' }
                 });
                 console.log(`✅ Notification sent for approved material request: ${request.item_name}`);
             } catch (notifErr) {
@@ -224,13 +220,15 @@ router.patch('/:id/decline', authenticateToken, async (req, res) => {
 
         const { id } = req.params;
         const userId = req.user.userId || req.user.id;
+        let companyId = req.user.companyId || req.user.company_id;
+        if (!companyId || !userId) return res.status(403).json({ message: 'A company account is required to review requests.' });
 
         const result = await pool.query(
             `UPDATE material_requests 
        SET status = 'declined', reviewed_by = $1, reviewed_at = NOW(), updated_at = NOW()
-       WHERE id = $2 AND status = 'pending' AND company_id = $3
+       WHERE id::text = $2::text AND status = 'pending' AND company_id::text = $3::text
        RETURNING *`,
-            [userId, id, req.user.companyId]
+            [userId, id, companyId]
         );
 
         if (result.rows.length === 0) {
@@ -240,14 +238,6 @@ router.patch('/:id/decline', authenticateToken, async (req, res) => {
         const request = result.rows[0];
 
         // Ensure we have company_id (fetch from DB if missing in token)
-        let companyId = req.user.companyId;
-        if (!companyId) {
-            const userRes = await pool.query('SELECT company_id FROM users WHERE id = $1', [userId]);
-            if (userRes.rows.length > 0) {
-                companyId = userRes.rows[0].company_id;
-            }
-        }
-
         // Send notification to employee
         if (companyId) {
             try {
@@ -258,7 +248,7 @@ router.patch('/:id/decline', authenticateToken, async (req, res) => {
                     title: 'Material Request Declined',
                     message: `Your request for ${request.item_name} has been declined`,
                     priority: 'low',
-                    data: { request_id: request.id, item_name: request.item_name, url: '/employee/notifications' }
+                    data: { request_id: request.id, item_name: request.item_name, url: '/employee/materials' }
                 });
                 console.log(`✅ Notification sent for declined material request: ${request.item_name}`);
             } catch (notifErr) {

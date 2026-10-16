@@ -221,6 +221,9 @@ const NUMBERED_MIGRATIONS = [
     '023_cnc_master_release.sql',
     '024_secure_account_deletion.sql',
     '025_security_ai_infrastructure.sql',
+    '026_password_reset_recovery_system.sql',
+    '027_refresh_tokens_updated_at.sql',
+    '028_material_purchase_verification.sql',
 ];
 
 async function runNumberedMigrations() {

@@ -10,6 +10,7 @@ const express = require('express');
 const router = express.Router();
 const jwt = require('jsonwebtoken');
 const { pool } = require('../db');
+const { storage } = require('../middleware/als');
 const authMiddleware = require('../middleware/authMiddleware');
 const invoiceService = require('../services/invoiceService');
 const pdfInvoiceService = require('../services/pdfInvoiceService');
@@ -45,13 +46,18 @@ function verifyInvoiceAccess(req, invoice) {
         return true;
       }
       const tokenCompanyId = decoded.companyId || decoded.company_id;
+      const tokenCustomerId = decoded.customerId || decoded.customer_id || decoded.id || decoded.userId;
+      // Customer sessions must match the invoice's customer, not just its
+      // company. Otherwise one customer could access another customer's invoice.
+      if (decoded.role === 'customer') {
+        return !!(invoice.customer_id && tokenCustomerId && String(tokenCustomerId) === String(invoice.customer_id));
+      }
       if (tokenCompanyId && String(tokenCompanyId) === String(invoice.company_id)) {
         return true;
       }
       if (decoded.role === 'super_admin' || decoded.isSuperAdmin) {
         return true;
       }
-      const tokenCustomerId = decoded.customerId || decoded.customer_id || decoded.id || decoded.userId;
       if (invoice.customer_id && tokenCustomerId && String(tokenCustomerId) === String(invoice.customer_id)) {
         return true;
       }
@@ -62,6 +68,10 @@ function verifyInvoiceAccess(req, invoice) {
 
   if (req.user) {
     const userCompanyId = req.user.companyId || req.user.company_id;
+    if (req.user.role === 'customer') {
+      const userCustomerId = req.user.customerId || req.user.customer_id || req.user.id;
+      return !!(invoice.customer_id && userCustomerId && String(userCustomerId) === String(invoice.customer_id));
+    }
     if (userCompanyId && String(userCompanyId) === String(invoice.company_id)) {
       return true;
     }
@@ -75,6 +85,36 @@ function verifyInvoiceAccess(req, invoice) {
   }
 
   return false;
+}
+
+// These customer-facing invoice routes authenticate inside their handlers to
+// support both bearer tokens and signed invoice links. Establish the tenant
+// context before their first database query so FORCE RLS permits company rows.
+function setInvoiceTenantContext(req, res, next) {
+  const token = req.query.token ||
+    (req.headers.authorization && req.headers.authorization.startsWith('Bearer ')
+      ? req.headers.authorization.split(' ')[1]
+      : null) ||
+    req.cookies?.access_token || req.cookies?.user_access_token ||
+    req.cookies?.customer_access_token || req.cookies?.superadmin_access_token;
+
+  if (!token) return next();
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const companyId = decoded.companyId || decoded.company_id;
+    const userId = decoded.customerId || decoded.customer_id || decoded.id || decoded.userId;
+    storage.run({
+      isWebRequest: true,
+      companyId,
+      role: decoded.role || 'invoice_viewer',
+      userId,
+      bypassRls: false,
+    }, next);
+  } catch {
+    // Let the route's normal access check return its existing 403 response.
+    next();
+  }
 }
 
 /**
@@ -452,7 +492,7 @@ router.post('/:id/reissue', authenticate, async (req, res) => {
  * POST /api/invoices/:id/track
  * Logs customer view or download activity with timestamps.
  */
-router.post('/:id/track', async (req, res) => {
+router.post('/:id/track', setInvoiceTenantContext, async (req, res) => {
   try {
     const { id } = req.params;
     const { actionType, performedByType, performedById, performedByName } = req.body;
@@ -494,7 +534,7 @@ router.post('/:id/track', async (req, res) => {
  * POST /api/invoices/:id/dispute
  * Allows customer to raise an issue on an invoice.
  */
-router.post('/:id/dispute', async (req, res) => {
+router.post('/:id/dispute', setInvoiceTenantContext, async (req, res) => {
   try {
     const { id } = req.params;
     // Accept both snake_case (from customer portal) and camelCase
@@ -609,7 +649,7 @@ router.patch('/disputes/:disputeId/resolve', authenticate, async (req, res) => {
  * Streams invoice PDF binary / HTML file.
  * Requires valid authenticated session or signed access token.
  */
-router.get('/:id/pdf', async (req, res) => {
+router.get('/:id/pdf', setInvoiceTenantContext, async (req, res) => {
   try {
     const { id } = req.params;
 

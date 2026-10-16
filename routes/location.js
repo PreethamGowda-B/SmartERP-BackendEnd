@@ -45,23 +45,37 @@ router.post('/update', authenticateToken, loadPlan, async (req, res) => {
 
         // Rate limit: 1 update per 8 seconds per employee (via Redis)
         if (redisClient && redisClient.status === 'ready') {
-            const rateLimitKey = `loc_rate:${userId}`;
-            const existing = await redisClient.get(rateLimitKey);
-            if (existing) {
-                return res.status(200).json({ success: true, message: 'Location update rate-limited (ignored safely)', data: null });
+            try {
+                const rateLimitKey = `loc_rate:${userId}`;
+                const existing = await redisClient.get(rateLimitKey);
+                if (existing) {
+                    return res.status(200).json({ success: true, message: 'Location update rate-limited (ignored safely)', data: null });
+                }
+                await redisClient.setex(rateLimitKey, 8, '1');
+            } catch (redisErr) {
+                // Redis only protects the update rate; it must not prevent GPS
+                // from being saved when Redis is temporarily unavailable.
+                console.warn('Location rate-limit check failed:', redisErr.message);
             }
-            await redisClient.setex(rateLimitKey, 8, '1');
         }
 
         // Find active jobs assigned to this employee (must be accepted/in_progress)
-        const activeJobsResult = await pool.query(
-            `SELECT id, customer_id FROM jobs
+        let activeJobs = [];
+        try {
+            const activeJobsResult = await pool.query(
+                `SELECT id, customer_id FROM jobs
        WHERE assigned_to = $1
          AND company_id::text = $2
          AND employee_status = 'accepted'
          AND status IN ('in_progress', 'open')`,
-            [userId, String(companyId)]
-        );
+                [userId, String(companyId)]
+            );
+            activeJobs = activeJobsResult.rows;
+        } catch (jobLookupErr) {
+            // Job notifications are auxiliary; a job-query issue should not
+            // turn an otherwise valid location update into a 500.
+            console.warn('Location active-job lookup failed:', jobLookupErr.message);
+        }
 
         // Upsert location
         const result = await pool.query(
@@ -79,7 +93,7 @@ router.post('/update', authenticateToken, loadPlan, async (req, res) => {
         const locationRow = result.rows[0];
 
         // Publish SSE to each job's customer stream
-        if (redisClient && redisClient.status === 'ready' && activeJobsResult.rows.length > 0) {
+        if (redisClient && redisClient.status === 'ready' && activeJobs.length > 0) {
             const ssePayload = JSON.stringify({
                 type: 'location_update',
                 lat: parseFloat(locationRow.latitude),
@@ -88,7 +102,7 @@ router.post('/update', authenticateToken, loadPlan, async (req, res) => {
                 employeeId: userId,
             });
 
-            for (const job of activeJobsResult.rows) {
+            for (const job of activeJobs) {
                 redisClient.publish(`customer_job_events:${job.id}`, ssePayload)
                     .catch(e => console.error(`SSE publish error (job ${job.id}):`, e.message));
             }
@@ -102,12 +116,14 @@ router.post('/update', authenticateToken, loadPlan, async (req, res) => {
                     longitude: parseFloat(locationRow.longitude),
                     location_updated_at: locationRow.location_updated_at,
                 },
-                active_jobs_notified: activeJobsResult.rows.length,
+                active_jobs_notified: activeJobs.length,
             },
             error: null,
         });
     } catch (err) {
-        console.error('POST /location/update error:', err.message);
+        // Keep the database error code and stack in server logs so production
+        // 500s can be diagnosed without exposing internals in the API response.
+        console.error('POST /location/update error:', err);
         res.status(500).json({ success: false, error: 'Server error updating location' });
     }
 });

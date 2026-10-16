@@ -316,12 +316,19 @@ router.get('/:id', async (req, res) => {
          j.approval_status,
          j.priority,
          j.progress,
+         j.assigned_to,
+         j.employee_status,
+         j.assigned_at,
+         j.accepted_at,
+         j.arrived_at,
          j.scheduled_at,
          j.machine_id,
          j.service_type,
          j.created_at, j.approved_at,
-         j.started_at, j.completed_at
+         j.started_at, j.completed_at,
+         u.name AS assigned_employee_name
        FROM jobs j
+       LEFT JOIN users u ON u.id = j.assigned_to
        WHERE j.id = $1
          AND j.customer_id = $2
          AND j.company_id = $3`,
@@ -376,8 +383,8 @@ router.get('/:id/tracking', async (req, res) => {
       `SELECT u.name, ep.latitude, ep.longitude, ep.location_updated_at
        FROM users u
        LEFT JOIN employee_profiles ep ON ep.user_id = u.id
-       WHERE u.id = $1`,
-      [job.assigned_to]
+       WHERE u.id = $1 AND u.company_id::text = $2`,
+      [job.assigned_to, String(companyId)]
     );
 
     if (locationResult.rows.length === 0) {
@@ -390,8 +397,8 @@ router.get('/:id/tracking', async (req, res) => {
     return ok(res, {
       available: true,
       employeeName: loc.name,
-      latitude: loc.latitude ? parseFloat(loc.latitude) : null,
-      longitude: loc.longitude ? parseFloat(loc.longitude) : null,
+      latitude: loc.latitude !== null && loc.latitude !== undefined ? parseFloat(loc.latitude) : null,
+      longitude: loc.longitude !== null && loc.longitude !== undefined ? parseFloat(loc.longitude) : null,
       location_updated_at: loc.location_updated_at || null,
       is_online: loc.location_updated_at
         ? (Date.now() - new Date(loc.location_updated_at).getTime()) < 30_000
@@ -419,6 +426,7 @@ router.get('/:id/invoice', async (req, res) => {
          AND (i.customer_id::text = $2::text OR j.customer_id::text = $2::text)
          AND i.company_id::text = $3::text
          AND i.is_latest = TRUE
+         AND COALESCE(i.status, 'draft') <> 'draft'
        ORDER BY i.created_at DESC
        LIMIT 1`,
       [id, String(customerId), String(companyId)]
@@ -433,6 +441,7 @@ router.get('/:id/invoice', async (req, res) => {
          WHERE i.id::text = $1::text 
            AND (i.customer_id::text = $2::text OR j.customer_id::text = $2::text)
            AND i.company_id::text = $3::text
+           AND COALESCE(i.status, 'draft') <> 'draft'
          LIMIT 1`,
         [id, String(customerId), String(companyId)]
       );

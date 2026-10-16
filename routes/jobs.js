@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
-const { createNotification, createNotificationForCompany, createNotificationForOwners } = require('../utils/notificationHelpers');
+const { createNotification, createNotificationForCompany, createNotificationForOwners, createCustomerPortalNotification } = require('../utils/notificationHelpers');
 const { sendJobAssignedEmail, sendJobCompletedEmail } = require('../services/emailNotificationService');
 const { body, validationResult } = require('express-validator');
 const { logJobAudit } = require('../utils/auditLogger');
@@ -528,6 +528,28 @@ const handleJobAccept = async (req, res) => {
     try {
       const userInfo = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
       const employeeName = userInfo.rows[0]?.name || 'Employee';
+      if (acceptedJob.customer_id) {
+        await createCustomerPortalNotification({
+          customerId: acceptedJob.customer_id,
+          companyId: req.user.companyId || acceptedJob.company_id,
+          type: 'customer_job_accepted',
+          title: 'Technician assigned',
+          message: `${employeeName} accepted your service request. You can now view live updates and chat.`,
+          jobId: acceptedJob.id,
+          url: `/customer/job/${acceptedJob.id}`,
+        });
+        await createNotification({
+          user_id: acceptedJob.customer_id,
+          company_id: req.user.companyId || acceptedJob.company_id,
+          type: 'customer_job_accepted',
+          title: 'Technician assigned',
+          message: `${employeeName} accepted your service request. You can now view live updates and chat.`,
+          priority: 'high',
+          actor_id: req.user.id,
+          idempotency_key: `customer_job_accepted_${acceptedJob.id}`,
+          data: { job_id: acceptedJob.id, employee_id: req.user.id, url: `/customer/job/${acceptedJob.id}` },
+        });
+      }
       await createNotificationForOwners({
         company_id: req.user.companyId || acceptedJob.company_id,
         type: 'job_accepted',
@@ -762,6 +784,29 @@ const handleJobAccept = async (req, res) => {
             priority: 'medium',
             data: { job_id: updatedJob.id, employee_id: req.user.id, url: '/owner/notifications' }
           });
+
+          if (updatedJob.customer_id) {
+            await createCustomerPortalNotification({
+              customerId: updatedJob.customer_id,
+              companyId: req.user.companyId || updatedJob.company_id,
+              type: 'customer_job_completed',
+              title: 'Service completed',
+              message: 'Your service request is complete. You can leave a review and view your invoice here.',
+              jobId: updatedJob.id,
+              url: `/customer/job/${updatedJob.id}`,
+            });
+            await createNotification({
+              user_id: updatedJob.customer_id,
+              company_id: req.user.companyId,
+              type: 'customer_job_completed',
+              title: 'Service completed',
+              message: 'Your service request is complete. You can leave a review and view your invoice here.',
+              priority: 'medium',
+              actor_id: req.user.id,
+              idempotency_key: `customer_job_completed_${updatedJob.id}`,
+              data: { job_id: updatedJob.id, url: `/customer/job/${updatedJob.id}` },
+            });
+          }
 
           if (ownerResult.rows[0]) {
             sendJobCompletedEmail({

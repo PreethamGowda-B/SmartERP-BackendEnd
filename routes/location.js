@@ -32,7 +32,7 @@ router.post('/update', authenticateToken, loadPlan, async (req, res) => {
         }
         const userId = req.user.userId || req.user.id;
         const companyId = req.user.companyId;
-        if (req.user.role !== 'employee') {
+        if (String(req.user.role || '').toLowerCase() !== 'employee') {
             return res.status(403).json({ success: false, error: 'Only employees can submit their location' });
         }
         if (!companyId) {
@@ -90,7 +90,7 @@ router.post('/update', authenticateToken, loadPlan, async (req, res) => {
         // claim or accepting a company ID supplied by the browser.
         const result = await storage.run({ isWebRequest: false, bypassRls: true }, () => pool.query(
             `INSERT INTO employee_profiles (user_id, company_id, latitude, longitude, location_updated_at)
-       SELECT u.id, u.company_id, $3::numeric, $4::numeric, NOW()
+       SELECT u.id, u.company_id, $2::numeric, $3::numeric, NOW()
        FROM users u
        WHERE u.id::text = $1::text
          AND LOWER(u.role) = 'employee'
@@ -168,8 +168,8 @@ router.get('/all', authenticateToken, loadPlan, requireFeature('location_trackin
          ep.department,
          ep.is_active
        FROM users u
-       LEFT JOIN employee_profiles ep ON ep.user_id = u.id
-       WHERE u.role = 'employee' AND u.company_id::text = $1
+       LEFT JOIN employee_profiles ep ON ep.user_id::text = u.id::text
+       WHERE LOWER(u.role) = 'employee' AND u.company_id::text = $1
        ORDER BY ep.location_updated_at DESC NULLS LAST, u.name ASC`,
             [String(companyId)]
         );
@@ -211,8 +211,8 @@ router.get('/:employeeId', authenticateToken, loadPlan, requireFeature('location
          u.id, COALESCE(u.name, split_part(u.email, '@', 1)) AS name,
          u.email, ep.latitude, ep.longitude, ep.location_updated_at, ep.position
        FROM users u
-       LEFT JOIN employee_profiles ep ON ep.user_id = u.id
-       WHERE u.id = $1 AND u.role = 'employee' AND u.company_id::text = $2`,
+       LEFT JOIN employee_profiles ep ON ep.user_id::text = u.id::text
+       WHERE u.id::text = $1::text AND LOWER(u.role) = 'employee' AND u.company_id::text = $2`,
             [employeeId, String(req.user.companyId)]
         );
 

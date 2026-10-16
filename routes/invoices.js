@@ -16,6 +16,8 @@ const invoiceService = require('../services/invoiceService');
 const pdfInvoiceService = require('../services/pdfInvoiceService');
 const whatsappService = require('../services/whatsappService');
 const emailService = require('../services/emailNotificationService');
+const { createCustomerPortalNotification } = require('../utils/notificationHelpers');
+const redisClient = require('../utils/redis');
 
 // Middleware to extract tenant context
 const authenticate = authMiddleware.authenticateToken || authMiddleware;
@@ -454,6 +456,27 @@ router.post('/finalize', authenticate, async (req, res) => {
       userId,
       invoiceData,
     });
+
+    const finalizedInvoice = result?.invoice;
+    if (finalizedInvoice?.customer_id) {
+      const title = 'Invoice ready';
+      const message = `Invoice ${finalizedInvoice.invoice_number || ''} for your completed service is ready to view.`;
+      await createCustomerPortalNotification({
+        customerId: finalizedInvoice.customer_id,
+        companyId,
+        type: 'invoice_issued',
+        title,
+        message,
+        jobId,
+        invoiceId: finalizedInvoice.id,
+        url: `/customer/job/${jobId}`,
+      }).catch(err => console.warn('Customer invoice activity notification failed:', err.message));
+      if (redisClient && redisClient.status === 'ready') {
+        redisClient.publish(`customer_job_events:${jobId}`, JSON.stringify({
+          type: 'invoice_issued', jobId, invoiceId: finalizedInvoice.id,
+        })).catch(() => {});
+      }
+    }
 
     return res.json(result);
   } catch (err) {

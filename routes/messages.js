@@ -811,7 +811,8 @@ router.get('/job/:jobId', async (req, res) => {
     }
 
     const result = await pool.query(
-      `SELECT id, sender_type, sender_id, sender_name, message, read_by_employee, read_by_customer, created_at
+      `SELECT id, sender_type, sender_id, sender_name, message, media_url, media_type, file_name, file_size,
+              read_by_employee, read_by_customer, created_at
        FROM job_messages
        WHERE job_id = $1
        ORDER BY created_at ASC
@@ -881,7 +882,8 @@ router.post('/job/:jobId', async (req, res) => {
     const result = await pool.query(
       `INSERT INTO job_messages (job_id, sender_type, sender_id, sender_name, message, company_id, read_by_employee, read_by_customer)
        VALUES ($1, 'employee', $2, $3, $4, $5, TRUE, FALSE)
-       RETURNING id, sender_type, sender_id, sender_name, message, read_by_employee, read_by_customer, created_at`,
+       RETURNING id, sender_type, sender_id, sender_name, message, media_url, media_type, file_name, file_size,
+         read_by_employee, read_by_customer, created_at`,
       [jobId, String(employeeId), senderName, message.trim(), safeCompanyId]
     );
 
@@ -948,7 +950,7 @@ router.get('/job-conversations', async (req, res) => {
           c.name            AS customer_name,
           c.email           AS customer_email,
           MAX(jm.created_at) AS last_message_time,
-          (SELECT message FROM job_messages jm2
+          (SELECT COALESCE(NULLIF(message, ''), '📎 ' || file_name, '') FROM job_messages jm2
             WHERE jm2.job_id = j.id
             ORDER BY jm2.created_at DESC LIMIT 1) AS last_message,
           COUNT(DISTINCT jm.id)      AS total_messages,
@@ -978,7 +980,7 @@ router.get('/job-conversations', async (req, res) => {
           c.name            AS customer_name,
           c.email           AS customer_email,
           MAX(jm.created_at) AS last_message_time,
-          (SELECT message FROM job_messages jm2
+          (SELECT COALESCE(NULLIF(message, ''), '📎 ' || file_name, '') FROM job_messages jm2
             WHERE jm2.job_id = j.id
             ORDER BY jm2.created_at DESC LIMIT 1) AS last_message,
           COUNT(DISTINCT jm.id)      AS total_messages,

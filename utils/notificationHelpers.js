@@ -157,6 +157,19 @@ async function createNotification(arg1, arg2, arg3, arg4, arg5) {
     }
 }
 
+/** Customer portal activity feed entries (separate from staff notification rows). */
+async function createCustomerPortalNotification({ customerId, companyId, type, title, message, jobId, invoiceId = null, url = null }) {
+    if (!customerId || !companyId) return null;
+    const details = { customer_id: customerId, type, title, message, job_id: jobId || null, invoice_id: invoiceId, url };
+    const result = await pool.query(
+        `INSERT INTO activities (user_id, action, activity_type, details, company_id, created_at)
+         VALUES ($1, $2, 'customer_notification', $3, $4, NOW())
+         RETURNING id, action AS type, details, created_at`,
+        [customerId, title, JSON.stringify(details), companyId]
+    );
+    return result.rows[0] || null;
+}
+
 /**
  * Broadcast a message to a specific user via SSE.
  * C4 FIX: Uses Redis pub/sub so broadcast works in cluster mode (multi-worker).
@@ -349,6 +362,7 @@ async function createNotificationForOwners({ company_id, type, title, message, p
 
 module.exports = {
     createNotification,
+    createCustomerPortalNotification,
     createNotificationForCompany,
     createNotificationForOwners,
     broadcastToUser,

@@ -14,9 +14,17 @@
 
 const express = require('express');
 const router  = express.Router({ mergeParams: true });
+const multer = require('multer');
 const { pool } = require('../../db');
 const redisClient = require('../../utils/redis');
 const { createNotification } = require('../../utils/notificationHelpers');
+const { requireValidFileSignature } = require('../../utils/fileValidation');
+
+const chatUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => cb(null, ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'].includes((file.mimetype || '').split(';')[0].toLowerCase())),
+});
 
 function ok(res, data, statusCode = 200) {
   return res.status(statusCode).json({ success: true, data, error: null });
@@ -38,6 +46,10 @@ async function ensureTable() {
       company_id      TEXT,
       read_by_customer  BOOLEAN NOT NULL DEFAULT FALSE,
       read_by_employee  BOOLEAN NOT NULL DEFAULT FALSE,
+      media_url       TEXT,
+      media_type      VARCHAR(30),
+      file_name       VARCHAR(255),
+      file_size       BIGINT,
       created_at      TIMESTAMP NOT NULL DEFAULT NOW()
     );
     CREATE INDEX IF NOT EXISTS idx_job_messages_job_id ON job_messages(job_id);
@@ -46,10 +58,52 @@ async function ensureTable() {
     -- Add unread columns to existing tables (safe to run multiple times)
     ALTER TABLE job_messages ADD COLUMN IF NOT EXISTS read_by_customer BOOLEAN NOT NULL DEFAULT FALSE;
     ALTER TABLE job_messages ADD COLUMN IF NOT EXISTS read_by_employee BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE job_messages ADD COLUMN IF NOT EXISTS media_url TEXT;
+    ALTER TABLE job_messages ADD COLUMN IF NOT EXISTS media_type VARCHAR(30);
+    ALTER TABLE job_messages ADD COLUMN IF NOT EXISTS file_name VARCHAR(255);
+    ALTER TABLE job_messages ADD COLUMN IF NOT EXISTS file_size BIGINT;
   `).catch(() => {}); // Silently ignore if already exists
 }
 
 ensureTable();
+
+// Customer uploads are scoped to a job where the employee has accepted it.
+router.post('/upload', chatUpload.single('attachment'), requireValidFileSignature({
+  allowedMimes: ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'],
+  fieldName: 'attachment',
+  required: true,
+}), async (req, res) => {
+  const customerId = req.customer.id;
+  const companyId = req.customer.companyId;
+  const jobId = req.params.id;
+  try {
+    if (!req.file) return fail(res, 'Choose an image or PDF (up to 10 MB)', 400);
+    const jobResult = await pool.query(
+      `SELECT id FROM jobs WHERE id = $1 AND customer_id = $2 AND company_id::text = $3
+         AND employee_status IN ('accepted', 'arrived') AND status <> 'completed'`,
+      [jobId, customerId, String(companyId)]
+    );
+    if (!jobResult.rows.length) return fail(res, 'Chat upload is unavailable for this job', 403);
+    const file = req.file;
+    const inserted = await pool.query(
+      `INSERT INTO message_media_files (file_name, file_type, file_size, data)
+       VALUES ($1, $2, $3, $4) RETURNING id`,
+      [file.originalname, file.mimetype, file.size, file.buffer]
+    );
+    const host = req.get('host') || 'api.prozync.in';
+    const protocol = req.protocol === 'http' && !req.secure ? 'http' : 'https';
+    const mediaUrl = `${protocol}://${host}/api/messages/media/${inserted.rows[0].id}`;
+    return ok(res, {
+      media_url: mediaUrl,
+      media_type: file.mimetype.startsWith('image/') ? 'image' : 'document',
+      file_name: file.originalname,
+      file_size: file.size,
+    }, 201);
+  } catch (err) {
+    console.error('Customer chat upload error:', err.message);
+    return fail(res, 'File upload failed', 500);
+  }
+});
 
 // ── GET /jobs/:id/messages ────────────────────────────────────────────────────
 router.get('/', async (req, res) => {
@@ -77,7 +131,7 @@ router.get('/', async (req, res) => {
     }
 
     const messages = await pool.query(
-      `SELECT id, sender_type, sender_id, sender_name, message,
+      `SELECT id, sender_type, sender_id, sender_name, message, media_url, media_type, file_name, file_size,
               read_by_customer, read_by_employee, created_at
        FROM job_messages
        WHERE job_id = $1
@@ -105,13 +159,13 @@ router.post('/', async (req, res) => {
   const customerId = req.customer.id;
   const companyId  = req.customer.companyId;
   const jobId      = req.params.id;
-  const { message } = req.body;
+  const { message, attachment } = req.body;
 
-  if (!message || !message.trim()) {
+  if ((!message || !message.trim()) && !attachment?.media_url) {
     return fail(res, 'Message cannot be empty', 400);
   }
 
-  if (message.length > 2000) {
+  if ((message || '').length > 2000) {
     return fail(res, 'Message too long (max 2000 characters)', 400);
   }
 
@@ -139,15 +193,40 @@ router.post('/', async (req, res) => {
 
     const senderName = job.customer_name || 'Customer';
 
+    let savedAttachment = null;
+    if (attachment?.media_url) {
+      const mediaId = String(attachment.media_url).match(/\/api\/messages\/media\/([0-9a-f-]{36})(?:$|\?)/i)?.[1];
+      if (!mediaId) return fail(res, 'Invalid attachment reference', 400);
+      const mediaResult = await pool.query(
+        `SELECT file_name, file_type, file_size FROM message_media_files WHERE id = $1`,
+        [mediaId]
+      );
+      if (!mediaResult.rows.length) return fail(res, 'Attachment not found', 400);
+      const media = mediaResult.rows[0];
+      if (!['image/jpeg', 'image/png', 'image/webp', 'application/pdf'].includes(media.file_type)) {
+        return fail(res, 'Unsupported attachment type', 400);
+      }
+      savedAttachment = {
+        media_url: attachment.media_url,
+        media_type: media.file_type.startsWith('image/') ? 'image' : 'document',
+        file_name: media.file_name,
+        file_size: media.file_size,
+      };
+    }
+
     const isUUID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/i.test(String(companyId));
     const safeCompanyId = isUUID ? String(companyId) : null;
 
     // Insert message — unread for employee by default
     const result = await pool.query(
-      `INSERT INTO job_messages (job_id, sender_type, sender_id, sender_name, message, company_id, read_by_customer, read_by_employee)
-       VALUES ($1, 'customer', $2, $3, $4, $5, TRUE, FALSE)
-       RETURNING id, sender_type, sender_id, sender_name, message, read_by_customer, read_by_employee, created_at`,
-      [jobId, customerId, senderName, message.trim(), safeCompanyId]
+      `INSERT INTO job_messages (job_id, sender_type, sender_id, sender_name, message, company_id,
+         media_url, media_type, file_name, file_size, read_by_customer, read_by_employee)
+       VALUES ($1, 'customer', $2, $3, $4, $5, $6, $7, $8, $9, TRUE, FALSE)
+       RETURNING id, sender_type, sender_id, sender_name, message, media_url, media_type, file_name, file_size,
+         read_by_customer, read_by_employee, created_at`,
+      [jobId, customerId, senderName, (message || '').trim(), safeCompanyId,
+        savedAttachment?.media_url || null, savedAttachment?.media_type || null,
+        savedAttachment?.file_name || null, savedAttachment?.file_size || null]
     );
 
     const newMessage = result.rows[0];
@@ -173,7 +252,8 @@ router.post('/', async (req, res) => {
     // FIX 1: Create in-app notification for the assigned employee
     // Medium FIX: idempotency_key prevents duplicate notifications on retry
     if (job.assigned_to) {
-      const preview = message.trim().substring(0, 50) + (message.trim().length > 50 ? '...' : '');
+      const previewText = (message || '').trim() || `Sent an attachment: ${savedAttachment?.file_name || 'file'}`;
+      const preview = previewText.substring(0, 50) + (previewText.length > 50 ? '...' : '');
       createNotification({
         user_id: job.assigned_to,
         company_id: companyId,

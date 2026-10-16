@@ -15,6 +15,7 @@
  */
 
 const jwt = require('jsonwebtoken');
+const { storage } = require('./als');
 
 function authenticateCustomer(req, res, next) {
   let token = null;
@@ -49,7 +50,19 @@ function authenticateCustomer(req, res, next) {
 
     // Attach decoded payload — downstream handlers use req.customer.id / req.customer.companyId
     req.customer = payload;
-    next();
+
+    // Customer requests need the same tenant-scoped RLS context as owner and
+    // employee requests. Without this, INSERTs into FORCE-RLS tables such as
+    // jobs are rejected even when the row belongs to the customer's company.
+    const companyId = payload.companyId || payload.company_id;
+    const customerId = payload.id || payload.customerId || payload.userId;
+    storage.run({
+      isWebRequest: true,
+      companyId,
+      role: 'customer',
+      userId: customerId,
+      bypassRls: false,
+    }, next);
   });
 }
 

@@ -23,6 +23,7 @@ const Redis = require('ioredis');
 const jwt = require('jsonwebtoken');
 
 const { pool } = require('../../db');
+const { storage } = require('../../middleware/als');
 
 // ─── Inline SSE auth — cookie-first, query token only as fallback ─────────────
 // We do NOT use the shared middleware here because SSE connections
@@ -62,7 +63,15 @@ function authenticateSSE(req, res, next) {
       return res.status(403).json({ message: 'Access denied' });
     }
     req.user = payload;
-    next();
+    const companyId = payload.companyId || payload.company_id;
+    const userId = payload.id || payload.userId || payload.customerId;
+    storage.run({
+      isWebRequest: true,
+      companyId,
+      role: payload.role,
+      userId,
+      bypassRls: false,
+    }, next);
   });
 }
 

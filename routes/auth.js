@@ -1410,24 +1410,26 @@ router.post("/refresh", async (req, res) => {
 // ✅ Get Current User Profile (Fresh from DB)
 // ---------------------------------------------
 router.get("/me", authenticateToken, async (req, res) => {
-  try {
-    const userId = req.user.userId || req.user.id;
-    const result = await pool.query(
-      `SELECT id, name, email, role, company_id, company_code 
-       FROM users WHERE id = $1`,
-      [userId]
-    );
+  const userId = req.user.userId || req.user.id;
+  return storage.run({ isWebRequest: true, bypassRls: true, userId }, async () => {
+    try {
+      const result = await pool.query(
+        `SELECT id, name, email, role, company_id, company_code 
+         FROM users WHERE id = $1`,
+        [userId]
+      );
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({ message: "User not found" });
+      if (result.rows.length === 0) {
+        return res.status(404).json({ message: "User not found" });
+      }
+
+      const user = result.rows[0];
+      res.json(user);
+    } catch (err) {
+      console.error("GET /me error:", err.message);
+      res.status(500).json({ message: "Server error" });
     }
-
-    const user = result.rows[0];
-    res.json(user);
-  } catch (err) {
-    console.error("GET /me error:", err.message);
-    res.status(500).json({ message: "Server error" });
-  }
+  });
 });
 
 // ---------------------------------------------
@@ -1532,144 +1534,157 @@ router.post("/validate-company", async (req, res) => {
 // ✅ Complete Employee Onboarding & Link Company
 // ---------------------------------------------
 router.post("/employee/onboarding", authenticateToken, async (req, res) => {
-  try {
-    const userId = req.user.userId || req.user.id;
-    const { name, phone, position, department, company_code } = req.body;
-
-    if (!company_code) {
-      return res.status(400).json({ message: "Company code is required to complete onboarding" });
-    }
-
-    // 1. Validate Company Code
-    const { validateCompanyCode } = require("../utils/companyIdGenerator");
-    const validation = await validateCompanyCode(company_code);
-
-    if (!validation.valid || !validation.company) {
-      return res.status(400).json({ message: "Invalid company code. Please check the code with your employer." });
-    }
-
-    const targetCompanyId = validation.company.id;
-    const targetCompanyCode = validation.company.company_id;
-    const targetCompanyName = validation.company.company_name;
-
-    // Check if company is suspended
-    if (validation.company.status === "suspended") {
-      return res.status(403).json({ message: "This company account is currently suspended. Please contact your employer." });
-    }
-
-    // 2. Update Users table
-    let updatedUser = null;
+  const userId = req.user.userId || req.user.id;
+  return storage.run({ isWebRequest: true, bypassRls: true, userId }, async () => {
     try {
-      const updateResult = await pool.query(
-        `UPDATE users 
-         SET name = COALESCE(NULLIF($1, ''), name), 
-             phone = COALESCE(NULLIF($2, ''), phone),
-             position = COALESCE(NULLIF($3, ''), position),
-             department = COALESCE(NULLIF($4, ''), department),
-             company_id = $5, 
-             company_code = $6,
-             updated_at = NOW()
-         WHERE id::text = $7::text
-         RETURNING id, name, email, role, company_id, company_code, phone, position, department`,
-        [
-          name?.trim() || null,
-          phone?.trim() || null,
-          position?.trim() || null,
-          department?.trim() || null,
-          targetCompanyId,
-          targetCompanyCode,
-          String(userId)
-        ]
-      );
-      updatedUser = updateResult.rows[0];
-    } catch (dbErr) {
-      console.warn("⚠️ Full update users failed, executing lightweight fallback:", dbErr.message);
-      const fallbackResult = await pool.query(
-        `UPDATE users 
-         SET name = COALESCE(NULLIF($1, ''), name), 
-             company_id = $2, 
-             company_code = $3
-         WHERE id::text = $4::text
-         RETURNING id, name, email, role, company_id, company_code`,
-        [name?.trim() || null, targetCompanyId, targetCompanyCode, String(userId)]
-      );
-      updatedUser = fallbackResult.rows[0];
-    }
+      const { name, phone, position, department, company_code } = req.body;
 
-    if (!updatedUser) {
-      return res.status(404).json({ message: "User account not found. Please log in again." });
-    }
-
-    // 3. Upsert into employee_profiles if table exists
-    try {
-      await pool.query(
-        `INSERT INTO employee_profiles (user_id, phone, position, department, created_at, updated_at)
-         VALUES ($1::uuid, $2, $3, $4, NOW(), NOW())
-         ON CONFLICT (user_id) 
-         DO UPDATE SET 
-           phone = COALESCE(EXCLUDED.phone, employee_profiles.phone),
-           position = COALESCE(EXCLUDED.position, employee_profiles.position),
-           department = COALESCE(EXCLUDED.department, employee_profiles.department),
-           updated_at = NOW()`,
-        [updatedUser.id, phone?.trim() || null, position?.trim() || null, department?.trim() || null]
-      );
-    } catch (epErr) {
-      console.warn("⚠️ Note: employee_profiles update non-critical:", epErr.message);
-    }
-
-    // 4. Issue Fresh JWT Tokens with the linked companyId
-    const newAccessToken = jwt.sign(
-      { id: updatedUser.id, userId: updatedUser.id, role: updatedUser.role, email: updatedUser.email, companyId: updatedUser.company_id },
-      ACCESS_SECRET,
-      { expiresIn: ACCESS_EXPIRY }
-    );
-    const newRefreshToken = jwt.sign({ id: updatedUser.id, userId: updatedUser.id }, REFRESH_SECRET, { expiresIn: REFRESH_EXPIRY });
-
-    // 5. Store rotated refresh token safely
-    try {
-      const tokenFamily = crypto.randomUUID();
-      await pool.query(
-        `INSERT INTO refresh_tokens (user_id, token, token_family, expires_at, created_at, user_agent, ip_address)
-         VALUES ($1::uuid, $2, $3::uuid, NOW() + INTERVAL '30 days', NOW(), $4, $5)`,
-        [updatedUser.id, newRefreshToken, tokenFamily, req.headers["user-agent"] || null, req.ip || null]
-      );
-    } catch (rtErr) {
-      console.warn("⚠️ Note: refresh_tokens storage non-critical:", rtErr.message);
-    }
-
-    const cookieOpts = {
-      httpOnly: true,
-      sameSite: "none",
-      secure: true,
-      path: "/",
-    };
-
-    res.cookie(COOKIE_ACCESS_USER, newAccessToken, { ...cookieOpts, maxAge: ACCESS_MAX_AGE });
-    res.cookie(COOKIE_REFRESH_USER, newRefreshToken, { ...cookieOpts, maxAge: REFRESH_MAX_AGE });
-
-    console.log(`✅ Employee ${updatedUser.email} successfully onboarded and linked to company ${targetCompanyCode} (${targetCompanyName})`);
-
-    return res.json({
-      ok: true,
-      user: {
-        ...updatedUser,
-        company_name: targetCompanyName,
-        phone: phone?.trim() || updatedUser.phone || undefined,
-        position: position?.trim() || updatedUser.position || undefined,
-        department: department?.trim() || updatedUser.department || undefined
-      },
-      accessToken: newAccessToken,
-      refreshToken: newRefreshToken,
-      company: {
-        id: targetCompanyId,
-        company_id: targetCompanyCode,
-        company_name: targetCompanyName
+      if (!company_code) {
+        return res.status(400).json({ message: "Company code is required to complete onboarding" });
       }
-    });
-  } catch (err) {
-    console.error("Employee onboarding error:", err);
-    res.status(500).json({ message: err.message || "Server error during onboarding. Please try again." });
-  }
+
+      // 1. Validate Company Code
+      const { validateCompanyCode } = require("../utils/companyIdGenerator");
+      const validation = await validateCompanyCode(company_code);
+
+      if (!validation.valid || !validation.company) {
+        return res.status(400).json({ message: "Invalid company code. Please check the code with your employer." });
+      }
+
+      const targetCompanyId = validation.company.id;
+      const targetCompanyCode = validation.company.company_id;
+      const targetCompanyName = validation.company.company_name;
+
+      // Check if company is suspended
+      if (validation.company.status === "suspended") {
+        return res.status(403).json({ message: "This company account is currently suspended. Please contact your employer." });
+      }
+
+      // 2. Update Users table
+      let updatedUser = null;
+      try {
+        const updateResult = await pool.query(
+          `UPDATE users 
+           SET name = COALESCE(NULLIF($1, ''), name), 
+               phone = COALESCE(NULLIF($2, ''), phone),
+               position = COALESCE(NULLIF($3, ''), position),
+               department = COALESCE(NULLIF($4, ''), department),
+               company_id = $5, 
+               company_code = $6,
+               updated_at = NOW()
+           WHERE id::text = $7::text
+           RETURNING id, name, email, role, company_id, company_code, phone, position, department`,
+          [
+            name?.trim() || null,
+            phone?.trim() || null,
+            position?.trim() || null,
+            department?.trim() || null,
+            targetCompanyId,
+            targetCompanyCode,
+            String(userId)
+          ]
+        );
+        updatedUser = updateResult.rows[0];
+      } catch (dbErr) {
+        console.warn("⚠️ Full update users failed, executing lightweight fallback:", dbErr.message);
+        const fallbackResult = await pool.query(
+          `UPDATE users 
+           SET name = COALESCE(NULLIF($1, ''), name), 
+               company_id = $2, 
+               company_code = $3
+           WHERE id::text = $4::text
+           RETURNING id, name, email, role, company_id, company_code`,
+          [name?.trim() || null, targetCompanyId, targetCompanyCode, String(userId)]
+        );
+        updatedUser = fallbackResult.rows[0];
+      }
+
+      if (!updatedUser) {
+        return res.status(404).json({ message: "User account not found. Please log in again." });
+      }
+
+      // 3. Upsert into employee_profiles with company_id so employee profile RLS works
+      try {
+        await pool.query(
+          `INSERT INTO employee_profiles (user_id, company_id, name, email, phone, position, department, created_at, updated_at)
+           VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+           ON CONFLICT (user_id) 
+           DO UPDATE SET 
+             company_id = EXCLUDED.company_id,
+             name = COALESCE(EXCLUDED.name, employee_profiles.name),
+             email = COALESCE(EXCLUDED.email, employee_profiles.email),
+             phone = COALESCE(EXCLUDED.phone, employee_profiles.phone),
+             position = COALESCE(EXCLUDED.position, employee_profiles.position),
+             department = COALESCE(EXCLUDED.department, employee_profiles.department),
+             updated_at = NOW()`,
+          [
+            updatedUser.id,
+            targetCompanyId,
+            updatedUser.name,
+            updatedUser.email,
+            phone?.trim() || null,
+            position?.trim() || null,
+            department?.trim() || null
+          ]
+        );
+      } catch (epErr) {
+        console.warn("⚠️ Note: employee_profiles update non-critical:", epErr.message);
+      }
+
+      // 4. Issue Fresh JWT Tokens with the linked companyId
+      const newAccessToken = jwt.sign(
+        { id: updatedUser.id, userId: updatedUser.id, role: updatedUser.role, email: updatedUser.email, companyId: updatedUser.company_id },
+        ACCESS_SECRET,
+        { expiresIn: ACCESS_EXPIRY }
+      );
+      const newRefreshToken = jwt.sign({ id: updatedUser.id, userId: updatedUser.id }, REFRESH_SECRET, { expiresIn: REFRESH_EXPIRY });
+
+      // 5. Store rotated refresh token safely
+      try {
+        const tokenFamily = crypto.randomUUID();
+        await pool.query(
+          `INSERT INTO refresh_tokens (user_id, token, token_family, expires_at, created_at, user_agent, ip_address)
+           VALUES ($1::uuid, $2, $3::uuid, NOW() + INTERVAL '30 days', NOW(), $4, $5)`,
+          [updatedUser.id, newRefreshToken, tokenFamily, req.headers["user-agent"] || null, req.ip || null]
+        );
+      } catch (rtErr) {
+        console.warn("⚠️ Note: refresh_tokens storage non-critical:", rtErr.message);
+      }
+
+      const cookieOpts = {
+        httpOnly: true,
+        sameSite: "none",
+        secure: true,
+        path: "/",
+      };
+
+      res.cookie(COOKIE_ACCESS_USER, newAccessToken, { ...cookieOpts, maxAge: ACCESS_MAX_AGE });
+      res.cookie(COOKIE_REFRESH_USER, newRefreshToken, { ...cookieOpts, maxAge: REFRESH_MAX_AGE });
+
+      console.log(`✅ Employee ${updatedUser.email} successfully onboarded and linked to company ${targetCompanyCode} (${targetCompanyName})`);
+
+      return res.json({
+        ok: true,
+        user: {
+          ...updatedUser,
+          company_name: targetCompanyName,
+          phone: phone?.trim() || updatedUser.phone || undefined,
+          position: position?.trim() || updatedUser.position || undefined,
+          department: department?.trim() || updatedUser.department || undefined
+        },
+        accessToken: newAccessToken,
+        refreshToken: newRefreshToken,
+        company: {
+          id: targetCompanyId,
+          company_id: targetCompanyCode,
+          company_name: targetCompanyName
+        }
+      });
+    } catch (err) {
+      console.error("Employee onboarding error:", err);
+      res.status(500).json({ message: err.message || "Server error during onboarding. Please try again." });
+    }
+  });
 });
 
 // ---------------------------------------------

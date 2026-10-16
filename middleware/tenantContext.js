@@ -42,8 +42,12 @@ function setTenantContext(req, res, next) {
     });
   }
 
+  const existingStore = storage.getStore();
+  // Preserve existing bypassRls from outer middleware (e.g., auth routes) or if user has no companyId yet (onboarding/registration)
+  const bypassRls = existingStore?.bypassRls === true || !companyId;
+
   // Run the rest of the request chain inside the ALS context
-  storage.run({ isWebRequest: true, companyId, role, userId }, () => {
+  storage.run({ isWebRequest: true, companyId, role, userId, bypassRls }, () => {
     next();
   });
 }

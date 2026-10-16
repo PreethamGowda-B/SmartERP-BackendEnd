@@ -6,6 +6,7 @@ const { authenticateToken } = require("../middleware/authMiddleware");
 const { requireClockIn } = require("../middleware/attendanceGatekeeperMiddleware");
 const { createNotification, createNotificationForOwners } = require("../utils/notificationHelpers");
 const EventMessagingService = require('../services/eventMessagingService');
+const { storage } = require('../middleware/als');
 
 // Helper to authenticate request via JWT (supports staff, customer, and signed query tokens)
 function resolveCaller(req) {
@@ -24,6 +25,31 @@ function resolveCaller(req) {
   } catch {
     return null;
   }
+}
+
+// These endpoints accept staff and customer JWTs directly. Install the same
+// tenant context as the normal auth middleware before any database queries so
+// FORCE ROW LEVEL SECURITY can see the caller's own company rows.
+function authenticateProofCaller(req, res, next) {
+  const caller = resolveCaller(req);
+  if (!caller) {
+    return res.status(401).json({ message: 'Authentication required.' });
+  }
+
+  const companyId = caller.companyId || caller.company_id;
+  const role = String(caller.role || '').toLowerCase();
+  if (!companyId && role !== 'super_admin') {
+    return res.status(401).json({ message: 'Authentication is missing company context.' });
+  }
+
+  req.proofCaller = caller;
+  storage.run({
+    isWebRequest: true,
+    companyId,
+    role,
+    userId: caller.id || caller.userId || caller.customerId,
+    bypassRls: false,
+  }, next);
 }
 
 // Ensure proof_of_work table exists in database lazily
@@ -166,13 +192,10 @@ router.post("/:id/proof-of-work", authenticateToken, requireClockIn, async (req,
 
 // ── 2. GET /api/jobs/:id/proof-of-work ──────────────────────────────────────
 // Fetch complete audit trail of site proof photos, GPS, & signatures
-router.get("/:id/proof-of-work", async (req, res) => {
+router.get("/:id/proof-of-work", authenticateProofCaller, async (req, res) => {
   try {
     await ensureDbInitialized();
-    const caller = resolveCaller(req);
-    if (!caller) {
-      return res.status(401).json({ message: "Authentication required." });
-    }
+    const caller = req.proofCaller;
 
     const jobId = req.params.id;
 
@@ -214,12 +237,9 @@ router.get("/:id/proof-of-work", async (req, res) => {
 
 // ── 3. POST /api/jobs/:id/customer-signoff ──────────────────────────────────
 // Customer E-Signature sign-off approval (Customer Portal & On-site Technician)
-router.post("/:id/customer-signoff", async (req, res) => {
+router.post("/:id/customer-signoff", authenticateProofCaller, async (req, res) => {
   try {
-    const caller = resolveCaller(req);
-    if (!caller) {
-      return res.status(401).json({ message: "Authentication required for customer sign-off." });
-    }
+    const caller = req.proofCaller;
 
     const jobId = req.params.id;
     const { signature_url, feedback_rating, customer_notes } = req.body;

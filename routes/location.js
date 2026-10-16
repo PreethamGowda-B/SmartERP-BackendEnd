@@ -85,13 +85,15 @@ router.post('/update', authenticateToken, loadPlan, async (req, res) => {
         }
 
         // Upsert location
-        // Older employee_profiles rows may have a NULL company_id. The table's
-        // RLS policy then hides the conflicting row, so the upsert fails before
-        // it can attach that profile to the employee's authenticated company.
-        // Bypass RLS only for this narrowly scoped, token-derived self update.
+        // Read the employee's canonical company ID from users. This also repairs
+        // older profiles with a NULL company_id, without trusting a stale token
+        // claim or accepting a company ID supplied by the browser.
         const result = await storage.run({ isWebRequest: false, bypassRls: true }, () => pool.query(
             `INSERT INTO employee_profiles (user_id, company_id, latitude, longitude, location_updated_at)
-       VALUES ($1, $2, $3, $4, NOW())
+       SELECT u.id, u.company_id, $3::numeric, $4::numeric, NOW()
+       FROM users u
+       WHERE u.id::text = $1::text
+         AND LOWER(u.role) = 'employee'
        ON CONFLICT (user_id)
        DO UPDATE SET
          company_id          = EXCLUDED.company_id,
@@ -99,8 +101,12 @@ router.post('/update', authenticateToken, loadPlan, async (req, res) => {
          longitude           = EXCLUDED.longitude,
          location_updated_at = NOW()
        RETURNING latitude, longitude, location_updated_at`,
-            [userId, companyId, latitude, longitude]
+            [userId, latitude, longitude]
         ));
+
+        if (!result.rows[0]) {
+            return res.status(403).json({ success: false, error: 'Employee company information is out of date. Please sign in again.' });
+        }
 
         const locationRow = result.rows[0];
 

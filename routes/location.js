@@ -15,6 +15,7 @@ const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 const { loadPlan } = require('../middleware/planMiddleware');
 const { requireFeature } = require('../middleware/featureGuard');
+const { storage } = require('../middleware/als');
 const redisClient = require('../utils/redis');
 
 // ─── POST /api/location/update ────────────────────────────────────────────────
@@ -31,6 +32,12 @@ router.post('/update', authenticateToken, loadPlan, async (req, res) => {
         }
         const userId = req.user.userId || req.user.id;
         const companyId = req.user.companyId;
+        if (req.user.role !== 'employee') {
+            return res.status(403).json({ success: false, error: 'Only employees can submit their location' });
+        }
+        if (!companyId) {
+            return res.status(400).json({ success: false, error: 'Employee is not associated with a company' });
+        }
         const { latitude, longitude } = req.body;
 
         if (latitude == null || longitude == null) {
@@ -78,17 +85,22 @@ router.post('/update', authenticateToken, loadPlan, async (req, res) => {
         }
 
         // Upsert location
-        const result = await pool.query(
-            `INSERT INTO employee_profiles (user_id, latitude, longitude, location_updated_at)
-       VALUES ($1, $2, $3, NOW())
+        // Older employee_profiles rows may have a NULL company_id. The table's
+        // RLS policy then hides the conflicting row, so the upsert fails before
+        // it can attach that profile to the employee's authenticated company.
+        // Bypass RLS only for this narrowly scoped, token-derived self update.
+        const result = await storage.run({ isWebRequest: false, bypassRls: true }, () => pool.query(
+            `INSERT INTO employee_profiles (user_id, company_id, latitude, longitude, location_updated_at)
+       VALUES ($1, $2, $3, $4, NOW())
        ON CONFLICT (user_id)
        DO UPDATE SET
+         company_id          = EXCLUDED.company_id,
          latitude            = EXCLUDED.latitude,
          longitude           = EXCLUDED.longitude,
          location_updated_at = NOW()
        RETURNING latitude, longitude, location_updated_at`,
-            [userId, latitude, longitude]
-        );
+            [userId, companyId, latitude, longitude]
+        ));
 
         const locationRow = result.rows[0];
 
@@ -163,8 +175,8 @@ router.get('/all', authenticateToken, loadPlan, requireFeature('location_trackin
             position: row.position || 'Employee',
             department: row.department || null,
             is_active: row.is_active !== false,
-            latitude: row.latitude ? parseFloat(row.latitude) : null,
-            longitude: row.longitude ? parseFloat(row.longitude) : null,
+            latitude: row.latitude != null ? parseFloat(row.latitude) : null,
+            longitude: row.longitude != null ? parseFloat(row.longitude) : null,
             location_updated_at: row.location_updated_at || null,
             is_online: row.location_updated_at
                 ? (Date.now() - new Date(row.location_updated_at).getTime()) < 30_000
@@ -210,8 +222,8 @@ router.get('/:employeeId', authenticateToken, loadPlan, requireFeature('location
                 name: row.name,
                 email: row.email,
                 position: row.position || 'Employee',
-                latitude: row.latitude ? parseFloat(row.latitude) : null,
-                longitude: row.longitude ? parseFloat(row.longitude) : null,
+                latitude: row.latitude != null ? parseFloat(row.latitude) : null,
+                longitude: row.longitude != null ? parseFloat(row.longitude) : null,
                 location_updated_at: row.location_updated_at || null,
                 is_online: row.location_updated_at
                     ? (Date.now() - new Date(row.location_updated_at).getTime()) < 30_000

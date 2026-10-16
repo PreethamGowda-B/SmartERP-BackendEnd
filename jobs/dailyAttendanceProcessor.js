@@ -1,10 +1,13 @@
 const cron = require('node-cron');
 const { pool } = require('../db');
+const { storage } = require('../middleware/als');
 const { createNotificationForOwners } = require('../utils/notificationHelpers');
+
+const ATTENDANCE_TIME_ZONE = 'Asia/Kolkata';
 
 /**
  * Daily Attendance Processing Job
- * Runs every day at 7:05 PM IST (13:35 UTC)
+ * Runs every day at 7:00 PM Asia/Kolkata
  * 
  * Tasks:
  * 1. Auto clock-out employees who didn't clock out
@@ -13,13 +16,15 @@ const { createNotificationForOwners } = require('../utils/notificationHelpers');
  */
 
 function startDailyAttendanceProcessor() {
-    // Run daily at 7:05 PM IST = 13:35 UTC (5-min grace after 7 PM cutoff)
-    // Using UTC directly to avoid node-cron timezone reliability issues on hosted servers
-    cron.schedule('35 13 * * *', async () => {
-        // Double-check we're running at the right IST time
-        const nowIST = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
-        const targetDate = nowIST.toISOString().split('T')[0];
+    // Run at the cutoff in the business timezone, regardless of the host's timezone.
+    cron.schedule('0 19 * * *', async () => {
+      const targetDate = new Date().toLocaleDateString('en-CA', {
+        timeZone: ATTENDANCE_TIME_ZONE
+      });
 
+      // Scheduled jobs have no request ALS context. Explicitly use the system
+      // context so RLS does not silently reject cross-company attendance work.
+      await storage.run({ isWebRequest: false, bypassRls: true }, async () => {
         console.log(`\n${'='.repeat(60)}`);
         console.log(`🕐 DAILY ATTENDANCE PROCESSING - ${targetDate}`);
         console.log(`${'='.repeat(60)}\n`);
@@ -35,9 +40,10 @@ function startDailyAttendanceProcessor() {
                         ((date || ' 19:00:00 Asia/Kolkata')::timestamptz AT TIME ZONE 'UTC') - check_in_time
                     )) / 3600,
                     status = CASE
-                        WHEN EXTRACT(HOUR FROM check_in_time) >= 13 THEN 'half_day'
-                        WHEN EXTRACT(HOUR FROM check_in_time) > 9
-                          OR (EXTRACT(HOUR FROM check_in_time) = 9 AND EXTRACT(MINUTE FROM check_in_time) > 0)
+                        WHEN EXTRACT(HOUR FROM (check_in_time AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')) >= 13 THEN 'half_day'
+                        WHEN EXTRACT(HOUR FROM (check_in_time AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')) > 9
+                          OR (EXTRACT(HOUR FROM (check_in_time AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')) = 9
+                              AND EXTRACT(MINUTE FROM (check_in_time AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')) > 0)
                           THEN 'late'
                         ELSE 'present'
                     END,
@@ -109,11 +115,12 @@ function startDailyAttendanceProcessor() {
                 priority: 'high'
             });
         }
+      });
     }, {
-        scheduled: true
+        timezone: ATTENDANCE_TIME_ZONE
     });
 
-    console.log('✅ Daily attendance processor scheduled (7:05 PM IST / 13:35 UTC)');
+    console.log('✅ Daily attendance processor scheduled (7:00 PM Asia/Kolkata)');
 }
 
 module.exports = { startDailyAttendanceProcessor };

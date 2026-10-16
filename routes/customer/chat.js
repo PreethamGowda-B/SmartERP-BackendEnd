@@ -266,7 +266,7 @@ router.post('/', async (req, res) => {
         data: {
           job_id: jobId,
           sender_name: senderName,
-          url: `/employee/jobs`,
+          url: `/employee/messages?tab=jobs&jobId=${encodeURIComponent(jobId)}`,
         },
       }).catch(e => console.error('Chat notification error:', e.message));
     }

@@ -101,6 +101,16 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 
+// Authenticated portal data must never be served from a browser, proxy, or CDN
+// cache. A cached pre-update empty list can otherwise replace the live page
+// state until the user reloads.
+app.use("/api", (_req, res, next) => {
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+  next();
+});
+
 // ✅ Security headers
 app.use(helmet({
   contentSecurityPolicy: {

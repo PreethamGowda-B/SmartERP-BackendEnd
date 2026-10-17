@@ -132,7 +132,11 @@ router.post('/', upload.single('invoice'), requireValidFileSignature({ allowedMi
   let bill;
   try {
     await client.query('BEGIN');
-    request = await requestAccess(client, req, { lock: true });
+    // Lock uploads per request without SELECT FOR UPDATE on material_requests.
+    // Under forced RLS, row locking can hide an otherwise readable request when
+    // the app role's UPDATE policy differs from its SELECT policy.
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`material-purchase-request:${companyId}:${req.params.requestId}`]);
+    request = await requestAccess(client, req);
     if (!request) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Material request not found for this employee and company.' }); }
     if (String(request.status).toLowerCase() !== 'accepted') { await client.query('ROLLBACK'); return res.status(409).json({ message: 'Only an approved material request can accept a purchase invoice.' }); }
 
@@ -478,7 +482,8 @@ router.post('/:billId/correction', async (req, res) => {
   let requestId;
   try {
     await client.query('BEGIN');
-    const request = await requestAccess(client, req, { lock: true });
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`material-purchase-request:${companyIdOf(req.user)}:${req.params.requestId}`]);
+    const request = await requestAccess(client, req);
     if (!request) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Material request not found for this company.' }); }
     const billRes = await client.query(
       `SELECT * FROM material_purchase_bills WHERE id::text=$1 AND material_request_id=$2 AND company_id=$3 FOR UPDATE`,

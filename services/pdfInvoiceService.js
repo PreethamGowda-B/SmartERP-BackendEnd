@@ -264,39 +264,195 @@ class PDFInvoiceService {
    * Generates PDF buffer for streaming/download.
    */
   static async generateInvoicePDF(invoice, lineItems = [], company = {}) {
-    const safe = (value) => String(value ?? '').replace(/₹/g, 'INR ').replace(/[^\x20-\x7E]/g, ' ').replace(/[\\()]/g, '\\$&');
-    const lines = [
-      company.legal_name || company.name || 'BUSINESS ENTERPRISE',
-      'TAX INVOICE',
-      `Invoice: ${invoice.invoice_number || ''}    Date: ${new Date(invoice.created_at || Date.now()).toLocaleDateString('en-IN')}`,
-      `Customer: ${invoice.customer_name || 'Customer'}`,
-      `Email: ${invoice.customer_email || ''}    Phone: ${invoice.customer_phone || ''}`,
-      `Address: ${invoice.customer_address || ''}`,
-      '',
-      'Description                         Qty       Rate       Amount',
-      '----------------------------------------------------------------',
-      ...lineItems.map((item) => `${String(item.description || 'Invoice item').slice(0, 34).padEnd(34)} ${Number(item.quantity || 0).toFixed(2).padStart(7)} ${Number(item.unit_price || 0).toFixed(2).padStart(10)} ${Number(item.total_amount || 0).toFixed(2).padStart(12)}`),
-      '----------------------------------------------------------------',
-      `Subtotal: INR ${Number(invoice.subtotal ?? invoice.total_amount ?? 0).toFixed(2)}`,
-      `Tax: INR ${Number(invoice.total_tax || 0).toFixed(2)} (CGST ${Number(invoice.cgst || 0).toFixed(2)}, SGST ${Number(invoice.sgst || 0).toFixed(2)}, IGST ${Number(invoice.igst || 0).toFixed(2)})`,
-      `Total: INR ${Number(invoice.total_amount || 0).toFixed(2)}`,
-      `Amount paid: INR ${Number(invoice.amount_paid || 0).toFixed(2)}    Due: INR ${Number(invoice.amount_due ?? invoice.total_amount ?? 0).toFixed(2)}`,
-      '',
-      invoice.customer_notes || 'Thank you for your business.',
+    // Keep the downloadable artifact self-contained: the owner preview and customer
+    // download both represent this same invoice data, but PDF rendering must work in
+    // production without a browser or a third-party PDF service.
+    const safe = (value) => String(value ?? '')
+      .replace(/₹/g, 'INR ')
+      .replace(/[^\x20-\x7E]/g, ' ')
+      .replace(/[\\()]/g, '\\$&');
+    const money = (value) => `INR ${Number(value || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    const date = (value) => new Date(value || Date.now()).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
+    const companyName = company.legal_name || company.name || 'BUSINESS ENTERPRISE';
+    const pageWidth = 595.28;
+    const pageHeight = 841.89;
+    const margin = 42;
+    const pageContents = [];
+    let ops = [];
+    let y = margin;
+    const rgb = (hex) => {
+      const normalized = hex.replace('#', '');
+      return [0, 2, 4].map((offset) => (parseInt(normalized.slice(offset, offset + 2), 16) / 255).toFixed(3)).join(' ');
+    };
+    const rect = (x, top, width, height, color, stroke = null) => {
+      const fill = rgb(color);
+      ops.push(`${fill} rg ${x} ${pageHeight - top - height} ${width} ${height} re f`);
+      if (stroke) ops.push(`${rgb(stroke)} RG 0.7 w ${x} ${pageHeight - top - height} ${width} ${height} re S`);
+    };
+    const line = (x1, top1, x2, top2, color = '#e2e8f0', width = 1) => {
+      ops.push(`${rgb(color)} RG ${width} w ${x1} ${pageHeight - top1} m ${x2} ${pageHeight - top2} l S`);
+    };
+    const text = (value, x, top, size = 10, color = '#334155', bold = false) => {
+      ops.push(`${rgb(color)} rg BT /${bold ? 'F2' : 'F1'} ${size} Tf 1 0 0 1 ${x} ${pageHeight - top - size} Tm (${safe(value)}) Tj ET`);
+    };
+    const rightText = (value, right, top, size = 10, color = '#334155', bold = false) => {
+      const safeValue = safe(value);
+      const estimatedWidth = safeValue.length * size * (bold ? 0.55 : 0.5);
+      text(value, right - estimatedWidth, top, size, color, bold);
+    };
+    const wrap = (value, maxChars) => {
+      const words = String(value || '').split(/\s+/);
+      const rows = [];
+      let current = '';
+      for (const word of words) {
+        const next = current ? `${current} ${word}` : word;
+        if (next.length > maxChars && current) { rows.push(current); current = word; }
+        else current = next;
+      }
+      if (current) rows.push(current);
+      return rows.length ? rows : [''];
+    };
+    const finishPage = () => { pageContents.push(Buffer.from(ops.join('\n'), 'ascii')); ops = []; };
+    const startContinuationPage = () => {
+      finishPage();
+      y = margin;
+      text(companyName, margin, y, 12, '#0f172a', true);
+      rightText(`TAX INVOICE  |  ${invoice.invoice_number || ''}`, pageWidth - margin, y + 1, 9, '#2563eb', true);
+      y += 24;
+      line(margin, y, pageWidth - margin, y, '#cbd5e1', 1.2);
+      y += 15;
+      rect(margin, y, pageWidth - margin * 2, 24, '#f1f5f9');
+      text('Item & Service Description', margin + 10, y + 7, 8, '#475569', true);
+      rightText('QTY', 395, y + 7, 8, '#475569', true);
+      rightText('UNIT RATE', 480, y + 7, 8, '#475569', true);
+      rightText('AMOUNT', pageWidth - margin - 10, y + 7, 8, '#475569', true);
+      y += 32;
+    };
+
+    // Company and invoice header.
+    rect(0, 0, pageWidth, 10, '#2563eb');
+    text(companyName, margin, y, 19, '#0f172a', true);
+    y += 27;
+    for (const detail of [
+      company.address ? `${company.address}${company.city ? `, ${company.city}` : ''}${company.state ? `, ${company.state}` : ''}${company.pincode ? ` ${company.pincode}` : ''}` : '',
+      [company.gstin ? `GSTIN: ${company.gstin}` : '', company.pan ? `PAN: ${company.pan}` : ''].filter(Boolean).join('  |  '),
+      [company.phone ? `Phone: ${company.phone}` : '', company.contact_email || ''].filter(Boolean).join('  |  '),
+    ].filter(Boolean)) {
+      text(detail, margin, y, 8.5, '#64748b');
+      y += 13;
+    }
+    const invoiceRight = pageWidth - margin;
+    text('TAX INVOICE', invoiceRight - 126, margin - 2, 17, '#2563eb', true);
+    text(`Invoice: ${invoice.invoice_number || ''}`, invoiceRight - 126, margin + 23, 10, '#0f172a', true);
+    text(`STATUS: ${(invoice.status || 'ISSUED').toUpperCase()}`, invoiceRight - 126, margin + 40, 8, invoice.status === 'paid' ? '#15803d' : '#b45309', true);
+    y += 3;
+    line(margin, y, invoiceRight, y, '#2563eb', 2);
+    y += 18;
+
+    // Billed-to and invoice metadata cards.
+    const cardTop = y;
+    rect(margin, cardTop, 300, 105, '#f8fafc', '#e2e8f0');
+    rect(margin + 314, cardTop, pageWidth - margin * 2 - 314, 105, '#ffffff', '#e2e8f0');
+    text('BILLED TO', margin + 12, cardTop + 11, 8, '#2563eb', true);
+    text(invoice.customer_name || 'Customer', margin + 12, cardTop + 27, 12, '#0f172a', true);
+    let customerY = cardTop + 45;
+    for (const detail of [invoice.customer_company, invoice.customer_address, invoice.customer_email, invoice.customer_phone && `Phone: ${invoice.customer_phone}`, invoice.customer_gstin && `GSTIN: ${invoice.customer_gstin}`].filter(Boolean)) {
+      for (const row of wrap(detail, 49).slice(0, 2)) { text(row, margin + 12, customerY, 8, '#64748b'); customerY += 11; }
+      if (customerY > cardTop + 91) break;
+    }
+    const metaX = margin + 326;
+    text('INVOICE DATE', metaX, cardTop + 12, 7.5, '#64748b', true);
+    text(date(invoice.created_at), metaX, cardTop + 24, 9, '#0f172a', true);
+    text('PAYMENT DUE', metaX, cardTop + 47, 7.5, '#64748b', true);
+    text(invoice.due_date ? date(invoice.due_date) : 'On Receipt', metaX, cardTop + 59, 9, '#0f172a', true);
+    if (invoice.job_title) {
+      text('JOB REFERENCE', metaX, cardTop + 80, 7.5, '#64748b', true);
+      text(wrap(invoice.job_title, 31)[0], metaX, cardTop + 91, 8, '#0f172a', true);
+    }
+    y = cardTop + 123;
+
+    // Line items with row wrapping and page continuation.
+    const tableX = margin;
+    const tableWidth = pageWidth - margin * 2;
+    const columns = { description: tableX + 12, qty: tableX + 374, rate: tableX + 465, amount: tableX + tableWidth - 12 };
+    rect(tableX, y, tableWidth, 27, '#eff6ff');
+    text('ITEM & SERVICE DESCRIPTION', columns.description, y + 9, 7.5, '#475569', true);
+    rightText('QTY', columns.qty, y + 9, 7.5, '#475569', true);
+    rightText('UNIT RATE', columns.rate, y + 9, 7.5, '#475569', true);
+    rightText('AMOUNT', columns.amount, y + 9, 7.5, '#475569', true);
+    y += 27;
+    const rows = lineItems.length ? lineItems : [{ description: 'Service / Labour Charges', quantity: invoice.labour_hours || 1, unit_price: invoice.labour_rate || 0, total_amount: invoice.labour_cost || invoice.total_amount || 0 }];
+    for (const [index, item] of rows.entries()) {
+      const descriptionRows = wrap(item.description || 'Invoice item', 53);
+      const hsnRows = item.hsn_code ? [`HSN/SAC: ${item.hsn_code}`] : [];
+      const rowHeight = Math.max(38, (descriptionRows.length + hsnRows.length) * 11 + 17);
+      if (y + rowHeight > pageHeight - 230) startContinuationPage();
+      if (index % 2 === 1) rect(tableX, y, tableWidth, rowHeight, '#fafcff');
+      descriptionRows.forEach((row, rowIndex) => text(row, columns.description, y + 9 + rowIndex * 11, 8.5, '#0f172a', rowIndex === 0));
+      hsnRows.forEach((row, rowIndex) => text(row, columns.description, y + 10 + (descriptionRows.length + rowIndex) * 11, 7, '#64748b'));
+      rightText(Number(item.quantity || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 }), columns.qty, y + 10, 8, '#334155');
+      rightText(money(item.unit_price), columns.rate, y + 10, 8, '#334155');
+      rightText(money(item.total_amount), columns.amount, y + 10, 8, '#0f172a', true);
+      y += rowHeight;
+      line(tableX, y, tableX + tableWidth, y, '#e2e8f0', 0.6);
+    }
+    y += 16;
+
+    // Payment/bank information and a clear total panel.
+    const summaryTop = y;
+    const summaryX = pageWidth - margin - 230;
+    const summaryRows = [
+      ['Subtotal', money(invoice.subtotal ?? invoice.total_amount)],
+      ...(Number(invoice.discount_amount) ? [['Discount', `- ${money(invoice.discount_amount)}`]] : []),
+      ...(invoice.is_inter_state
+        ? [['IGST', money(invoice.igst ?? invoice.total_tax)]]
+        : [['CGST', money(invoice.cgst ?? (Number(invoice.total_tax || 0) / 2))], ['SGST', money(invoice.sgst ?? (Number(invoice.total_tax || 0) / 2))]]),
     ];
-    const pageChunks = [];
-    for (let i = 0; i < lines.length; i += 40) pageChunks.push(lines.slice(i, i + 40));
+    const bankRows = [
+      company.bank_name && `Bank: ${company.bank_name}`,
+      company.account_number && `Account: ${company.account_number}`,
+      company.ifsc_code && `IFSC: ${company.ifsc_code}`,
+      company.upi_id && `UPI: ${company.upi_id}`,
+    ].filter(Boolean);
+    if (bankRows.length) {
+      text('PAYMENT DETAILS', margin, summaryTop, 8, '#475569', true);
+      bankRows.forEach((row, index) => text(row, margin, summaryTop + 16 + index * 13, 8, '#64748b'));
+    }
+    summaryRows.forEach(([label, value], index) => {
+      text(label, summaryX, summaryTop + index * 18, 8.5, '#64748b');
+      rightText(value, pageWidth - margin, summaryTop + index * 18, 8.5, '#334155', true);
+    });
+    const totalTop = summaryTop + summaryRows.length * 18 + 3;
+    rect(summaryX - 8, totalTop, 238, 34, '#eff6ff', '#bfdbfe');
+    text('GRAND TOTAL', summaryX, totalTop + 11, 9, '#1e3a8a', true);
+    rightText(money(invoice.total_amount), pageWidth - margin - 8, totalTop + 8, 12, '#1d4ed8', true);
+    text(`Paid ${money(invoice.amount_paid)}    Balance due ${money(invoice.amount_due ?? invoice.total_amount)}`, summaryX, totalTop + 43, 8, '#475569', true);
+    y = Math.max(totalTop + 60, summaryTop + (bankRows.length ? 20 + bankRows.length * 13 : 0));
+    if (invoice.customer_notes || company.terms_and_conditions) {
+      y += 10;
+      line(margin, y, pageWidth - margin, y);
+      y += 12;
+      const note = invoice.customer_notes || 'Thank you for your business.';
+      text('NOTES', margin, y, 7.5, '#475569', true);
+      wrap(note, 100).slice(0, 3).forEach((row, index) => text(row, margin, y + 12 + index * 11, 8, '#64748b'));
+      y += 47;
+    }
+    const footerY = Math.min(Math.max(y + 10, pageHeight - 65), pageHeight - 44);
+    line(margin, footerY, pageWidth - margin, footerY, '#cbd5e1', 1);
+    text('This is a computer-generated tax invoice.', margin, footerY + 10, 7.5, '#64748b');
+    rightText(company.authorized_signatory_name ? `For ${company.authorized_signatory_name}` : `For ${companyName}`, pageWidth - margin, footerY + 10, 8, '#334155', true);
+    finishPage();
+
     const objects = [];
-    const pageIds = pageChunks.map((_, index) => 4 + index * 2);
+    const pageIds = pageContents.map((_, index) => 5 + index * 2);
     objects[1] = '<< /Type /Catalog /Pages 2 0 R >>';
     objects[2] = `<< /Type /Pages /Kids [${pageIds.map((id) => `${id} 0 R`).join(' ')}] /Count ${pageIds.length} >>`;
     objects[3] = '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>';
-    pageChunks.forEach((chunk, index) => {
+    objects[4] = '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>';
+    pageContents.forEach((content, index) => {
       const pageId = pageIds[index];
       const contentId = pageId + 1;
-      const textOps = chunk.map((line, lineIndex) => `BT /F1 10 Tf 48 ${790 - lineIndex * 18} Td (${safe(line)}) Tj ET`).join('\n');
-      const content = Buffer.from(textOps, 'ascii');
-      objects[pageId] = `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 842] /Resources << /Font << /F1 3 0 R >> >> /Contents ${contentId} 0 R >>`;
+      objects[pageId] = `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${pageWidth} ${pageHeight}] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents ${contentId} 0 R >>`;
       objects[contentId] = { stream: content };
     });
     let pdf = '%PDF-1.4\n';

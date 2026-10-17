@@ -5,6 +5,8 @@ const { authenticateToken } = require('../middleware/authMiddleware');
 const { loadPlan } = require('../middleware/planMiddleware');
 const { requireFeature } = require('../middleware/featureGuard');
 const { cacheMiddleware } = require('../middleware/cache');
+const AttendancePolicy = require('../services/attendancePolicyService');
+const { dateRangeForWorkDate } = require('../services/attendanceAccess');
 
 // ─── Startup: ensure all columns used by reports exist ───────────────────────
 async function ensureReportColumns() {
@@ -34,20 +36,26 @@ async function ensureReportColumns() {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-function dateRangeFilter(period, dateColumn, startIdx) {
-    const now = new Date();
-    let start = new Date(now);
-
-    switch (period) {
-        case 'week': start.setDate(now.getDate() - 7); break;
-        case 'quarter': start.setMonth(now.getMonth() - 3); break;
-        case 'year': start.setFullYear(now.getFullYear() - 1); break;
-        default: start.setMonth(now.getMonth() - 1); break;
+function dateRangeFilter(period, dateColumn, startIdx, workDate) {
+    let startDate;
+    let endDate;
+    if (workDate) {
+        ({ startDate, endDate } = dateRangeForWorkDate(period, workDate));
+    } else {
+        const now = new Date();
+        const start = new Date(now);
+        switch (period) {
+            case 'week': start.setDate(now.getDate() - 7); break;
+            case 'quarter': start.setMonth(now.getMonth() - 3); break;
+            case 'year': start.setFullYear(now.getFullYear() - 1); break;
+            default: start.setMonth(now.getMonth() - 1); break;
+        }
+        startDate = start.toISOString();
+        endDate = now.toISOString();
     }
-
     return {
         clause: `AND ${dateColumn} >= $${startIdx} AND ${dateColumn} <= $${startIdx + 1}`,
-        params: [start.toISOString(), now.toISOString()],
+        params: [startDate, endDate],
     };
 }
 
@@ -79,7 +87,9 @@ router.get('/attendance', authenticateToken, loadPlan, requireFeature('advanced_
 
         const companyId = req.user.companyId;
         const period = req.query.period || 'month';
-        const { clause, params } = dateRangeFilter(period, 'a.date', 2);
+        const policy = await AttendancePolicy.getCompanyPolicy(companyId, pool);
+        const workDate = AttendancePolicy.localDate(new Date(), policy.timezone);
+        const { clause, params } = dateRangeFilter(period, 'a.date', 2, workDate);
 
         const employees = await safeQuery(
             `SELECT
@@ -92,7 +102,7 @@ router.get('/attendance', authenticateToken, loadPlan, requireFeature('advanced_
          ROUND(COALESCE(SUM(COALESCE(a.working_hours, 0)), 0)::numeric, 2) AS total_hours,
          ROUND(COALESCE(AVG(COALESCE(a.working_hours, 0)), 0)::numeric, 2) AS avg_hours_per_day
        FROM users u
-       LEFT JOIN attendance a ON a.user_id = u.id ${clause}
+       LEFT JOIN attendance a ON a.user_id = u.id AND a.company_id::text = u.company_id::text ${clause}
        WHERE u.company_id = $1 AND u.role = 'employee'
        GROUP BY u.id, u.name, u.email
        ORDER BY u.name ASC`,
@@ -108,7 +118,7 @@ router.get('/attendance', authenticateToken, loadPlan, requireFeature('advanced_
          COUNT(CASE WHEN a.status = 'absent'  THEN 1 END)              AS total_absent,
          ROUND(COALESCE(SUM(COALESCE(a.working_hours, 0)), 0)::numeric, 2) AS total_hours
        FROM attendance a
-       JOIN users u ON u.id = a.user_id
+       JOIN users u ON u.id = a.user_id AND u.company_id::text = a.company_id::text
        WHERE u.company_id = $1 ${clause}`,
             [companyId, ...params],
             [{}]
@@ -201,7 +211,9 @@ router.get('/employees', authenticateToken, loadPlan, requireFeature('advanced_r
 
         const companyId = req.user.companyId;
         const period = req.query.period || 'month';
-        const { clause: attClause, params: attParams } = dateRangeFilter(period, 'a.date', 2);
+        const policy = await AttendancePolicy.getCompanyPolicy(companyId, pool);
+        const workDate = AttendancePolicy.localDate(new Date(), policy.timezone);
+        const { clause: attClause, params: attParams } = dateRangeFilter(period, 'a.date', 3, workDate);
         const { clause: jobClause, params: jobParams } = dateRangeFilter(period, 'j.created_at', 2);
 
         // Try joining employee_profiles — fall back to users-only if it doesn't exist
@@ -226,8 +238,8 @@ router.get('/employees', authenticateToken, loadPlan, requireFeature('advanced_r
              ROUND(COALESCE(SUM(COALESCE(working_hours,0)), 0)::numeric,1) AS total_hours,
              COUNT(CASE WHEN COALESCE(is_late,false)=true THEN 1 END)      AS late_count
            FROM attendance a
-           WHERE a.user_id = $1 ${attClause}`,
-                    [emp.id, ...attParams],
+           WHERE a.user_id = $1 AND a.company_id::text = $2::text ${attClause}`,
+                    [emp.id, String(companyId), ...attParams],
                     [{ total_days: 0, present: 0, total_hours: 0, late_count: 0 }]
                 );
 
@@ -383,8 +395,12 @@ router.get('/my-attendance', authenticateToken, async (req, res) => {
     try {
         await ensureReportColumns();
         const userId = req.user.userId || req.user.id;
+        const companyId = req.user.companyId || req.user.company_id;
         const period = req.query.period || 'month';
-        const { clause, params } = dateRangeFilter(period, 'date', 2);
+        if (!companyId) return res.status(403).json({ message: 'Missing company affiliation' });
+        const policy = await AttendancePolicy.getCompanyPolicy(companyId, pool);
+        const workDate = AttendancePolicy.localDate(new Date(), policy.timezone);
+        const { clause, params } = dateRangeFilter(period, 'date', 3, workDate);
 
         const summaryRows = await safeQuery(
             `SELECT
@@ -396,8 +412,8 @@ router.get('/my-attendance', authenticateToken, async (req, res) => {
          ROUND(COALESCE(SUM(COALESCE(working_hours, 0)), 0)::numeric, 2) AS total_hours,
          ROUND(COALESCE(AVG(COALESCE(working_hours, 0)), 0)::numeric, 2) AS avg_hours
        FROM attendance
-       WHERE user_id = $1 ${clause}`,
-            [userId, ...params],
+       WHERE user_id = $1 AND company_id::text = $2::text ${clause}`,
+            [userId, String(companyId), ...params],
             [{}]
         );
 
@@ -406,9 +422,9 @@ router.get('/my-attendance', authenticateToken, async (req, res) => {
               COALESCE(working_hours, 0) AS working_hours,
               status, COALESCE(is_late, false) AS is_late, notes
        FROM attendance
-       WHERE user_id = $1 ${clause}
+       WHERE user_id = $1 AND company_id::text = $2::text ${clause}
        ORDER BY date DESC`,
-            [userId, ...params],
+            [userId, String(companyId), ...params],
             []
         );
 

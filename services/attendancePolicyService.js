@@ -107,6 +107,13 @@ function evaluateClockIn(now, policyInput = DEFAULT_ATTENDANCE_POLICY) {
   return { allowed: true, code: null, reason: null, is_late: isLate(now, policy), status: classifyStatus(now, null, policy) };
 }
 
+function automaticClockOutFor(workDate, at = new Date(), policyInput = DEFAULT_ATTENDANCE_POLICY) {
+  const policy = validatePolicy(policyInput);
+  const cutoff = zonedDateTimeToUtc(workDate, policy.automaticClockOutTime, policy.timezone);
+  const cutoffReached = new Date(at).getTime() >= cutoff.getTime();
+  return { cutoff, cutoffReached, due: policy.automaticClockOutEnabled && cutoffReached };
+}
+
 async function getCompanyPolicy(companyId, queryable) {
   return (await getCompanyPolicyEntry(companyId, queryable)).policy;
 }
@@ -144,8 +151,8 @@ async function processCompanyDate(companyId, workDate, queryable, now = new Date
   if (workDate < currentDate && policyEntry.updatedAt && localDate(policyEntry.updatedAt, policy.timezone) > workDate) {
     return { date: workDate, due: false, policy_changed: true, auto_clocked_out: 0, marked_absent: 0, records_locked: 0, duplicate_records: 0 };
   }
-  const cutoff = zonedDateTimeToUtc(workDate, policy.automaticClockOutTime, policy.timezone);
-  if (now < cutoff) {
+  const { cutoff, cutoffReached } = automaticClockOutFor(workDate, now, policy);
+  if (!cutoffReached) {
     return { date: workDate, due: false, auto_clocked_out: 0, marked_absent: 0, records_locked: 0 };
   }
   const employees = await queryable.query("SELECT id FROM users WHERE role = 'employee' AND company_id::text = $1::text ORDER BY id", [String(companyId)]);
@@ -165,7 +172,7 @@ async function processCompanyDate(companyId, workDate, queryable, now = new Date
       const status = classifyStatus(record.check_in_time, cutoff, policy);
       const updated = await queryable.query(`UPDATE attendance SET check_out_time = $1, working_hours = $2, status = $3, is_auto_clocked_out = TRUE, clock_out_method = 'automatic', updated_at = NOW() WHERE id = $4 AND company_id::text = $5::text AND check_out_time IS NULL RETURNING id`, [cutoff, hours, status, record.id, String(companyId)]);
       counts.auto_clocked_out += updated.rows.length;
-    } else if (!record) {
+    } else {
       const leave = await queryable.query(
         `SELECT 1 FROM hr_employee_requests
          WHERE company_id::text = $1::text AND user_id::text = $2::text AND request_type = 'leave' AND status = 'approved'
@@ -174,7 +181,17 @@ async function processCompanyDate(companyId, workDate, queryable, now = new Date
          LIMIT 1`,
         [String(companyId), String(userId), workDate],
       );
-      if (!leave.rows.length) {
+      if (leave.rows.length && record?.status === 'absent' && workDate === currentDate) {
+        // Approval may arrive after today's absence row was processed. Correct
+        // only the current work date; never rewrite a historical attendance row.
+        const updated = await queryable.query(
+          `UPDATE attendance SET status = 'leave', updated_at = NOW()
+           WHERE id = $1 AND company_id::text = $2::text AND date = $3 AND status = 'absent'
+           RETURNING id, status, is_processed`,
+          [record.id, String(companyId), workDate]
+        );
+        if (updated.rows.length) record = { ...record, ...updated.rows[0] };
+      } else if (!record && !leave.rows.length) {
         const inserted = await queryable.query(`INSERT INTO attendance (user_id, company_id, date, status, is_processed, created_at, updated_at) VALUES ($1, $2, $3, 'absent', FALSE, NOW(), NOW()) RETURNING id`, [userId, companyId, workDate]);
         counts.marked_absent += inserted.rows.length;
         record = inserted.rows[0];
@@ -200,6 +217,7 @@ module.exports = {
   isLate,
   classifyStatus,
   evaluateClockIn,
+  automaticClockOutFor,
   getCompanyPolicy,
   getCompanyPolicyEntry,
   saveCompanyPolicy,

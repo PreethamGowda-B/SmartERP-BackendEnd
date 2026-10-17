@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
+const AttendancePolicy = require('../services/attendancePolicyService');
 
 // ─── GET /api/command-center (Executive CNC Operations Hub Payload) ───────
 router.get('/', authenticateToken, async (req, res) => {
@@ -18,6 +19,10 @@ router.get('/', authenticateToken, async (req, res) => {
 
     const isSuperAdmin = userRole === 'super_admin';
     const params = isSuperAdmin ? [] : [String(companyId)];
+    const policy = isSuperAdmin
+      ? AttendancePolicy.DEFAULT_ATTENDANCE_POLICY
+      : await AttendancePolicy.getCompanyPolicy(companyId, pool);
+    const today = AttendancePolicy.localDate(new Date(), policy.timezone);
 
     // 1. Active Jobs Count & Breakdown Counts
     const jobsQuery = isSuperAdmin
@@ -36,15 +41,16 @@ router.get('/', authenticateToken, async (req, res) => {
     const techQuery = isSuperAdmin
       ? `SELECT count(DISTINCT user_id) as count
          FROM attendance
-         WHERE date = CURRENT_DATE
-           AND clock_out_time IS NULL`
+         WHERE date = $1
+           AND check_out_time IS NULL`
       : `SELECT count(DISTINCT user_id) as count
          FROM attendance
          WHERE company_id::text = $1::text
-           AND date = CURRENT_DATE
-           AND clock_out_time IS NULL`;
+           AND date = $2
+           AND check_out_time IS NULL`;
 
-    const techOnlineRes = await pool.query(techQuery, params).catch(() => ({ rows: [{ count: 0 }] }));
+    const techParams = isSuperAdmin ? [today] : [String(companyId), today];
+    const techOnlineRes = await pool.query(techQuery, techParams).catch(() => ({ rows: [{ count: 0 }] }));
 
     // 3. Machines Health & Breakdown Summary
     const machQuery = isSuperAdmin

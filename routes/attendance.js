@@ -233,8 +233,7 @@ router.post('/clock-out', authenticateToken, async (req, res) => {
       const existing = records.rows[0];
       if (!existing?.check_in_time) throw Object.assign(new Error('Please clock in first'), { statusCode: 400 });
       if (existing.check_out_time) return { record: existing, changed: false };
-      const cutoff = AttendancePolicy.zonedDateTimeToUtc(today, policy.automaticClockOutTime, policy.timezone);
-      const automatic = policy.automaticClockOutEnabled && now >= cutoff;
+      const { cutoff, due: automatic } = AttendancePolicy.automaticClockOutFor(today, now, policy);
       const clockOutTime = automatic ? cutoff : now;
       const workingHours = AttendancePolicy.calculateWorkingHours(existing.check_in_time, clockOutTime, policy);
       const status = AttendancePolicy.classifyStatus(existing.check_in_time, clockOutTime, policy);
@@ -680,54 +679,43 @@ router.patch('/corrections/:id/approve', authenticateToken, async (req, res) => 
       return res.status(403).json({ message: 'Missing company affiliation' });
     }
 
-    // Get correction request and verify company ownership
-    const correction = await pool.query(
-      `SELECT ac.*, a.company_id, a.is_processed
-       FROM attendance_corrections ac 
-       JOIN attendance a ON ac.attendance_id = a.id 
-       WHERE ac.id = $1 AND a.company_id = $2`,
-      [id, companyId]
-    );
-
-    if (correction.rows.length === 0) {
-      return res.status(404).json({ message: 'Correction request not found' });
+    let correctionData;
+    let reviewedCorrection;
+    try {
+      ({ correctionData, reviewedCorrection } = await withAttendanceTransaction(async (client) => {
+        const correction = await client.query(
+          `SELECT ac.*, a.company_id, a.is_processed
+           FROM attendance_corrections ac JOIN attendance a ON ac.attendance_id = a.id
+           WHERE ac.id = $1 AND a.company_id::text = $2::text FOR UPDATE OF ac, a`,
+          [id, String(companyId)]
+        );
+        if (!correction.rows.length) throw Object.assign(new Error('Correction request not found'), { statusCode: 404 });
+        const row = correction.rows[0];
+        if (row.status !== 'pending') throw Object.assign(new Error('Correction request has already been reviewed'), { statusCode: 409 });
+        if (row.is_processed) throw Object.assign(new Error('Cannot approve a correction for processed attendance'), { statusCode: 403 });
+        const policy = await AttendancePolicy.getCompanyPolicy(companyId, client);
+        const workingHours = AttendancePolicy.calculateWorkingHours(row.requested_check_in, row.requested_check_out, policy);
+        const status = AttendancePolicy.classifyStatus(row.requested_check_in, row.requested_check_out, policy);
+        const late = AttendancePolicy.isLate(row.requested_check_in, policy);
+        const attendanceUpdate = await client.query(
+          `UPDATE attendance SET check_in_time = $1, check_out_time = $2, working_hours = $3, status = $4, is_late = $5, is_manual = TRUE, edited_by = $6, updated_at = NOW()
+           WHERE id = $7 AND company_id::text = $8::text AND is_processed = FALSE RETURNING id`,
+          [row.requested_check_in, row.requested_check_out, workingHours, status, late, reviewedBy, row.attendance_id, String(companyId)]
+        );
+        if (!attendanceUpdate.rows.length) throw Object.assign(new Error('Attendance was processed while the correction was pending'), { statusCode: 403 });
+        const result = await client.query(
+          `UPDATE attendance_corrections SET status = 'approved', reviewed_by = $1, reviewed_at = NOW()
+           WHERE id = $2 AND status = 'pending' RETURNING *`,
+          [reviewedBy, id]
+        );
+        if (!result.rows.length) throw Object.assign(new Error('Correction request has already been reviewed'), { statusCode: 409 });
+        return { correctionData: row, reviewedCorrection: result.rows[0] };
+      }));
+    } catch (error) {
+      if (error.statusCode) return res.status(error.statusCode).json({ message: error.message });
+      throw error;
     }
-
-    const correctionData = correction.rows[0];
-    if (correctionData.is_processed) return res.status(403).json({ message: 'Cannot approve a correction for processed attendance' });
-
-    // Update attendance record
-    const policy = await AttendancePolicy.getCompanyPolicy(companyId, pool);
-    const workingHours = AttendancePolicy.calculateWorkingHours(correctionData.requested_check_in, correctionData.requested_check_out, policy);
-    const status = AttendancePolicy.classifyStatus(correctionData.requested_check_in, correctionData.requested_check_out, policy);
-    const late = AttendancePolicy.isLate(correctionData.requested_check_in, policy);
-
-    const attendanceUpdate = await pool.query(
-      `UPDATE attendance 
-             SET check_in_time = $1,
-                 check_out_time = $2,
-                 working_hours = $3,
-                 status = $4,
-                 is_late = $5,
-                 is_manual = TRUE,
-                 edited_by = $6,
-                 updated_at = NOW()
-             WHERE id = $7 AND company_id = $8 AND is_processed = FALSE
-             RETURNING id`,
-      [correctionData.requested_check_in, correctionData.requested_check_out,
-        workingHours, status, late, reviewedBy, correctionData.attendance_id, companyId]
-    );
-    if (!attendanceUpdate.rows.length) return res.status(403).json({ message: 'Attendance was processed while the correction was pending' });
-
-    // Update correction status
-    const result = await pool.query(
-      `UPDATE attendance_corrections 
-             SET status = 'approved', reviewed_by = $1, reviewed_at = NOW()
-             WHERE id = $2 AND status = 'pending'
-             RETURNING *`,
-      [reviewedBy, id]
-    );
-    if (!result.rows.length) return res.status(409).json({ message: 'Correction request has already been reviewed' });
+    const result = { rows: [reviewedCorrection] };
 
     // Notify employee
     try {
@@ -831,7 +819,7 @@ router.patch('/:id', authenticateToken, async (req, res) => {
     }
 
     const { id } = req.params;
-    const { check_in_time, check_out_time, status, notes } = req.body;
+    const { check_in_time, check_out_time, notes } = req.body;
     const editedBy = req.user.userId || req.user.id;
 
     const companyId = req.user.companyId;
@@ -850,27 +838,23 @@ router.patch('/:id', authenticateToken, async (req, res) => {
 
     // Calculate working hours and status through the same company policy used by punches.
     let workingHours = null;
-    let canonicalStatus = status || null;
-    let canonicalLate = null;
     const nextIn = check_in_time || existing.rows[0].check_in_time;
     const nextOut = check_out_time || existing.rows[0].check_out_time;
-    if (nextIn && nextOut) {
-      const policy = await AttendancePolicy.getCompanyPolicy(companyId, pool);
-      workingHours = AttendancePolicy.calculateWorkingHours(nextIn, nextOut, policy);
-      canonicalStatus = AttendancePolicy.classifyStatus(nextIn, nextOut, policy);
-      canonicalLate = AttendancePolicy.isLate(nextIn, policy);
-    }
+    const policy = await AttendancePolicy.getCompanyPolicy(companyId, pool);
+    if (nextIn && nextOut) workingHours = AttendancePolicy.calculateWorkingHours(nextIn, nextOut, policy);
+    const canonicalStatus = AttendancePolicy.classifyStatus(nextIn, nextOut, policy);
+    const canonicalLate = nextIn ? AttendancePolicy.isLate(nextIn, policy) : false;
 
     const result = await pool.query(
       `UPDATE attendance 
              SET check_in_time = COALESCE($1, check_in_time),
                  check_out_time = COALESCE($2, check_out_time),
-                 working_hours = COALESCE($3, working_hours),
-                  status = COALESCE($4, status),
+                working_hours = CASE WHEN $1 IS NULL THEN NULL WHEN $2 IS NULL THEN NULL ELSE $3 END,
+                 status = $4,
                  notes = COALESCE($5, notes),
                  is_manual = TRUE,
                  edited_by = $6,
-                  is_late = COALESCE($9, is_late),
+                  is_late = $9,
                   updated_at = NOW()
              WHERE id = $7 AND company_id = $8 AND is_processed = FALSE
              RETURNING *`,
@@ -914,7 +898,7 @@ router.get('/report', authenticateToken, async (req, res) => {
                 u.email as employee_email,
                 a.*
             FROM users u
-            LEFT JOIN attendance a ON u.id = a.user_id
+      LEFT JOIN attendance a ON u.id::text = a.user_id::text AND u.company_id::text = a.company_id::text
             WHERE u.role = 'employee'
               AND u.company_id = $3
               AND EXTRACT(MONTH FROM a.date) = $1
@@ -1034,6 +1018,9 @@ router.post('/process-daily', authenticateToken, async (req, res) => {
  */
 router.post('/biometric/webhook', async (req, res) => {
   try {
+    if (!BiometricWebhookAuth.isWebhookEnabled(process.env.BIOMETRIC_WEBHOOK_ENABLED, process.env.BIOMETRIC_GATEWAY_CONTRACT_VERIFIED)) {
+      return res.status(503).json({ message: 'Biometric webhook integration is disabled pending gateway contract verification' });
+    }
     const secret = process.env.BIOMETRIC_WEBHOOK_SECRET;
     if (!secret) return res.status(503).json({ message: 'Biometric webhook authentication is not configured' });
     if (!redisClient || redisClient.status !== 'ready') return res.status(503).json({ message: 'Biometric replay protection is unavailable' });
@@ -1108,8 +1095,7 @@ router.post('/biometric/webhook', async (req, res) => {
         if (existing.rows.length > 1) throw Object.assign(new Error('Duplicate attendance rows require owner review'), { statusCode: 409 });
         if (existing.rows[0].check_out_time) return existing.rows[0];
         const currentPolicy = await AttendancePolicy.getCompanyPolicy(companyId, client);
-        const cutoff = AttendancePolicy.zonedDateTimeToUtc(today, currentPolicy.automaticClockOutTime, currentPolicy.timezone);
-        const automatic = actionTime > cutoff && currentPolicy.automaticClockOutEnabled;
+        const { cutoff, due: automatic } = AttendancePolicy.automaticClockOutFor(today, actionTime, currentPolicy);
         const effectiveOut = automatic ? cutoff : actionTime;
         const workingHours = AttendancePolicy.calculateWorkingHours(existing.rows[0].check_in_time, effectiveOut, currentPolicy);
         const status = AttendancePolicy.classifyStatus(existing.rows[0].check_in_time, effectiveOut, currentPolicy);

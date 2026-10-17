@@ -45,7 +45,9 @@ async function runDailyAttendanceProcessing(now = new Date()) {
 }
 
 function startDailyAttendanceProcessor() {
-  cron.schedule('*/5 * * * *', () => {
+  // Tick every minute so a transient process/database failure is retried on
+  // the next tick, with startup recovery and transactional idempotency intact.
+  cron.schedule('* * * * *', () => {
     runDailyAttendanceProcessing().catch((error) => {
       console.error('[attendance-processor] failed', error.message, error.stack);
     });
@@ -56,7 +58,7 @@ function startDailyAttendanceProcessor() {
   runDailyAttendanceProcessing().catch((error) => {
     console.error('[attendance-processor] startup recovery failed', error.message, error.stack);
   });
-  console.log('✅ Daily attendance processor scheduled (policy cutoff, Asia/Kolkata; 5-minute recovery scan)');
+  console.log('✅ Daily attendance processor scheduled (policy cutoff, Asia/Kolkata; 1-minute retry and startup recovery)');
 }
 
 module.exports = { startDailyAttendanceProcessor, runDailyAttendanceProcessing, processCompany };

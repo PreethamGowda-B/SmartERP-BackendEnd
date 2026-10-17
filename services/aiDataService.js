@@ -1,4 +1,5 @@
 const { pool } = require("../db");
+const AttendancePolicy = require('./attendancePolicyService');
 
 class AIDataService {
   /**
@@ -6,6 +7,8 @@ class AIDataService {
    */
   static async getOwnerDashboardSummary({ companyId }) {
     const cid = String(companyId);
+    const policy = await AttendancePolicy.getCompanyPolicy(companyId, pool);
+    const workDate = AttendancePolicy.localDate(new Date(), policy.timezone);
 
     const [
       jobsRes,
@@ -60,11 +63,11 @@ class AIDataService {
            a.status,
            a.is_late
          FROM users u
-         LEFT JOIN attendance a ON u.id = a.user_id AND (a.date = CURRENT_DATE OR a.date::text = CURRENT_DATE::text)
+         LEFT JOIN attendance a ON u.id::text = a.user_id::text AND a.company_id::text = u.company_id::text AND a.date = $2
          WHERE (u.role = 'employee' OR (u.role != 'owner' AND u.role != 'admin' AND u.role != 'customer'))
            AND (u.company_id = $1 OR u.company_id::text = $1::text)
          ORDER BY u.name ASC`,
-        [cid]
+        [cid, workDate]
       ).catch((err) => {
         console.error("❌ AIDataService attendance overview query error:", err.message);
         return { rows: [] };
@@ -93,8 +96,8 @@ class AIDataService {
          FROM leave_requests
          WHERE (company_id = $1 OR company_id::text = $1::text)
            AND status = 'approved'
-           AND CURRENT_DATE BETWEEN start_date AND end_date`,
-        [cid]
+           AND $2::date BETWEEN start_date AND end_date`,
+        [cid, workDate]
       ).catch(() => ({ rows: [{ on_leave_count: 0 }] })),
     ]);
 
@@ -163,6 +166,8 @@ class AIDataService {
   static async getEmployeeDashboardSummary({ userId, companyId }) {
     const uid = String(userId);
     const cid = String(companyId);
+    const policy = await AttendancePolicy.getCompanyPolicy(companyId, pool);
+    const workDate = AttendancePolicy.localDate(new Date(), policy.timezone);
 
     const [jobsRes, attendanceRes, leavesRes, materialsRes] = await Promise.all([
       // Employee's assigned jobs
@@ -178,9 +183,10 @@ class AIDataService {
       pool.query(
         `SELECT date, check_in_time as clock_in, check_out_time as clock_out, check_in_time, check_out_time, status, working_hours, is_late 
          FROM attendance 
-         WHERE (user_id = $1 OR user_id::text = $1) AND DATE_TRUNC('month', date) = DATE_TRUNC('month', CURRENT_DATE)
+         WHERE user_id::text = $1 AND company_id::text = $2
+           AND date >= date_trunc('month', $3::date)::date AND date <= $4::date
          ORDER BY date DESC LIMIT 10`,
-        [uid]
+        [uid, cid, workDate.slice(0, 7) + '-01', workDate]
       ).catch(() => ({ rows: [] })),
 
       // Employee's leave requests
@@ -222,6 +228,8 @@ class AIDataService {
    */
   static async getHrDashboardSummary({ companyId }) {
     const cid = String(companyId);
+    const policy = await AttendancePolicy.getCompanyPolicy(companyId, pool);
+    const workDate = AttendancePolicy.localDate(new Date(), policy.timezone);
 
     const [leavesRes, attendanceRes, employeesRes] = await Promise.all([
       // Pending leaves with employee details
@@ -242,11 +250,11 @@ class AIDataService {
            COALESCE(a.status, 'absent') as status,
            a.is_late
          FROM users u
-         LEFT JOIN attendance a ON u.id = a.user_id AND (a.date = CURRENT_DATE OR a.date::text = CURRENT_DATE::text)
+         LEFT JOIN attendance a ON u.id::text = a.user_id::text AND a.company_id::text = u.company_id::text AND a.date = $2
          WHERE (u.company_id = $1 OR u.company_id::text = $1::text)
            AND (u.role = 'employee' OR (u.role != 'owner' AND u.role != 'admin' AND u.role != 'customer'))
            AND (a.is_late = true OR a.status = 'late' OR a.check_in_time IS NULL)`,
-        [cid]
+        [cid, workDate]
       ).catch(() => ({ rows: [] })),
 
       // Employee headcount by department

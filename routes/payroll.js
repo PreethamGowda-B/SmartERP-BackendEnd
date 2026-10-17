@@ -76,10 +76,11 @@ router.post('/', authenticateToken, loadPlan, requireFeature('payroll'), checkPe
         COUNT(*) FILTER (WHERE status = 'half_day') as half_days,
         COALESCE(SUM(working_hours), 0) as total_hours
        FROM attendance
-       WHERE user_id = $1 
-         AND EXTRACT(MONTH FROM date) = $2
-         AND EXTRACT(YEAR FROM date) = $3`,
-      [employee.id, payroll_month, payroll_year]
+       WHERE user_id::text = $1::text
+         AND company_id::text = $2::text
+         AND EXTRACT(MONTH FROM date) = $3
+         AND EXTRACT(YEAR FROM date) = $4`,
+      [String(employee.id), String(req.user.companyId), payroll_month, payroll_year]
     );
 
     const attendanceSummary = attendanceResult.rows[0] || {

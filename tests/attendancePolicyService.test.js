@@ -47,6 +47,12 @@ test('IST local work date is stable across UTC midnight boundary', () => {
   assert.equal(AttendancePolicy.localDate(afterUtcMidnight), '2026-10-18');
 });
 
+test('IST automatic clock-out is due inclusively at 19:00 and remains due after a delayed tick', () => {
+  assert.equal(AttendancePolicy.automaticClockOutFor('2026-10-17', ist('2026-10-17', '18:59:59')).due, false);
+  assert.equal(AttendancePolicy.automaticClockOutFor('2026-10-17', ist('2026-10-17', '19:00')).due, true);
+  assert.equal(AttendancePolicy.automaticClockOutFor('2026-10-17', ist('2026-10-17', '19:17')).cutoff.getTime(), ist('2026-10-17', '19:00').getTime());
+});
+
 test('policy rejects unapproved timezone, unknown fields and invalid time ordering', () => {
   assert.throws(() => AttendancePolicy.validatePolicy({ timezone: 'UTC' }), /fixed to Asia\/Kolkata/);
   assert.throws(() => AttendancePolicy.validatePolicy({ company_id: 'other-tenant' }), /Unknown attendance policy field/);

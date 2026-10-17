@@ -3,6 +3,7 @@ const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 const { cacheMiddleware } = require('../middleware/cache');
+const AttendancePolicy = require('../services/attendancePolicyService');
 
 // ─── GET /api/dashboard/owner/metrics ────────────────────────────────────────
 router.get('/owner/metrics', authenticateToken, cacheMiddleware(300), async (req, res) => {
@@ -15,7 +16,8 @@ router.get('/owner/metrics', authenticateToken, cacheMiddleware(300), async (req
 
     try {
         const companyId = req.user.companyId;
-        const today = new Date().toISOString().split('T')[0];
+        const policy = companyId ? await AttendancePolicy.getCompanyPolicy(companyId, pool) : AttendancePolicy.DEFAULT_ATTENDANCE_POLICY;
+        const today = AttendancePolicy.localDate(new Date(), policy.timezone);
 
         // 🚀 Parallelize all 4 independent queries for sub-second dashboard load
         const [jobsResult, employeesResult, attResult, projectsResult] = await Promise.all([
@@ -118,7 +120,7 @@ router.get('/owner/recent-activity', authenticateToken, cacheMiddleware(60), asy
                 pool.query(
                     `SELECT a.id, u.name, a.status, a.date, a.created_at
                      FROM attendance a
-                     JOIN users u ON u.id = a.user_id
+                     JOIN users u ON u.id = a.user_id AND u.company_id::text = a.company_id::text
                      WHERE u.company_id = $1
                      ORDER BY a.created_at DESC LIMIT 5`,
                     [companyId]

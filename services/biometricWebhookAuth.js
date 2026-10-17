@@ -1,5 +1,9 @@
 const crypto = require('crypto');
 
+function isWebhookEnabled(value, contractVerified) {
+  return String(value || '').toLowerCase() === 'true' && String(contractVerified || '').toLowerCase() === 'true';
+}
+
 function verifyBiometricSignature({ secret, signature, signedAt, nonce, body, now = Date.now() }) {
   if (!secret) return { valid: false, reason: 'not_configured' };
   const cleanSignature = String(signature || '').replace(/^sha256=/i, '').toLowerCase();
@@ -22,4 +26,4 @@ async function claimNonce(redisClient, nonce) {
   return result === 'OK' ? 'claimed' : 'replayed';
 }
 
-module.exports = { verifyBiometricSignature, claimNonce };
+module.exports = { verifyBiometricSignature, claimNonce, isWebhookEnabled };

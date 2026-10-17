@@ -5,6 +5,22 @@ const { authenticateToken } = require('../middleware/authMiddleware');
 const { createNotification } = require('../utils/notificationHelpers');
 const EventMessagingService = require('../services/eventMessagingService');
 const AttendancePolicy = require('../services/attendancePolicyService');
+const { canAccessHrAnalytics } = require('../services/attendanceAccess');
+
+async function withHrTransaction(work) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const value = await work(client);
+    await client.query('COMMIT');
+    return value;
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
 
 // ── HR Audit Logging Helper ──────────────────────────────────────────────────
 async function logHrAudit({ companyId, performedBy, performedByName, action, targetEmployeeId, targetEmployeeName, oldValue, newValue, reason, req }) {
@@ -36,8 +52,12 @@ async function logHrAudit({ companyId, performedBy, performedByName, action, tar
 
 // ── 1. GET /api/hr/analytics — Master HR Executive Dashboard Metrics ─────────
 router.get('/analytics', authenticateToken, async (req, res) => {
+  if (!canAccessHrAnalytics(req.user.role)) return res.status(403).json({ message: 'Access denied' });
   try {
     const companyId = req.user.companyId;
+    if (!companyId) return res.status(401).json({ message: 'Missing company context' });
+    const policy = await AttendancePolicy.getCompanyPolicy(companyId, pool);
+    const today = AttendancePolicy.localDate(new Date(), policy.timezone);
 
     // 🚀 Parallelize all 6 independent HR metrics queries
     const [
@@ -49,8 +69,8 @@ router.get('/analytics', authenticateToken, async (req, res) => {
       assetRes
     ] = await Promise.all([
       pool.query(`SELECT COUNT(*) as total FROM users WHERE company_id = $1 AND is_active = true`, [companyId]),
-      pool.query(`SELECT COUNT(DISTINCT user_id) as count FROM attendance WHERE company_id = $1 AND date = CURRENT_DATE AND status IN ('present', 'arrived')`, [companyId]),
-      pool.query(`SELECT COUNT(DISTINCT user_id) as count FROM attendance WHERE company_id = $1 AND date = CURRENT_DATE AND is_late = true`, [companyId]),
+      pool.query(`SELECT COUNT(DISTINCT user_id) as count FROM attendance WHERE company_id::text = $1::text AND date = $2 AND status IN ('present', 'arrived', 'late', 'half_day')`, [String(companyId), today]),
+      pool.query(`SELECT COUNT(DISTINCT user_id) as count FROM attendance WHERE company_id::text = $1::text AND date = $2 AND (is_late = true OR status = 'late')`, [String(companyId), today]),
       pool.query(`SELECT COUNT(*) as count FROM hr_employee_requests WHERE company_id = $1 AND status = 'pending'`, [companyId]),
       pool.query(`SELECT COUNT(*) as count FROM hr_recruitment_candidates WHERE company_id = $1 AND stage NOT IN ('joined', 'rejected')`, [companyId]),
       pool.query(`SELECT COUNT(*) as count FROM hr_assets WHERE company_id = $1 AND return_status = 'assigned'`, [companyId]),
@@ -179,43 +199,46 @@ router.patch('/requests/:id/review', authenticateToken, async (req, res) => {
       return res.status(400).json({ message: 'Invalid status' });
     }
 
-    const reqRes = await pool.query(`SELECT * FROM hr_employee_requests WHERE id = $1 AND company_id = $2`, [id, companyId]);
-    if (reqRes.rows.length === 0) return res.status(404).json({ message: 'Request not found' });
-
-    const empReq = reqRes.rows[0];
-    const details = typeof empReq.details === 'string' ? JSON.parse(empReq.details || '{}') : (empReq.details || {});
-    let attendanceCorrection = null;
-    if (status === 'approved' && empReq.request_type === 'attendance_correction') {
-      const workDate = details.date;
-      const checkIn = details.requested_check_in || details.check_in_time;
-      const checkOut = details.requested_check_out || details.check_out_time;
-      if (!workDate || !checkIn || !checkOut) return res.status(400).json({ message: 'Attendance correction approval requires a date, clock-in, and clock-out time. Submit a complete correction through the Attendance workflow.' });
-      const policy = await AttendancePolicy.getCompanyPolicy(companyId, pool);
-      const workingHours = AttendancePolicy.calculateWorkingHours(checkIn, checkOut, policy);
-      const statusValue = AttendancePolicy.classifyStatus(checkIn, checkOut, policy);
-      attendanceCorrection = { workDate, checkIn, checkOut, workingHours, statusValue, late: AttendancePolicy.isLate(checkIn, policy) };
-      const sourceRow = await pool.query('SELECT id, is_processed FROM attendance WHERE user_id::text = $1::text AND company_id::text = $2::text AND date = $3 LIMIT 1', [String(empReq.user_id), String(companyId), workDate]);
-      if (!sourceRow.rows.length) return res.status(404).json({ message: 'Attendance record not found for this employee and date' });
-      if (sourceRow.rows[0].is_processed) return res.status(403).json({ message: 'Attendance has been processed; use the authorized Attendance correction workflow' });
+    let empReq;
+    let reviewedRequest;
+    try {
+      ({ empReq, reviewedRequest } = await withHrTransaction(async (client) => {
+        const reqRes = await client.query(`SELECT * FROM hr_employee_requests WHERE id = $1 AND company_id = $2 FOR UPDATE`, [id, companyId]);
+        if (!reqRes.rows.length) throw Object.assign(new Error('Request not found'), { statusCode: 404 });
+        const currentRequest = reqRes.rows[0];
+        if (currentRequest.status !== 'pending') throw Object.assign(new Error('Request has already been reviewed'), { statusCode: 409 });
+        const details = typeof currentRequest.details === 'string' ? JSON.parse(currentRequest.details || '{}') : (currentRequest.details || {});
+        if (status === 'approved' && currentRequest.request_type === 'attendance_correction') {
+          const workDate = details.date;
+          const checkIn = details.requested_check_in || details.check_in_time;
+          const checkOut = details.requested_check_out || details.check_out_time;
+          if (!workDate || !checkIn || !checkOut) throw Object.assign(new Error('Attendance correction approval requires a date, clock-in, and clock-out time. Submit a complete correction through the Attendance workflow.'), { statusCode: 400 });
+          const policy = await AttendancePolicy.getCompanyPolicy(companyId, client);
+          const workingHours = AttendancePolicy.calculateWorkingHours(checkIn, checkOut, policy);
+          const statusValue = AttendancePolicy.classifyStatus(checkIn, checkOut, policy);
+          const sourceRow = await client.query('SELECT id, is_processed FROM attendance WHERE user_id::text = $1::text AND company_id::text = $2::text AND date = $3 FOR UPDATE', [String(currentRequest.user_id), String(companyId), workDate]);
+          if (!sourceRow.rows.length) throw Object.assign(new Error('Attendance record not found for this employee and date'), { statusCode: 404 });
+          if (sourceRow.rows[0].is_processed) throw Object.assign(new Error('Attendance has been processed; use the authorized Attendance correction workflow'), { statusCode: 403 });
+          const updated = await client.query(
+            `UPDATE attendance SET check_in_time = $1, check_out_time = $2, working_hours = $3, status = $4, is_late = $5, is_manual = TRUE, edited_by = $6, updated_at = NOW()
+             WHERE id = $7 AND company_id::text = $8::text AND is_processed = FALSE`,
+            [checkIn, checkOut, workingHours, statusValue, AttendancePolicy.isLate(checkIn, policy), reviewerId, sourceRow.rows[0].id, String(companyId)]
+          );
+          if (!updated.rowCount) throw Object.assign(new Error('Attendance was processed while the correction was pending'), { statusCode: 403 });
+        }
+        const result = await client.query(
+          `UPDATE hr_employee_requests SET status = $1, hr_comments = $2, reviewed_by = $3, reviewed_at = NOW()
+           WHERE id = $4 AND company_id = $5 AND status = 'pending' RETURNING *`,
+          [status, hr_comments || null, reviewerName, id, companyId]
+        );
+        if (!result.rows.length) throw Object.assign(new Error('Request has already been reviewed'), { statusCode: 409 });
+        return { empReq: currentRequest, reviewedRequest: result.rows[0] };
+      }));
+    } catch (error) {
+      if (error.statusCode) return res.status(error.statusCode).json({ message: error.message });
+      throw error;
     }
-
-    if (attendanceCorrection) {
-      const updated = await pool.query(
-        `UPDATE attendance SET check_in_time = $1, check_out_time = $2, working_hours = $3, status = $4, is_late = $5, is_manual = TRUE, edited_by = $6, updated_at = NOW()
-         WHERE user_id::text = $7::text AND company_id::text = $8::text AND date = $9 AND is_processed = FALSE`,
-        [attendanceCorrection.checkIn, attendanceCorrection.checkOut, attendanceCorrection.workingHours, attendanceCorrection.statusValue, attendanceCorrection.late, reviewerId, String(empReq.user_id), String(companyId), attendanceCorrection.workDate]
-      );
-      if (!updated.rowCount) return res.status(403).json({ message: 'Attendance was processed while the correction was pending' });
-    }
-
-    const result = await pool.query(
-      `UPDATE hr_employee_requests 
-       SET status = $1, hr_comments = $2, reviewed_by = $3, reviewed_at = NOW()
-       WHERE id = $4 AND company_id = $5 AND status = 'pending'
-       RETURNING *`,
-      [status, hr_comments || null, reviewerName, id, companyId]
-    );
-    if (!result.rows.length) return res.status(409).json({ message: 'Request has already been reviewed' });
+    const result = { rows: [reviewedRequest] };
 
     await logHrAudit({
       companyId,

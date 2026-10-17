@@ -1,5 +1,6 @@
 const { pool } = require('../db');
 const { createNotification, createCustomerPortalNotification, createNotificationForOwners, createNotificationForCompany, broadcastToUser } = require('../utils/notificationHelpers');
+const AttendancePolicy = require('./attendancePolicyService');
 
 /**
  * Enterprise Notification Routing Service
@@ -109,7 +110,8 @@ class NotificationRoutingService {
     if (!employeeId || !companyId) return null;
 
     // Use current IST date if dateStr not supplied
-    const targetDate = dateStr || new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' })).toISOString().split('T')[0];
+    const policy = await AttendancePolicy.getCompanyPolicy(companyId, pool);
+    const targetDate = dateStr || AttendancePolicy.localDate(new Date(), policy.timezone);
 
     // Check 1: Verify employee role
     const userRes = await pool.query(
@@ -117,7 +119,7 @@ class NotificationRoutingService {
       [String(employeeId)]
     );
     const user = userRes.rows[0];
-    if (!user || user.role !== 'employee') {
+    if (!user || user.role !== 'employee' || String(user.company_id) !== String(companyId)) {
       console.log(`🔕 Skipped attendance reminder: User ${employeeId} is role=${user?.role}, not employee.`);
       return null;
     }
@@ -125,9 +127,9 @@ class NotificationRoutingService {
     // Check 2: Has employee already clocked in today?
     const attCheck = await pool.query(
       `SELECT id, check_in_time FROM attendance 
-       WHERE user_id::text = $1::text AND date = $2 AND check_in_time IS NOT NULL 
+       WHERE user_id::text = $1::text AND company_id::text = $3::text AND date = $2 AND check_in_time IS NOT NULL
        LIMIT 1`,
-      [String(employeeId), targetDate]
+      [String(employeeId), targetDate, String(companyId)]
     );
     if (attCheck.rows.length > 0) {
       console.log(`🔕 Skipped attendance reminder: Employee ${employeeId} already clocked in on ${targetDate}.`);
@@ -154,7 +156,8 @@ class NotificationRoutingService {
    * NEVER notifies owners.
    */
   static async dispatchDailyAttendanceReminders({ companyId = null, targetDate = null } = {}) {
-    const today = targetDate || new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' })).toISOString().split('T')[0];
+    const policy = companyId ? await AttendancePolicy.getCompanyPolicy(companyId, pool) : AttendancePolicy.DEFAULT_ATTENDANCE_POLICY;
+    const today = targetDate || AttendancePolicy.localDate(new Date(), policy.timezone);
 
     let query = `
       SELECT u.id, u.company_id, u.name 
@@ -163,7 +166,7 @@ class NotificationRoutingService {
         AND u.company_id IS NOT NULL
         AND NOT EXISTS (
           SELECT 1 FROM attendance a
-          WHERE a.user_id = u.id 
+          WHERE a.user_id::text = u.id::text AND a.company_id::text = u.company_id::text
             AND a.date = $1 
             AND a.check_in_time IS NOT NULL
         )

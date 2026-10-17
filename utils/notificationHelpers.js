@@ -1,6 +1,7 @@
 const { pool } = require('../db');
 const { redisClient } = require('./redis');
 const { sendPushNotification } = require('../services/firebaseService');
+const { isInternalNotificationRole, isCustomerNotificationTypeAllowed } = require('./notificationAudience');
 
 // Store active SSE connections: { userId: [response1, response2, ...] }
 const sseConnections = new Map();
@@ -32,6 +33,21 @@ async function createNotification(arg1, arg2, arg3, arg4, arg5) {
         console.warn('⚠️ createNotification called without user_id');
         return null;
     }
+
+    // Staff notification rows and their SSE/push payloads are internal-only.
+    // Reject customer recipients before any persistence or fan-out.
+    const recipientResult = await pool.query(
+        'SELECT id, role, company_id FROM users WHERE id::text = $1::text LIMIT 1',
+        [String(user_id)]
+    );
+    const recipient = recipientResult.rows[0];
+    if (!recipient || !isInternalNotificationRole(recipient.role)) {
+        throw new Error(`Refusing staff notification for non-internal recipient ${user_id}`);
+    }
+    if (company_id != null && String(recipient.company_id ?? '') !== String(company_id)) {
+        throw new Error(`Refusing cross-company notification for recipient ${user_id}`);
+    }
+    company_id = recipient.company_id;
 
     // Lookup company_id if omitted
     if (!company_id) {
@@ -160,6 +176,39 @@ async function createNotification(arg1, arg2, arg3, arg4, arg5) {
 /** Customer portal activity feed entries (separate from staff notification rows). */
 async function createCustomerPortalNotification({ customerId, companyId, type, title, message, jobId, invoiceId = null, url = null }) {
     if (!customerId || !companyId) return null;
+    if (!isCustomerNotificationTypeAllowed(type)) {
+        throw new Error(`Customer notification type is not allowlisted: ${type}`);
+    }
+    let job = null;
+    if (jobId) {
+        const jobResult = await pool.query(
+            `SELECT id, customer_id, company_id FROM jobs
+             WHERE id::text = $1::text AND customer_id::text = $2::text AND company_id::text = $3::text LIMIT 1`,
+            [String(jobId), String(customerId), String(companyId)]
+        );
+        job = jobResult.rows[0];
+        if (!job) throw new Error('Customer notification job does not belong to this customer and company');
+    }
+    if (invoiceId) {
+        const invoiceResult = await pool.query(
+            `SELECT i.id, i.job_id, i.customer_id, i.company_id
+             FROM invoices i
+             WHERE i.id::text = $1::text AND i.customer_id::text = $2::text AND i.company_id::text = $3::text
+               AND (i.job_id IS NULL OR EXISTS (
+                 SELECT 1 FROM jobs j WHERE j.id = i.job_id AND j.customer_id::text = $2::text
+                   AND j.company_id::text = $3::text
+               ))
+             LIMIT 1`,
+            [String(invoiceId), String(customerId), String(companyId)]
+        );
+        if (!invoiceResult.rows[0]) throw new Error('Customer notification invoice does not belong to this customer and company');
+        if (job && String(invoiceResult.rows[0].job_id || '') !== String(job.id)) {
+            throw new Error('Customer notification invoice is not associated with the specified job');
+        }
+    }
+    if (!job && !invoiceId) {
+        throw new Error('Customer notifications must reference an authorized job or invoice');
+    }
     const details = { customer_id: customerId, type, title, message, job_id: jobId || null, invoice_id: invoiceId, url };
     const result = await pool.query(
         `INSERT INTO activities (user_id, action, activity_type, details, company_id, created_at)
@@ -242,20 +291,12 @@ function unregisterSSEConnection(userId, response) {
  */
 async function createNotificationForCompany({ company_id, type, title, message, priority = 'medium', data = null, exclude_user_id = null }) {
     try {
-        // 1. Fetch all target employee IDs
-        let query = "SELECT id FROM users WHERE role = 'employee'";
-        let params = [];
-
-        if (company_id) {
-            const cid = String(company_id);
-            const isDefault = cid === '1' || cid === '0' || cid === '00000000-0000-0000-0000-000000000000';
-            if (!isDefault) {
-                query += " AND company_id::text = $1";
-                params.push(cid);
-            } else {
-                query += " AND (company_id::text = '1' OR company_id::text = '0' OR company_id IS NULL)";
-            }
+        if (company_id == null || String(company_id).trim() === '') {
+            return { success: true, count: 0 };
         }
+        // 1. Fetch all target employee IDs
+        let query = "SELECT id FROM users WHERE role = 'employee' AND company_id::text = $1::text";
+        let params = [String(company_id)];
         if (exclude_user_id) {
             query += ` AND id::text != $${params.length + 1}::text`;
             params.push(String(exclude_user_id));
@@ -306,20 +347,12 @@ async function createNotificationForCompany({ company_id, type, title, message, 
  */
 async function createNotificationForOwners({ company_id, type, title, message, priority = 'medium', data = null, exclude_user_id = null }) {
     try {
-        // 1. Fetch all target owner/admin IDs
-        let query = "SELECT id FROM users WHERE role IN ('owner', 'admin')";
-        let params = [];
-
-        if (company_id) {
-            const cid = String(company_id);
-            const isDefault = cid === '1' || cid === '0' || cid === '00000000-0000-0000-0000-000000000000';
-            if (!isDefault) {
-                query += " AND company_id::text = $1";
-                params.push(cid);
-            } else {
-                query += " AND (company_id::text = '1' OR company_id::text = '0' OR company_id IS NULL)";
-            }
+        if (company_id == null || String(company_id).trim() === '') {
+            return { success: true, count: 0 };
         }
+        // 1. Fetch all target owner/admin IDs
+        let query = "SELECT id FROM users WHERE role IN ('owner', 'admin') AND company_id::text = $1::text";
+        let params = [String(company_id)];
         if (exclude_user_id) {
             query += ` AND id::text != $${params.length + 1}::text`;
             params.push(String(exclude_user_id));

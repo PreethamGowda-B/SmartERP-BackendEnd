@@ -1,79 +1,57 @@
-const { pool } = require("../db");
+'use strict';
 
+const { randomUUID } = require('crypto');
+const invoiceService = require('./invoiceService');
+
+/**
+ * Backward-compatible GST invoice facade. All persistence, tax math, numbering,
+ * line items, and AR/PDF references are handled by the canonical invoice service.
+ */
 class GSTInvoiceService {
-  /**
-   * Computes GST tax splits and formats e-invoice payload.
-   * @param {Object} params
-   * @param {string} params.companyId - Tenant Scope
-   * @param {string} params.customerName - Client name
-   * @param {string} [params.customerGstin] - Customer GSTIN / Tax ID
-   * @param {Array} params.items - Line items [{ description, hsnCode, quantity, unitPrice }]
-   * @param {boolean} [params.isInterState] - True for IGST (interstate), False for CGST+SGST (intrastate)
-   */
-  static async generateGSTInvoice({ companyId, customerName, customerGstin = "N/A", items = [], isInterState = false }) {
-    if (!companyId || !customerName || !items || items.length === 0) {
-      throw new Error("Company ID, customer name, and at least one line item are required.");
+  static async generateGSTInvoice({ companyId, customerName, customerGstin = '', items = [], isInterState = false, userId = null, idempotencyKey = randomUUID() }) {
+    if (!companyId || !customerName || !Array.isArray(items) || !items.length) {
+      throw new Error('Company ID, customer name, and at least one line item are required.');
     }
-
-    let subtotal = 0;
-    const computedItems = items.map((item) => {
-      const qty = parseFloat(item.quantity || 1);
-      const price = parseFloat(item.unitPrice || 0);
-      const total = qty * price;
-      subtotal += total;
-
-      return {
-        description: item.description || "Service / Item",
-        hsnCode: item.hsnCode || "998311", // Default IT/Consulting HSN
-        quantity: qty,
-        unitPrice: price,
-        total: total,
-      };
+    const result = await invoiceService.createDirectInvoice({
+      companyId,
+      userId,
+      invoiceData: {
+        customer_name: customerName,
+        customer_gstin: customerGstin,
+        lineItems: items.map((item) => ({
+          item_type: item.item_type || 'service',
+          description: item.description || 'Service / Item',
+          hsn_code: item.hsnCode || item.hsn_code || '998311',
+          quantity: item.quantity ?? 1,
+          unit_price: item.unitPrice ?? item.unit_price ?? 0,
+        })),
+        gst_rate: 18,
+        is_inter_state: isInterState,
+        due_days: 15,
+        payment_status: 'unpaid',
+        invoice_type: 'gst',
+        idempotency_key: idempotencyKey,
+      },
     });
-
-    const taxRate = 0.18; // Standard 18% GST rate
-    const totalTax = subtotal * taxRate;
-
-    let cgst = 0;
-    let sgst = 0;
-    let igst = 0;
-
-    if (isInterState) {
-      igst = totalTax;
-    } else {
-      cgst = totalTax / 2;
-      sgst = totalTax / 2;
-    }
-
-    const grandTotal = subtotal + totalTax;
-    const invoiceNumber = `GST-INV-${Date.now().toString().slice(-6)}`;
-
-    // Store invoice in database
-    const res = await pool.query(
-      `INSERT INTO invoices (customer_name, amount, due_date, status, company_id, created_at)
-       VALUES ($1, $2, NOW() + INTERVAL '15 days', 'pending', $3, NOW())
-       RETURNING id, customer_name, amount, due_date, status, created_at`,
-      [customerName, grandTotal, companyId]
-    );
-
+    const invoice = result.invoice;
     return {
       success: true,
       invoice: {
-        id: res.rows[0].id,
-        invoiceNumber,
-        customerName,
-        customerGstin,
-        createdDate: new Date().toISOString().split("T")[0],
-        dueDate: res.rows[0].due_date,
-        isInterState,
-        subtotal: subtotal.toFixed(2),
-        cgst: cgst.toFixed(2),
-        sgst: sgst.toFixed(2),
-        igst: igst.toFixed(2),
-        totalTax: totalTax.toFixed(2),
-        grandTotal: grandTotal.toFixed(2),
-        currency: "INR (₹)",
-        lineItems: computedItems,
+        id: invoice.id,
+        invoiceNumber: invoice.invoice_number,
+        customerName: invoice.customer_name,
+        customerGstin: invoice.customer_gstin,
+        createdDate: new Date(invoice.created_at).toISOString().slice(0, 10),
+        dueDate: invoice.due_date,
+        isInterState: Boolean(invoice.is_inter_state),
+        subtotal: Number(invoice.subtotal).toFixed(2),
+        cgst: Number(invoice.cgst).toFixed(2),
+        sgst: Number(invoice.sgst).toFixed(2),
+        igst: Number(invoice.igst).toFixed(2),
+        totalTax: Number(invoice.total_tax).toFixed(2),
+        grandTotal: Number(invoice.total_amount).toFixed(2),
+        currency: 'INR (₹)',
+        lineItems: result.lineItems,
       },
     };
   }

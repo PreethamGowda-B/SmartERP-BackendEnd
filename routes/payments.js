@@ -8,6 +8,7 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
+const PayrollValidationService = require('../services/payrollValidationService');
 
 function requireOwnerOrAdmin(req, res, next) {
   if (!['owner', 'admin'].includes(req.user?.role)) {
@@ -28,7 +29,7 @@ router.post('/pay', authenticateToken, requireOwnerOrAdmin, async (req, res) => 
   try {
     // Verify the payroll entry belongs to this company before touching it
     const entryCheck = await pool.query(
-      `SELECT pe.id FROM payroll_entries pe
+      `SELECT pe.id, p.payroll_month, p.payroll_year FROM payroll_entries pe
        JOIN payroll p ON p.id = pe.payroll_id
        WHERE pe.id = $1 AND p.company_id::text = $2`,
       [payrollEntryId, String(companyId)]
@@ -36,6 +37,26 @@ router.post('/pay', authenticateToken, requireOwnerOrAdmin, async (req, res) => 
 
     if (entryCheck.rows.length === 0) {
       return res.status(404).json({ success: false, error: 'Payroll entry not found or access denied' });
+    }
+
+    const entry = entryCheck.rows[0];
+    const auditResult = await pool.query(
+      `SELECT id::text FROM payroll_validation_runs
+        WHERE company_id::text = $1::text AND month = $2 AND year = $3
+        ORDER BY created_at DESC, id DESC LIMIT 1`,
+      [String(companyId), entry.payroll_month, entry.payroll_year]
+    );
+    if (!auditResult.rows.length) {
+      return res.status(409).json({ success: false, error: 'Payout blocked: run and approve the current payroll audit first.' });
+    }
+    const audit = await PayrollValidationService.getRunDetails({ companyId, runId: auditResult.rows[0].id });
+    const criticalUnresolved = audit?.flags?.some((flag) => flag.severity === 'critical' && !flag.is_resolved);
+    const checks = audit?.run?.check_results;
+    const checksComplete = Array.isArray(checks) && checks.length === 7
+      && checks.every((check) => !['unable_to_validate', 'not_applicable'].includes(check.status));
+    if (!audit?.run?.is_approved || !['passed', 'needs_review', 'failed'].includes(audit.run.audit_status) || Number(audit.run.checks_executed) !== 7
+      || !checksComplete || audit.run.is_stale || criticalUnresolved) {
+      return res.status(409).json({ success: false, error: 'Payout blocked: a current, complete audit with no unresolved critical findings is required.' });
     }
 
     const result = await pool.query(

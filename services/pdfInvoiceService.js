@@ -264,8 +264,57 @@ class PDFInvoiceService {
    * Generates PDF buffer for streaming/download.
    */
   static async generateInvoicePDF(invoice, lineItems = [], company = {}) {
-    const html = this.generateInvoiceHTML(invoice, lineItems, company);
-    return Buffer.from(html, 'utf-8');
+    const safe = (value) => String(value ?? '').replace(/₹/g, 'INR ').replace(/[^\x20-\x7E]/g, ' ').replace(/[\\()]/g, '\\$&');
+    const lines = [
+      company.legal_name || company.name || 'BUSINESS ENTERPRISE',
+      'TAX INVOICE',
+      `Invoice: ${invoice.invoice_number || ''}    Date: ${new Date(invoice.created_at || Date.now()).toLocaleDateString('en-IN')}`,
+      `Customer: ${invoice.customer_name || 'Customer'}`,
+      `Email: ${invoice.customer_email || ''}    Phone: ${invoice.customer_phone || ''}`,
+      `Address: ${invoice.customer_address || ''}`,
+      '',
+      'Description                         Qty       Rate       Amount',
+      '----------------------------------------------------------------',
+      ...lineItems.map((item) => `${String(item.description || 'Invoice item').slice(0, 34).padEnd(34)} ${Number(item.quantity || 0).toFixed(2).padStart(7)} ${Number(item.unit_price || 0).toFixed(2).padStart(10)} ${Number(item.total_amount || 0).toFixed(2).padStart(12)}`),
+      '----------------------------------------------------------------',
+      `Subtotal: INR ${Number(invoice.subtotal ?? invoice.total_amount ?? 0).toFixed(2)}`,
+      `Tax: INR ${Number(invoice.total_tax || 0).toFixed(2)} (CGST ${Number(invoice.cgst || 0).toFixed(2)}, SGST ${Number(invoice.sgst || 0).toFixed(2)}, IGST ${Number(invoice.igst || 0).toFixed(2)})`,
+      `Total: INR ${Number(invoice.total_amount || 0).toFixed(2)}`,
+      `Amount paid: INR ${Number(invoice.amount_paid || 0).toFixed(2)}    Due: INR ${Number(invoice.amount_due ?? invoice.total_amount ?? 0).toFixed(2)}`,
+      '',
+      invoice.customer_notes || 'Thank you for your business.',
+    ];
+    const pageChunks = [];
+    for (let i = 0; i < lines.length; i += 40) pageChunks.push(lines.slice(i, i + 40));
+    const objects = [];
+    const pageIds = pageChunks.map((_, index) => 4 + index * 2);
+    objects[1] = '<< /Type /Catalog /Pages 2 0 R >>';
+    objects[2] = `<< /Type /Pages /Kids [${pageIds.map((id) => `${id} 0 R`).join(' ')}] /Count ${pageIds.length} >>`;
+    objects[3] = '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>';
+    pageChunks.forEach((chunk, index) => {
+      const pageId = pageIds[index];
+      const contentId = pageId + 1;
+      const textOps = chunk.map((line, lineIndex) => `BT /F1 10 Tf 48 ${790 - lineIndex * 18} Td (${safe(line)}) Tj ET`).join('\n');
+      const content = Buffer.from(textOps, 'ascii');
+      objects[pageId] = `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 842] /Resources << /Font << /F1 3 0 R >> >> /Contents ${contentId} 0 R >>`;
+      objects[contentId] = { stream: content };
+    });
+    let pdf = '%PDF-1.4\n';
+    const offsets = [0];
+    for (let id = 1; id < objects.length; id += 1) {
+      offsets[id] = Buffer.byteLength(pdf, 'ascii');
+      const object = objects[id];
+      if (object && typeof object === 'object' && object.stream) {
+        pdf += `${id} 0 obj\n<< /Length ${object.stream.length} >>\nstream\n${object.stream.toString('ascii')}\nendstream\nendobj\n`;
+      } else {
+        pdf += `${id} 0 obj\n${object}\nendobj\n`;
+      }
+    }
+    const xrefOffset = Buffer.byteLength(pdf, 'ascii');
+    pdf += `xref\n0 ${objects.length}\n0000000000 65535 f \n`;
+    for (let id = 1; id < objects.length; id += 1) pdf += `${String(offsets[id]).padStart(10, '0')} 00000 n \n`;
+    pdf += `trailer\n<< /Size ${objects.length} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`;
+    return Buffer.from(pdf, 'ascii');
   }
 }
 

@@ -70,30 +70,30 @@ test.describe('Enterprise Notification Routing & Portal Delivery Test Suite', ()
   // -----------------------------------------------------------------
   // 3. Mark All Read Query Multi-Tenant & Null Safety
   // -----------------------------------------------------------------
-  test('NOTIF-1: mark-all-read query covers null company_id and matching company_id', () => {
+  test('NOTIF-1: mark-all-read cannot cross company boundaries or include unrelated null-company rows', () => {
     const simulateFilter = (notif, userId, companyId) => {
       const userMatches = String(notif.user_id) === String(userId);
-      const companyMatches = (companyId === '' || String(notif.company_id) === String(companyId) || notif.company_id === null);
+      const companyMatches = companyId == null
+        ? notif.company_id === null
+        : String(notif.company_id) === String(companyId);
       const unread = notif.read === false;
       return userMatches && companyMatches && unread;
     };
 
     const notifs = [
       { id: 1, user_id: 'u1', company_id: 'c1', read: false },
-      { id: 2, user_id: 'u1', company_id: null, read: false }, // System notification
+      { id: 2, user_id: 'u1', company_id: null, read: false }, // Unscoped legacy row
       { id: 3, user_id: 'u1', company_id: 'c2', read: false }, // Other company
       { id: 4, user_id: 'u2', company_id: 'c1', read: false }, // Other user
       { id: 5, user_id: 'u1', company_id: 'c1', read: true }   // Already read
     ];
 
     const markedForU1C1 = notifs.filter(n => simulateFilter(n, 'u1', 'c1'));
-    assert.equal(markedForU1C1.length, 2, 'Should mark matching company_id AND null company_id for user u1');
-    assert.equal(markedForU1C1.map(n => n.id).sort().join(','), '1,2');
+    assert.equal(markedForU1C1.length, 1, 'Should only mark the matching company row for user u1');
+    assert.equal(markedForU1C1.map(n => n.id).sort().join(','), '1');
 
-    // For user with empty companyId (e.g. superadmin):
-    const markedForU1Any = notifs.filter(n => simulateFilter(n, 'u1', ''));
-    assert.equal(markedForU1Any.length, 3, 'When companyId is empty, marks all unread notifications for user u1');
-    assert.equal(markedForU1Any.map(n => n.id).sort().join(','), '1,2,3');
+    const markedForUnscopedU1 = notifs.filter(n => simulateFilter(n, 'u1', null));
+    assert.deepEqual(markedForUnscopedU1.map(n => n.id), [2], 'An unscoped principal sees only its own null-company rows');
   });
 
   // -----------------------------------------------------------------

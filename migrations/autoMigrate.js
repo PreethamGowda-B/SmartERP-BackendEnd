@@ -1,4 +1,5 @@
 const { pool } = require('../db');
+const { storage } = require('../middleware/als');
 const fs = require('fs');
 const path = require('path');
 
@@ -224,40 +225,44 @@ const NUMBERED_MIGRATIONS = [
     '026_password_reset_recovery_system.sql',
     '027_refresh_tokens_updated_at.sql',
     '028_material_purchase_verification.sql',
+    '029_customer_notification_read_state.sql',
+    '030_invoice_idempotency.sql',
+    '031_material_request_job_scope.sql',
 ];
 
 async function runNumberedMigrations() {
-    let setupClient;
-    try {
-        setupClient = await pool.connect();
-        await setupClient.query('SET ROLE postgres').catch(() => {});
-        await setupClient.query('GRANT ALL ON SCHEMA public TO PUBLIC').catch(() => {});
-        await setupClient.query('GRANT ALL ON SCHEMA public TO postgres').catch(() => {});
-    } catch (_) {} finally {
-        if (setupClient) setupClient.release();
-    }
-
-    for (const filename of NUMBERED_MIGRATIONS) {
-        const filePath = path.join(__dirname, filename);
-        let client;
+    return storage.run({ bypassRls: true }, async () => {
+        let setupClient;
         try {
-            const sql = fs.readFileSync(filePath, 'utf8');
-            client = await pool.connect();
-            await client.query('SET ROLE postgres').catch(() => {});
-            await client.query('BEGIN');
-            await client.query(sql);
-            await client.query('COMMIT');
-            console.log(`✅ Migration applied: ${filename}`);
-        } catch (err) {
-            if (client) {
-                try { await client.query('ROLLBACK'); } catch (_) {}
-            }
-            // Log but don't crash the server — each migration is independently guarded
-            console.error(`⚠️  Migration failed (${filename}):`, err.message);
-        } finally {
-            if (client) client.release();
+            setupClient = await pool.connect();
+            await setupClient.query('RESET ROLE').catch(() => {});
+            await setupClient.query('GRANT ALL ON SCHEMA public TO PUBLIC').catch(() => {});
+        } catch (_) {} finally {
+            if (setupClient) setupClient.release();
         }
-    }
+
+        for (const filename of NUMBERED_MIGRATIONS) {
+            const filePath = path.join(__dirname, filename);
+            let client;
+            try {
+                const sql = fs.readFileSync(filePath, 'utf8');
+                client = await pool.connect();
+                await client.query('RESET ROLE').catch(() => {});
+                await client.query('BEGIN');
+                await client.query(sql);
+                await client.query('COMMIT');
+                console.log(`✅ Migration applied: ${filename}`);
+            } catch (err) {
+                if (client) {
+                    try { await client.query('ROLLBACK'); } catch (_) {}
+                }
+                // Log but don't crash the server — each migration is independently guarded
+                console.error(`⚠️  Migration failed (${filename}):`, err.message);
+            } finally {
+                if (client) client.release();
+            }
+        }
+    });
 }
 
 module.exports = { fixMaterialRequestsSchema, setupDocumentsTable, runNumberedMigrations };

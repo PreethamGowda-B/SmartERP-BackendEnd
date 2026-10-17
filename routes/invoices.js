@@ -390,6 +390,12 @@ router.post('/direct-create', authenticate, async (req, res) => {
   try {
     const companyId = req.user.companyId || req.user.company_id;
     const userId = req.user.id || req.user.userId;
+    if (!['owner', 'admin', 'super_admin'].includes(String(req.user.role || '').toLowerCase())) {
+      return res.status(403).json({ error: 'Only an owner or administrator can issue invoices.' });
+    }
+    if (!req.body?.idempotency_key) {
+      return res.status(400).json({ error: 'An idempotency_key is required to issue a direct invoice.' });
+    }
 
     const result = await invoiceService.createDirectInvoice({
       companyId,
@@ -400,7 +406,7 @@ router.post('/direct-create', authenticate, async (req, res) => {
     return res.status(201).json(result);
   } catch (err) {
     console.error('POST /api/invoices/direct-create error:', err.message);
-    return res.status(500).json({ error: err.message });
+    return res.status(err.statusCode || 500).json({ error: err.message });
   }
 });
 
@@ -444,10 +450,16 @@ router.post('/finalize', authenticate, async (req, res) => {
   try {
     const companyId = req.user.companyId || req.user.company_id;
     const userId = req.user.id || req.user.userId;
+    if (!['owner', 'admin', 'super_admin'].includes(String(req.user.role || '').toLowerCase())) {
+      return res.status(403).json({ error: 'Only an owner or administrator can issue invoices.' });
+    }
     const { jobId, ...invoiceData } = req.body;
 
     if (!jobId) {
       return res.status(400).json({ error: 'Job ID is required' });
+    }
+    if (!invoiceData.idempotency_key) {
+      return res.status(400).json({ error: 'An idempotency_key is required to finalize an invoice.' });
     }
 
     const result = await invoiceService.finalizeInvoice({
@@ -458,7 +470,7 @@ router.post('/finalize', authenticate, async (req, res) => {
     });
 
     const finalizedInvoice = result?.invoice;
-    if (finalizedInvoice?.customer_id) {
+    if (result?.reason !== 'idempotent_replay' && finalizedInvoice?.customer_id) {
       const title = 'Invoice ready';
       const message = `Invoice ${finalizedInvoice.invoice_number || ''} for your completed service is ready to view.`;
       await createCustomerPortalNotification({
@@ -481,7 +493,7 @@ router.post('/finalize', authenticate, async (req, res) => {
     return res.json(result);
   } catch (err) {
     console.error('POST /api/invoices/finalize error:', err.message);
-    return res.status(500).json({ error: err.message });
+    return res.status(err.statusCode || 500).json({ error: err.message });
   }
 });
 
@@ -493,6 +505,9 @@ router.post('/:id/reissue', authenticate, async (req, res) => {
   try {
     const companyId = req.user.companyId || req.user.company_id;
     const userId = req.user.id || req.user.userId;
+    if (!['owner', 'admin', 'super_admin'].includes(String(req.user.role || '').toLowerCase())) {
+      return res.status(403).json({ error: 'Only an owner or administrator can reissue an invoice.' });
+    }
     const parentInvoiceId = req.params.id;
     const { disputeId, updateData } = req.body;
 
@@ -504,10 +519,27 @@ router.post('/:id/reissue', authenticate, async (req, res) => {
       updateData,
     });
 
+    if (result?.reason !== 'idempotent_replay' && result?.invoice?.customer_id) {
+      const jobId = result.invoice.job_id;
+      await createCustomerPortalNotification({
+        customerId: result.invoice.customer_id,
+        companyId,
+        type: 'invoice_issued',
+        title: 'Revised invoice ready',
+        message: `Revised invoice ${result.invoice.invoice_number} is ready to view.`,
+        jobId,
+        invoiceId: result.invoice.id,
+        url: jobId ? `/customer/job/${jobId}` : `/customer/invoices/${result.invoice.id}`,
+      }).catch(err => console.warn('Customer revised invoice notification failed:', err.message));
+      if (jobId && redisClient && redisClient.status === 'ready') {
+        redisClient.publish(`customer_job_events:${jobId}`, JSON.stringify({ type: 'invoice_issued', jobId, invoiceId: result.invoice.id })).catch(() => {});
+      }
+    }
+
     return res.json(result);
   } catch (err) {
     console.error('POST /api/invoices/:id/reissue error:', err.message);
-    return res.status(500).json({ error: err.message });
+    return res.status(err.statusCode || 500).json({ error: err.message });
   }
 });
 
@@ -720,9 +752,10 @@ router.get('/:id/pdf', setInvoiceTenantContext, async (req, res) => {
       default_notes: s.default_notes || 'Thank you for choosing our services!'
     };
 
-    const html = pdfInvoiceService.generateInvoiceHTML(invoice, itemsRes.rows, companyProfile);
-    res.setHeader('Content-Type', 'text/html');
-    return res.send(html);
+    const pdf = await pdfInvoiceService.generateInvoicePDF(invoice, itemsRes.rows, companyProfile);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="Invoice-${String(invoice.invoice_number || invoice.id).replace(/[^a-zA-Z0-9_-]/g, '_')}.pdf"`);
+    return res.send(pdf);
   } catch (err) {
     console.error('GET /api/invoices/:id/pdf error:', err.message);
     return res.status(500).send('Error generating PDF');

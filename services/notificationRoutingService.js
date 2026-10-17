@@ -1,5 +1,5 @@
 const { pool } = require('../db');
-const { createNotification, createNotificationForOwners, createNotificationForCompany, broadcastToUser } = require('../utils/notificationHelpers');
+const { createNotification, createCustomerPortalNotification, createNotificationForOwners, createNotificationForCompany, broadcastToUser } = require('../utils/notificationHelpers');
 
 /**
  * Enterprise Notification Routing Service
@@ -255,28 +255,16 @@ class NotificationRoutingService {
   static async routeCustomerNotification({ customerUserId, companyId, type, title, message, data = {}, idempotencyKey = null }) {
     if (!customerUserId || !companyId) return null;
 
-    // Verify user is a customer and belongs to the company context
-    const customerRes = await pool.query(
-      `SELECT id, role FROM users WHERE id::text = $1::text`,
-      [String(customerUserId)]
-    );
-    const customerUser = customerRes.rows[0];
-    if (!customerUser || customerUser.role !== 'customer') {
-      console.warn(`⚠️ Target user ${customerUserId} is not a customer (role=${customerUser?.role})`);
-      return null;
-    }
-
     const url = this.resolvePortalUrl('customer', type, data);
-
-    return await createNotification({
-      user_id: customerUserId,
-      company_id: companyId,
+    return await createCustomerPortalNotification({
+      customerId: customerUserId,
+      companyId,
       type,
       title,
       message,
-      priority: 'high',
-      data: { ...data, url },
-      idempotency_key: idempotencyKey
+      jobId: data.job_id || data.jobId,
+      invoiceId: data.invoice_id || data.invoiceId || null,
+      url,
     });
   }
 

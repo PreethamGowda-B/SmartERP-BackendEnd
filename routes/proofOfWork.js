@@ -357,23 +357,6 @@ router.post("/:id/customer-signoff", authenticateProofCaller, async (req, res) =
       [jobId]
     ).catch(() => {});
 
-    // Check if invoice exists; if not, create draft invoice automatically with verified job.company_id
-    try {
-      const invCheck = await pool.query(`SELECT id FROM invoices WHERE job_id::text = $1::text`, [jobId]);
-      if (invCheck.rows.length === 0) {
-        const invNum = `INV-${Date.now()}-${String(jobId).substring(0, 8).toUpperCase()}`;
-        const totalAmt = Number(job.budget || job.estimated_cost || 0);
-
-        await pool.query(
-          `INSERT INTO invoices (company_id, customer_id, job_id, invoice_number, total_amount, status)
-           VALUES ($1, $2, $3, $4, $5, 'issued')`,
-          [job.company_id, job.customer_id || null, jobId, invNum, totalAmt]
-        );
-      }
-    } catch (invErr) {
-      console.warn("⚠️ Could not auto-generate invoice upon customer signoff:", invErr.message);
-    }
-
     return res.status(200).json({
       success: true,
       message: "Customer digital sign-off completed & job verified.",

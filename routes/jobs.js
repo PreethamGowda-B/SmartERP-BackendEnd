@@ -538,17 +538,6 @@ const handleJobAccept = async (req, res) => {
           jobId: acceptedJob.id,
           url: `/customer/job/${acceptedJob.id}`,
         });
-        await createNotification({
-          user_id: acceptedJob.customer_id,
-          company_id: req.user.companyId || acceptedJob.company_id,
-          type: 'customer_job_accepted',
-          title: 'Technician assigned',
-          message: `${employeeName} accepted your service request. You can now view live updates and chat.`,
-          priority: 'high',
-          actor_id: req.user.id,
-          idempotency_key: `customer_job_accepted_${acceptedJob.id}`,
-          data: { job_id: acceptedJob.id, employee_id: req.user.id, url: `/customer/job/${acceptedJob.id}` },
-        });
       }
       await createNotificationForOwners({
         company_id: req.user.companyId || acceptedJob.company_id,
@@ -750,9 +739,8 @@ const handleJobAccept = async (req, res) => {
           [req.user.id]
         ).catch(e => console.error('active_job_count decrement error:', e.message));
 
-        const { generateInvoice } = require('../services/billingService');
-        generateInvoice(updatedJob.id, updatedJob.company_id || req.user.companyId)
-          .catch(e => console.error('Invoice generation error:', e.message));
+        // Invoice issuance is an Owner action after job review; do not create
+        // an unreviewed draft as a progress side effect.
       }
 
       try {
@@ -794,17 +782,6 @@ const handleJobAccept = async (req, res) => {
               message: 'Your service request is complete. You can leave a review and view your invoice here.',
               jobId: updatedJob.id,
               url: `/customer/job/${updatedJob.id}`,
-            });
-            await createNotification({
-              user_id: updatedJob.customer_id,
-              company_id: req.user.companyId,
-              type: 'customer_job_completed',
-              title: 'Service completed',
-              message: 'Your service request is complete. You can leave a review and view your invoice here.',
-              priority: 'medium',
-              actor_id: req.user.id,
-              idempotency_key: `customer_job_completed_${updatedJob.id}`,
-              data: { job_id: updatedJob.id, url: `/customer/job/${updatedJob.id}` },
             });
           }
 
@@ -940,6 +917,10 @@ const handleJobAccept = async (req, res) => {
     try {
       const { id } = req.params;
       const userCompanyId = req.user.companyId || req.user.company_id;
+      const role = String(req.user.role || '').toLowerCase();
+      if (!['owner', 'admin', 'super_admin'].includes(role)) {
+        return res.status(403).json({ message: 'Only an owner or administrator can prepare a job invoice.' });
+      }
 
       // Fetch job record with strict tenant isolation
       const jobRes = await pool.query('SELECT * FROM jobs WHERE id::text = $1::text AND company_id::text = $2::text', [id, String(userCompanyId)]);
@@ -953,71 +934,17 @@ const handleJobAccept = async (req, res) => {
         return res.status(400).json({ message: 'Invalid status: Invoices can only be generated for completed jobs' });
       }
 
-      const invoiceNumber = `INV-${Date.now().toString().slice(-6)}`;
-      const amount = parseFloat(job.amount || job.total_amount || 1500);
-
-      // Cloudinary upload for invoice PDF
-      let pdfUrl = null;
-      const { cloudinary, hasCloudinaryConfig } = require('../config/cloudinary');
-      const cloudName = process.env.CLOUDINARY_CLOUD_NAME || 'dvqnrmbdo';
-      if (hasCloudinaryConfig) {
-        try {
-          const invoiceContent = `Invoice #${invoiceNumber} for Job ${job.title} - Total: ₹${amount}`;
-          const uploadResult = await cloudinary.uploader.upload(`data:text/plain;base64,${Buffer.from(invoiceContent).toString('base64')}`, {
-            folder: `smarterp/invoices/${userCompanyId}`,
-            public_id: `invoice_${invoiceNumber}`,
-            resource_type: 'raw'
-          });
-          pdfUrl = uploadResult.secure_url;
-        } catch (cloudErr) {
-          console.warn('⚠️ Cloudinary invoice upload warning:', cloudErr.message);
-          pdfUrl = `https://res.cloudinary.com/${cloudName}/raw/upload/v${Date.now()}/smarterp/invoices/${userCompanyId}/invoice_${invoiceNumber}.pdf`;
-        }
-      } else {
-        pdfUrl = `https://res.cloudinary.com/${cloudName}/raw/upload/v${Date.now()}/smarterp/invoices/${userCompanyId}/invoice_${invoiceNumber}.pdf`;
-      }
-
-      await pool.query('ALTER TABLE invoices ADD COLUMN IF NOT EXISTS pdf_url TEXT;').catch(() => { });
-
-      const invRes = await pool.query(
-        `INSERT INTO invoices 
-       (job_id, company_id, customer_id, invoice_number, total_amount, status, pdf_url, generated_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, 'generated', $6, NOW(), NOW())
-       RETURNING *`,
-        [job.id, String(userCompanyId), job.customer_id || null, invoiceNumber, amount, pdfUrl]
-      );
-
-      // Post invoice ERP card to job conversation thread (Enterprise Communication Backbone)
-      EventMessagingService.onInvoiceIssued({
-        jobId: job.id,
-        companyId: userCompanyId,
-        invoiceNumber,
-        totalAmount: amount,
-        senderId: req.user.id,
-      }).catch(() => { }); // non-blocking
-
-      // Notify Customer in real-time if job has a customer_id
-      if (job.customer_id) {
-        createNotification({
-          user_id: job.customer_id,
-          company_id: userCompanyId,
-          type: 'invoice_generated',
-          title: 'New Invoice Issued',
-          message: `Invoice #${invoiceNumber} for ₹${Number(amount).toLocaleString('en-IN')} has been generated.`,
-          priority: 'high',
-          actor_id: req.user.id,
-          data: { invoice_id: invRes.rows[0].id, job_id: job.id, url: '/customer/invoices' }
-        }).catch(() => { });
-      }
-
-      res.status(201).json({
+      const invoice = await require('../services/invoiceService').createJobDraft({
+        companyId: userCompanyId, jobId: job.id, userId: req.user.id,
+      });
+      res.status(200).json({
         success: true,
-        message: 'Invoice generated successfully',
-        invoice: invRes.rows[0]
+        message: 'Invoice draft is ready for Owner review. Edit and issue it in the invoice editor.',
+        invoice,
       });
     } catch (err) {
       console.error('❌ Error generating job invoice:', err);
-      res.status(500).json({ message: 'Server error generating invoice' });
+      res.status(err.statusCode || 500).json({ message: err.message || 'Server error preparing invoice' });
     }
   });
 
@@ -1026,8 +953,6 @@ const handleJobAccept = async (req, res) => {
   router.get('/invoices/all', authenticateToken, async (req, res) => {
     try {
       const userCompanyId = req.user.companyId;
-      await pool.query('ALTER TABLE invoices ADD COLUMN IF NOT EXISTS pdf_url TEXT;').catch(() => { });
-
       const result = await pool.query(
         `SELECT i.*, j.title as job_title, COALESCE(i.customer_name, c.name, 'Customer') as customer_name 
        FROM invoices i

@@ -10,7 +10,7 @@ router.use('/:requestId/purchase-bills', require('./materialPurchaseWorkflow'));
 // Create new material request (employee)
 router.post('/', authenticateToken, async (req, res) => {
     try {
-        const { item_name, quantity, urgency, description, unit } = req.body;
+        const { item_name, quantity, urgency, description, unit, job_id } = req.body;
         // Support both `id` (old) and `userId` (new) field names in JWT payload
         const userId = req.user.userId || req.user.id;
 
@@ -42,14 +42,21 @@ router.post('/', authenticateToken, async (req, res) => {
 
         const userName = userResult.rows[0]?.name || userResult.rows[0]?.email || 'Unknown';
         const companyId = req.user.companyId || userResult.rows[0]?.company_id || null;
+        if (job_id) {
+            const job = await pool.query(
+                'SELECT id FROM jobs WHERE id::text = $1::text AND company_id::text = $2::text',
+                [String(job_id), String(companyId)]
+            );
+            if (!job.rows.length) return res.status(404).json({ message: 'Job not found for this company' });
+        }
 
         const isValidUuid = (str) => typeof str === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str);
         const safeRequestedBy = isValidUuid(String(userId)) ? String(userId) : null;
 
         const result = await pool.query(
             `INSERT INTO material_requests 
-       (item_name, quantity, unit, urgency, description, requested_by, requested_by_name, company_id, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+       (item_name, quantity, unit, urgency, description, requested_by, requested_by_name, company_id, job_id, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
        RETURNING *`,
             [
                 item_name.trim(),
@@ -60,6 +67,7 @@ router.post('/', authenticateToken, async (req, res) => {
                 safeRequestedBy,
                 userName,
                 companyId,
+                job_id || null,
             ]
         );
 

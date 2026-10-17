@@ -30,37 +30,39 @@ test('🚀 End-to-End Acceptance Test: Job-Centric Financial Architecture', asyn
   });
 
   await t.test('Step 1: Setup Test Entities & Execute Full E2E Flow', async () => {
-    // 1. Company
-    const compSlug = 'TC_' + Math.floor(Math.random() * 89999 + 10000);
-    const compRes = await pool.query(
-      `INSERT INTO companies (company_name, company_id, status) VALUES ('Test Financial Corp', $1, 'active') RETURNING id`,
-      [compSlug]
-    );
-    companyId = compRes.rows[0].id;
+    await storage.run({ bypassRls: true }, async () => {
+      // 1. Company
+      const compSlug = 'TC_' + Math.floor(Math.random() * 89999 + 10000);
+      const compRes = await pool.query(
+        `INSERT INTO companies (company_name, company_id, status) VALUES ('Test Financial Corp', $1, 'active') RETURNING id`,
+        [compSlug]
+      );
+      companyId = compRes.rows[0].id;
 
-    // 2. Owner
-    const ownerEmail = `owner_test_${Date.now()}@prozync.in`;
-    const ownerRes = await pool.query(
-      `INSERT INTO users (name, email, password_hash, role, company_id) VALUES ('Test Owner', $1, 'hash', 'owner', $2) RETURNING id`,
-      [ownerEmail, companyId]
-    );
-    ownerId = ownerRes.rows[0].id;
+      // 2. Owner
+      const ownerEmail = `owner_test_${Date.now()}@prozync.in`;
+      const ownerRes = await pool.query(
+        `INSERT INTO users (name, email, password_hash, role, company_id) VALUES ('Test Owner', $1, 'hash', 'owner', $2) RETURNING id`,
+        [ownerEmail, companyId]
+      );
+      ownerId = ownerRes.rows[0].id;
 
-    // 3. Employee
-    const empEmail = `emp_test_${Date.now()}@prozync.in`;
-    const empRes = await pool.query(
-      `INSERT INTO users (name, email, password_hash, role, company_id) VALUES ('Test Employee', $1, 'hash', 'employee', $2) RETURNING id`,
-      [empEmail, companyId]
-    );
-    employeeId = empRes.rows[0].id;
+      // 3. Employee
+      const empEmail = `emp_test_${Date.now()}@prozync.in`;
+      const empRes = await pool.query(
+        `INSERT INTO users (name, email, password_hash, role, company_id) VALUES ('Test Employee', $1, 'hash', 'employee', $2) RETURNING id`,
+        [empEmail, companyId]
+      );
+      employeeId = empRes.rows[0].id;
 
-    // 4. Customer
-    const custEmail = `rahul_${Date.now()}@example.com`;
-    const custRes = await pool.query(
-      `INSERT INTO customers (name, email, phone, company_id) VALUES ('Rahul Sharma', $1, '9876543210', $2) RETURNING id`,
-      [custEmail, companyId]
-    );
-    customerId = custRes.rows[0].id;
+      // 4. Customer
+      const custEmail = `rahul_${Date.now()}@example.com`;
+      const custRes = await pool.query(
+        `INSERT INTO customers (name, email, phone, company_id) VALUES ('Rahul Sharma', $1, '9876543210', $2) RETURNING id`,
+        [custEmail, companyId]
+      );
+      customerId = custRes.rows[0].id;
+    });
 
     assert.ok(companyId && ownerId && employeeId && customerId, 'All test entities created');
 
@@ -105,6 +107,7 @@ test('🚀 End-to-End Acceptance Test: Job-Centric Financial Architecture', asyn
         jobId,
         userId: ownerId,
         invoiceData: {
+          idempotency_key: `e2e-invoice-${jobId}`,
           labour_hours: 5,
           labour_rate: 600,
           equipment_charges: 200,
@@ -168,6 +171,7 @@ test('🚀 End-to-End Acceptance Test: Job-Centric Financial Architecture', asyn
         disputeId: disputeRes.dispute.id,
         userId: ownerId,
         updateData: {
+          idempotency_key: `e2e-reissue-${invoiceId}`,
           labour_hours: 5,
           labour_rate: 600,
           materials_cost: 450,
@@ -198,6 +202,8 @@ test('🚀 End-to-End Acceptance Test: Job-Centric Financial Architecture', asyn
   });
 
   t.after(async () => {
-    await pool.query(`DELETE FROM companies WHERE id = $1`, [companyId]).catch(() => {});
+    await storage.run({ bypassRls: true }, async () => {
+      await pool.query(`DELETE FROM companies WHERE id = $1`, [companyId]).catch(() => {});
+    });
   });
 });

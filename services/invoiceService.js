@@ -11,8 +11,69 @@
 const { pool } = require('../db');
 const auditService = require('./auditService');
 const pdfInvoiceService = require('./pdfInvoiceService');
+const { calculateInvoice } = require('./invoiceMath');
+
+async function allocateInvoiceNumber(client, companyId) {
+  // Lock one tenant row so every invoice path serializes number allocation company-wide.
+  const company = await client.query('SELECT id FROM companies WHERE id::text = $1::text FOR UPDATE', [String(companyId)]);
+  if (!company.rows.length) throw new Error('Company not found');
+  const year = new Date().getFullYear();
+  const numbers = await client.query(
+    `SELECT invoice_number FROM invoices WHERE company_id::text = $1::text`,
+    [String(companyId)]
+  );
+  const prefix = `INV-${year}-`;
+  const maxSequence = numbers.rows.reduce((max, row) => {
+    const match = String(row.invoice_number || '').match(new RegExp(`^INV-${year}-(\\d+)$`));
+    return match ? Math.max(max, Number(match[1])) : max;
+  }, 0);
+  return `${prefix}${String(maxSequence + 1).padStart(4, '0')}`;
+}
 
 class InvoiceService {
+  static async createJobDraft({ companyId, jobId, userId }) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const jobRes = await client.query(
+        `SELECT j.*, c.name AS customer_name, c.email AS customer_email, c.phone AS customer_phone
+         FROM jobs j LEFT JOIN customers c ON j.customer_id::text = c.id::text
+         WHERE j.id::text = $1::text AND j.company_id::text = $2::text FOR UPDATE OF j`,
+        [String(jobId), String(companyId)]
+      );
+      if (!jobRes.rows.length) throw new Error('Job not found for this company');
+      const job = jobRes.rows[0];
+      const existing = await client.query(
+        `SELECT * FROM invoices WHERE job_id::text = $1::text AND company_id::text = $2::text
+         AND status <> 'cancelled' ORDER BY created_at DESC LIMIT 1 FOR UPDATE`,
+        [String(jobId), String(companyId)]
+      );
+      if (existing.rows.length) {
+        await client.query('COMMIT');
+        return existing.rows[0];
+      }
+      const invoiceNumber = await allocateInvoiceNumber(client, companyId);
+      const inserted = await client.query(
+        `INSERT INTO invoices (company_id, job_id, customer_id, customer_name, customer_email,
+          customer_phone, invoice_number, status, amount_paid, amount_due, total_amount,
+          created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'draft', 0, 0, 0, NOW(), NOW()) RETURNING *`,
+        [companyId, job.id, job.customer_id || null, job.customer_name || 'Customer',
+          job.customer_email || '', job.customer_phone || '', invoiceNumber]
+      );
+      await client.query('COMMIT');
+      auditService.log({ companyId, actorType: userId ? 'user' : 'system', actorId: userId || null,
+        actionType: 'invoice_draft_created', entityType: 'invoice', entityId: inserted.rows[0].id,
+        newValue: { job_id: job.id, invoice_number: invoiceNumber } }).catch(() => {});
+      return inserted.rows[0];
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
   /**
    * Fetches pre-populated data for the Dedicated Invoice Editor Page.
    * Pulls job details, labor hours, material requests, customer info, and company rates.
@@ -132,16 +193,16 @@ class InvoiceService {
       const materialsRes = await pool.query(
         `SELECT item_name, quantity, description 
          FROM material_requests 
-         WHERE company_id::text = $1::text AND status = 'approved'
+         WHERE company_id::text = $1::text AND job_id::text = $2::text AND status = 'approved'
          ORDER BY created_at DESC`,
-        [String(companyId)]
+        [String(companyId), String(job.id)]
       );
 
       materialsUsed = materialsRes.rows.map((m) => ({
         item_name: m.item_name,
         quantity: parseFloat(m.quantity || 1),
-        unit_cost: 150.0, // Default estimate
-        total_cost: parseFloat(((m.quantity || 1) * 150.0).toFixed(2)),
+        unit_cost: 0,
+        total_cost: 0,
       }));
     } catch (mErr) {
       console.warn('[invoiceService] material_requests query non-fatal warning:', mErr.message);
@@ -154,7 +215,7 @@ class InvoiceService {
       const invQuery = await pool.query(
         `SELECT * FROM invoices 
          WHERE (job_id::text = $1::text OR id::text = $2::text) AND company_id::text = $3::text 
-         ORDER BY created_at DESC LIMIT 1`,
+         ORDER BY CASE WHEN status = 'draft' THEN 0 ELSE 1 END, created_at DESC LIMIT 1`,
         [String(job.id), String(identifier), String(companyId)]
       );
       if (invQuery.rows.length > 0) {
@@ -242,6 +303,20 @@ class InvoiceService {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+      const idempotencyKey = invoiceData.idempotency_key;
+      if (!idempotencyKey) {
+        const err = new Error('Invoice finalization requires an idempotency key');
+        err.statusCode = 400;
+        throw err;
+      }
+      const replay = await client.query(
+        `SELECT * FROM invoices WHERE company_id::text = $1::text AND idempotency_key = $2 FOR UPDATE`,
+        [String(companyId), String(idempotencyKey)]
+      );
+      if (replay.rows.length) {
+        await client.query('COMMIT');
+        return { success: true, invoice: replay.rows[0], reason: 'idempotent_replay' };
+      }
 
       // 1. Fetch job with lock (supporting jobId or invoiceId identifier)
       let jobRes = await client.query(
@@ -299,57 +374,66 @@ class InvoiceService {
 
       const job = jobRes.rows[0];
       const actualJobId = job.id || null;
+      if (!job.is_direct_invoice && !['completed', 'billed_and_closed'].includes(String(job.status || '').toLowerCase())) {
+        const conflict = new Error('Invoices can only be issued for completed jobs');
+        conflict.statusCode = 409;
+        throw conflict;
+      }
 
       // 2. Check if invoice is already issued/paid/draft for this job — if so, update & increment edited_count
       const existingIssuedInv = await client.query(
-        `SELECT id, invoice_number, edited_count FROM invoices 
+        `SELECT id, invoice_number, edited_count, status, amount_paid, version_number, idempotency_key FROM invoices
          WHERE ((job_id IS NOT NULL AND job_id::text = $1::text) OR id::text = $2::text) AND company_id::text = $3::text 
-         ORDER BY created_at DESC LIMIT 1`,
+         ORDER BY CASE WHEN status = 'draft' THEN 0 ELSE 1 END, created_at DESC LIMIT 1`,
         [actualJobId ? String(actualJobId) : '', String(jobId), String(companyId)]
       );
 
       if (existingIssuedInv.rows.length > 0) {
         const existingId = existingIssuedInv.rows[0].id;
+        if (existingIssuedInv.rows[0].idempotency_key === idempotencyKey) {
+          const issued = await client.query('SELECT * FROM invoices WHERE id = $1 AND company_id::text = $2::text', [existingId, String(companyId)]);
+          await client.query('COMMIT');
+          return { success: true, invoice: issued.rows[0], reason: 'idempotent_replay' };
+        }
+        if (existingIssuedInv.rows[0].status !== 'draft') {
+          const conflict = new Error('This invoice has already been issued. Issued or paid invoices are immutable; create a revised version through invoice dispute review.');
+          conflict.statusCode = 409;
+          throw conflict;
+        }
 
         // Compute Financial Totals for edit
-        const labourHours = parseFloat(invoiceData.labour_hours || 0);
-        const labourRate = parseFloat(invoiceData.labour_rate || 0);
-        const labourCost = parseFloat((labourHours * labourRate).toFixed(2));
-
-        let materialsCost = 0;
+        const labourHours = Number(invoiceData.labour_hours || 0);
+        const labourRate = Number(invoiceData.labour_rate || 0);
         const lineItems = invoiceData.lineItems || [];
-        lineItems.forEach((item) => {
-          item.total_amount = parseFloat((parseFloat(item.quantity || 1) * parseFloat(item.unit_price || 0)).toFixed(2));
-          if (item.item_type === 'material') materialsCost += item.total_amount;
-        });
-
-        const equipmentCharges = parseFloat(invoiceData.equipment_charges || 0);
-        const transportCharges = parseFloat(invoiceData.transport_charges || 0);
-        const additionalCharges = parseFloat(invoiceData.additional_charges || 0);
-        const discountAmount = parseFloat(invoiceData.discount_amount || 0);
-
-        let subtotal = Math.max(0, parseFloat((labourCost + materialsCost + equipmentCharges + transportCharges + additionalCharges - discountAmount).toFixed(2)));
-        const gstRateVal = parseFloat(invoiceData.gst_rate || 18.0);
+        const totals = calculateInvoice({ ...invoiceData, lineItems, labourHours, labourRate });
+        const labourCost = totals.labourCost;
+        const materialsCost = totals.materialsCost;
+        const equipmentCharges = Number(invoiceData.equipment_charges || 0);
+        const transportCharges = Number(invoiceData.transport_charges || 0);
+        const additionalCharges = Number(invoiceData.additional_charges || 0);
+        const discountAmount = Number(invoiceData.discount_amount || 0);
+        const gstRateVal = totals.gstRate;
         const gstRate = gstRateVal / 100.0;
-        let totalTax = parseFloat((subtotal * gstRate).toFixed(2));
+        let subtotal = totals.subtotal;
+        let totalTax = totals.totalTax;
 
         let cgst = 0, sgst = 0, igst = 0;
-        let totalAmount = parseFloat((subtotal + totalTax).toFixed(2));
+        let totalAmount = totals.totalAmount;
 
         // Handle Owner Manual Invoice Adjustment
         const isManualAdjustment = Boolean(invoiceData.is_manual_adjustment);
         const manualTotal = parseFloat(invoiceData.manual_grand_total);
         if (isManualAdjustment && !isNaN(manualTotal) && manualTotal >= 0) {
           totalAmount = manualTotal;
-          subtotal = parseFloat((totalAmount / (1 + gstRate)).toFixed(2));
+          subtotal = gstRate === 0 ? totalAmount : parseFloat((totalAmount / (1 + gstRate)).toFixed(2));
           totalTax = parseFloat((totalAmount - subtotal).toFixed(2));
         }
 
         if (invoiceData.is_inter_state) {
           igst = totalTax;
         } else {
-          cgst = parseFloat((totalTax / 2).toFixed(2));
-          sgst = parseFloat((totalTax / 2).toFixed(2));
+          cgst = isManualAdjustment ? parseFloat((totalTax / 2).toFixed(2)) : totals.cgst;
+          sgst = isManualAdjustment ? parseFloat((totalTax - cgst).toFixed(2)) : totals.sgst;
         }
 
         // Update Invoice & Increment edited_count, transition draft -> issued
@@ -361,16 +445,24 @@ class InvoiceService {
             cgst = $12, sgst = $13, igst = $14, total_tax = $15, total_amount = $16,
             amount_due = GREATEST(0, $16 - amount_paid), customer_notes = $17, internal_notes = $18,
             edited_count = COALESCE(edited_count, 0) + 1, updated_at = NOW(),
-            status = CASE WHEN status IN ('draft', 'disputed') THEN 'issued' ELSE status END
+            status = 'issued', due_date = CURRENT_DATE + $21::integer,
+            customer_name = $22, customer_email = $23, customer_phone = $24,
+            payment_terms = $25, pdf_url = $26, idempotency_key = $27
            WHERE id::text = $19::text AND company_id::text = $20::text
            RETURNING *`,
           [
             labourHours, labourRate, labourCost, materialsCost,
             equipmentCharges, transportCharges, additionalCharges,
             discountAmount, subtotal, Boolean(invoiceData.is_inter_state),
-            invoiceData.gst_rate || 18.0, cgst, sgst, igst, totalTax,
+            gstRateVal, cgst, sgst, igst, totalTax,
             totalAmount, invoiceData.customer_notes || 'Thank you for your business!',
-            invoiceData.internal_notes || '', String(existingId), String(companyId)
+            invoiceData.internal_notes || '', String(existingId), String(companyId),
+            Number.parseInt(invoiceData.due_days || 15, 10),
+            invoiceData.customer_name || job.customer_name || 'Customer',
+            invoiceData.customer_email || job.customer_email || '',
+            invoiceData.customer_phone || job.customer_phone || '',
+            invoiceData.payment_terms || 'Due on receipt',
+            `/api/invoices/${existingId}/pdf`, idempotencyKey
           ]
         );
 
@@ -378,14 +470,34 @@ class InvoiceService {
 
         // Replace Line Items
         await client.query(`DELETE FROM invoice_items WHERE invoice_id = $1`, [existingId]);
-        for (const item of lineItems) {
+        for (const item of totals.lineItems) {
           await client.query(
             `INSERT INTO invoice_items
              (invoice_id, company_id, item_type, description, hsn_code, quantity, unit_price, total_amount)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-            [existingId, companyId, item.item_type || 'service', item.description || 'Service Item', item.hsn_code || '998311', item.quantity || 1, item.unit_price || 0, item.total_amount || 0]
+            [existingId, companyId, item.item_type || 'service', item.description || 'Service Item', item.hsn_code || '998311', item.quantity, item.unit_price, item.total_amount]
           );
         }
+
+        const dueDays = Number.parseInt(invoiceData.due_days || 15, 10);
+        const dueDate = new Date();
+        dueDate.setDate(dueDate.getDate() + dueDays);
+        await client.query(
+          `INSERT INTO ar_collection_schedules
+           (company_id, invoice_id, customer_id, customer_name, customer_phone, customer_email,
+            invoice_amount, amount_outstanding, due_date, current_stage, is_paused)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, 'pre_due_3d', FALSE)
+           ON CONFLICT (company_id, invoice_id) DO UPDATE SET
+             customer_id = EXCLUDED.customer_id, customer_name = EXCLUDED.customer_name,
+             customer_phone = EXCLUDED.customer_phone, customer_email = EXCLUDED.customer_email,
+             invoice_amount = EXCLUDED.invoice_amount, amount_outstanding = EXCLUDED.amount_outstanding,
+             due_date = EXCLUDED.due_date, is_paused = FALSE, updated_at = NOW()`,
+          [companyId, existingId, job.customer_id || null, updatedInvoice.customer_name,
+            updatedInvoice.customer_phone, updatedInvoice.customer_email, totalAmount, dueDate]
+        );
+
+        const pdfBuffer = await pdfInvoiceService.generateInvoicePDF(updatedInvoice, totals.lineItems);
+        if (!pdfBuffer.subarray(0, 5).equals(Buffer.from('%PDF-'))) throw new Error('Invoice PDF generation failed');
 
         // Create Activity Log entry for Edit (Issue 3 Requirement)
         await client.query(
@@ -409,55 +521,44 @@ class InvoiceService {
       }
 
       // 3. Compute Financial Totals
-      const labourHours = parseFloat(invoiceData.labour_hours || 0);
-      const labourRate = parseFloat(invoiceData.labour_rate || 0);
-      const labourCost = parseFloat((labourHours * labourRate).toFixed(2));
-
-      let materialsCost = 0;
       const lineItems = invoiceData.lineItems || [];
-      lineItems.forEach((item) => {
-        item.total_amount = parseFloat((parseFloat(item.quantity || 1) * parseFloat(item.unit_price || 0)).toFixed(2));
-        if (item.item_type === 'material') {
-          materialsCost += item.total_amount;
-        }
-      });
+      const labourHours = Number(invoiceData.labour_hours || 0);
+      const labourRate = Number(invoiceData.labour_rate || 0);
+      const totals = calculateInvoice({ ...invoiceData, lineItems, labourHours, labourRate });
+      const processedLineItems = totals.lineItems;
+      const labourCost = totals.labourCost;
+      const materialsCost = totals.materialsCost;
+      const equipmentCharges = Number(invoiceData.equipment_charges || 0);
+      const transportCharges = Number(invoiceData.transport_charges || 0);
+      const additionalCharges = Number(invoiceData.additional_charges || 0);
+      const discountAmount = Number(invoiceData.discount_amount || 0);
 
-      const equipmentCharges = parseFloat(invoiceData.equipment_charges || 0);
-      const transportCharges = parseFloat(invoiceData.transport_charges || 0);
-      const additionalCharges = parseFloat(invoiceData.additional_charges || 0);
-      const discountAmount = parseFloat(invoiceData.discount_amount || 0);
+      let subtotal = totals.subtotal;
 
-      let subtotal = Math.max(
-        0,
-        parseFloat(
-          (labourCost + materialsCost + equipmentCharges + transportCharges + additionalCharges - discountAmount).toFixed(2)
-        )
-      );
-
-      const gstRateVal = parseFloat(invoiceData.gst_rate || 18.0);
+      const gstRateVal = totals.gstRate;
       const gstRate = gstRateVal / 100.0;
-      let totalTax = parseFloat((subtotal * gstRate).toFixed(2));
+      let totalTax = totals.totalTax;
 
       let cgst = 0;
       let sgst = 0;
       let igst = 0;
 
-      let totalAmount = parseFloat((subtotal + totalTax).toFixed(2));
+      let totalAmount = totals.totalAmount;
 
       // 🚀 Handle Owner Manual Invoice Adjustment
       const isManualAdjustment = Boolean(invoiceData.is_manual_adjustment);
       const manualTotal = parseFloat(invoiceData.manual_grand_total);
       if (isManualAdjustment && !isNaN(manualTotal) && manualTotal >= 0) {
         totalAmount = manualTotal;
-        subtotal = parseFloat((totalAmount / (1 + gstRate)).toFixed(2));
+        subtotal = gstRate === 0 ? totalAmount : parseFloat((totalAmount / (1 + gstRate)).toFixed(2));
         totalTax = parseFloat((totalAmount - subtotal).toFixed(2));
       }
 
       if (invoiceData.is_inter_state) {
         igst = totalTax;
       } else {
-        cgst = parseFloat((totalTax / 2).toFixed(2));
-        sgst = parseFloat((totalTax / 2).toFixed(2));
+        cgst = isManualAdjustment ? parseFloat((totalTax / 2).toFixed(2)) : totals.cgst;
+        sgst = isManualAdjustment ? parseFloat((totalTax - cgst).toFixed(2)) : totals.sgst;
       }
 
       const dueDays = parseInt(invoiceData.due_days || 15, 10);
@@ -465,13 +566,7 @@ class InvoiceService {
       dueDate.setDate(dueDate.getDate() + dueDays);
 
       // Generate Invoice Number
-      const year = new Date().getFullYear();
-      const invoiceNumRes = await client.query(
-        `SELECT COUNT(*) AS count FROM invoices WHERE company_id::text = $1::text`,
-        [String(companyId)]
-      );
-      const count = parseInt(invoiceNumRes.rows[0].count, 10) + 1;
-      const invoiceNumber = `INV-${year}-${String(count).padStart(4, '0')}`;
+      const invoiceNumber = await allocateInvoiceNumber(client, companyId);
 
       // 4. Insert Invoice Row
       const invRes = await client.query(
@@ -482,12 +577,12 @@ class InvoiceService {
           transport_charges, additional_charges, discount_amount, subtotal,
           is_inter_state, gst_rate, cgst, sgst, igst, total_tax,
           total_amount, amount_paid, amount_due, due_date, payment_terms,
-          customer_notes, internal_notes, created_at, updated_at)
+          customer_notes, internal_notes, idempotency_key, created_at, updated_at)
          VALUES
          ($1, $2, $3, $4, $5, $6, $7, 1, TRUE, 'issued',
           $8, $9, $10, $11, $12, $13, $14, $15, $16,
           $17, $18, $19, $20, $21, $22,
-          $23, 0.00, $23, $24, $25, $26, $27, NOW(), NOW())
+          $23, 0.00, $23, $24, $25, $26, $27, $28, NOW(), NOW())
          RETURNING *`,
         [
           companyId,
@@ -507,7 +602,7 @@ class InvoiceService {
           discountAmount,
           subtotal,
           Boolean(invoiceData.is_inter_state),
-          invoiceData.gst_rate || 18.0,
+          gstRateVal,
           cgst,
           sgst,
           igst,
@@ -517,14 +612,15 @@ class InvoiceService {
           invoiceData.payment_terms || 'Due on receipt',
           invoiceData.customer_notes || 'Thank you for your business!',
           invoiceData.internal_notes || '',
+          idempotencyKey,
         ]
       );
 
       const invoice = invRes.rows[0];
 
       // 5. Insert Line Items
-      if (lineItems.length > 0) {
-        for (const item of lineItems) {
+      if (processedLineItems.length > 0) {
+        for (const item of processedLineItems) {
           await client.query(
             `INSERT INTO invoice_items
              (invoice_id, company_id, item_type, description, hsn_code, quantity, unit_price, total_amount)
@@ -535,9 +631,9 @@ class InvoiceService {
               item.item_type || 'service',
               item.description || 'Service Line Item',
               item.hsn_code || '998311',
-              item.quantity || 1,
-              item.unit_price || 0,
-              item.total_amount || 0,
+              item.quantity,
+              item.unit_price,
+              item.total_amount,
             ]
           );
         }
@@ -552,7 +648,8 @@ class InvoiceService {
       }
 
       // 6. Generate PDF and save URL
-      const pdfBuffer = await pdfInvoiceService.generateInvoicePDF(invoice, lineItems);
+      const pdfBuffer = await pdfInvoiceService.generateInvoicePDF(invoice, processedLineItems);
+      if (!pdfBuffer.subarray(0, 5).equals(Buffer.from('%PDF-'))) throw new Error('Invoice PDF generation failed');
       // In production, save buffer to Cloudinary or S3. Fallback: Data URL or route URL
       const pdfUrl = `/api/invoices/${invoice.id}/pdf`;
       await client.query(`UPDATE invoices SET pdf_url = $1 WHERE id = $2`, [pdfUrl, invoice.id]);
@@ -576,9 +673,7 @@ class InvoiceService {
           totalAmount,
           dueDate,
         ]
-      ).catch((e) => {
-        console.warn('[invoiceService] ar_collection_schedules non-fatal warning:', e.message);
-      });
+      );
 
       // Record Manual Adjustment Audit Log if enabled
       if (isManualAdjustment) {
@@ -632,6 +727,20 @@ class InvoiceService {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+      const idempotencyKey = updateData?.idempotency_key;
+      if (!idempotencyKey) {
+        const err = new Error('Invoice reissue requires an idempotency key');
+        err.statusCode = 400;
+        throw err;
+      }
+      const replay = await client.query(
+        'SELECT * FROM invoices WHERE company_id::text = $1::text AND idempotency_key = $2 FOR UPDATE',
+        [String(companyId), String(idempotencyKey)]
+      );
+      if (replay.rows.length) {
+        await client.query('COMMIT');
+        return { success: true, invoice: replay.rows[0], reason: 'idempotent_replay' };
+      }
 
       // Fetch parent invoice
       const parentRes = await client.query(
@@ -644,44 +753,51 @@ class InvoiceService {
       }
 
       const parent = parentRes.rows[0];
+      if (Number(parent.amount_paid || 0) > 0) {
+        const conflict = new Error('This invoice has recorded payments and cannot be revised automatically. Reconcile its payment history before reissuing.');
+        conflict.statusCode = 409;
+        throw conflict;
+      }
       const newVersionNumber = parent.version_number + 1;
+
+      let lineItems = Array.isArray(updateData.lineItems) ? updateData.lineItems : [];
+      if (!lineItems.length) {
+        const existingItems = await client.query(
+          'SELECT item_type, description, hsn_code, quantity, unit_price, total_amount FROM invoice_items WHERE invoice_id = $1 ORDER BY id',
+          [parent.id]
+        );
+        lineItems = existingItems.rows;
+      }
+      const totals = calculateInvoice({
+        lineItems,
+        labourHours: updateData.labour_hours ?? parent.labour_hours ?? 0,
+        labourRate: updateData.labour_rate ?? parent.labour_rate ?? 0,
+        equipmentCharges: updateData.equipment_charges ?? parent.equipment_charges ?? 0,
+        transportCharges: updateData.transport_charges ?? parent.transport_charges ?? 0,
+        additionalCharges: updateData.additional_charges ?? parent.additional_charges ?? 0,
+        discountAmount: updateData.discount_amount ?? parent.discount_amount ?? 0,
+        gstRate: updateData.gst_rate ?? parent.gst_rate ?? 18,
+        isInterState: updateData.is_inter_state ?? parent.is_inter_state,
+      });
 
       // Mark parent as is_latest = FALSE
       await client.query(`UPDATE invoices SET is_latest = FALSE WHERE id = $1`, [parentInvoiceId]);
 
       // Calculate totals for new version
-      const labourHours = parseFloat(updateData.labour_hours || parent.labour_hours);
-      const labourRate = parseFloat(updateData.labour_rate || parent.labour_rate);
-      const labourCost = parseFloat((labourHours * labourRate).toFixed(2));
-      const materialsCost = parseFloat(updateData.materials_cost || parent.materials_cost);
-      const equipmentCharges = parseFloat(updateData.equipment_charges || parent.equipment_charges);
-      const transportCharges = parseFloat(updateData.transport_charges || parent.transport_charges);
-      const additionalCharges = parseFloat(updateData.additional_charges || parent.additional_charges);
-      const discountAmount = parseFloat(updateData.discount_amount || parent.discount_amount);
-
-      const subtotal = Math.max(
-        0,
-        parseFloat(
-          (labourCost + materialsCost + equipmentCharges + transportCharges + additionalCharges - discountAmount).toFixed(2)
-        )
-      );
-
-      const gstRate = parseFloat(updateData.gst_rate || parent.gst_rate || 18.0) / 100.0;
-      const totalTax = parseFloat((subtotal * gstRate).toFixed(2));
-
-      let cgst = 0;
-      let sgst = 0;
-      let igst = 0;
-      const isInterState = updateData.is_inter_state !== undefined ? updateData.is_inter_state : parent.is_inter_state;
-
-      if (isInterState) {
-        igst = totalTax;
-      } else {
-        cgst = parseFloat((totalTax / 2).toFixed(2));
-        sgst = parseFloat((totalTax / 2).toFixed(2));
-      }
-
-      const totalAmount = parseFloat((subtotal + totalTax).toFixed(2));
+      const labourHours = Number(updateData.labour_hours ?? parent.labour_hours ?? 0);
+      const labourRate = Number(updateData.labour_rate ?? parent.labour_rate ?? 0);
+      const labourCost = totals.labourCost;
+      const materialsCost = totals.materialsCost;
+      const equipmentCharges = Number(updateData.equipment_charges ?? parent.equipment_charges ?? 0);
+      const transportCharges = Number(updateData.transport_charges ?? parent.transport_charges ?? 0);
+      const additionalCharges = Number(updateData.additional_charges ?? parent.additional_charges ?? 0);
+      const discountAmount = Number(updateData.discount_amount ?? parent.discount_amount ?? 0);
+      const subtotal = totals.subtotal;
+      const gstRate = totals.gstRate;
+      const totalTax = totals.totalTax;
+      const { cgst, sgst, igst } = totals;
+      const isInterState = Boolean(updateData.is_inter_state ?? parent.is_inter_state);
+      const totalAmount = totals.totalAmount;
 
       // Insert New Invoice Version
       const newInvRes = await client.query(
@@ -692,7 +808,7 @@ class InvoiceService {
           transport_charges, additional_charges, discount_amount, subtotal,
           is_inter_state, gst_rate, cgst, sgst, igst, total_tax,
           total_amount, amount_paid, amount_due, due_date, payment_terms,
-          customer_notes, internal_notes, created_at, updated_at)
+          customer_notes, internal_notes, idempotency_key, created_at, updated_at)
          VALUES
          ($1, $2, $3, $4, $5, $6,
           $7, $8, $9, TRUE, 'issued',
@@ -700,7 +816,7 @@ class InvoiceService {
           $15, $16, $17, $18,
           $19, $20, $21, $22, $23, $24,
           $25, $26, $25, $27, $28,
-          $29, $30, NOW(), NOW())
+          $29, $30, $31, NOW(), NOW())
          RETURNING *`,
         [
           companyId,
@@ -722,7 +838,7 @@ class InvoiceService {
           discountAmount,
           subtotal,
           isInterState,
-          gstRate * 100,
+          gstRate,
           cgst,
           sgst,
           igst,
@@ -733,14 +849,14 @@ class InvoiceService {
           parent.payment_terms,
           updateData.customer_notes || parent.customer_notes,
           `Reissued v${newVersionNumber} following dispute resolution`,
+          idempotencyKey,
         ]
       );
 
       const newInvoice = newInvRes.rows[0];
 
       // Insert updated line items
-      const lineItems = updateData.lineItems || [];
-      for (const item of lineItems) {
+      for (const item of totals.lineItems) {
         await client.query(
           `INSERT INTO invoice_items
            (invoice_id, company_id, item_type, description, hsn_code, quantity, unit_price, total_amount)
@@ -751,32 +867,51 @@ class InvoiceService {
             item.item_type || 'service',
             item.description || 'Service Line Item',
             item.hsn_code || '998311',
-            item.quantity || 1,
-            item.unit_price || 0,
-            (item.quantity || 1) * (item.unit_price || 0),
+            item.quantity,
+            item.unit_price,
+            item.total_amount,
           ]
         );
       }
 
-      // Mark dispute as resolved
-      if (disputeId) {
+      // Resolve the selected issue, or the latest open issue for this invoice.
+      const disputeToResolve = disputeId || (await client.query(
+        `SELECT id FROM invoice_disputes WHERE invoice_id = $1 AND company_id::text = $2::text
+         AND status IN ('open', 'under_review') ORDER BY created_at DESC LIMIT 1`,
+        [parent.id, String(companyId)]
+      )).rows[0]?.id;
+      if (disputeToResolve) {
         await client.query(
           `UPDATE invoice_disputes 
            SET status = 'resolved', resolved_in_version = $1, updated_at = NOW() 
            WHERE id = $2 AND company_id = $3`,
-          [newVersionNumber, disputeId, companyId]
+          [newVersionNumber, disputeToResolve, companyId]
         );
       }
 
-      // Resume AR schedule with updated amount
+      // Move or create the AR schedule for the revised outstanding invoice.
       await client.query(
         `UPDATE ar_collection_schedules
          SET invoice_id = $1, invoice_amount = $2, amount_outstanding = $2, is_paused = FALSE, updated_at = NOW()
          WHERE company_id::text = $3::text AND invoice_id::text = $4::text`,
         [newInvoice.id, totalAmount, String(companyId), String(parentInvoiceId)]
-      ).catch((e) => {
-        console.warn('[invoiceService] ar_collection_schedules update non-fatal warning:', e.message);
-      });
+      );
+      await client.query(
+        `INSERT INTO ar_collection_schedules
+         (company_id, invoice_id, customer_id, customer_name, customer_phone, customer_email,
+          invoice_amount, amount_outstanding, due_date, current_stage, is_paused)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, 'pre_due_3d', FALSE)
+         ON CONFLICT (company_id, invoice_id) DO UPDATE SET
+           invoice_amount = EXCLUDED.invoice_amount, amount_outstanding = EXCLUDED.amount_outstanding,
+           due_date = EXCLUDED.due_date, is_paused = FALSE, updated_at = NOW()`,
+        [companyId, newInvoice.id, parent.customer_id || null, parent.customer_name || 'Customer',
+          parent.customer_phone || '', parent.customer_email || '', totalAmount, parent.due_date]
+      );
+      const pdfUrl = `/api/invoices/${newInvoice.id}/pdf`;
+      await client.query('UPDATE invoices SET pdf_url = $1 WHERE id = $2 AND company_id::text = $3::text', [pdfUrl, newInvoice.id, String(companyId)]);
+      newInvoice.pdf_url = pdfUrl;
+      const pdf = await pdfInvoiceService.generateInvoicePDF(newInvoice, totals.lineItems);
+      if (!pdf.subarray(0, 5).equals(Buffer.from('%PDF-'))) throw new Error('Invoice PDF generation failed');
 
       await client.query('COMMIT');
 
@@ -958,8 +1093,26 @@ class InvoiceService {
    */
   static async createDirectInvoice({ companyId, userId, invoiceData }) {
     const client = await pool.connect();
+    let idempotencyKey = null;
     try {
       await client.query('BEGIN');
+      idempotencyKey = invoiceData.idempotency_key || null;
+      if (!idempotencyKey) {
+        const err = new Error('Direct invoice creation requires an idempotency key');
+        err.statusCode = 400;
+        throw err;
+      }
+      if (idempotencyKey) {
+        const previous = await client.query(
+          `SELECT * FROM invoices WHERE company_id::text = $1::text AND idempotency_key = $2 FOR UPDATE`,
+          [String(companyId), String(idempotencyKey)]
+        );
+        if (previous.rows.length) {
+          const items = await client.query('SELECT * FROM invoice_items WHERE invoice_id = $1 ORDER BY id', [previous.rows[0].id]);
+          await client.query('COMMIT');
+          return { success: true, invoice: previous.rows[0], lineItems: items.rows, payment: null, pdfUrl: previous.rows[0].pdf_url, idempotentReplay: true };
+        }
+      }
 
       // 1. Customer resolution (existing or walk-in inline)
       let customerId = invoiceData.customer_id || null;
@@ -974,11 +1127,10 @@ class InvoiceService {
           `SELECT id, name, email, phone FROM customers WHERE id = $1 AND company_id = $2`,
           [customerId, companyId]
         );
-        if (customerResult.rows.length > 0) {
-          customerName = customerResult.rows[0].name || customerName;
-          customerEmail = customerResult.rows[0].email || customerEmail;
-          customerPhone = customerResult.rows[0].phone || customerPhone;
-        }
+        if (!customerResult.rows.length) throw new Error('Customer not found for this company');
+        customerName = customerResult.rows[0].name || customerName;
+        customerEmail = customerResult.rows[0].email || customerEmail;
+        customerPhone = customerResult.rows[0].phone || customerPhone;
       } else if (customerName && customerEmail) {
         // Try to match or auto-link customer by email for this company
         const existingCustomer = await client.query(
@@ -1002,30 +1154,19 @@ class InvoiceService {
         throw new Error('At least one line item is required to generate an invoice');
       }
 
-      let materialsCost = 0;
-      let labourCost = 0;
-      let itemsTotal = 0;
-
-      const processedLineItems = rawLineItems.map((item) => {
-        const qty = Math.max(0.01, parseFloat(item.quantity) || 1);
-        const unitPrice = Math.max(0, parseFloat(item.unit_price) || 0);
-        const lineTotal = parseFloat((qty * unitPrice).toFixed(2));
-        const itemType = item.item_type === 'material' ? 'material' : 'service';
-
-        if (itemType === 'material') {
-          materialsCost += lineTotal;
-        } else {
-          labourCost += lineTotal;
-        }
-        itemsTotal += lineTotal;
-
+      const totals = calculateInvoice({ ...invoiceData, lineItems: rawLineItems });
+      const materialsCost = totals.materialsCost;
+      const labourCost = totals.labourCost;
+      const processedLineItems = totals.lineItems.map((item) => {
+        const itemType = ['service', 'labour', 'labor', 'material', 'equipment', 'transport', 'extra'].includes(String(item.item_type).toLowerCase())
+          ? String(item.item_type).toLowerCase() : 'service';
         return {
           item_type: itemType,
-          description: (item.description || 'Item Description').trim(),
+          description: String(item.description || 'Item Description').trim(),
           hsn_code: (item.hsn_code || (itemType === 'material' ? '847990' : '998311')).trim(),
-          quantity: qty,
-          unit_price: unitPrice,
-          total_amount: lineTotal,
+          quantity: item.quantity,
+          unit_price: item.unit_price,
+          total_amount: item.total_amount,
           inventory_item_id: item.inventory_item_id || null,
         };
       });
@@ -1036,14 +1177,13 @@ class InvoiceService {
       const additionalCharges = parseFloat(invoiceData.additional_charges || 0);
       const discountAmount = Math.max(0, parseFloat(invoiceData.discount_amount || 0));
 
-      const subtotalBeforeDiscount = itemsTotal + equipmentCharges + transportCharges + additionalCharges;
-      const subtotal = Math.max(0, parseFloat((subtotalBeforeDiscount - discountAmount).toFixed(2)));
+      const subtotal = totals.subtotal;
 
       // 3. GST Calculation
       const isInterState = Boolean(invoiceData.is_inter_state);
       const gstRateVal = parseFloat(invoiceData.gst_rate !== undefined ? invoiceData.gst_rate : 18.0);
       const gstRateFrac = gstRateVal / 100.0;
-      const totalTax = parseFloat((subtotal * gstRateFrac).toFixed(2));
+      const totalTax = totals.totalTax;
 
       let cgst = 0;
       let sgst = 0;
@@ -1052,11 +1192,11 @@ class InvoiceService {
       if (isInterState) {
         igst = totalTax;
       } else {
-        cgst = parseFloat((totalTax / 2).toFixed(2));
-        sgst = parseFloat((totalTax / 2).toFixed(2));
+        cgst = totals.cgst;
+        sgst = totals.sgst;
       }
 
-      const totalAmount = parseFloat((subtotal + totalTax).toFixed(2));
+      const totalAmount = totals.totalAmount;
 
       // 4. Due Date
       const dueDays = parseInt(invoiceData.due_days || 0, 10);
@@ -1064,13 +1204,7 @@ class InvoiceService {
       dueDate.setDate(dueDate.getDate() + dueDays);
 
       // 5. Atomic Sequential Invoice Number Generation
-      const year = new Date().getFullYear();
-      const invoiceCountRes = await client.query(
-        `SELECT COUNT(*) AS count FROM invoices WHERE company_id = $1`,
-        [companyId]
-      );
-      const nextSequence = parseInt(invoiceCountRes.rows[0].count, 10) + 1;
-      const invoiceNumber = `INV-${year}-${String(nextSequence).padStart(4, '0')}`;
+      const invoiceNumber = await allocateInvoiceNumber(client, companyId);
 
       // 6. Payment Status Handling
       const isPaidNow = invoiceData.payment_status === 'paid';
@@ -1088,7 +1222,7 @@ class InvoiceService {
           materials_cost, equipment_charges, transport_charges, additional_charges,
           discount_amount, subtotal, is_inter_state, gst_rate, cgst, sgst, igst,
           total_tax, total_amount, amount_paid, amount_due, due_date, payment_terms,
-          customer_notes, internal_notes, created_at, updated_at)
+          customer_notes, internal_notes, idempotency_key, created_at, updated_at)
          VALUES
          ($1, NULL, $2, $3, $4, $5,
           $6, $7, $8, $9, 1,
@@ -1096,7 +1230,7 @@ class InvoiceService {
           $13, $14, $15, $16,
           $17, $18, $19, $20, $21, $22, $23,
           $24, $25, $26, $27, $28, $29,
-          $30, $31, NOW(), NOW())
+          $30, $31, $32, NOW(), NOW())
          RETURNING *`,
         [
           companyId, customerId, customerName, customerEmail, customerPhone,
@@ -1105,7 +1239,7 @@ class InvoiceService {
           materialsCost, equipmentCharges, transportCharges, additionalCharges,
           discountAmount, subtotal, isInterState, gstRateVal, cgst, sgst, igst,
           totalTax, totalAmount, amountPaid, amountDue, dueDate, invoiceData.payment_terms || (isPaidNow ? 'Immediate Payment' : 'Due on receipt'),
-          invoiceData.customer_notes || 'Thank you for your business!', invoiceData.internal_notes || ''
+          invoiceData.customer_notes || 'Thank you for your business!', invoiceData.internal_notes || '', idempotencyKey
         ]
       );
 
@@ -1122,12 +1256,13 @@ class InvoiceService {
 
         // Deduct from inventory if linked
         if (item.inventory_item_id) {
-          await client.query(
+          const stockUpdate = await client.query(
             `UPDATE inventory_items 
-             SET quantity = GREATEST(0, quantity - $1), updated_at = NOW() 
-             WHERE id = $2 AND company_id = $3`,
-            [Math.round(item.quantity), item.inventory_item_id, companyId]
-          ).catch((invErr) => console.warn('Inventory deduction notice:', invErr.message));
+             SET quantity = quantity - $1, updated_at = NOW()
+             WHERE id = $2 AND company_id::text = $3::text AND quantity >= $1 RETURNING id`,
+            [item.quantity, item.inventory_item_id, String(companyId)]
+          );
+          if (!stockUpdate.rows.length) throw new Error(`Insufficient or unavailable inventory for ${item.description}`);
         }
       }
 
@@ -1160,13 +1295,15 @@ class InvoiceService {
             companyId, invoice.id, customerId, customerName,
             customerPhone, customerEmail, totalAmount, dueDate
           ]
-        ).catch((arErr) => console.warn('AR schedule notice:', arErr.message));
+        );
       }
 
       // 10. Generate PDF link
       const pdfUrl = `/api/invoices/${invoice.id}/pdf`;
       await client.query(`UPDATE invoices SET pdf_url = $1 WHERE id = $2`, [pdfUrl, invoice.id]);
       invoice.pdf_url = pdfUrl;
+      const pdfBuffer = await pdfInvoiceService.generateInvoicePDF(invoice, processedLineItems);
+      if (!pdfBuffer.subarray(0, 5).equals(Buffer.from('%PDF-'))) throw new Error('Invoice PDF generation failed');
 
       // 11. Log Activity
       await client.query(
@@ -1187,6 +1324,16 @@ class InvoiceService {
       };
     } catch (err) {
       await client.query('ROLLBACK').catch(() => {});
+      if (err.code === '23505' && idempotencyKey) {
+        const previous = await client.query(
+          `SELECT * FROM invoices WHERE company_id::text = $1::text AND idempotency_key = $2`,
+          [String(companyId), String(idempotencyKey)]
+        ).catch(() => ({ rows: [] }));
+        if (previous.rows.length) {
+          const items = await client.query('SELECT * FROM invoice_items WHERE invoice_id = $1 ORDER BY id', [previous.rows[0].id]).catch(() => ({ rows: [] }));
+          return { success: true, invoice: previous.rows[0], lineItems: items.rows, payment: null, pdfUrl: previous.rows[0].pdf_url, idempotentReplay: true };
+        }
+      }
       console.error('invoiceService.createDirectInvoice error:', err.message);
       throw err;
     } finally {
@@ -1194,5 +1341,7 @@ class InvoiceService {
     }
   }
 }
+
+InvoiceService.allocateInvoiceNumber = allocateInvoiceNumber;
 
 module.exports = InvoiceService;

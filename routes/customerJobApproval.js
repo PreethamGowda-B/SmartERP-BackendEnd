@@ -26,7 +26,7 @@ const crypto = require('crypto');
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 const { dispatchJob } = require('../services/smartDispatch');
-const { createNotificationForOwners } = require('../utils/notificationHelpers');
+const { createNotificationForOwners, createCustomerPortalNotification } = require('../utils/notificationHelpers');
 const auditService = require('../services/auditService');
 const slaService = require('../services/slaService');
 const errorLogger = require('../utils/errorLogger');
@@ -55,31 +55,18 @@ function requireOwnerOrHr(req, res, next) {
   next();
 }
 
-/** Notify customer via in-app activity record and notifications table (non-blocking, post-commit) */
+/** Notify customer only through the customer-scoped notification feed. */
 function notifyCustomer(customerId, companyId, opts) {
   const { type, title, message, jobId } = opts;
-  // 1. Activity log (legacy)
-  pool.query(
-    'INSERT INTO activities (user_id, action, activity_type, details, company_id, created_at)' +
-    ' VALUES ($1, $2, $3, $4, $5, NOW())',
-    [
-      null, type, 'customer_notification',
-      JSON.stringify({ customer_id: customerId, title, message, job_id: jobId }),
-      companyId,
-    ]
-  ).catch(function (e) { console.error('notifyCustomer activity error:', e.message); });
-
-  // 2. Low FIX: Notifications table (visible in Customer Portal UI)
-  const { createNotification } = require('../utils/notificationHelpers');
-  createNotification({
-    user_id: customerId,
-    company_id: companyId,
+  createCustomerPortalNotification({
+    customerId,
+    companyId,
     type: type,
     title: title,
     message: message,
-    priority: 'high',
-    data: { job_id: jobId, url: `/customer/job/${jobId}` },
-  }).catch(function (e) { console.error('notifyCustomer notification error:', e.message); });
+    jobId,
+    url: `/customer/job/${jobId}`,
+  }).catch(function (e) { console.error('notifyCustomer activity error:', e.message); });
 }
 
 /** Publish SSE event to customer portal (non-blocking, post-commit) */

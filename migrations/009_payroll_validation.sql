@@ -19,33 +19,43 @@ END $$;
 -- 2. Payroll Validation Runs Table
 CREATE TABLE IF NOT EXISTS payroll_validation_runs (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  -- Keep tenant identifiers as text because live installations use both UUID and legacy integer IDs.
+  company_id TEXT NOT NULL,
   created_by UUID NOT NULL REFERENCES users(id),
   month INT NOT NULL,
   year INT NOT NULL,
   status VARCHAR(50) DEFAULT 'processing',
+  audit_status VARCHAR(40) DEFAULT 'processing',
   total_employees_checked INT DEFAULT 0,
   total_anomalies_found INT DEFAULT 0,
+  record_count INT DEFAULT 0,
+  checks_executed INT DEFAULT 0,
+  check_results JSONB NOT NULL DEFAULT '[]'::jsonb,
+  payroll_fingerprint TEXT,
+  source_updated_at TIMESTAMP WITH TIME ZONE,
   risk_level payroll_risk_level DEFAULT 'low',
   is_approved BOOLEAN DEFAULT FALSE,
   approved_by UUID REFERENCES users(id),
   approved_at TIMESTAMP WITH TIME ZONE,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-  CONSTRAINT unq_company_payroll_period UNIQUE(company_id, month, year)
+  CONSTRAINT payroll_validation_period_valid CHECK (month BETWEEN 1 AND 12 AND year BETWEEN 2000 AND 2100)
 );
 
 -- 3. Payroll Validation Anomaly Flags Table
 CREATE TABLE IF NOT EXISTS payroll_validation_flags (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   validation_run_id UUID NOT NULL REFERENCES payroll_validation_runs(id) ON DELETE CASCADE,
-  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  company_id TEXT NOT NULL,
   user_id UUID REFERENCES users(id),
   employee_name VARCHAR(255),
   flag_type payroll_flag_type NOT NULL,
   severity payroll_flag_severity DEFAULT 'warning',
   description TEXT NOT NULL,
   ai_analysis_reasoning TEXT,
+  source_table TEXT,
+  source_record_id TEXT,
+  finding_details JSONB NOT NULL DEFAULT '{}'::jsonb,
   is_resolved BOOLEAN DEFAULT FALSE,
   resolution_notes TEXT,
   resolved_by UUID REFERENCES users(id),
@@ -54,7 +64,7 @@ CREATE TABLE IF NOT EXISTS payroll_validation_flags (
 );
 
 -- 4. Performance Indexes
-CREATE INDEX IF NOT EXISTS idx_payroll_val_runs_period ON payroll_validation_runs(company_id, month, year);
+CREATE INDEX IF NOT EXISTS idx_payroll_val_runs_period ON payroll_validation_runs(company_id, month, year, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_payroll_val_flags_run ON payroll_validation_flags(validation_run_id);
 CREATE INDEX IF NOT EXISTS idx_payroll_val_flags_type ON payroll_validation_flags(company_id, flag_type);
 

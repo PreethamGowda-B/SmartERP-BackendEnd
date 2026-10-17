@@ -903,17 +903,15 @@ router.post('/job/:jobId', async (req, res) => {
     // Notify customer (NOT the employee sender)
     try {
       if (job.customer_id) {
-        const { createNotification } = require('../utils/notificationHelpers');
-        await createNotification({
-          user_id: job.customer_id,
-          company_id: String(companyId),
-          type: 'chat_message',
+        const { createCustomerPortalNotification } = require('../utils/notificationHelpers');
+        await createCustomerPortalNotification({
+          customerId: job.customer_id,
+          companyId: String(companyId),
+          type: 'customer_message',
           title: isOwnerOrAdmin ? 'New Message from Management' : 'New Message from Technician',
           message: `${senderName}: ${message.trim().substring(0, 60)}${message.length > 60 ? '…' : ''}`,
-          priority: 'medium',
-          actor_id: employeeId,
-          idempotency_key: `chat_emp_${newMessage.id}`,
-          data: { job_id: jobId, url: `/customer/job/${jobId}` }
+          jobId,
+          url: `/customer/job/${jobId}`,
         });
       }
     } catch { }

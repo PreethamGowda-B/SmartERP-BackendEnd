@@ -116,44 +116,60 @@ router.get('/ar-aging', authenticate, async (req, res) => {
 router.get('/gst-summary', authenticate, async (req, res) => {
   try {
     const companyId = req.user.companyId || req.user.company_id;
+    const role = String(req.user.role || '').toLowerCase();
+    if (!['owner', 'admin'].includes(role)) {
+      return res.status(403).json({ error: 'Only company owners and administrators can view GST summaries.' });
+    }
+    if (!companyId) return res.status(401).json({ error: 'Company context is required.' });
 
-    const gstRes = await pool.query(
-      `SELECT 
-         id, invoice_number, customer_name, subtotal, cgst, sgst, igst, total_tax, total_amount, is_inter_state, created_at, status
-       FROM invoices
-       WHERE company_id = $1 AND is_latest = TRUE AND status != 'cancelled'
-       ORDER BY created_at DESC`,
-      [companyId]
-    );
+    const period = req.query.period == null ? null : String(req.query.period);
+    let periodStart = null;
+    let periodEnd = null;
+    if (period) {
+      const match = /^(\d{4})-(0[1-9]|1[0-2])$/.exec(period);
+      if (!match) return res.status(400).json({ error: 'Period must be in YYYY-MM format.' });
+      const year = Number(match[1]);
+      const month = Number(match[2]);
+      periodStart = `${match[1]}-${match[2]}-01`;
+      periodEnd = month === 12 ? `${year + 1}-01-01` : `${match[1]}-${String(month + 1).padStart(2, '0')}-01`;
+    }
 
-    let totalSubtotal = 0;
-    let totalCgst = 0;
-    let totalSgst = 0;
-    let totalIgst = 0;
-    let totalTax = 0;
-
-    gstRes.rows.forEach((row) => {
-      totalSubtotal += parseFloat(row.subtotal || 0);
-      totalCgst += parseFloat(row.cgst || 0);
-      totalSgst += parseFloat(row.sgst || 0);
-      totalIgst += parseFloat(row.igst || 0);
-      totalTax += parseFloat(row.total_tax || 0);
-    });
+    const params = period ? [String(companyId), periodStart, periodEnd] : [String(companyId)];
+    const periodClause = period ? "AND (created_at AT TIME ZONE 'Asia/Kolkata') >= $2::date::timestamp AND (created_at AT TIME ZONE 'Asia/Kolkata') < $3::date::timestamp" : '';
+    const [gstRes, totalsRes] = await Promise.all([
+      pool.query(
+        `SELECT id, invoice_number, customer_name, subtotal, cgst, sgst, igst, total_tax,
+                total_amount, is_inter_state, created_at, status
+           FROM invoices
+          WHERE company_id::text = $1::text AND is_latest = TRUE
+            AND LOWER(COALESCE(status, '')) IN ('issued', 'sent', 'viewed', 'paid', 'partially_paid', 'disputed')
+            ${periodClause}
+          ORDER BY created_at DESC, id DESC`,
+        params
+      ),
+      pool.query(
+        `SELECT COALESCE(SUM(subtotal), 0)::numeric(18,2)::text AS subtotal,
+                COALESCE(SUM(cgst), 0)::numeric(18,2)::text AS cgst,
+                COALESCE(SUM(sgst), 0)::numeric(18,2)::text AS sgst,
+                COALESCE(SUM(igst), 0)::numeric(18,2)::text AS igst,
+                COALESCE(SUM(total_tax), 0)::numeric(18,2)::text AS total_tax
+           FROM invoices
+          WHERE company_id::text = $1::text AND is_latest = TRUE
+            AND LOWER(COALESCE(status, '')) IN ('issued', 'sent', 'viewed', 'paid', 'partially_paid', 'disputed')
+            ${periodClause}`,
+        params
+      ),
+    ]);
 
     return res.json({
       success: true,
-      totals: {
-        subtotal: totalSubtotal.toFixed(2),
-        cgst: totalCgst.toFixed(2),
-        sgst: totalSgst.toFixed(2),
-        igst: totalIgst.toFixed(2),
-        total_tax: totalTax.toFixed(2),
-      },
+      period,
+      totals: totalsRes.rows[0],
       invoices: gstRes.rows,
     });
   } catch (err) {
     console.error('GET /api/finance/gst-summary error:', err.message);
-    return res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: 'Could not load the GST summary. Please retry.' });
   }
 });
 

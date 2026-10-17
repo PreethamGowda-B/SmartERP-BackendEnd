@@ -17,10 +17,23 @@ const pdfInvoiceService = require('../services/pdfInvoiceService');
 const whatsappService = require('../services/whatsappService');
 const emailService = require('../services/emailNotificationService');
 const { createCustomerPortalNotification } = require('../utils/notificationHelpers');
+const GstReconciliationService = require('../services/gstReconciliationService');
 const redisClient = require('../utils/redis');
 
 // Middleware to extract tenant context
 const authenticate = authMiddleware.authenticateToken || authMiddleware;
+
+async function notifyOtherOwnersOfGstInvoice({ companyId, actorId, invoice, action }) {
+  if (!invoice?.id || !companyId) return;
+  await GstReconciliationService.notifyOwners({
+    companyId,
+    actorId,
+    type: 'gst_invoice_issued',
+    title: action === 'reissued' ? 'GST invoice revised' : 'GST invoice issued',
+    message: `${invoice.invoice_number || 'A tax invoice'} was ${action} and is included in the company GST ledger.`,
+    idempotencyKey: `gst-invoice:${invoice.id}:${invoice.version_number || 1}:${action}`,
+  });
+}
 
 /**
  * Generates a signed token for secure invoice PDF access.
@@ -403,6 +416,11 @@ router.post('/direct-create', authenticate, async (req, res) => {
       invoiceData: req.body,
     });
 
+    if (!result?.idempotentReplay) {
+      await notifyOtherOwnersOfGstInvoice({ companyId, actorId: userId, invoice: result?.invoice, action: 'issued' })
+        .catch((error) => console.warn('GST invoice owner notification could not be persisted:', error.message));
+    }
+
     return res.status(201).json(result);
   } catch (err) {
     console.error('POST /api/invoices/direct-create error:', err.message);
@@ -470,6 +488,10 @@ router.post('/finalize', authenticate, async (req, res) => {
     });
 
     const finalizedInvoice = result?.invoice;
+    if (result?.reason !== 'idempotent_replay') {
+      await notifyOtherOwnersOfGstInvoice({ companyId, actorId: userId, invoice: finalizedInvoice, action: 'issued' })
+        .catch((error) => console.warn('GST invoice owner notification could not be persisted:', error.message));
+    }
     if (result?.reason !== 'idempotent_replay' && finalizedInvoice?.customer_id) {
       const title = 'Invoice ready';
       const message = `Invoice ${finalizedInvoice.invoice_number || ''} for your completed service is ready to view.`;
@@ -518,6 +540,11 @@ router.post('/:id/reissue', authenticate, async (req, res) => {
       userId,
       updateData,
     });
+
+    if (result?.reason !== 'idempotent_replay') {
+      await notifyOtherOwnersOfGstInvoice({ companyId, actorId: userId, invoice: result?.invoice, action: 'reissued' })
+        .catch((error) => console.warn('GST invoice revision owner notification could not be persisted:', error.message));
+    }
 
     if (result?.reason !== 'idempotent_replay' && result?.invoice?.customer_id) {
       const jobId = result.invoice.job_id;

@@ -218,6 +218,8 @@ const NUMBERED_MIGRATIONS = [
     '019_workforce_gatekeeper_audit_logs.sql',
     '020_cnc_service_edition.sql',
     '021_cnc_phase2.sql',
+    // Upgrade existing installs whose 009 table predates the persisted pre-run audit fields.
+    '021_payroll_pre_run_audit_engine.sql',
     '022_cnc_phase3.sql',
     '023_cnc_master_release.sql',
     '024_secure_account_deletion.sql',

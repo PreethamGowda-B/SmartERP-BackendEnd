@@ -1,6 +1,6 @@
 const { pool } = require('../db');
 const ProviderFactory = require('../ai/providers/provider.factory');
-const redisClient = require('../utils/redis');
+const { createNotification } = require('../utils/notificationHelpers');
 
 class GstReconciliationService {
   /**
@@ -151,6 +151,7 @@ Mathematical Score: ${scoreResult.score}%, Status: ${scoreResult.matchStatus}, V
     try {
       await client.query('BEGIN');
       await client.query(`SELECT set_config('app.current_company_id', $1::text, true)`, [String(companyId)]);
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))', [String(companyId), `${financialPeriod}:${gstrType}`]);
 
       // 1. Mark previous runs for this period and type as not latest
       await client.query(
@@ -188,11 +189,59 @@ Mathematical Score: ${scoreResult.score}%, Status: ${scoreResult.matchStatus}, V
     }
   }
 
+  static async getVerifiedPurchaseInvoices({ companyId, financialPeriod }) {
+    const [year, month] = financialPeriod.split('-').map(Number);
+    const start = `${financialPeriod}-01`;
+    const end = month === 12 ? `${year + 1}-01-01` : `${year}-${String(month + 1).padStart(2, '0')}-01`;
+    const result = await pool.query(
+      `SELECT supplier_gstin, supplier_name, invoice_number, invoice_date,
+              COALESCE(subtotal, 0)::numeric(15,2)::text AS taxable_value,
+              COALESCE(tax_amount, 0)::numeric(15,2)::text AS total_tax
+         FROM material_purchase_bills
+        WHERE company_id::text = $1::text AND received_confirmed = TRUE
+          AND draft_status = 'verified' AND invoice_number IS NOT NULL
+          AND invoice_date >= $2::date AND invoice_date < $3::date
+        ORDER BY invoice_date, invoice_number, id`,
+      [String(companyId), start, end]
+    );
+    return result.rows.map((row) => ({
+      supplierGstin: row.supplier_gstin || '',
+      supplierName: row.supplier_name || 'Supplier',
+      invoiceNumber: row.invoice_number,
+      invoiceDate: row.invoice_date,
+      taxableValue: Number(row.taxable_value),
+      totalTax: Number(row.total_tax),
+      // Purchase-bill storage currently persists total tax, not its GST-component split.
+      cgst: 0, sgst: 0, igst: 0,
+    }));
+  }
+
+  static async notifyOwners({ companyId, actorId = null, type, title, message, idempotencyKey, runId = null }) {
+    const owners = await pool.query(
+      `SELECT id FROM users WHERE company_id::text = $1::text
+        AND LOWER(role) IN ('owner', 'admin') AND ($2::text IS NULL OR id::text <> $2::text)`,
+      [String(companyId), actorId == null ? null : String(actorId)]
+    );
+    const results = await Promise.allSettled(owners.rows.map((owner) => createNotification({
+      user_id: owner.id,
+      company_id: companyId,
+      type,
+      title,
+      message,
+      priority: type === 'gst_reconciliation_failed' ? 'high' : 'normal',
+      idempotency_key: `${idempotencyKey}:${owner.id}`,
+      actor_id: actorId,
+      data: { url: '/owner/finance/gst', run_id: runId },
+    })));
+    const failures = results.filter((result) => result.status === 'rejected');
+    if (failures.length) console.error('GST owner notification persistence failed:', failures.map((result) => result.reason?.message || 'unknown error'));
+    return { recipients: owners.rows.length, persisted: results.length - failures.length, failures: failures.length };
+  }
+
   /**
    * Bulk Batch Reconciliation Processor with Redis Checkpointing.
    */
   static async processReconciliationBatch({ runId, companyId, booksInvoices = [], portalInvoices = [] }) {
-    const checkpointKey = `gst:job:${runId}:checkpoint`;
     const client = await pool.connect();
 
     try {
@@ -207,29 +256,30 @@ Mathematical Score: ${scoreResult.score}%, Status: ${scoreResult.matchStatus}, V
       );
       const canonicalTolerance = settingsRes.rows[0] ? parseFloat(settingsRes.rows[0].canonical_tolerance_amount) : 5.00;
 
-      // Check Redis Checkpoint
-      const lastIndexStr = await redisClient.hget(checkpointKey, 'last_processed_index');
-      let startIndex = lastIndexStr ? parseInt(lastIndexStr, 10) : 0;
-
       let totalMatched = 0;
       let totalMismatched = 0;
       let totalClaimed = 0;
       let totalBlocked = 0;
 
-      for (let i = startIndex; i < booksInvoices.length; i++) {
+      const usedPortalIndices = new Set();
+      for (let i = 0; i < booksInvoices.length; i++) {
         const booksItem = booksInvoices[i];
         
         // Find best matching portal item
         let bestMatch = null;
         let highestScoreResult = { score: 0.0, matchStatus: 'missing_in_gstr', variance: 0.0 };
 
-        for (const portalItem of portalInvoices) {
+        for (let portalIndex = 0; portalIndex < portalInvoices.length; portalIndex++) {
+          if (usedPortalIndices.has(portalIndex)) continue;
+          const portalItem = portalInvoices[portalIndex];
           const scoreResult = this.calculateConfidenceScore({ booksItem, portalItem, canonicalTolerance });
           if (scoreResult.score > highestScoreResult.score) {
             highestScoreResult = scoreResult;
             bestMatch = portalItem;
+            highestScoreResult.portalIndex = portalIndex;
           }
         }
+        if (bestMatch && Number.isInteger(highestScoreResult.portalIndex)) usedPortalIndices.add(highestScoreResult.portalIndex);
 
         const matchStatus = highestScoreResult.matchStatus;
         const confidenceScore = highestScoreResult.score;
@@ -277,10 +327,26 @@ Mathematical Score: ${scoreResult.score}%, Status: ${scoreResult.matchStatus}, V
           ]
         );
 
-        // Update Redis Checkpoint every 250 items
-        if ((i + 1) % 250 === 0 || i === booksInvoices.length - 1) {
-          await redisClient.hset(checkpointKey, 'last_processed_index', i + 1);
-        }
+      }
+
+      for (let portalIndex = 0; portalIndex < portalInvoices.length; portalIndex++) {
+        if (usedPortalIndices.has(portalIndex)) continue;
+        const portalItem = portalInvoices[portalIndex];
+        const portalTax = Number(portalItem.totalTax || 0);
+        await client.query(
+          `INSERT INTO gst_reconciliation_items
+           (reconciliation_run_id, company_id, supplier_gstin, supplier_name, invoice_number_books, invoice_number_portal,
+            invoice_date_books, invoice_date_portal, taxable_value_books, taxable_value_portal,
+            cgst_books, cgst_portal, sgst_books, sgst_portal, igst_books, igst_portal,
+            variance_amount, match_status, confidence_score, ai_match_reasoning)
+           VALUES ($1, $2, $3, $4, NULL, $5, NULL, $6, 0, $7, 0, $8, 0, $9, 0, $10, $11, 'missing_in_books', 0, $12)`,
+          [runId, companyId, portalItem.supplierGstin || 'UNKNOWN', portalItem.supplierName || 'Supplier',
+            portalItem.invoiceNumber || null, portalItem.invoiceDate || null, Number(portalItem.taxableValue || 0),
+            Number(portalItem.cgst || 0), Number(portalItem.sgst || 0), Number(portalItem.igst || 0), portalTax,
+            `Statement invoice ${portalItem.invoiceNumber || ''} has no matched verified purchase bill in SmartERP for this company and period.`]
+        );
+        totalMismatched += 1;
+        totalBlocked += portalTax;
       }
 
       // Update Header Record
@@ -288,17 +354,18 @@ Mathematical Score: ${scoreResult.score}%, Status: ${scoreResult.matchStatus}, V
         `UPDATE gst_reconciliation_runs
          SET total_books_invoices = $1, total_portal_invoices = $2, total_matched = $3,
              total_mismatched = $4, total_itc_claimed = $5, total_itc_blocked = $6, status = 'completed', updated_at = NOW()
-         WHERE id = $7`,
-        [booksInvoices.length, portalInvoices.length, totalMatched, totalMismatched, totalClaimed, totalBlocked, runId]
+         WHERE id = $7 AND company_id::text = $8::text`,
+        [booksInvoices.length, portalInvoices.length, totalMatched, totalMismatched, totalClaimed, totalBlocked, runId, String(companyId)]
       );
 
       await client.query('COMMIT');
-      await redisClient.del(checkpointKey); // Cleanup checkpoint on success
 
       return { success: true, runId, totalMatched, totalMismatched };
     } catch (err) {
       await client.query('ROLLBACK');
-      await client.query(`UPDATE gst_reconciliation_runs SET status = 'failed' WHERE id = $1`, [runId]);
+      await client.query('BEGIN').catch(() => {});
+      await client.query(`SELECT set_config('app.current_company_id', $1::text, true)`, [String(companyId)]).catch(() => {});
+      await client.query(`UPDATE gst_reconciliation_runs SET status = 'failed', updated_at = NOW() WHERE id = $1 AND company_id::text = $2::text`, [runId, String(companyId)]).then(() => client.query('COMMIT')).catch(async () => client.query('ROLLBACK').catch(() => {}));
       throw err;
     } finally {
       client.release();

@@ -42,20 +42,33 @@ async function appendEvent(client, { companyId, requestId, billId, actorId, type
   );
 }
 
-async function requestAccess(client, req, { lock = false } = {}) {
+async function requestAccess(client, req) {
   const companyId = companyIdOf(req.user);
-  const requestId = req.params.requestId;
+  // Nested Express routers normally inherit this param via mergeParams. Keep a
+  // URL fallback as well so authorization does not silently fail if a proxy or
+  // a future route mount changes the child router's params object.
+  const requestId = req.params.requestId || req.baseUrl.match(/\/material-requests\/([^/]+)\/purchase-bills(?:\/|$)/)?.[1];
   if (!companyId || !requestId) return null;
   const result = await client.query(
     `SELECT id, item_name, quantity, unit, description, status, purchase_status,
             requested_by, requested_by_name, reviewed_by, reviewed_at, company_id
        FROM material_requests
-      WHERE id::text = $1::text AND company_id::text = $2::text${lock ? ' FOR UPDATE' : ''}`,
+      WHERE id::text = $1::text AND company_id::text = $2::text`,
     [requestId, companyId]
   );
   const request = result.rows[0];
-  if (!request) return null;
-  if (!isApprover(req.user) && String(request.requested_by || '') !== userIdOf(req.user)) return null;
+  if (!request) {
+    console.warn('Material purchase request unavailable to company scope', {
+      requestId: String(requestId), role: String(req.user?.role || ''),
+    });
+    return null;
+  }
+  if (!isApprover(req.user) && String(request.requested_by || '') !== userIdOf(req.user)) {
+    console.warn('Material purchase request access denied: requester mismatch', {
+      requestId: String(request.id), role: String(req.user?.role || ''),
+    });
+    return null;
+  }
   return request;
 }
 
@@ -267,20 +280,29 @@ router.post('/', upload.single('invoice'), requireValidFileSignature({ allowedMi
                 discount_amount = COALESCE($8,discount_amount), tax_amount = COALESCE($9,tax_amount), invoice_total = COALESCE($10,invoice_total),
                 currency = COALESCE($11,currency), supplier_gstin = COALESCE($12,supplier_gstin), extraction = $13::jsonb,
                 discrepancies = $14::jsonb, ai_status = $15, matched_inventory_item_id = $16, updated_at = NOW()
-          WHERE id::text = $17 AND company_id = $18 AND draft_status = 'awaiting_owner_verification' RETURNING id`,
+          WHERE id::text = $17 AND company_id = $18 RETURNING id, draft_status`,
         [invoice.supplierName, invoice.invoiceNumber, invoice.invoiceDate, invoice.quantity, invoice.unit, invoice.unitPrice,
           invoice.subtotal, invoice.discount, invoice.tax, invoice.total, invoice.currency, invoice.gstin,
           JSON.stringify({ status: analysis.status, reason: analysis.reason || null, fields: originalExtraction }),
           JSON.stringify(discrepancies), finalAiStatus, matchedItemId, bill.id, companyId]
       );
-      if (!stored.rows.length) throw new Error('Bill status changed while analysis was running.');
-      const purchaseStatus = finalAiStatus === 'ai_verification_passed' ? 'ready_for_owner' : finalAiStatus;
-      await updateClient.query(`UPDATE material_requests SET purchase_status = $1, updated_at = NOW() WHERE id = $2 AND company_id::text = $3`, [purchaseStatus, request.id, companyId]);
-      await appendEvent(updateClient, { companyId, requestId: request.id, billId: bill.id, actorId: userId, type: 'ai_analysis_completed', details: { ai_status: finalAiStatus, discrepancy_count: discrepancies.length } });
+      if (!stored.rows.length) throw new Error('Uploaded bill is no longer visible to its company.');
+      // Persist the analysis before optional request timeline bookkeeping. A
+      // failed event/status update must not roll back the saved analysis.
       await updateClient.query('COMMIT');
+      try {
+        await updateClient.query('BEGIN');
+        const purchaseStatus = finalAiStatus === 'ai_verification_passed' ? 'ready_for_owner' : finalAiStatus;
+        await updateClient.query(`UPDATE material_requests SET purchase_status = $1, updated_at = NOW() WHERE id = $2 AND company_id::text = $3`, [purchaseStatus, request.id, companyId]);
+        await appendEvent(updateClient, { companyId, requestId: request.id, billId: bill.id, actorId: userId, type: 'ai_analysis_completed', details: { ai_status: finalAiStatus, discrepancy_count: discrepancies.length } });
+        await updateClient.query('COMMIT');
+      } catch (eventError) {
+        await updateClient.query('ROLLBACK').catch(() => {});
+        console.warn('Material invoice analysis saved but request status/event update failed:', eventError.code || eventError.message || 'workflow_update_error');
+      }
     } catch (error) {
       await updateClient.query('ROLLBACK').catch(() => {});
-      console.error('Material invoice analysis result was not stored:', error.code || error.name || 'analysis_save_error');
+      console.error('Material invoice analysis result was not stored:', error.code || error.message || error.name || 'analysis_save_error');
       return res.status(202).json({ success: true, bill_id: bill.id, status: 'processing', message: 'Invoice was securely saved; analysis result could not be saved yet. Refresh the request.' });
     } finally { updateClient.release(); }
     try {

@@ -72,10 +72,13 @@ async function requireClockIn(req, res, next) {
 
   } catch (err) {
     console.error('❌ Attendance Gatekeeper Middleware Error:', err.message);
-    return res.status(403).json({
+    // A policy/database failure is not evidence that the employee has no active
+    // shift. Keep the response distinct so clients can offer a retry instead of
+    // falsely telling a clocked-in employee to punch in again.
+    return res.status(503).json({
       success: false,
-      code: 'SHIFT_NOT_STARTED',
-      message: 'You must clock in before performing company operations.'
+      code: 'ATTENDANCE_STATUS_UNAVAILABLE',
+      message: 'Could not verify your attendance status. Please try again.'
     });
   }
 }

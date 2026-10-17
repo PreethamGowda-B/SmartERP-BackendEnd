@@ -64,7 +64,7 @@ function authenticateSSE(req, res, next) {
     }
     req.user = payload;
     const companyId = payload.companyId || payload.company_id;
-    const userId = payload.id || payload.userId || payload.customerId;
+    const userId = payload.id || payload.customerId || payload.userId;
     storage.run({
       isWebRequest: true,
       companyId,
@@ -77,8 +77,8 @@ function authenticateSSE(req, res, next) {
 
 // ─── GET /jobs/:id/events ─────────────────────────────────────────────────────
 router.get('/jobs/:id/events', authenticateSSE, async (req, res) => {
-  const userId = req.user.id || req.user.userId;
-  const companyId = req.user.companyId;
+  const userId = req.user.id || req.user.customerId || req.user.userId;
+  const companyId = req.user.companyId || req.user.company_id;
   const role = req.user.role;
   const { id: jobId } = req.params;
 
@@ -87,8 +87,8 @@ router.get('/jobs/:id/events', authenticateSSE, async (req, res) => {
     let jobCheck;
     if (role === 'customer') {
       jobCheck = await pool.query(
-        `SELECT id FROM jobs WHERE id = $1 AND customer_id = $2 AND company_id = $3`,
-        [jobId, userId, companyId]
+        `SELECT id FROM jobs WHERE id::text = $1::text AND customer_id::text = $2::text AND company_id::text = $3::text`,
+        [String(jobId), String(userId), String(companyId)]
       );
     } else if (role === 'employee') {
       jobCheck = await pool.query(

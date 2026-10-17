@@ -520,8 +520,8 @@ router.get('/:id/materials', async (req, res) => {
   try {
     // Ownership check
     const jobCheck = await pool.query(
-      `SELECT id FROM jobs WHERE id = $1 AND customer_id = $2 AND company_id = $3`,
-      [id, customerId, companyId]
+      `SELECT id FROM jobs WHERE id::text = $1::text AND customer_id::text = $2::text AND company_id::text = $3::text`,
+      [String(id), String(customerId), String(companyId)]
     );
     if (jobCheck.rows.length === 0) return fail(res, 'Job not found', 404);
 

@@ -116,7 +116,7 @@ router.get('/', async (req, res) => {
     const jobResult = await pool.query(
       `SELECT id, customer_id, assigned_to, employee_status, company_id
        FROM jobs
-       WHERE id = $1 AND customer_id = $2 AND company_id::text = $3`,
+       WHERE id::text = $1::text AND customer_id::text = $2::text AND company_id::text = $3::text`,
       [jobId, customerId, String(companyId)]
     );
 
@@ -176,8 +176,8 @@ router.post('/', async (req, res) => {
               c.name AS customer_name
        FROM jobs j
        LEFT JOIN customers c ON c.id = j.customer_id
-       WHERE j.id = $1 AND j.customer_id = $2
-         AND (j.company_id::text = $3 OR j.company_id IN (SELECT id FROM companies WHERE id::text = $3))`,
+       WHERE j.id::text = $1::text AND j.customer_id::text = $2::text
+         AND j.company_id::text = $3::text`,
       [jobId, customerId, String(companyId)]
     );
 

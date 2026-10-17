@@ -48,14 +48,16 @@ function authenticateCustomer(req, res, next) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
-    // Attach decoded payload — downstream handlers use req.customer.id / req.customer.companyId
-    req.customer = payload;
+    // Normalize legacy claim spellings once at the auth boundary. Several older
+    // customer tokens carry customerId/userId or company_id instead of id/companyId.
+    // Downstream customer routes consistently consume id and companyId.
+    const customerId = payload.id || payload.customerId || payload.userId;
+    const companyId = payload.companyId || payload.company_id;
+    req.customer = { ...payload, id: customerId, companyId };
 
     // Customer requests need the same tenant-scoped RLS context as owner and
     // employee requests. Without this, INSERTs into FORCE-RLS tables such as
     // jobs are rejected even when the row belongs to the customer's company.
-    const companyId = payload.companyId || payload.company_id;
-    const customerId = payload.id || payload.customerId || payload.userId;
     storage.run({
       isWebRequest: true,
       companyId,

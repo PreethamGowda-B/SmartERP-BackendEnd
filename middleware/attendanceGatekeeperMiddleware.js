@@ -1,4 +1,5 @@
 const { pool } = require('../db');
+const AttendancePolicy = require('../services/attendancePolicyService');
 
 /**
  * Enterprise Attendance & Clock-In Gatekeeper Middleware
@@ -15,32 +16,27 @@ async function requireClockIn(req, res, next) {
     }
 
     const userId = req.user?.id || req.user?.userId;
-    const companyId = req.user?.companyId || req.user?.company_id || 1;
+    const companyId = req.user?.companyId || req.user?.company_id;
 
     if (!userId) {
       return res.status(401).json({ success: false, message: 'Authentication required' });
     }
 
-    const today = new Date().toISOString().split('T')[0];
+    if (!companyId) return res.status(403).json({ success: false, code: 'COMPANY_REQUIRED', message: 'Company affiliation is required.' });
+    const policy = await AttendancePolicy.getCompanyPolicy(companyId, pool);
+    const today = AttendancePolicy.localDate(new Date(), policy.timezone);
 
     // Check if employee has an active clock-in record for TODAY
     const shiftRes = await pool.query(
       `SELECT id, check_in_time, check_out_time FROM attendance
        WHERE user_id::text = $1::text 
-         AND (date = $2 OR (check_in_time IS NOT NULL AND check_in_time::date = $2::date))
+         AND company_id::text = $3::text
+         AND date = $2
          AND check_in_time IS NOT NULL
          AND check_out_time IS NULL
        ORDER BY created_at DESC LIMIT 1`,
-      [String(userId), today]
-    ).catch(async (dbErr) => {
-      console.warn('⚠️ Primary attendance query fallback:', dbErr.message);
-      return pool.query(
-        `SELECT id, check_in_time, check_out_time FROM attendance
-         WHERE user_id::text = $1::text AND check_in_time IS NOT NULL AND check_out_time IS NULL
-         ORDER BY created_at DESC LIMIT 1`,
-        [String(userId)]
-      ).catch(() => ({ rows: [] }));
-    });
+      [String(userId), today, String(companyId)]
+    );
 
     if (shiftRes.rows.length > 0) {
       // Employee is clocked in with active shift — allow operation

@@ -1,4 +1,5 @@
 const { pool } = require("../db");
+const AttendancePolicy = require("./attendancePolicyService");
 
 class AttendanceService {
   /**
@@ -7,7 +8,8 @@ class AttendanceService {
   static async getTodayAttendance({ companyId }) {
     if (!companyId) throw new Error("Company ID is required.");
     const cid = String(companyId);
-    const todayStr = new Date().toISOString().split("T")[0];
+    const policy = await AttendancePolicy.getCompanyPolicy(cid, pool);
+    const todayStr = AttendancePolicy.localDate(new Date(), policy.timezone);
 
     const result = await pool.query(
       `SELECT 
@@ -22,11 +24,10 @@ class AttendanceService {
          a.status,
          a.is_late
        FROM users u
-       LEFT JOIN attendance a ON u.id = a.user_id AND (a.date = CURRENT_DATE OR a.date::text = CURRENT_DATE::text)
-       WHERE (u.role = 'employee' OR (u.role != 'owner' AND u.role != 'admin' AND u.role != 'customer'))
-         AND (u.company_id = $1 OR u.company_id::text = $1::text)
+       LEFT JOIN attendance a ON u.id = a.user_id AND a.company_id::text = u.company_id::text AND a.date = $2
+       WHERE u.role = 'employee' AND u.company_id::text = $1::text
        ORDER BY u.name ASC`,
-      [cid]
+      [cid, todayStr]
     ).catch((err) => {
       console.error("❌ AttendanceService.getTodayAttendance error:", err.message);
       return { rows: [] };
@@ -68,9 +69,8 @@ class AttendanceService {
     const res = await pool.query(
       `SELECT u.name, u.email, COUNT(a.id) as attendance_records
        FROM users u
-       LEFT JOIN attendance a ON u.id = a.user_id AND (a.check_in_time IS NOT NULL OR a.status IN ('present', 'late', 'half_day'))
-       WHERE (u.company_id = $1 OR u.company_id::text = $1::text)
-         AND (u.role = 'employee' OR (u.role != 'owner' AND u.role != 'admin' AND u.role != 'customer'))
+       LEFT JOIN attendance a ON u.id = a.user_id AND a.company_id::text = u.company_id::text AND (a.check_in_time IS NOT NULL OR a.status IN ('present', 'late', 'half_day'))
+       WHERE u.company_id::text = $1::text AND u.role = 'employee'
        GROUP BY u.id, u.name, u.email
        ORDER BY attendance_records ASC LIMIT 5`,
       [cid]

@@ -3,6 +3,10 @@ const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 const { createNotification, createNotificationForOwners } = require('../utils/notificationHelpers');
+const AttendancePolicy = require('../services/attendancePolicyService');
+const { redisClient } = require('../utils/redis');
+const { storage } = require('../middleware/als');
+const BiometricWebhookAuth = require('../services/biometricWebhookAuth');
 
 // company_id helper
 function safeCompanyId(value) {
@@ -19,78 +23,90 @@ function safeCompanyId(value) {
 // Shift Times: 9:00 AM - 7:00 PM
 // Auto clock-out, half-day detection, biometric support, daily processing
 
-// ─── HELPER FUNCTIONS ────────────────────────────────────────────────────────
+// ─── TRANSACTION AND RESPONSE HELPERS ────────────────────────────────────────
 
-/**
- * Calculate working hours between clock-in and clock-out
- */
-function calculateWorkingHours(clockInTime, clockOutTime) {
-  const diffMs = new Date(clockOutTime) - new Date(clockInTime);
-  const hours = diffMs / (1000 * 60 * 60);
-  return Math.round(hours * 100) / 100; // Round to 2 decimals
-}
-
-/**
- * Get India Standard Time (IST) Date object
- * Helper to ensure consistency across UTC servers
- */
-function getISTTime(dateInput = new Date()) {
-  const d = new Date(dateInput);
-  // India is UTC + 5:30
-  const utc = d.getTime() + (d.getTimezoneOffset() * 60000);
-  return new Date(utc + (3600000 * 5.5));
-}
-
-/**
- * Check if clock-in is late (after 9:00 AM IST)
- * Late: 9:01 AM – 12:59 PM
- */
-function isLateCheckIn(clockInTime) {
-  const d = getISTTime(clockInTime);
-  const hour = d.getHours();
-  const minute = d.getMinutes();
-  // Late if after 9:00 AM sharp and before 1:00 PM
-  const afterNine = hour > 9 || (hour === 9 && minute > 0);
-  const beforeOne = hour < 13;
-  return afterNine && beforeOne;
-}
-
-/**
- * Check if clock-in qualifies as Half Day (at or after 1:00 PM IST)
- */
-function isHalfDayClockIn(clockInTime) {
-  const hour = getISTTime(clockInTime).getHours();
-  return hour >= 13;
-}
-
-/**
- * Check if clock-out is before shift end (7:00 PM IST)
- */
-function isEarlyClockOut(clockOutTime) {
-  const hour = getISTTime(clockOutTime).getHours();
-  return hour < 19;
-}
-
-/**
- * Determine final attendance status.
- * Rules (in priority order):
- *  1. Clocked in at/after 1:00 PM                      → half_day
- *  2. Clocked out before 7:00 PM                        → half_day
- *  3. Clocked in between 9:01 AM and 12:59 PM           → late
- *  4. Clocked in before 9:00 AM, out at/after 7:00 PM  → present
- */
-function determineStatus(clockInTime, clockOutTime, workingHours) {
-  if (isHalfDayClockIn(clockInTime)) {
-    return 'half_day'; // Came in after 1 PM
+async function withAttendanceTransaction(work) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const value = await work(client);
+    await client.query('COMMIT');
+    return value;
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
   }
-  if (isEarlyClockOut(clockOutTime)) {
-    return 'half_day'; // Left before 7 PM
-  }
-  if (isLateCheckIn(clockInTime)) {
-    return 'late';    // 9:01 AM – 12:59 PM
-  }
-  return 'present';   // On time and stayed till 7 PM
 }
+
+function formatPolicyTime(instant, timezone) {
+  return new Intl.DateTimeFormat('en-IN', { timeZone: timezone, hour: '2-digit', minute: '2-digit', hour12: true }).format(new Date(instant));
+}
+
+function requireEmployee(req, res) {
+  if ((req.user?.role || '').toLowerCase() !== 'employee') {
+    res.status(403).json({ message: 'Employee attendance action required' });
+    return false;
+  }
+  if (!req.user?.companyId && !req.user?.company_id) {
+    res.status(403).json({ message: 'Missing company affiliation' });
+    return false;
+  }
+  return true;
+}
+
+router.get('/policy', authenticateToken, async (req, res) => {
+  try {
+    const companyId = safeCompanyId(req.user.companyId || req.user.company_id);
+    if (!companyId) return res.status(403).json({ message: 'Missing company affiliation' });
+    const policy = await AttendancePolicy.getCompanyPolicy(companyId, pool);
+    const now = new Date();
+    const role = (req.user.role || '').toLowerCase();
+    let attendance = null;
+    let eligibility = null;
+    if (role === 'employee') {
+      const workDate = AttendancePolicy.localDate(now, policy.timezone);
+      const result = await pool.query('SELECT * FROM attendance WHERE user_id = $1 AND company_id::text = $2::text AND date = $3 ORDER BY created_at ASC LIMIT 2', [req.user.userId || req.user.id, String(companyId), workDate]);
+      if (result.rows.length > 1) return res.status(409).json({ message: 'Multiple attendance records exist for this work date; owner review is required' });
+      attendance = result.rows[0] || null;
+      eligibility = attendance?.check_in_time
+        ? { allowed: false, code: 'already_clocked_in', reason: 'Attendance is already recorded for today' }
+        : AttendancePolicy.evaluateClockIn(now, policy);
+    } else if (!['owner', 'admin', 'hr', 'superadmin'].includes(role)) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+    res.json({ policy, work_date: AttendancePolicy.localDate(now, policy.timezone), eligibility, attendance });
+  } catch (err) {
+    console.error('❌ Error reading attendance policy:', err);
+    res.status(500).json({ message: 'Could not load attendance policy' });
+  }
+});
+
+router.put('/policy', authenticateToken, async (req, res) => {
+  try {
+    if ((req.user.role || '').toLowerCase() !== 'owner') return res.status(403).json({ message: 'Only the company owner can update attendance policy' });
+    const companyId = safeCompanyId(req.user.companyId || req.user.company_id);
+    if (!companyId) return res.status(403).json({ message: 'Missing company affiliation' });
+    const input = AttendancePolicy.validatePolicy(req.body?.policy || req.body);
+    const current = await AttendancePolicy.getCompanyPolicy(companyId, pool);
+    const today = AttendancePolicy.localDate(new Date(), current.timezone);
+    const outcome = await withAttendanceTransaction(async (client) => {
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [AttendancePolicy.policyLockKey(companyId, today)]);
+      const latest = await AttendancePolicy.getCompanyPolicy(companyId, client);
+      const hasTodayRecords = await client.query('SELECT id FROM attendance WHERE company_id::text = $1::text AND date = $2 LIMIT 1', [String(companyId), today]);
+      if (hasTodayRecords.rows.length && JSON.stringify(input) !== JSON.stringify(latest)) return { conflict: true };
+      return { policy: await AttendancePolicy.saveCompanyPolicy(companyId, req.user.userId || req.user.id, input, client) };
+    });
+    if (outcome.conflict) return res.status(409).json({ message: 'Attendance policy changes are blocked after today’s attendance has started. Save the new policy before the next work date.' });
+    const policy = outcome.policy;
+    res.json({ success: true, policy });
+  } catch (err) {
+    const status = /policy|time|timezone|unknown|must|invalid|cutoff|shift|break|grace|rounding/i.test(err.message) ? 400 : 500;
+    console.error('❌ Error saving attendance policy:', err);
+    res.status(status).json({ message: status === 400 ? err.message : 'Could not save attendance policy' });
+  }
+});
 
 // ─── EMPLOYEE ENDPOINTS ──────────────────────────────────────────────────────
 
@@ -100,74 +116,41 @@ function determineStatus(clockInTime, clockOutTime, workingHours) {
  */
 router.post('/clock-in', authenticateToken, async (req, res) => {
   try {
+    if (!requireEmployee(req, res)) return;
     const userId = req.user.userId || req.user.id;
-    const companyId = safeCompanyId(req.user.companyId);
-    const { biometric_device_id, method = 'manual' } = req.body;
+    const companyId = safeCompanyId(req.user.companyId || req.user.company_id);
+    const method = 'manual';
+    const biometric_device_id = null;
     const clockInTime = new Date();
-    const istClockIn = getISTTime(clockInTime);
-    const clockHour = istClockIn.getHours();
-    // Consistent IST date format YYYY-MM-DD
-    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
-
-    // ── Attendance window rules (IST) ───────────────────────────────────────
-    // Before 9:00 AM  → Present (on time / early)
-    // 9:01 – 12:59    → Late
-    // 13:00 – 18:59   → Half Day (came in after 1 PM)
-    // 19:00+          → Overtime / Evening shift (allowed for CNC emergency repairs)
-    // ────────────────────────────────────────────────────────────────────────
-
-    const isOvertime = clockHour >= 19;
-    const isLate = !isOvertime && isLateCheckIn(clockInTime);
-    const isHalfDay = !isOvertime && isHalfDayClockIn(clockInTime);
-
-    // Check if already clocked in today
-    const existing = await pool.query(
-      'SELECT * FROM attendance WHERE user_id = $1 AND (date::text = $2 OR date = CURRENT_DATE)',
-      [userId, today]
-    );
-
-    if (existing.rows.length > 0 && existing.rows[0].check_in_time) {
-      // If the technician was auto clocked out by system cron (7 PM), allow them to resume for overtime
-      if (existing.rows[0].is_auto_clocked_out) {
-        const resumed = await pool.query(
-          `UPDATE attendance 
-           SET check_out_time = NULL, is_auto_clocked_out = FALSE, updated_at = NOW()
-           WHERE id = $1 RETURNING *`,
-          [existing.rows[0].id]
-        );
-        return res.json({ ...resumed.rows[0], status_label: 'Present (Overtime)' });
+    const currentPolicy = await AttendancePolicy.getCompanyPolicy(companyId, pool);
+    const today = AttendancePolicy.localDate(clockInTime, currentPolicy.timezone);
+    const { record, policy, created } = await withAttendanceTransaction(async (client) => {
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [AttendancePolicy.policyLockKey(companyId, today)]);
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [AttendancePolicy.lockKey(userId, companyId, today)]);
+      const member = await client.query('SELECT id FROM users WHERE id = $1 AND company_id::text = $2::text AND role = $3 LIMIT 1', [userId, String(companyId), 'employee']);
+      if (!member.rows.length) throw Object.assign(new Error('Employee does not belong to this company'), { statusCode: 403 });
+      const companyPolicy = await AttendancePolicy.getCompanyPolicy(companyId, client);
+      const existing = await client.query('SELECT * FROM attendance WHERE user_id = $1 AND company_id::text = $2::text AND date = $3 ORDER BY created_at ASC FOR UPDATE', [userId, String(companyId), today]);
+      if (existing.rows.length > 1) throw Object.assign(new Error('Multiple attendance records exist for this employee and work date; owner review is required'), { statusCode: 409 });
+      if (existing.rows[0]?.check_in_time) return { record: existing.rows[0], policy: companyPolicy, created: false };
+      const eligibility = AttendancePolicy.evaluateClockIn(clockInTime, companyPolicy);
+      if (!eligibility.allowed) throw Object.assign(new Error(eligibility.reason), { statusCode: 400, code: eligibility.code });
+      let result;
+      if (existing.rows.length === 1) {
+        result = await client.query(`UPDATE attendance SET check_in_time = $1, is_late = $2, status = $3, clock_in_method = $4, biometric_device_id = $5, updated_at = NOW() WHERE id = $6 AND company_id::text = $7::text RETURNING *`, [clockInTime, eligibility.is_late, eligibility.status, method, biometric_device_id || null, existing.rows[0].id, String(companyId)]);
+      } else {
+        result = await client.query(`INSERT INTO attendance (user_id, company_id, date, check_in_time, is_late, status, clock_in_method, biometric_device_id, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW()) RETURNING *`, [userId, companyId, today, clockInTime, eligibility.is_late, eligibility.status, method, biometric_device_id || null]);
       }
-      return res.status(400).json({
-        message: 'Already clocked in today',
-        attendance: existing.rows[0]
-      });
-    }
-
-    // Determine provisional status at clock-in time
-    let provisionalStatus = 'present';
-    if (isOvertime) provisionalStatus = 'overtime';
-    else if (isHalfDay) provisionalStatus = 'half_day';
-    else if (isLate) provisionalStatus = 'late';
-
-    // Create or update attendance record
-    // Ensure companyId is a valid UUID
-    // Use the companyId as-is (SQL will handle type casting if it's an integer)
-    // If it's a UUID, it will work for UUID columns. If it's a numeric string, it works for Integer columns.
-    const validCompanyId = companyId;
-
-    const result = await pool.query(
-      `INSERT INTO attendance 
-             (user_id, company_id, date, check_in_time, is_late, status, clock_in_method, biometric_device_id, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
-             ON CONFLICT (user_id, date) 
-             DO UPDATE SET check_in_time = $4, is_late = $5, status = $6, clock_in_method = $7, biometric_device_id = $8, updated_at = NOW()
-             RETURNING *`,
-      [userId, validCompanyId, today, clockInTime, isLate, provisionalStatus, method, biometric_device_id]
-    );
+      return { record: result.rows[0], policy: companyPolicy, created: true };
+    });
+    const isLate = Boolean(record.is_late);
+    const isHalfDay = record.status === 'half_day';
+    const provisionalStatus = record.status;
+    if (!created) return res.json({ ...record, status_label: isHalfDay ? 'Half Day' : isLate ? 'Late' : 'Present' });
 
     // Build human-readable status label
     const statusLabel = isHalfDay ? 'Half Day' : isLate ? 'Late' : 'Present';
-    console.log(`✅ Clock-in recorded for user ${userId} at ${clockInTime.toLocaleTimeString()} — ${statusLabel} (${method})`);
+    console.log(`✅ Clock-in recorded for user ${userId} at ${formatPolicyTime(clockInTime, policy.timezone)} — ${statusLabel} (${method})`);
 
     // Send notification to owners about employee clock-in
     try {
@@ -178,9 +161,9 @@ router.post('/clock-in', authenticateToken, async (req, res) => {
         company_id: companyId,
         type: 'employee_clock_in',
         title: 'Employee Clocked In',
-        message: `${employeeName} clocked in at ${istClockIn.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true })} (${statusLabel})`,
+        message: `${employeeName} clocked in at ${formatPolicyTime(clockInTime, policy.timezone)} (${statusLabel})`,
         priority: isHalfDay ? 'high' : isLate ? 'medium' : 'low',
-        data: { employee_id: userId, attendance_id: result.rows[0].id, is_late: isLate, status: provisionalStatus, url: '/owner/attendance' }
+        data: { employee_id: userId, attendance_id: record.id, is_late: isLate, status: provisionalStatus, url: '/owner/attendance' }
       });
 
       console.log(`✅ Notified owners about clock-in`);
@@ -196,9 +179,9 @@ router.post('/clock-in', authenticateToken, async (req, res) => {
           company_id: companyId,
           type: 'attendance_half_day',
           title: 'Half Day Recorded',
-          message: `You clocked in at ${clockInTime.toLocaleTimeString()} — recorded as Half Day. Shift started at 9:00 AM.`,
+          message: `You clocked in at ${formatPolicyTime(clockInTime, policy.timezone)} — recorded as Half Day.`,
           priority: 'medium',
-          data: { attendance_id: result.rows[0].id, url: '/employee/attendance' }
+          data: { attendance_id: record.id, url: '/employee/attendance' }
         });
       } catch (notifErr) {
         console.error('❌ Failed to send half-day notification:', notifErr);
@@ -210,9 +193,9 @@ router.post('/clock-in', authenticateToken, async (req, res) => {
           company_id: companyId,
           type: 'attendance_late',
           title: 'Late Clock-In',
-          message: `You clocked in late at ${clockInTime.toLocaleTimeString()}. Shift starts at 9:00 AM.`,
+          message: `You clocked in late at ${formatPolicyTime(clockInTime, policy.timezone)}.`,
           priority: 'low',
-          data: { attendance_id: result.rows[0].id, url: '/employee/attendance' }
+          data: { attendance_id: record.id, url: '/employee/attendance' }
         });
       } catch (notifErr) {
         console.error('❌ Failed to send late notification:', notifErr);
@@ -220,10 +203,10 @@ router.post('/clock-in', authenticateToken, async (req, res) => {
     }
 
     // Return record with status label for the frontend
-    res.json({ ...result.rows[0], status_label: statusLabel });
+    res.json({ ...record, status_label: statusLabel });
   } catch (err) {
     console.error('❌ Clock-in error:', err);
-    res.status(500).json({ message: 'Server error during clock-in' });
+    res.status(err.statusCode || 500).json({ message: err.statusCode ? err.message : 'Server error during clock-in', ...(err.code ? { code: err.code } : {}) });
   }
 });
 
@@ -233,40 +216,34 @@ router.post('/clock-in', authenticateToken, async (req, res) => {
  */
 router.post('/clock-out', authenticateToken, async (req, res) => {
   try {
+    if (!requireEmployee(req, res)) return;
     const userId = req.user.userId || req.user.id;
-    const { biometric_device_id, method = 'manual' } = req.body;
-    const today = new Date().toISOString().split('T')[0];
-    const clockOutTime = new Date();
-
-    // Get today's attendance record
-    const existing = await pool.query(
-      'SELECT * FROM attendance WHERE user_id = $1 AND date = $2',
-      [userId, today]
-    );
-
-    if (existing.rows.length === 0 || !existing.rows[0].check_in_time) {
-      return res.status(400).json({ message: 'Please clock in first' });
-    }
-
-    if (existing.rows[0].check_out_time) {
-      return res.status(400).json({
-        message: 'Already clocked out today',
-        attendance: existing.rows[0]
-      });
-    }
-
-    const clockInTime = existing.rows[0].check_in_time;
-    const workingHours = calculateWorkingHours(clockInTime, clockOutTime);
-    const status = determineStatus(clockInTime, clockOutTime, workingHours);
-
-    // Update attendance record
-    const result = await pool.query(
-      `UPDATE attendance 
-             SET check_out_time = $1, working_hours = $2, status = $3, clock_out_method = $4, biometric_device_id = COALESCE($5, biometric_device_id), updated_at = NOW()
-             WHERE user_id = $6 AND date = $7
-             RETURNING *`,
-      [clockOutTime, workingHours, status, method, biometric_device_id, userId, today]
-    );
+    const companyId = safeCompanyId(req.user.companyId || req.user.company_id);
+    const method = 'manual';
+    const biometric_device_id = null;
+    const now = new Date();
+    const currentPolicy = await AttendancePolicy.getCompanyPolicy(companyId, pool);
+    const today = AttendancePolicy.localDate(now, currentPolicy.timezone);
+    const { record: resultRecord, changed } = await withAttendanceTransaction(async (client) => {
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [AttendancePolicy.policyLockKey(companyId, today)]);
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [AttendancePolicy.lockKey(userId, companyId, today)]);
+      const policy = await AttendancePolicy.getCompanyPolicy(companyId, client);
+      const records = await client.query('SELECT * FROM attendance WHERE user_id = $1 AND company_id::text = $2::text AND date = $3 ORDER BY created_at ASC FOR UPDATE', [userId, String(companyId), today]);
+      if (records.rows.length > 1) throw Object.assign(new Error('Multiple attendance records exist for this employee and work date; owner review is required'), { statusCode: 409 });
+      const existing = records.rows[0];
+      if (!existing?.check_in_time) throw Object.assign(new Error('Please clock in first'), { statusCode: 400 });
+      if (existing.check_out_time) return { record: existing, changed: false };
+      const cutoff = AttendancePolicy.zonedDateTimeToUtc(today, policy.automaticClockOutTime, policy.timezone);
+      const automatic = policy.automaticClockOutEnabled && now >= cutoff;
+      const clockOutTime = automatic ? cutoff : now;
+      const workingHours = AttendancePolicy.calculateWorkingHours(existing.check_in_time, clockOutTime, policy);
+      const status = AttendancePolicy.classifyStatus(existing.check_in_time, clockOutTime, policy);
+      const updated = await client.query(`UPDATE attendance SET check_out_time = $1, working_hours = $2, status = $3, clock_out_method = $4, is_auto_clocked_out = $5, biometric_device_id = COALESCE($6, biometric_device_id), updated_at = NOW() WHERE id = $7 AND company_id::text = $8::text AND check_out_time IS NULL RETURNING *`, [clockOutTime, workingHours, status, automatic ? 'automatic' : method, automatic, biometric_device_id || null, existing.id, String(companyId)]);
+      return { record: updated.rows[0] || existing, changed: Boolean(updated.rows[0]) };
+    });
+    if (!changed) return res.json(resultRecord);
+    const workingHours = Number(resultRecord.working_hours || 0);
+    const status = resultRecord.status;
 
     console.log(`✅ Clock-out recorded for user ${userId}. Hours: ${workingHours}, Status: ${status} (${method})`);
 
@@ -275,7 +252,6 @@ router.post('/clock-out', authenticateToken, async (req, res) => {
       // Get employee name
       const userInfo = await pool.query('SELECT name FROM users WHERE id = $1', [userId]);
       const employeeName = userInfo.rows[0]?.name || 'Employee';
-      const companyId = safeCompanyId(req.user.companyId);
 
       await createNotificationForOwners({
         company_id: companyId,
@@ -283,7 +259,7 @@ router.post('/clock-out', authenticateToken, async (req, res) => {
         title: 'Employee Clocked Out',
         message: `${employeeName} clocked out. Hours: ${workingHours.toFixed(2)}, Status: ${status}`,
         priority: 'low',
-        data: { employee_id: userId, attendance_id: result.rows[0].id, working_hours: workingHours, status, url: '/owner/attendance' }
+        data: { employee_id: userId, attendance_id: resultRecord.id, working_hours: workingHours, status, url: '/owner/attendance' }
       });
 
       console.log(`✅ Notified owners about clock-out`);
@@ -291,10 +267,10 @@ router.post('/clock-out', authenticateToken, async (req, res) => {
       console.error('❌ Failed to send clock-out notification to owners:', notifErr);
     }
 
-    res.json(result.rows[0]);
+    res.json(resultRecord);
   } catch (err) {
     console.error('❌ Clock-out error:', err);
-    res.status(500).json({ message: 'Server error during clock-out' });
+    res.status(err.statusCode || 500).json({ message: err.statusCode ? err.message : 'Server error during clock-out' });
   }
 });
 
@@ -305,19 +281,22 @@ router.post('/clock-out', authenticateToken, async (req, res) => {
 router.get('/me', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId || req.user.id;
-    const companyId = req.user.companyId || req.user.company_id;
-    const today = new Date().toISOString().split('T')[0];
+    const companyId = safeCompanyId(req.user.companyId || req.user.company_id);
+    if (!companyId) return res.status(403).json({ message: 'Missing company affiliation' });
+    const policy = await AttendancePolicy.getCompanyPolicy(companyId, pool);
+    const today = AttendancePolicy.localDate(new Date(), policy.timezone);
 
     // Fetch today's record
     const todayRes = await pool.query(
-      `SELECT * FROM attendance WHERE user_id = $1 AND date = $2`,
-      [userId, today]
+      `SELECT * FROM attendance WHERE user_id = $1 AND company_id::text = $2::text AND date = $3 ORDER BY created_at ASC LIMIT 2`,
+      [userId, String(companyId), today]
     );
+    if (todayRes.rows.length > 1) return res.status(409).json({ message: 'Multiple attendance records exist for today; Owner review is required' });
 
     // Fetch last 60 days history
     const historyRes = await pool.query(
-      `SELECT * FROM attendance WHERE user_id = $1 ORDER BY date DESC LIMIT 60`,
-      [userId]
+      `SELECT * FROM attendance WHERE user_id = $1 AND company_id::text = $2::text ORDER BY date DESC LIMIT 60`,
+      [userId, String(companyId)]
     );
 
     let openRecord = null;
@@ -327,15 +306,16 @@ router.get('/me', authenticateToken, async (req, res) => {
       const row = todayRes.rows[0];
       todayRecord = row;
       if (row.check_in_time && !row.check_out_time) {
-        const inTimeStr = new Date(row.check_in_time).toLocaleTimeString('en-IN', { hour12: false, hour: '2-digit', minute: '2-digit' });
+        const inTimeStr = AttendancePolicy.localTime(row.check_in_time, policy.timezone);
         openRecord = {
           id: row.id,
-          date: row.date ? new Date(row.date).toISOString().split('T')[0] : today,
+          date: row.date ? String(row.date).slice(0, 10) : today,
           clockIn: inTimeStr,
           clock_in: row.check_in_time,
           clockOut: null,
           clock_out: null,
-          status: row.status || 'present'
+          status: row.status || 'present',
+          is_auto_clocked_out: Boolean(row.is_auto_clocked_out),
         };
       }
     }
@@ -343,39 +323,37 @@ router.get('/me', authenticateToken, async (req, res) => {
     const records = historyRes.rows.map((r) => {
       const inTime = r.check_in_time ? new Date(r.check_in_time) : null;
       const outTime = r.check_out_time ? new Date(r.check_out_time) : null;
-      let hoursWorked = 0;
-      if (inTime && outTime) {
-        hoursWorked = Math.round(((outTime.getTime() - inTime.getTime()) / (1000 * 60 * 60)) * 10) / 10;
-      }
+      let hoursWorked = Number(r.working_hours) || 0;
+      if (!r.working_hours && inTime && outTime) hoursWorked = AttendancePolicy.calculateWorkingHours(inTime, outTime, policy);
       return {
         id: r.id,
-        date: r.date ? new Date(r.date).toISOString().split('T')[0] : today,
-        clockIn: inTime ? inTime.toLocaleTimeString('en-IN', { hour12: false, hour: '2-digit', minute: '2-digit' }) : null,
-        clockOut: outTime ? outTime.toLocaleTimeString('en-IN', { hour12: false, hour: '2-digit', minute: '2-digit' }) : null,
+        date: r.date ? String(r.date).slice(0, 10) : today,
+        clockIn: inTime ? AttendancePolicy.localTime(inTime, policy.timezone) : null,
+        clockOut: outTime ? AttendancePolicy.localTime(outTime, policy.timezone) : null,
         hoursWorked,
         status: r.status || 'present',
         is_late: Boolean(r.is_late),
+        is_auto_clocked_out: Boolean(r.is_auto_clocked_out),
         notes: r.notes || ''
       };
     });
 
-    const currentMonth = new Date().getMonth() + 1;
-    const currentYear = new Date().getFullYear();
+    const [currentYear, currentMonth] = today.split('-').map(Number);
     const monthRecords = records.filter((r) => {
-      const d = new Date(r.date);
-      return d.getMonth() + 1 === currentMonth && d.getFullYear() === currentYear;
+      return r.date?.startsWith(`${currentYear}-${String(currentMonth).padStart(2, '0')}-`);
     });
 
     const daysPresent = monthRecords.filter((r) => r.status === 'present' || r.status === 'late').length;
     const lateCount = monthRecords.filter((r) => r.is_late || r.status === 'late').length;
     const halfDayCount = monthRecords.filter((r) => r.status === 'half_day').length;
-    const totalHours = Math.round(monthRecords.reduce((sum, r) => sum + r.hoursWorked, 0) * 10) / 10;
+    const totalHours = Math.round(monthRecords.reduce((sum, r) => sum + r.hoursWorked, 0) * 100) / 100;
 
     res.json({
       success: true,
       openRecord,
       today: todayRecord,
       records,
+      policy: { timezone: policy.timezone },
       stats: {
         daysPresent,
         totalHours,
@@ -396,16 +374,19 @@ router.get('/me', authenticateToken, async (req, res) => {
 router.get('/today', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId || req.user.id;
-    const todayIST = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
-    const todayUTC = new Date().toISOString().split('T')[0];
+    const companyId = safeCompanyId(req.user.companyId || req.user.company_id);
+    if (!companyId) return res.status(403).json({ message: 'Missing company affiliation' });
+    const policy = await AttendancePolicy.getCompanyPolicy(companyId, pool);
+    const todayIST = AttendancePolicy.localDate(new Date(), policy.timezone);
 
     const result = await pool.query(
       `SELECT * FROM attendance 
-       WHERE user_id = $1 
-         AND (date::text = $2 OR date::text = $3 OR date = CURRENT_DATE)
-       ORDER BY date DESC, check_in_time DESC LIMIT 1`,
-      [userId, todayIST, todayUTC]
+       WHERE user_id = $1 AND company_id::text = $2::text AND date = $3
+       ORDER BY date DESC, check_in_time DESC LIMIT 2`,
+      [userId, String(companyId), todayIST]
     );
+
+    if (result.rows.length > 1) return res.status(409).json({ message: 'Multiple attendance records exist for today; Owner review is required' });
 
     if (result.rows.length === 0) {
       return res.json({
@@ -433,13 +414,15 @@ router.get('/today', authenticateToken, async (req, res) => {
 router.get('/history', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId || req.user.id;
+    const companyId = safeCompanyId(req.user.companyId || req.user.company_id);
     const { month, year } = req.query;
+    if (!companyId) return res.status(403).json({ message: 'Missing company affiliation' });
 
-    let query = 'SELECT * FROM attendance WHERE user_id = $1';
-    const params = [userId];
+    let query = 'SELECT * FROM attendance WHERE user_id = $1 AND company_id::text = $2::text';
+    const params = [userId, String(companyId)];
 
     if (month && year) {
-      query += ' AND EXTRACT(MONTH FROM date) = $2 AND EXTRACT(YEAR FROM date) = $3';
+      query += ' AND EXTRACT(MONTH FROM date) = $3 AND EXTRACT(YEAR FROM date) = $4';
       params.push(month, year);
     }
 
@@ -460,8 +443,9 @@ router.get('/history', authenticateToken, async (req, res) => {
  */
 router.post('/corrections', authenticateToken, async (req, res) => {
   try {
+    if (!requireEmployee(req, res)) return;
     const userId = req.user.userId || req.user.id;
-    const companyId = safeCompanyId(req.user.companyId);
+    const companyId = safeCompanyId(req.user.companyId || req.user.company_id);
     const { attendance_id, requested_check_in, requested_check_out, reason } = req.body;
 
     if (!attendance_id || !reason) {
@@ -470,8 +454,8 @@ router.post('/corrections', authenticateToken, async (req, res) => {
 
     // Verify attendance belongs to user
     const attendance = await pool.query(
-      'SELECT * FROM attendance WHERE id = $1 AND user_id = $2',
-      [attendance_id, userId]
+      'SELECT * FROM attendance WHERE id = $1 AND user_id = $2 AND company_id::text = $3::text',
+      [attendance_id, userId, String(companyId)]
     );
 
     if (attendance.rows.length === 0) {
@@ -527,8 +511,10 @@ router.get('/overview', authenticateToken, async (req, res) => {
       return res.status(403).json({ message: 'Access denied' });
     }
 
-    const today = new Date().toISOString().split('T')[0];
-    const companyId = req.user.companyId || safeCompanyId(req.user.companyId);
+    const companyId = safeCompanyId(req.user.companyId || req.user.company_id);
+    if (!companyId) return res.status(403).json({ message: 'Missing company affiliation' });
+    const policy = await AttendancePolicy.getCompanyPolicy(companyId, pool);
+    const today = AttendancePolicy.localDate(new Date(), policy.timezone);
 
     const result = await pool.query(
       `SELECT 
@@ -542,9 +528,18 @@ router.get('/overview', authenticateToken, async (req, res) => {
                 a.working_hours,
                 a.status,
                 a.is_late,
-                a.is_auto_clocked_out
+                a.is_auto_clocked_out,
+                (lv.user_id IS NOT NULL) AS on_leave
              FROM users u
-             LEFT JOIN attendance a ON u.id = a.user_id AND a.date = $1
+             LEFT JOIN attendance a ON u.id = a.user_id AND a.company_id::text = u.company_id::text AND a.date = $1
+             LEFT JOIN LATERAL (
+               SELECT lr.user_id FROM hr_employee_requests lr
+               WHERE lr.user_id::text = u.id::text AND lr.company_id::text = u.company_id::text
+                 AND lr.request_type = 'leave' AND lr.status = 'approved'
+                 AND COALESCE(lr.details->>'start_date', lr.details->>'from_date') <= $1::text
+                 AND COALESCE(lr.details->>'end_date', lr.details->>'to_date') >= $1::text
+               LIMIT 1
+             ) lv ON TRUE
              WHERE u.role = 'employee' AND u.company_id = $2
              ORDER BY u.name ASC`,
       [today, companyId]
@@ -554,8 +549,9 @@ router.get('/overview', authenticateToken, async (req, res) => {
     const summary = {
       total: result.rows.length,
       present: result.rows.filter(r => r.check_in_time).length,
-      absent: result.rows.filter(r => !r.check_in_time).length,
-      late: result.rows.filter(r => r.is_late).length
+      absent: result.rows.filter(r => !r.check_in_time && !r.on_leave).length,
+      late: result.rows.filter(r => r.is_late).length,
+      on_leave: result.rows.filter(r => r.on_leave).length,
     };
 
     res.json({ summary, employees: result.rows });
@@ -577,7 +573,7 @@ router.get('/employee/:userId', authenticateToken, async (req, res) => {
 
     const { userId } = req.params;
     const { month, year } = req.query;
-    const companyId = req.user.companyId;
+    const companyId = safeCompanyId(req.user.companyId || req.user.company_id);
 
     // Verify the requested employee belongs to this owner's company
     const empCheck = await pool.query(
@@ -588,17 +584,19 @@ router.get('/employee/:userId', authenticateToken, async (req, res) => {
       return res.status(403).json({ message: 'Employee not found in your company' });
     }
 
-    const currentMonth = month || new Date().getMonth() + 1;
-    const currentYear = year || new Date().getFullYear();
+    const policy = await AttendancePolicy.getCompanyPolicy(companyId, pool);
+    const [localYear, localMonth] = AttendancePolicy.localDate(new Date(), policy.timezone).split('-').map(Number);
+    const currentMonth = month || localMonth;
+    const currentYear = year || localYear;
 
     // Get attendance records
     const records = await pool.query(
       `SELECT * FROM attendance 
-             WHERE user_id = $1 
+             WHERE user_id = $1 AND company_id::text = $4::text
                AND EXTRACT(MONTH FROM date) = $2 
                AND EXTRACT(YEAR FROM date) = $3
              ORDER BY date DESC`,
-      [userId, currentMonth, currentYear]
+      [userId, currentMonth, currentYear, String(companyId)]
     );
 
     // Calculate summary
@@ -641,17 +639,19 @@ router.get('/calendar/:userId', authenticateToken, async (req, res) => {
       return res.status(403).json({ message: 'Employee not found in your company' });
     }
 
-    const currentMonth = month || new Date().getMonth() + 1;
-    const currentYear = year || new Date().getFullYear();
+    const policy = await AttendancePolicy.getCompanyPolicy(companyId, pool);
+    const [localYear, localMonth] = AttendancePolicy.localDate(new Date(), policy.timezone).split('-').map(Number);
+    const currentMonth = month || localMonth;
+    const currentYear = year || localYear;
 
     const records = await pool.query(
       `SELECT date, check_in_time, check_out_time, working_hours, status, is_late, is_auto_clocked_out
              FROM attendance 
-             WHERE user_id = $1 
+             WHERE user_id = $1 AND company_id::text = $4::text
                AND EXTRACT(MONTH FROM date) = $2 
                AND EXTRACT(YEAR FROM date) = $3
              ORDER BY date ASC`,
-      [userId, currentMonth, currentYear]
+      [userId, currentMonth, currentYear, String(companyId)]
     );
 
     res.json(records.rows);
@@ -682,7 +682,7 @@ router.patch('/corrections/:id/approve', authenticateToken, async (req, res) => 
 
     // Get correction request and verify company ownership
     const correction = await pool.query(
-      `SELECT ac.*, a.company_id 
+      `SELECT ac.*, a.company_id, a.is_processed
        FROM attendance_corrections ac 
        JOIN attendance a ON ac.attendance_id = a.id 
        WHERE ac.id = $1 AND a.company_id = $2`,
@@ -694,40 +694,40 @@ router.patch('/corrections/:id/approve', authenticateToken, async (req, res) => 
     }
 
     const correctionData = correction.rows[0];
+    if (correctionData.is_processed) return res.status(403).json({ message: 'Cannot approve a correction for processed attendance' });
 
     // Update attendance record
-    const workingHours = calculateWorkingHours(
-      correctionData.requested_check_in,
-      correctionData.requested_check_out
-    );
-    const status = determineStatus(
-      correctionData.requested_check_in,
-      correctionData.requested_check_out,
-      workingHours
-    );
+    const policy = await AttendancePolicy.getCompanyPolicy(companyId, pool);
+    const workingHours = AttendancePolicy.calculateWorkingHours(correctionData.requested_check_in, correctionData.requested_check_out, policy);
+    const status = AttendancePolicy.classifyStatus(correctionData.requested_check_in, correctionData.requested_check_out, policy);
+    const late = AttendancePolicy.isLate(correctionData.requested_check_in, policy);
 
-    await pool.query(
+    const attendanceUpdate = await pool.query(
       `UPDATE attendance 
              SET check_in_time = $1,
                  check_out_time = $2,
                  working_hours = $3,
                  status = $4,
+                 is_late = $5,
                  is_manual = TRUE,
-                 edited_by = $5,
+                 edited_by = $6,
                  updated_at = NOW()
-             WHERE id = $6 AND company_id = $7`,
+             WHERE id = $7 AND company_id = $8 AND is_processed = FALSE
+             RETURNING id`,
       [correctionData.requested_check_in, correctionData.requested_check_out,
-        workingHours, status, reviewedBy, correctionData.attendance_id, companyId]
+        workingHours, status, late, reviewedBy, correctionData.attendance_id, companyId]
     );
+    if (!attendanceUpdate.rows.length) return res.status(403).json({ message: 'Attendance was processed while the correction was pending' });
 
     // Update correction status
     const result = await pool.query(
       `UPDATE attendance_corrections 
              SET status = 'approved', reviewed_by = $1, reviewed_at = NOW()
-             WHERE id = $2
+             WHERE id = $2 AND status = 'pending'
              RETURNING *`,
       [reviewedBy, id]
     );
+    if (!result.rows.length) return res.status(409).json({ message: 'Correction request has already been reviewed' });
 
     // Notify employee
     try {
@@ -840,7 +840,7 @@ router.patch('/:id', authenticateToken, async (req, res) => {
     }
 
     // Check if record is processed (locked) and verify company_id
-    const existing = await pool.query('SELECT is_processed, company_id FROM attendance WHERE id = $1 AND company_id = $2', [id, companyId]);
+    const existing = await pool.query('SELECT is_processed, company_id, check_in_time, check_out_time FROM attendance WHERE id = $1 AND company_id = $2', [id, companyId]);
     if (existing.rows.length === 0) {
       return res.status(404).json({ message: 'Attendance record not found or access denied' });
     }
@@ -848,10 +848,17 @@ router.patch('/:id', authenticateToken, async (req, res) => {
       return res.status(403).json({ message: 'Cannot edit processed records' });
     }
 
-    // Calculate working hours if both times provided
+    // Calculate working hours and status through the same company policy used by punches.
     let workingHours = null;
-    if (check_in_time && check_out_time) {
-      workingHours = calculateWorkingHours(check_in_time, check_out_time);
+    let canonicalStatus = status || null;
+    let canonicalLate = null;
+    const nextIn = check_in_time || existing.rows[0].check_in_time;
+    const nextOut = check_out_time || existing.rows[0].check_out_time;
+    if (nextIn && nextOut) {
+      const policy = await AttendancePolicy.getCompanyPolicy(companyId, pool);
+      workingHours = AttendancePolicy.calculateWorkingHours(nextIn, nextOut, policy);
+      canonicalStatus = AttendancePolicy.classifyStatus(nextIn, nextOut, policy);
+      canonicalLate = AttendancePolicy.isLate(nextIn, policy);
     }
 
     const result = await pool.query(
@@ -859,18 +866,19 @@ router.patch('/:id', authenticateToken, async (req, res) => {
              SET check_in_time = COALESCE($1, check_in_time),
                  check_out_time = COALESCE($2, check_out_time),
                  working_hours = COALESCE($3, working_hours),
-                 status = COALESCE($4, status),
+                  status = COALESCE($4, status),
                  notes = COALESCE($5, notes),
                  is_manual = TRUE,
                  edited_by = $6,
-                 updated_at = NOW()
-             WHERE id = $7 AND company_id = $8
+                  is_late = COALESCE($9, is_late),
+                  updated_at = NOW()
+             WHERE id = $7 AND company_id = $8 AND is_processed = FALSE
              RETURNING *`,
-      [check_in_time, check_out_time, workingHours, status, notes, editedBy, id, companyId]
+      [check_in_time, check_out_time, workingHours, canonicalStatus, notes, editedBy, id, companyId, canonicalLate]
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ message: 'Attendance record not found' });
+      return res.status(403).json({ message: 'Attendance was processed before the edit could be saved' });
     }
 
     console.log(`✅ Attendance ${id} manually edited by owner`);
@@ -892,8 +900,12 @@ router.get('/report', authenticateToken, async (req, res) => {
     }
 
     const { month, year, employee_id } = req.query;
-    const currentMonth = month || new Date().getMonth() + 1;
-    const currentYear = year || new Date().getFullYear();
+    const companyId = safeCompanyId(req.user.companyId || req.user.company_id);
+    if (!companyId) return res.status(403).json({ message: 'Missing company affiliation' });
+    const policy = await AttendancePolicy.getCompanyPolicy(companyId, pool);
+    const [localYear, localMonth] = AttendancePolicy.localDate(new Date(), policy.timezone).split('-').map(Number);
+    const currentMonth = month || localMonth;
+    const currentYear = year || localYear;
 
     let query = `
             SELECT 
@@ -909,7 +921,7 @@ router.get('/report', authenticateToken, async (req, res) => {
               AND EXTRACT(YEAR FROM a.date) = $2
         `;
 
-    const params = [currentMonth, currentYear, req.user.companyId];
+    const params = [currentMonth, currentYear, companyId];
 
     if (employee_id) {
       query += ' AND u.id = $4';
@@ -983,73 +995,34 @@ router.get('/report', authenticateToken, async (req, res) => {
  */
 router.post('/process-daily', authenticateToken, async (req, res) => {
   try {
-    // Only allow admin/owner to manually trigger
-    if (req.user.role !== 'owner' && req.user.role !== 'admin') {
+    if (!['owner', 'admin'].includes((req.user.role || '').toLowerCase())) {
       return res.status(403).json({ message: 'Access denied' });
     }
-
-    const { date } = req.body;
-    const targetDate = date || new Date().toISOString().split('T')[0];
-
-    console.log(`🕐 Running daily attendance processing for ${targetDate}...`);
-
-    // 1. Auto clock-out employees who didn't clock out
-    const autoClockOutResult = await pool.query(`
-            UPDATE attendance
-            SET check_out_time = (date || ' 19:00:00 Asia/Kolkata')::timestamptz AT TIME ZONE 'UTC',
-                is_auto_clocked_out = TRUE,
-                working_hours = EXTRACT(EPOCH FROM (
-                    ((date || ' 19:00:00 Asia/Kolkata')::timestamptz AT TIME ZONE 'UTC') - check_in_time
-                )) / 3600,
-                status = CASE 
-                    WHEN EXTRACT(EPOCH FROM (((date || ' 19:00:00 Asia/Kolkata')::timestamptz AT TIME ZONE 'UTC') - check_in_time)) / 3600 >= 8 THEN 'present'
-                    ELSE 'half_day'
-                END,
-                updated_at = NOW()
-            WHERE date = $1 
-              AND check_in_time IS NOT NULL 
-              AND check_out_time IS NULL
-              AND is_processed = FALSE
-            RETURNING id
-        `, [targetDate]);
-
-    console.log(`✅ Auto clocked-out ${autoClockOutResult.rows.length} employees`);
-
-    // 2. Mark absentees
-    const absenteeResult = await pool.query(`
-            INSERT INTO attendance (user_id, company_id, date, status, is_processed, created_at, updated_at)
-            SELECT u.id, u.company_id, $1, 'absent', FALSE, NOW(), NOW()
-            FROM users u
-            WHERE u.role = 'employee'
-              AND NOT EXISTS (
-                  SELECT 1 FROM attendance a 
-                  WHERE a.user_id = u.id AND a.date = $1
-              )
-            RETURNING id
-        `, [targetDate]);
-
-    console.log(`✅ Marked ${absenteeResult.rows.length} employees as absent`);
-
-    // 3. Mark all records as processed (locked)
-    const lockResult = await pool.query(`
-            UPDATE attendance
-            SET is_processed = TRUE, processed_at = NOW()
-            WHERE date = $1 AND is_processed = FALSE
-            RETURNING id
-        `, [targetDate]);
-
-    console.log(`✅ Locked ${lockResult.rows.length} attendance records`);
+    const companyId = safeCompanyId(req.user.companyId || req.user.company_id);
+    if (!companyId) return res.status(403).json({ message: 'Missing company affiliation' });
+    const policy = await AttendancePolicy.getCompanyPolicy(companyId, pool);
+    const today = AttendancePolicy.localDate(new Date(), policy.timezone);
+    const targetDate = req.body?.date || today;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(targetDate) || targetDate > today) return res.status(400).json({ message: 'A valid company-local date no later than today is required' });
+    const yesterdayInstant = new Date(AttendancePolicy.zonedDateTimeToUtc(today, '12:00', policy.timezone).getTime() - 86400000);
+    const yesterday = AttendancePolicy.localDate(yesterdayInstant, policy.timezone);
+    if (targetDate !== today && targetDate !== yesterday) return res.status(400).json({ message: 'Manual processing is limited to today and yesterday for scheduler recovery' });
+    const result = await withAttendanceTransaction(async (client) => {
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`attendance-run:${companyId}:${targetDate}`]);
+      return AttendancePolicy.processCompanyDate(companyId, targetDate, client, new Date());
+    });
 
     res.json({
       success: true,
       date: targetDate,
-      auto_clocked_out: autoClockOutResult.rows.length,
-      marked_absent: absenteeResult.rows.length,
-      records_locked: lockResult.rows.length
+      auto_clocked_out: result.auto_clocked_out,
+      marked_absent: result.marked_absent,
+      records_locked: result.records_locked,
+      due: result.due,
     });
   } catch (err) {
     console.error('❌ Daily processing error:', err);
-    res.status(500).json({ message: 'Server error during daily processing' });
+    res.status(err.statusCode || 500).json({ message: err.statusCode ? err.message : 'Server error during daily processing' });
   }
 });
 
@@ -1061,17 +1034,29 @@ router.post('/process-daily', authenticateToken, async (req, res) => {
  */
 router.post('/biometric/webhook', async (req, res) => {
   try {
-    const { device_id, employee_id, action, timestamp, biometric_data } = req.body;
+    const secret = process.env.BIOMETRIC_WEBHOOK_SECRET;
+    if (!secret) return res.status(503).json({ message: 'Biometric webhook authentication is not configured' });
+    if (!redisClient || redisClient.status !== 'ready') return res.status(503).json({ message: 'Biometric replay protection is unavailable' });
+    const verified = BiometricWebhookAuth.verifyBiometricSignature({
+      secret,
+      signature: req.get('x-device-signature'),
+      signedAt: req.get('x-device-timestamp'),
+      nonce: req.get('x-device-nonce'),
+      body: req.body,
+    });
+    if (!verified.valid) return res.status(401).json({ message: verified.reason === 'expired' ? 'Biometric signature timestamp expired' : 'Invalid biometric signature headers' });
+    const nonceResult = await BiometricWebhookAuth.claimNonce(redisClient, verified.nonce);
+    if (nonceResult === 'unavailable') return res.status(503).json({ message: 'Biometric replay protection is unavailable' });
+    if (nonceResult === 'replayed') return res.status(409).json({ message: 'Biometric request replay detected' });
+
+    const { device_id, employee_id, action, timestamp } = req.body;
 
     if (!device_id || !employee_id || !action) {
       return res.status(400).json({ message: 'Missing required fields' });
     }
 
-    // Verify device is registered
-    const device = await pool.query(
-      'SELECT * FROM biometric_devices WHERE device_id = $1 AND is_active = TRUE',
-      [device_id]
-    );
+    return await storage.run({ isWebRequest: false, bypassRls: true, role: 'system' }, async () => {
+    const device = await pool.query('SELECT * FROM biometric_devices WHERE device_id = $1 AND is_active = TRUE', [device_id]);
 
     if (device.rows.length === 0) {
       return res.status(404).json({ message: 'Device not registered or inactive' });
@@ -1079,7 +1064,7 @@ router.post('/biometric/webhook', async (req, res) => {
 
     // Verify employee exists and belongs to the same company as the device
     const employee = await pool.query(
-      'SELECT id, company_id FROM users WHERE id = $1',
+      "SELECT id, company_id FROM users WHERE id = $1 AND role = 'employee'",
       [employee_id]
     );
 
@@ -1092,56 +1077,54 @@ router.post('/biometric/webhook', async (req, res) => {
       return res.status(403).json({ message: 'Device and employee company mismatch' });
     }
 
-    const today = new Date(timestamp || Date.now()).toISOString().split('T')[0];
     const actionTime = new Date(timestamp || Date.now());
+    if (!Number.isFinite(actionTime.getTime()) || Math.abs(Date.now() - actionTime.getTime()) > 5 * 60 * 1000) return res.status(400).json({ message: 'Biometric event timestamp is outside the accepted window' });
+    const companyId = employee.rows[0].company_id;
+    const policy = await AttendancePolicy.getCompanyPolicy(companyId, pool);
+    const today = AttendancePolicy.localDate(actionTime, policy.timezone);
 
     if (action === 'clock_in') {
-      const isLate = isLateCheckIn(actionTime);
-
-      const result = await pool.query(
-        `INSERT INTO attendance 
-                 (user_id, company_id, date, check_in_time, is_late, clock_in_method, biometric_device_id, created_at, updated_at)
-                 VALUES ($1, $2, $3, $4, $5, 'biometric', $6, NOW(), NOW())
-                 ON CONFLICT (user_id, date) 
-                 DO UPDATE SET check_in_time = $4, is_late = $5, clock_in_method = 'biometric', biometric_device_id = $6, updated_at = NOW()
-                 RETURNING *`,
-        [employee_id, employee.rows[0].company_id, today, actionTime, isLate, device_id]
-      );
-
-      console.log(`✅ Biometric clock-in: ${employee_id} via ${device_id}`);
-      return res.json({ success: true, attendance: result.rows[0] });
+      const result = await withAttendanceTransaction(async (client) => {
+        await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [AttendancePolicy.policyLockKey(companyId, today)]);
+        await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [AttendancePolicy.lockKey(employee_id, companyId, today)]);
+        const currentPolicy = await AttendancePolicy.getCompanyPolicy(companyId, client);
+        const eligibility = AttendancePolicy.evaluateClockIn(actionTime, currentPolicy);
+        if (!eligibility.allowed) throw Object.assign(new Error(eligibility.reason), { statusCode: 400, code: eligibility.code });
+        const existing = await client.query('SELECT * FROM attendance WHERE user_id = $1 AND company_id::text = $2::text AND date = $3 ORDER BY created_at ASC FOR UPDATE', [employee_id, String(companyId), today]);
+        if (existing.rows.length > 1) throw new Error('Duplicate attendance rows require owner review');
+        if (existing.rows[0]?.check_in_time) return existing.rows[0];
+        if (existing.rows.length === 1) return (await client.query("UPDATE attendance SET check_in_time = $1, is_late = $2, status = $3, clock_in_method = 'biometric', biometric_device_id = $4, updated_at = NOW() WHERE id = $5 RETURNING *", [actionTime, eligibility.is_late, eligibility.status, device_id, existing.rows[0].id])).rows[0];
+        return (await client.query("INSERT INTO attendance (user_id, company_id, date, check_in_time, is_late, status, clock_in_method, biometric_device_id, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,'biometric',$7,NOW(),NOW()) RETURNING *", [employee_id, companyId, today, actionTime, eligibility.is_late, eligibility.status, device_id])).rows[0];
+      });
+      return res.json({ success: true, attendance: result });
     }
 
     if (action === 'clock_out') {
-      const existing = await pool.query(
-        'SELECT * FROM attendance WHERE user_id = $1 AND date = $2',
-        [employee_id, today]
-      );
-
-      if (existing.rows.length === 0 || !existing.rows[0].check_in_time) {
-        return res.status(400).json({ message: 'No clock-in record found' });
-      }
-
-      const clockInTime = existing.rows[0].check_in_time;
-      const workingHours = calculateWorkingHours(clockInTime, actionTime);
-      const status = determineStatus(clockInTime, actionTime, workingHours);
-
-      const result = await pool.query(
-        `UPDATE attendance 
-                 SET check_out_time = $1, working_hours = $2, status = $3, clock_out_method = 'biometric', biometric_device_id = $4, updated_at = NOW()
-                 WHERE user_id = $5 AND date = $6
-                 RETURNING *`,
-        [actionTime, workingHours, status, device_id, employee_id, today]
-      );
-
+      const record = await withAttendanceTransaction(async (client) => {
+        await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [AttendancePolicy.policyLockKey(companyId, today)]);
+        await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [AttendancePolicy.lockKey(employee_id, companyId, today)]);
+        const existing = await client.query('SELECT * FROM attendance WHERE user_id = $1 AND company_id::text = $2::text AND date = $3 ORDER BY created_at ASC FOR UPDATE', [employee_id, String(companyId), today]);
+        if (!existing.rows.length || !existing.rows[0].check_in_time) throw Object.assign(new Error('No clock-in record found'), { statusCode: 400 });
+        if (existing.rows.length > 1) throw Object.assign(new Error('Duplicate attendance rows require owner review'), { statusCode: 409 });
+        if (existing.rows[0].check_out_time) return existing.rows[0];
+        const currentPolicy = await AttendancePolicy.getCompanyPolicy(companyId, client);
+        const cutoff = AttendancePolicy.zonedDateTimeToUtc(today, currentPolicy.automaticClockOutTime, currentPolicy.timezone);
+        const automatic = actionTime > cutoff && currentPolicy.automaticClockOutEnabled;
+        const effectiveOut = automatic ? cutoff : actionTime;
+        const workingHours = AttendancePolicy.calculateWorkingHours(existing.rows[0].check_in_time, effectiveOut, currentPolicy);
+        const status = AttendancePolicy.classifyStatus(existing.rows[0].check_in_time, effectiveOut, currentPolicy);
+        const updated = await client.query(`UPDATE attendance SET check_out_time = $1, working_hours = $2, status = $3, clock_out_method = 'biometric', is_auto_clocked_out = $4, biometric_device_id = $5, updated_at = NOW() WHERE id = $6 AND company_id::text = $7::text AND check_out_time IS NULL RETURNING *`, [effectiveOut, workingHours, status, automatic, device_id, existing.rows[0].id, String(companyId)]);
+        return updated.rows[0] || existing.rows[0];
+      });
       console.log(`✅ Biometric clock-out: ${employee_id} via ${device_id}`);
-      return res.json({ success: true, attendance: result.rows[0] });
+      return res.json({ success: true, attendance: record });
     }
 
     res.status(400).json({ message: 'Invalid action' });
+    });
   } catch (err) {
-    console.error('❌ Biometric webhook error:', err);
-    res.status(500).json({ message: 'Server error' });
+    console.error('❌ Biometric webhook error:', err.message);
+    res.status(err.statusCode || 500).json({ message: err.statusCode ? err.message : 'Server error' });
   }
 });
 

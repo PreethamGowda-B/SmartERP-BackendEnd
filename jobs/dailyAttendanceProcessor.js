@@ -1,126 +1,62 @@
 const cron = require('node-cron');
 const { pool } = require('../db');
 const { storage } = require('../middleware/als');
-const { createNotificationForOwners } = require('../utils/notificationHelpers');
+const AttendancePolicy = require('../services/attendancePolicyService');
 
-const ATTENDANCE_TIME_ZONE = 'Asia/Kolkata';
-
-/**
- * Daily Attendance Processing Job
- * Runs every day at 7:00 PM Asia/Kolkata
- * 
- * Tasks:
- * 1. Auto clock-out employees who didn't clock out
- * 2. Mark absentees
- * 3. Lock attendance records for the day
- */
-
-function startDailyAttendanceProcessor() {
-    // Run at the cutoff in the business timezone, regardless of the host's timezone.
-    cron.schedule('0 19 * * *', async () => {
-      const targetDate = new Date().toLocaleDateString('en-CA', {
-        timeZone: ATTENDANCE_TIME_ZONE
-      });
-
-      // Scheduled jobs have no request ALS context. Explicitly use the system
-      // context so RLS does not silently reject cross-company attendance work.
-      await storage.run({ isWebRequest: false, bypassRls: true }, async () => {
-        console.log(`\n${'='.repeat(60)}`);
-        console.log(`🕐 DAILY ATTENDANCE PROCESSING - ${targetDate}`);
-        console.log(`${'='.repeat(60)}\n`);
-
-        try {
-            // 1. Auto clock-out employees who didn't clock out
-            console.log('📋 Step 1: Auto clock-out employees...');
-            const autoClockOutResult = await pool.query(`
-                UPDATE attendance
-                SET check_out_time = (date || ' 19:00:00 Asia/Kolkata')::timestamptz AT TIME ZONE 'UTC',
-                    is_auto_clocked_out = TRUE,
-                    working_hours = EXTRACT(EPOCH FROM (
-                        ((date || ' 19:00:00 Asia/Kolkata')::timestamptz AT TIME ZONE 'UTC') - check_in_time
-                    )) / 3600,
-                    status = CASE
-                        WHEN EXTRACT(HOUR FROM (check_in_time AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')) >= 13 THEN 'half_day'
-                        WHEN EXTRACT(HOUR FROM (check_in_time AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')) > 9
-                          OR (EXTRACT(HOUR FROM (check_in_time AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')) = 9
-                              AND EXTRACT(MINUTE FROM (check_in_time AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')) > 0)
-                          THEN 'late'
-                        ELSE 'present'
-                    END,
-                    updated_at = NOW()
-                WHERE date = $1 
-                  AND check_in_time IS NOT NULL 
-                  AND check_out_time IS NULL
-                  AND is_processed = FALSE
-                RETURNING id, user_id
-            `, [targetDate]);
-
-            console.log(`   ✅ Auto clocked-out ${autoClockOutResult.rows.length} employees`);
-            if (autoClockOutResult.rows.length > 0) {
-                console.log(`   📝 User IDs: ${autoClockOutResult.rows.map(r => r.user_id).join(', ')}`);
-            }
-
-            // 2. Mark absentees
-            console.log('\n📋 Step 2: Marking absentees...');
-            const absenteeResult = await pool.query(`
-                INSERT INTO attendance (user_id, company_id, date, status, is_processed, created_at, updated_at)
-                SELECT u.id, u.company_id, $1, 'absent', FALSE, NOW(), NOW()
-                FROM users u
-                WHERE u.role = 'employee'
-                  AND u.company_id IS NOT NULL
-                  AND NOT EXISTS (
-                      SELECT 1 FROM attendance a 
-                      WHERE a.user_id = u.id AND a.date = $1
-                  )
-                RETURNING id, user_id
-            `, [targetDate]);
-
-            console.log(`   ✅ Marked ${absenteeResult.rows.length} employees as absent`);
-            if (absenteeResult.rows.length > 0) {
-                console.log(`   📝 User IDs: ${absenteeResult.rows.map(r => r.user_id).join(', ')}`);
-            }
-
-            // 3. Lock all records for the day
-            console.log('\n📋 Step 3: Locking attendance records...');
-            const lockResult = await pool.query(`
-                UPDATE attendance
-                SET is_processed = TRUE, processed_at = NOW()
-                WHERE date = $1 AND is_processed = FALSE
-                RETURNING id
-            `, [targetDate]);
-
-            console.log(`   ✅ Locked ${lockResult.rows.length} attendance records`);
-
-            // Summary
-            console.log(`\n${'='.repeat(60)}`);
-            console.log('✅ DAILY PROCESSING COMPLETED SUCCESSFULLY');
-            console.log(`   Date: ${targetDate}`);
-            console.log(`   Auto Clock-Outs: ${autoClockOutResult.rows.length}`);
-            console.log(`   Absentees Marked: ${absenteeResult.rows.length}`);
-            console.log(`   Records Locked: ${lockResult.rows.length}`);
-            console.log(`${'='.repeat(60)}\n`);
-
-        } catch (err) {
-            console.error('\n❌ DAILY PROCESSING FAILED');
-            console.error('Error:', err.message);
-            console.error('Stack:', err.stack);
-            console.error(`${'='.repeat(60)}\n`);
-
-            // ✅ Send alert notification to admin/owner
-            await createNotificationForOwners({
-                company_id: null, // Global alert
-                type: 'alert_attendance_processor_failed',
-                title: '❌ Attendance Processor Failed',
-                message: `The daily attendance processor failed on ${targetDate}. Error: ${err.message}`,
-                priority: 'high'
-            });
-        }
-      });
-    }, {
-        timezone: ATTENDANCE_TIME_ZONE
-    });
-
-    console.log('✅ Daily attendance processor scheduled (7:00 PM Asia/Kolkata)');
+async function processCompany(companyId, workDate, now = new Date()) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`attendance-run:${companyId}:${workDate}`]);
+    const result = await AttendancePolicy.processCompanyDate(companyId, workDate, client, now);
+    await client.query('COMMIT');
+    return result;
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
-module.exports = { startDailyAttendanceProcessor };
+async function runDailyAttendanceProcessing(now = new Date()) {
+  return storage.run({ isWebRequest: false, bypassRls: true, role: 'system' }, async () => {
+    const companies = await pool.query('SELECT id FROM companies ORDER BY id');
+    const results = [];
+    for (const { id: companyId } of companies.rows) {
+      // Company policies currently default to IST. The policy service resolves
+      // the work date and due cutoff for that company's timezone.
+      const policy = await AttendancePolicy.getCompanyPolicy(companyId, pool);
+      const today = AttendancePolicy.localDate(now, policy.timezone);
+      const candidates = [today];
+      // Recover the previous work date after a restart, but never rewrite a
+      // processed historical row. The task intentionally has no data migration.
+      const yesterdayDate = new Date(AttendancePolicy.zonedDateTimeToUtc(today, '12:00', policy.timezone).getTime() - 86400000);
+      const yesterday = AttendancePolicy.localDate(yesterdayDate, policy.timezone);
+      candidates.unshift(yesterday);
+      for (const workDate of candidates) {
+        const outcome = await processCompany(companyId, workDate, now);
+        results.push({ company_id: companyId, ...outcome });
+      }
+    }
+    console.info('[attendance-processor] completed', JSON.stringify(results));
+    return results;
+  });
+}
+
+function startDailyAttendanceProcessor() {
+  cron.schedule('*/5 * * * *', () => {
+    runDailyAttendanceProcessing().catch((error) => {
+      console.error('[attendance-processor] failed', error.message, error.stack);
+    });
+  }, { timezone: 'Asia/Kolkata' });
+
+  // Catch up a missed cutoff after process restart. Service-level due checks
+  // ensure this never closes today's session before its configured cutoff.
+  runDailyAttendanceProcessing().catch((error) => {
+    console.error('[attendance-processor] startup recovery failed', error.message, error.stack);
+  });
+  console.log('✅ Daily attendance processor scheduled (policy cutoff, Asia/Kolkata; 5-minute recovery scan)');
+}
+
+module.exports = { startDailyAttendanceProcessor, runDailyAttendanceProcessing, processCompany };

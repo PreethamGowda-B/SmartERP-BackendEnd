@@ -19,6 +19,7 @@ router.use('/', require('./sse'));
 
 // ── Protected routes — require valid customer JWT ─────────────────────────────
 router.use('/jobs', authenticateCustomer, require('./jobs'));
+router.use('/manufacturing-requests', authenticateCustomer, require('./manufacturingRequests'));
 router.use('/jobs/:id/messages', authenticateCustomer, require('./chat'));
 router.use('/jobs/:id/review', authenticateCustomer, require('./reviews'));
 router.use('/profile', authenticateCustomer, require('./profile'));

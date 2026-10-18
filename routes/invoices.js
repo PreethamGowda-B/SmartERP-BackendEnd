@@ -167,6 +167,45 @@ router.get('/', authenticate, async (req, res) => {
 });
 
 /**
+ * GET /api/invoices/editor-data/production-order/:productionOrderId
+ * Production-order invoice prefill; the canonical service enforces readiness.
+ */
+router.get('/editor-data/production-order/:productionOrderId', authenticate, async (req, res) => {
+  try {
+    const companyId = req.user.companyId || req.user.company_id;
+    if (!['owner', 'admin'].includes(String(req.user.role || '').toLowerCase())) {
+      return res.status(403).json({ error: 'Only an owner or administrator can prepare a production invoice.' });
+    }
+    const editorData = await invoiceService.prepareInvoiceDataForProductionOrder(req.params.productionOrderId, companyId);
+    return res.json({ success: true, ...editorData });
+  } catch (err) {
+    if (['42P01', '42703'].includes(err?.code)) {
+      return res.status(503).json({ error: 'Production invoice storage is not enabled. Apply the approved production and manufacturing migrations first.' });
+    }
+    const status = err.statusCode || (err.message && err.message.includes('not found') ? 404 : 500);
+    return res.status(status).json({ error: err.message });
+  }
+});
+
+/** Create or resume the single draft for an eligible production order. */
+router.post('/production-order/:productionOrderId/draft', authenticate, async (req, res) => {
+  try {
+    const companyId = req.user.companyId || req.user.company_id;
+    const userId = req.user.id || req.user.userId;
+    if (!['owner', 'admin'].includes(String(req.user.role || '').toLowerCase())) {
+      return res.status(403).json({ error: 'Only an owner or administrator can create a production invoice.' });
+    }
+    const invoice = await invoiceService.createProductionOrderDraft({ companyId, productionOrderId: req.params.productionOrderId, userId });
+    return res.json({ success: true, invoice });
+  } catch (err) {
+    if (['42P01', '42703'].includes(err?.code)) {
+      return res.status(503).json({ error: 'Production invoice storage is not enabled. Apply the approved production and manufacturing migrations first.' });
+    }
+    return res.status(err.statusCode || 500).json({ error: err.message });
+  }
+});
+
+/**
  * GET /api/invoices/editor-data/:jobId
  * Pre-populates the Dedicated Invoice Editor Page for a completed job.
  */
@@ -471,10 +510,10 @@ router.post('/finalize', authenticate, async (req, res) => {
     if (!['owner', 'admin', 'super_admin'].includes(String(req.user.role || '').toLowerCase())) {
       return res.status(403).json({ error: 'Only an owner or administrator can issue invoices.' });
     }
-    const { jobId, ...invoiceData } = req.body;
+    const { jobId, productionOrderId, ...invoiceData } = req.body;
 
-    if (!jobId) {
-      return res.status(400).json({ error: 'Job ID is required' });
+    if ((!jobId && !productionOrderId) || (jobId && productionOrderId)) {
+      return res.status(400).json({ error: 'Provide exactly one jobId or productionOrderId.' });
     }
     if (!invoiceData.idempotency_key) {
       return res.status(400).json({ error: 'An idempotency_key is required to finalize an invoice.' });
@@ -483,6 +522,7 @@ router.post('/finalize', authenticate, async (req, res) => {
     const result = await invoiceService.finalizeInvoice({
       companyId,
       jobId,
+      productionOrderId,
       userId,
       invoiceData,
     });
@@ -492,7 +532,27 @@ router.post('/finalize', authenticate, async (req, res) => {
       await notifyOtherOwnersOfGstInvoice({ companyId, actorId: userId, invoice: finalizedInvoice, action: 'issued' })
         .catch((error) => console.warn('GST invoice owner notification could not be persisted:', error.message));
     }
-    if (result?.reason !== 'idempotent_replay' && finalizedInvoice?.customer_id) {
+    if (result?.reason !== 'idempotent_replay' && finalizedInvoice?.customer_id && productionOrderId) {
+      const linkedRequest = await pool.query(
+        `SELECT l.request_id FROM customer_manufacturing_production_links l
+          WHERE l.company_id=$1 AND l.production_order_id=$2::uuid LIMIT 1`,
+        [String(companyId), String(productionOrderId)]
+      ).catch(() => ({ rows: [] }));
+      if (linkedRequest.rows[0]?.request_id) {
+        await createCustomerPortalNotification({
+          customerId: finalizedInvoice.customer_id, companyId, type: 'invoice_issued',
+          title: 'Manufacturing invoice issued',
+          message: `Invoice ${finalizedInvoice.invoice_number || ''} is ready to view.`,
+          invoiceId: finalizedInvoice.id, url: '/customer/manufacturing-requests',
+        }).catch(err => console.warn('Customer manufacturing invoice notification failed:', err.message));
+        if (redisClient?.status === 'ready') {
+          redisClient.publish(`customer_manufacturing_events:${linkedRequest.rows[0].request_id}`, JSON.stringify({
+            type: 'invoice_issued', requestId: linkedRequest.rows[0].request_id, invoiceId: finalizedInvoice.id,
+          })).catch(() => {});
+        }
+      }
+    }
+    if (result?.reason !== 'idempotent_replay' && finalizedInvoice?.customer_id && jobId) {
       const title = 'Invoice ready';
       const message = `Invoice ${finalizedInvoice.invoice_number || ''} for your completed service is ready to view.`;
       await createCustomerPortalNotification({
@@ -741,6 +801,28 @@ router.get('/:id/pdf', setInvoiceTenantContext, async (req, res) => {
     }
 
     const invoice = invRes.rows[0];
+
+    const sessionToken = req.headers.authorization?.startsWith('Bearer ')
+      ? req.headers.authorization.split(' ')[1]
+      : req.cookies?.access_token || req.cookies?.user_access_token || req.cookies?.customer_access_token;
+    let session = null;
+    if (sessionToken) {
+      try { session = jwt.verify(sessionToken, process.env.JWT_SECRET); } catch (_) { /* handled by normal access verifier */ }
+    }
+    if (String(session?.role || '').toLowerCase() === 'employee' && invoice.invoice_type === 'production') {
+      const employeeId = session.userId || session.id;
+      const allowed = employeeId && ['issued','sent','viewed','partially_paid','paid'].includes(String(invoice.status || '').toLowerCase())
+        ? await pool.query(
+          `SELECT 1 FROM production_order_invoice_links l
+           JOIN production_orders o ON o.id=l.production_order_id AND o.company_id::text=l.company_id
+           WHERE l.company_id::text=$1::text AND l.invoice_id=$2
+             AND (o.assigned_employee_id::text=$3::text OR o.dispatch_employee_id::text=$3::text)
+           LIMIT 1`,
+          [String(invoice.company_id), invoice.id, String(employeeId)]
+        )
+        : { rows: [] };
+      if (!allowed.rows.length) return res.status(404).json({ error: 'Issued production invoice not found for this employee.' });
+    }
 
     // Cryptographic validation: user session or signed access token required
     if (!verifyInvoiceAccess(req, invoice)) {

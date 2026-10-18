@@ -33,7 +33,24 @@ const PRODUCTION_PACKING_WORKFLOW = {
   file: '035_production_packing_workflow.sql',
 };
 
-const FORWARD_MIGRATIONS = [PRODUCTION_DISPATCH, PRODUCTION_DISPATCH_PRIVILEGES, PRODUCTION_PACKING_WORKFLOW];
+const CUSTOMER_MANUFACTURING_REQUESTS = {
+  id: '036_customer_manufacturing_requests',
+  file: '036_customer_manufacturing_requests.sql',
+  tables: [
+    'customer_manufacturing_requests', 'customer_manufacturing_request_events',
+    'customer_manufacturing_production_links', 'production_order_invoice_links',
+  ],
+  indexes: [
+    'idx_mfg_requests_company_status_created', 'idx_mfg_requests_customer_created',
+    'idx_mfg_events_request_created', 'idx_mfg_production_link_order',
+    'idx_production_invoice_link_order', 'idx_production_invoice_link_invoice',
+  ],
+};
+
+const FORWARD_MIGRATIONS = [
+  PRODUCTION_DISPATCH, PRODUCTION_DISPATCH_PRIVILEGES, PRODUCTION_PACKING_WORKFLOW,
+  CUSTOMER_MANUFACTURING_REQUESTS,
+];
 
 function stripOuterTransaction(sql) {
   return sql
@@ -191,6 +208,37 @@ async function assertProductionDispatchPrivileges(client) {
   return row;
 }
 
+async function assertCustomerManufacturingRequestSchema(client) {
+  const result = await client.query(`
+    SELECT
+      (SELECT COUNT(*)::int FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+       WHERE n.nspname='public' AND c.relkind IN ('r','p') AND c.relname=ANY($1::text[])) AS table_count,
+      (SELECT COUNT(*)::int FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+       WHERE n.nspname='public' AND c.relkind IN ('r','p') AND c.relrowsecurity AND c.relname=ANY($1::text[])) AS rls_count,
+      (SELECT COUNT(*)::int FROM pg_policies WHERE schemaname='public' AND tablename=ANY($1::text[])) AS policy_count,
+      (SELECT COUNT(*)::int FROM pg_indexes WHERE schemaname='public' AND indexname=ANY($2::text[])) AS index_count,
+      (SELECT COUNT(*)::int FROM unnest($1::text[]) AS t(name)
+       WHERE has_table_privilege('smarterp_app','public.' || quote_ident(t.name),'SELECT')
+         AND has_table_privilege('smarterp_app','public.' || quote_ident(t.name),'INSERT')) AS app_read_insert_count,
+      has_table_privilege('smarterp_app','public.customer_manufacturing_requests','UPDATE') AS request_update,
+      has_table_privilege('smarterp_app','public.customer_manufacturing_request_events','UPDATE') AS event_update,
+      has_table_privilege('smarterp_app','public.customer_manufacturing_request_events','DELETE') AS event_delete,
+      has_table_privilege('smarterp_app','public.customer_manufacturing_production_links','UPDATE') AS production_link_update,
+      has_table_privilege('smarterp_app','public.production_order_invoice_links','UPDATE') AS invoice_link_update
+  `, [CUSTOMER_MANUFACTURING_REQUESTS.tables, CUSTOMER_MANUFACTURING_REQUESTS.indexes]);
+  const row = result.rows[0] || {};
+  const expected = { table_count: 4, rls_count: 4, policy_count: 4, index_count: 6, app_read_insert_count: 4 };
+  const failures = Object.entries(expected)
+    .filter(([key, value]) => Number(row[key]) !== value)
+    .map(([key, value]) => `${key}: expected ${value}, got ${row[key] ?? 'missing'}`);
+  if (!row.request_update) failures.push('application request update permission is missing');
+  for (const key of ['event_update','event_delete','production_link_update','invoice_link_update']) {
+    if (row[key]) failures.push(`${key} must not be granted to the application role`);
+  }
+  if (failures.length) throw new Error(`Customer manufacturing request schema verification failed: ${failures.join('; ')}`);
+  return row;
+}
+
 async function verifyMigration(client, migrationId) {
   await assertProductionDispatchSchema(client);
   if (migrationId === PRODUCTION_DISPATCH_PRIVILEGES.id) {
@@ -198,6 +246,10 @@ async function verifyMigration(client, migrationId) {
   }
   if (migrationId === PRODUCTION_PACKING_WORKFLOW.id) {
     await assertProductionPackingWorkflowSchema(client);
+  }
+  if (migrationId === CUSTOMER_MANUFACTURING_REQUESTS.id) {
+    await assertProductionPackingWorkflowSchema(client);
+    await assertCustomerManufacturingRequestSchema(client);
   }
 }
 
@@ -298,11 +350,13 @@ module.exports = {
   PRODUCTION_DISPATCH,
   PRODUCTION_DISPATCH_PRIVILEGES,
   PRODUCTION_PACKING_WORKFLOW,
+  CUSTOMER_MANUFACTURING_REQUESTS,
   FORWARD_MIGRATIONS,
   stripOuterTransaction,
   migrationChecksum,
   assertProductionDispatchSchema,
   assertProductionDispatchPrivileges,
   assertProductionPackingWorkflowSchema,
+  assertCustomerManufacturingRequestSchema,
   applyForwardMigration,
 };

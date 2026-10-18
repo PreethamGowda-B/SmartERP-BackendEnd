@@ -185,8 +185,8 @@ const ORDER_SELECT = `
     ) latest_inspection ON TRUE
    WHERE o.company_id::text = $1::text`;
 
-function mapOrder(row) {
-  return {
+function mapOrder(row, includeDraftInvoice = false) {
+  const result = {
     id: row.id,
     orderNumber: row.order_number,
     customerId: row.customer_id,
@@ -223,6 +223,37 @@ function mapOrder(row) {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+  result.invoice = null;
+  return result;
+}
+
+async function attachInvoiceSummaries(orders, companyId, includeDrafts) {
+  if (!orders.length) return orders;
+  try {
+    const result = await pool.query(
+      `SELECT DISTINCT ON (il.production_order_id) il.production_order_id,
+              i.id, i.invoice_number, i.status, i.total_amount, i.updated_at
+         FROM production_order_invoice_links il
+         JOIN invoices i ON i.id=il.invoice_id AND i.company_id::text=il.company_id
+        WHERE il.company_id=$1 AND il.production_order_id=ANY($2::uuid[]) AND i.status <> 'cancelled'
+        ORDER BY il.production_order_id,
+                 CASE WHEN i.status='draft' THEN 0 ELSE 1 END, i.created_at DESC`,
+      [String(companyId), orders.map((order) => order.id)]
+    );
+    const byOrder = new Map(result.rows.map((row) => [String(row.production_order_id), row]));
+    for (const order of orders) {
+      const row = byOrder.get(String(order.id));
+      const status = String(row?.status || '').toLowerCase();
+      if (!row || (status === 'draft' && !includeDrafts)) continue;
+      if (!['draft','issued','sent','viewed','partially_paid','paid'].includes(status)) continue;
+      order.invoice = { id: row.id, invoiceNumber: row.invoice_number, status, amount: Number(row.total_amount || 0), issuedAt: status === 'draft' ? null : row.updated_at };
+    }
+  } catch (error) {
+    // Existing production orders remain usable when the additive invoice-link
+    // migration has not been installed yet. Only this optional summary is absent.
+    if (!['42P01','42703'].includes(error?.code)) throw error;
+  }
+  return orders;
 }
 
 async function fetchOrder(client, orderId, companyId, lock = false) {
@@ -349,7 +380,8 @@ router.get('/orders', route(async (req) => {
     `${ORDER_SELECT}${where} ORDER BY o.due_date ASC, o.updated_at DESC LIMIT $${listParams.length - 1} OFFSET $${listParams.length}`,
     listParams
   );
-  return { orders: result.rows.map(mapOrder), page, pageSize, total: count.rows[0].total };
+  const orders = await attachInvoiceSummaries(result.rows.map((row) => mapOrder(row, true)), user.companyId, true);
+  return { orders, page, pageSize, total: count.rows[0].total };
 }));
 
 router.get('/my-orders', route(async (req) => {
@@ -365,13 +397,15 @@ router.get('/my-orders', route(async (req) => {
     pool.query(`SELECT i.* FROM production_inspections i WHERE i.company_id::text=$1::text AND i.order_id=ANY($2::uuid[]) ORDER BY i.inspected_at DESC`, [user.companyId,orderIds]),
     pool.query(`SELECT p.*, COALESCE(d.dispatched_quantity,0) AS dispatched_quantity, GREATEST(p.quantity-COALESCE(d.dispatched_quantity,0),0) AS remaining_quantity FROM production_packing_records p LEFT JOIN LATERAL (SELECT SUM(x.quantity) + COALESCE((SELECT SUM(a.quantity_delta) FROM production_dispatch_adjustments a WHERE a.company_id::text=p.company_id::text AND a.dispatch_id IN (SELECT id FROM production_dispatches WHERE company_id::text=p.company_id::text AND packing_record_id=p.id)),0) AS dispatched_quantity FROM production_dispatches x WHERE x.company_id::text=p.company_id::text AND x.packing_record_id=p.id) d ON TRUE WHERE p.company_id::text=$1::text AND p.order_id=ANY($2::uuid[]) ORDER BY p.created_at`, [user.companyId,orderIds]),
   ]);
-  return { orders: result.rows.map((row) => ({
-    ...mapOrder(row),
+  const orders = result.rows.map((row) => ({
+    ...mapOrder(row, false),
     isAssignedOperator: String(row.assigned_employee_id) === user.id,
     isAssignedDispatcher: String(row.dispatch_employee_id) === user.id,
     inspections: inspections.rows.filter((item) => String(item.order_id) === String(row.id)),
     packingRecords: packingRecords.rows.filter((item) => String(item.order_id) === String(row.id)),
-  })) };
+  }));
+  await attachInvoiceSummaries(orders, user.companyId, false);
+  return { orders };
 }));
 
 router.get('/orders/:orderId', route(async (req) => {
@@ -393,7 +427,8 @@ router.get('/orders/:orderId', route(async (req) => {
       client.query(`SELECT e.* FROM production_events e WHERE e.company_id::text=$1::text AND e.order_id=$2 ORDER BY e.created_at`, [user.companyId, req.params.orderId]),
       client.query(`SELECT p.*, COALESCE(d.dispatched_quantity,0) AS dispatched_quantity, GREATEST(p.quantity-COALESCE(d.dispatched_quantity,0),0) AS remaining_quantity FROM production_packing_records p LEFT JOIN LATERAL (SELECT SUM(x.quantity) + COALESCE((SELECT SUM(a.quantity_delta) FROM production_dispatch_adjustments a WHERE a.company_id::text=p.company_id::text AND a.order_id=p.order_id AND a.dispatch_id IN (SELECT id FROM production_dispatches WHERE company_id::text=p.company_id::text AND packing_record_id=p.id)),0) AS dispatched_quantity FROM production_dispatches x WHERE x.company_id::text=p.company_id::text AND x.packing_record_id=p.id) d ON TRUE WHERE p.company_id::text=$1::text AND p.order_id=$2 ORDER BY p.created_at`, [user.companyId, req.params.orderId]),
     ]);
-    return { order: mapOrder(row), batches: batches.rows, reports: reports.rows, materials: materials.rows, inspections: inspections.rows, dispatches: dispatches.rows, events: events.rows, packingRecords: packingRecords.rows };
+    const order = (await attachInvoiceSummaries([mapOrder(row, OWNER_ROLES.has(user.role))], user.companyId, OWNER_ROLES.has(user.role)))[0];
+    return { order, batches: batches.rows, reports: reports.rows, materials: materials.rows, inspections: inspections.rows, dispatches: dispatches.rows, events: events.rows, packingRecords: packingRecords.rows };
   } finally { client.release(); }
 }));
 

@@ -30,6 +30,49 @@ async function allocateInvoiceNumber(client, companyId) {
   return `${prefix}${String(maxSequence + 1).padStart(4, '0')}`;
 }
 
+async function fetchProductionInvoiceSource(client, productionOrderId, companyId, lock = false) {
+  const result = await client.query(
+    `SELECT o.*, c.name AS customer_name, c.email AS customer_email, c.phone AS customer_phone,
+            COALESCE(q.accepted_quantity,0) AS accepted_quantity
+       FROM production_orders o
+       LEFT JOIN customers c ON c.id::text=o.customer_id::text AND c.company_id::text=o.company_id::text
+       LEFT JOIN LATERAL (
+         SELECT SUM(i.accepted_quantity) AS accepted_quantity
+           FROM production_inspections i
+          WHERE i.company_id::text=o.company_id::text AND i.order_id=o.id
+       ) q ON TRUE
+      WHERE o.id::text=$1::text AND o.company_id::text=$2::text${lock ? ' FOR UPDATE OF o' : ''}`,
+    [String(productionOrderId), String(companyId)]
+  );
+  if (!result.rows.length) {
+    const error = new Error('Production order not found for this company.'); error.statusCode = 404; throw error;
+  }
+  const order = result.rows[0];
+  const accepted = Number(order.accepted_quantity || 0);
+  const planned = Number(order.planned_quantity || 0);
+  // Initial implementation uses whole-order invoicing. Partial invoicing needs a
+  // billed-quantity ledger and is deliberately rejected until that policy exists.
+  if (order.status !== 'ready_for_dispatch' || accepted + 0.0005 < planned) {
+    const error = new Error('A production invoice is available after the full order quantity is accepted and verified as ready for dispatch.');
+    error.statusCode = 409; throw error;
+  }
+  if (!order.customer_id || !order.customer_name) {
+    const error = new Error('The production order customer is not verified for invoicing.'); error.statusCode = 409; throw error;
+  }
+  return order;
+}
+
+function assertProductionInvoiceLineQuantities(items, order) {
+  if (!order?.is_production_order) return;
+  const componentQuantity = items
+    .filter((item) => ['product', 'component', 'manufactured_component'].includes(String(item.item_type || '').toLowerCase()))
+    .reduce((total, item) => total + Number(item.quantity || 0), 0);
+  if (Math.abs(componentQuantity - Number(order.accepted_quantity || 0)) > 0.0005) {
+    const error = new Error('The component invoice quantity must match the full Owner-accepted production quantity.');
+    error.statusCode = 400; throw error;
+  }
+}
+
 class InvoiceService {
   static async createJobDraft({ companyId, jobId, userId }) {
     const client = await pool.connect();
@@ -72,6 +115,103 @@ class InvoiceService {
     } finally {
       client.release();
     }
+  }
+
+  static async createProductionOrderDraft({ companyId, productionOrderId, userId }) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const order = await fetchProductionInvoiceSource(client, productionOrderId, companyId, true);
+      const existing = await client.query(
+        `SELECT i.* FROM production_order_invoice_links l
+         JOIN invoices i ON i.id=l.invoice_id AND i.company_id::text=l.company_id
+         WHERE l.company_id=$1 AND l.production_order_id=$2::uuid AND i.status <> 'cancelled'
+         ORDER BY CASE WHEN i.status='draft' THEN 0 ELSE 1 END, i.created_at DESC
+         LIMIT 1 FOR UPDATE OF i`,
+        [String(companyId), String(productionOrderId)]
+      );
+      if (existing.rows.length) {
+        await client.query('COMMIT');
+        return existing.rows[0];
+      }
+      const invoiceNumber = await allocateInvoiceNumber(client, companyId);
+      const inserted = await client.query(
+        `INSERT INTO invoices (company_id, job_id, customer_id, customer_name, customer_email,
+          customer_phone, invoice_number, invoice_type, status, amount_paid, amount_due, total_amount,
+          created_at, updated_at)
+         VALUES ($1, NULL, $2, $3, $4, $5, $6, 'production', 'draft', 0, 0, 0, NOW(), NOW()) RETURNING *`,
+        [companyId, order.customer_id, order.customer_name, order.customer_email || '', order.customer_phone || '', invoiceNumber]
+      );
+      const invoice = inserted.rows[0];
+      await client.query(
+        `INSERT INTO production_order_invoice_links(company_id,production_order_id,invoice_id,linked_by)
+         VALUES ($1,$2::uuid,$3,$4)`,
+        [String(companyId), String(productionOrderId), invoice.id, userId || null]
+      );
+      await client.query('COMMIT');
+      auditService.log({ companyId, actorType: 'user', actorId: userId || null,
+        actionType: 'production_invoice_draft_created', entityType: 'invoice', entityId: invoice.id,
+        newValue: { production_order_id: String(productionOrderId), invoice_number: invoiceNumber } }).catch(() => {});
+      return invoice;
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw error;
+    } finally { client.release(); }
+  }
+
+  static async prepareInvoiceDataForProductionOrder(productionOrderId, companyId) {
+    const client = await pool.connect();
+    try {
+      const order = await fetchProductionInvoiceSource(client, productionOrderId, companyId, false);
+      const existingResult = await client.query(
+        `SELECT i.* FROM production_order_invoice_links l
+         JOIN invoices i ON i.id=l.invoice_id AND i.company_id::text=l.company_id
+         WHERE l.company_id=$1 AND l.production_order_id=$2::uuid AND i.status <> 'cancelled'
+         ORDER BY CASE WHEN i.status='draft' THEN 0 ELSE 1 END, i.created_at DESC LIMIT 1`,
+        [String(companyId), String(productionOrderId)]
+      );
+      const existingInvoice = existingResult.rows[0] || null;
+      const itemResult = existingInvoice ? await client.query(
+        `SELECT item_type,description,hsn_code,quantity,unit_price,total_amount
+           FROM invoice_items WHERE invoice_id=$1 ORDER BY id`, [existingInvoice.id]
+      ) : { rows: [] };
+      const componentLine = {
+        item_type: 'product', description: order.component_name, hsn_code: '',
+        quantity: Number(order.accepted_quantity), unit_price: 0,
+        total_amount: 0,
+      };
+      return {
+        sourceType: 'production_order',
+        productionOrder: {
+          id: String(order.id), order_number: order.order_number, component_name: order.component_name,
+          part_number: order.part_number, customer_order_reference: order.customer_order_reference,
+          planned_quantity: Number(order.planned_quantity), accepted_quantity: Number(order.accepted_quantity),
+          unit: order.unit, status: order.status,
+        },
+        job: {
+          id: String(order.id), title: `${order.component_name} (${order.order_number})`,
+          description: order.instructions || '', status: 'completed', customer_id: order.customer_id,
+          customer_name: order.customer_name, customer_email: order.customer_email || '',
+          customer_phone: order.customer_phone || '', accepted_quantity: Number(order.accepted_quantity), is_production_order: true,
+        },
+        existingInvoice,
+        prefilled: {
+          labour_hours: Number(existingInvoice?.labour_hours || 0),
+          labour_rate: Number(existingInvoice?.labour_rate || 0),
+          line_items: itemResult.rows.length ? itemResult.rows : [componentLine],
+          equipment_charges: Number(existingInvoice?.equipment_charges || 0),
+          transport_charges: Number(existingInvoice?.transport_charges || 0),
+          additional_charges: Number(existingInvoice?.additional_charges || 0),
+          discount_amount: Number(existingInvoice?.discount_amount || 0),
+          gst_rate: Number(existingInvoice?.gst_rate || 0),
+          is_inter_state: Boolean(existingInvoice?.is_inter_state),
+          payment_terms: existingInvoice?.payment_terms || 'Due on receipt',
+          customer_notes: existingInvoice?.customer_notes || 'Thank you for your business!',
+          internal_notes: existingInvoice?.internal_notes || '',
+          due_days: 15,
+        },
+      };
+    } finally { client.release(); }
   }
 
   /**
@@ -299,7 +439,7 @@ class InvoiceService {
    * Finalizes an invoice in an atomic transaction.
    * Generates Invoice #, PDF, inserts DB records, creates AR schedule & GST ledger.
    */
-  static async finalizeInvoice({ companyId, jobId, userId, invoiceData }) {
+  static async finalizeInvoice({ companyId, jobId, productionOrderId, userId, invoiceData }) {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -319,7 +459,18 @@ class InvoiceService {
       }
 
       // 1. Fetch job with lock (supporting jobId or invoiceId identifier)
-      let jobRes = await client.query(
+      let jobRes;
+      if (productionOrderId) {
+        const order = await fetchProductionInvoiceSource(client, productionOrderId, companyId, true);
+        jobRes = { rows: [{
+          id: null, production_order_id: String(order.id), title: `${order.component_name} (${order.order_number})`,
+          description: order.instructions || '', status: 'completed', customer_id: order.customer_id,
+          customer_name: order.customer_name, customer_email: order.customer_email || '',
+          customer_phone: order.customer_phone || '', accepted_quantity: Number(order.accepted_quantity),
+          is_production_order: true,
+        }] };
+      } else {
+        jobRes = await client.query(
         `SELECT j.*, 
                 c.name AS customer_name, c.email AS customer_email, c.phone AS customer_phone
          FROM jobs j
@@ -327,9 +478,10 @@ class InvoiceService {
          WHERE j.id::text = $1::text AND j.company_id::text = $2::text
          FOR UPDATE OF j`,
         [String(jobId), String(companyId)]
-      );
+        );
+      }
 
-      if (jobRes.rows.length === 0) {
+      if (!productionOrderId && jobRes.rows.length === 0) {
         // Check if jobId is actually an invoice ID
         const invCheck = await client.query(
           `SELECT id, job_id FROM invoices WHERE id::text = $1::text AND company_id::text = $2::text`,
@@ -374,19 +526,32 @@ class InvoiceService {
 
       const job = jobRes.rows[0];
       const actualJobId = job.id || null;
-      if (!job.is_direct_invoice && !['completed', 'billed_and_closed'].includes(String(job.status || '').toLowerCase())) {
+      if (!job.is_direct_invoice && !job.is_production_order && !['completed', 'billed_and_closed'].includes(String(job.status || '').toLowerCase())) {
         const conflict = new Error('Invoices can only be issued for completed jobs');
         conflict.statusCode = 409;
         throw conflict;
       }
 
       // 2. Check if invoice is already issued/paid/draft for this job — if so, update & increment edited_count
-      const existingIssuedInv = await client.query(
-        `SELECT id, invoice_number, edited_count, status, amount_paid, version_number, idempotency_key FROM invoices
-         WHERE ((job_id IS NOT NULL AND job_id::text = $1::text) OR id::text = $2::text) AND company_id::text = $3::text 
-         ORDER BY CASE WHEN status = 'draft' THEN 0 ELSE 1 END, created_at DESC LIMIT 1`,
-        [actualJobId ? String(actualJobId) : '', String(jobId), String(companyId)]
-      );
+      const existingIssuedInv = productionOrderId
+        ? await client.query(
+          `SELECT i.id, i.invoice_number, i.edited_count, i.status, i.amount_paid, i.version_number, i.idempotency_key
+             FROM production_order_invoice_links l JOIN invoices i ON i.id=l.invoice_id AND i.company_id::text=l.company_id
+            WHERE l.company_id=$1 AND l.production_order_id=$2::uuid
+            ORDER BY CASE WHEN i.status='draft' THEN 0 ELSE 1 END, i.created_at DESC LIMIT 1 FOR UPDATE OF i`,
+          [String(companyId), String(productionOrderId)]
+        )
+        : await client.query(
+          `SELECT id, invoice_number, edited_count, status, amount_paid, version_number, idempotency_key FROM invoices
+           WHERE ((job_id IS NOT NULL AND job_id::text = $1::text) OR id::text = $2::text) AND company_id::text = $3::text
+           ORDER BY CASE WHEN status = 'draft' THEN 0 ELSE 1 END, created_at DESC LIMIT 1 FOR UPDATE`,
+          [actualJobId ? String(actualJobId) : '', String(jobId), String(companyId)]
+        );
+
+      if (productionOrderId && !existingIssuedInv.rows.length) {
+        const conflict = new Error('Create or resume the production invoice draft before issuing it.');
+        conflict.statusCode = 409; throw conflict;
+      }
 
       if (existingIssuedInv.rows.length > 0) {
         const existingId = existingIssuedInv.rows[0].id;
@@ -406,6 +571,7 @@ class InvoiceService {
         const labourRate = Number(invoiceData.labour_rate || 0);
         const lineItems = invoiceData.lineItems || [];
         const totals = calculateInvoice({ ...invoiceData, lineItems, labourHours, labourRate });
+        assertProductionInvoiceLineQuantities(totals.lineItems, job);
         const labourCost = totals.labourCost;
         const materialsCost = totals.materialsCost;
         const equipmentCharges = Number(invoiceData.equipment_charges || 0);
@@ -525,6 +691,7 @@ class InvoiceService {
       const labourHours = Number(invoiceData.labour_hours || 0);
       const labourRate = Number(invoiceData.labour_rate || 0);
       const totals = calculateInvoice({ ...invoiceData, lineItems, labourHours, labourRate });
+      assertProductionInvoiceLineQuantities(totals.lineItems, job);
       const processedLineItems = totals.lineItems;
       const labourCost = totals.labourCost;
       const materialsCost = totals.materialsCost;

@@ -108,6 +108,11 @@ BEGIN
   END LOOP;
 END $$;
 
+-- Clear any database-level default ACLs first. CREATE TABLE can inherit broad
+-- privileges from ALTER DEFAULT PRIVILEGES, and GRANT alone does not narrow them.
+REVOKE ALL ON customer_manufacturing_requests, customer_manufacturing_request_events,
+  customer_manufacturing_production_links, production_order_invoice_links FROM smarterp_app;
+
 GRANT SELECT, INSERT, UPDATE ON customer_manufacturing_requests TO smarterp_app;
 GRANT SELECT, INSERT ON customer_manufacturing_request_events TO smarterp_app;
 GRANT SELECT, INSERT ON customer_manufacturing_production_links TO smarterp_app;

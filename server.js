@@ -92,7 +92,8 @@ const corsOptions = {
     "X-Request-Id",
     "Cache-Control",
     "Pragma",
-    "Origin"
+    "Origin",
+    "Idempotency-Key"
   ],
   exposedHeaders: ["Set-Cookie", "x-rtb-fingerprint-id", "request-id", "X-Request-Id"],
   optionsSuccessStatus: 200,
@@ -974,7 +975,7 @@ app.use((err, req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Access-Control-Allow-Credentials', 'true');
     res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-CSRF-Token,X-Requested-With,Accept');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-CSRF-Token,X-Requested-With,Accept,Idempotency-Key');
   }
 
   // Handle CSRF errors specifically

@@ -28,7 +28,12 @@ const PRODUCTION_DISPATCH_PRIVILEGES = {
   file: '034_production_dispatch_privileges.sql',
 };
 
-const FORWARD_MIGRATIONS = [PRODUCTION_DISPATCH, PRODUCTION_DISPATCH_PRIVILEGES];
+const PRODUCTION_PACKING_WORKFLOW = {
+  id: '035_production_packing_workflow',
+  file: '035_production_packing_workflow.sql',
+};
+
+const FORWARD_MIGRATIONS = [PRODUCTION_DISPATCH, PRODUCTION_DISPATCH_PRIVILEGES, PRODUCTION_PACKING_WORKFLOW];
 
 function stripOuterTransaction(sql) {
   return sql
@@ -60,6 +65,7 @@ async function assertProductionDispatchSchema(client) {
        WHERE connamespace='public'::regnamespace AND contype='f'
          AND conrelid IN (SELECT oid FROM pg_class WHERE relname=ANY($1::text[]))) AS foreign_key_count,
       to_regprocedure('public.production_reject_history_mutation()') IS NOT NULL AS history_function,
+      to_regclass('public.production_packing_records') IS NOT NULL AS packing_workflow_installed,
       EXISTS (SELECT 1 FROM pg_roles WHERE rolname='smarterp_app' AND NOT rolsuper AND NOT rolbypassrls) AS app_role_safe,
       has_schema_privilege('smarterp_app', 'public', 'USAGE') AS app_schema_usage,
       (SELECT COUNT(*)::int FROM unnest($1::text[]) AS t(name)
@@ -74,8 +80,8 @@ async function assertProductionDispatchSchema(client) {
     policy_count: PRODUCTION_DISPATCH.tables.length,
     index_count: PRODUCTION_DISPATCH.indexes.length,
     trigger_count: PRODUCTION_DISPATCH.triggers.length,
-    constraint_count: 57,
-    foreign_key_count: 22,
+    constraint_count: row.packing_workflow_installed ? 59 : 57,
+    foreign_key_count: row.packing_workflow_installed ? 24 : 22,
     app_grant_count: PRODUCTION_DISPATCH.tables.length,
   };
   const failures = Object.entries(expected)
@@ -85,6 +91,56 @@ async function assertProductionDispatchSchema(client) {
   if (!row.app_role_safe) failures.push('smarterp_app must exist without superuser or BYPASSRLS privileges');
   if (!row.app_schema_usage) failures.push('smarterp_app lacks public schema USAGE');
   if (failures.length) throw new Error(`Production & Dispatch schema verification failed: ${failures.join('; ')}`);
+  return row;
+}
+
+async function assertProductionPackingWorkflowSchema(client) {
+  const result = await client.query(`
+    SELECT
+      (SELECT COUNT(*)::int FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+       WHERE n.nspname='public' AND c.relkind IN ('r','p') AND c.relname='production_packing_records') AS table_count,
+      (SELECT COUNT(*)::int FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+       WHERE n.nspname='public' AND c.relname='production_packing_records' AND c.relrowsecurity) AS rls_count,
+      (SELECT COUNT(*)::int FROM pg_policies WHERE schemaname='public' AND tablename='production_packing_records') AS policy_count,
+      (SELECT COUNT(*)::int FROM pg_indexes WHERE schemaname='public' AND indexname=ANY($1::text[])) AS index_count,
+      (SELECT COUNT(*)::int FROM pg_constraint
+       WHERE connamespace='public'::regnamespace AND conrelid='public.production_packing_records'::regclass) AS packing_constraint_count,
+      (SELECT COUNT(*)::int FROM pg_constraint
+       WHERE connamespace='public'::regnamespace AND contype='f' AND conrelid='public.production_packing_records'::regclass) AS packing_foreign_key_count,
+      EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='public.production_orders'::regclass AND conname='production_orders_dispatch_employee_fk') AS dispatch_employee_fk,
+      EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='public.production_dispatches'::regclass AND conname='production_dispatches_packing_record_fk') AS dispatch_packing_fk,
+      EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='production_orders' AND column_name='dispatch_employee_id') AS dispatch_employee_column,
+      EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='production_dispatches' AND column_name='packing_record_id') AS dispatch_packing_column,
+      has_table_privilege('smarterp_app','public.production_packing_records','SELECT') AS app_select,
+      has_table_privilege('smarterp_app','public.production_packing_records','INSERT') AS app_insert,
+      has_table_privilege('smarterp_app','public.production_packing_records','UPDATE') AS app_update,
+      has_table_privilege('smarterp_app','public.production_packing_records','DELETE') OR
+        has_table_privilege('smarterp_app','public.production_packing_records','TRUNCATE') AS app_destructive_privilege,
+      (SELECT COUNT(*)::int FROM unnest(ARRAY['anon','authenticated','service_role']::text[]) AS r(role_name)
+       WHERE has_table_privilege(r.role_name,'public.production_packing_records','SELECT') OR
+             has_table_privilege(r.role_name,'public.production_packing_records','INSERT') OR
+             has_table_privilege(r.role_name,'public.production_packing_records','UPDATE') OR
+             has_table_privilege(r.role_name,'public.production_packing_records','DELETE') OR
+             has_table_privilege(r.role_name,'public.production_packing_records','TRUNCATE')) AS external_privilege_count
+  `, [['idx_production_orders_dispatch_employee','idx_production_packing_order','idx_production_packing_inspection','idx_production_dispatches_packing']]);
+  const row = result.rows[0] || {};
+  const expected = {
+    table_count: 1,
+    rls_count: 1,
+    policy_count: 1,
+    index_count: 4,
+    packing_constraint_count: 7,
+    packing_foreign_key_count: 3,
+    external_privilege_count: 0,
+  };
+  const failures = Object.entries(expected)
+    .filter(([key, value]) => Number(row[key]) !== value)
+    .map(([key, value]) => `${key}: expected ${value}, got ${row[key] ?? 'missing'}`);
+  for (const key of ['dispatch_employee_fk','dispatch_packing_fk','dispatch_employee_column','dispatch_packing_column','app_select','app_insert','app_update']) {
+    if (!row[key]) failures.push(`${key} is missing`);
+  }
+  if (row.app_destructive_privilege) failures.push('smarterp_app has DELETE or TRUNCATE on packing records');
+  if (failures.length) throw new Error(`Production packing workflow schema verification failed: ${failures.join('; ')}`);
   return row;
 }
 
@@ -139,6 +195,9 @@ async function verifyMigration(client, migrationId) {
   await assertProductionDispatchSchema(client);
   if (migrationId === PRODUCTION_DISPATCH_PRIVILEGES.id) {
     await assertProductionDispatchPrivileges(client);
+  }
+  if (migrationId === PRODUCTION_PACKING_WORKFLOW.id) {
+    await assertProductionPackingWorkflowSchema(client);
   }
 }
 
@@ -238,10 +297,12 @@ async function applyForwardMigration(client, { migrationId, sql }) {
 module.exports = {
   PRODUCTION_DISPATCH,
   PRODUCTION_DISPATCH_PRIVILEGES,
+  PRODUCTION_PACKING_WORKFLOW,
   FORWARD_MIGRATIONS,
   stripOuterTransaction,
   migrationChecksum,
   assertProductionDispatchSchema,
   assertProductionDispatchPrivileges,
+  assertProductionPackingWorkflowSchema,
   applyForwardMigration,
 };

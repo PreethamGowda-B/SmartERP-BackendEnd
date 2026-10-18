@@ -7,6 +7,9 @@ const {
   assertProductionReport,
   assertQualityOutcome,
   assertDispatchQuantity,
+  assertPackingQuantity,
+  assertPackingStatusTransition,
+  assertPackingDispatchPermission,
   assertStatusTransition,
   deriveDispatchStatus,
   ORDER_STATUSES,
@@ -64,7 +67,7 @@ function sendError(res, error) {
     });
   }
   if (error instanceof ProductionRuleError) {
-    return res.status(400).json({ success: false, code: error.code, message: error.message });
+    return res.status(error.status || 400).json({ success: false, code: error.code, message: error.message });
   }
   const status = Number(error?.status) || 500;
   if (status < 500) return res.status(status).json({ success: false, message: error.message });
@@ -139,10 +142,11 @@ const ORDER_SELECT = `
   SELECT o.id, o.company_id, o.order_number, o.customer_id, o.customer_order_reference,
          o.component_name, o.part_number, o.drawing_number, o.drawing_revision,
          o.planned_quantity, o.unit, o.due_date, o.priority, o.machine_id,
-         o.assigned_employee_id, o.job_id, o.instructions, o.status, o.created_at, o.updated_at,
+         o.assigned_employee_id, o.dispatch_employee_id, o.job_id, o.instructions, o.status, o.created_at, o.updated_at,
          COALESCE(c.name, 'Customer') AS customer_name,
          m.machine_name,
          COALESCE(assignee.name, assignee.email) AS assigned_employee_name,
+         COALESCE(dispatch_assignee.name, dispatch_assignee.email) AS dispatch_employee_name,
          b.id AS active_batch_id, b.status AS active_batch_status,
          COALESCE(t.good_quantity, 0) AS good_quantity,
          COALESCE(t.rejected_quantity, 0) AS rejected_quantity,
@@ -158,6 +162,7 @@ const ORDER_SELECT = `
     LEFT JOIN customers c ON c.id::text = o.customer_id::text AND c.company_id::text = o.company_id::text
     LEFT JOIN customer_machines m ON m.id::text = o.machine_id::text AND m.company_id::text = o.company_id::text
     LEFT JOIN users assignee ON assignee.id::text = o.assigned_employee_id::text AND assignee.company_id::text = o.company_id::text
+    LEFT JOIN users dispatch_assignee ON dispatch_assignee.id::text = o.dispatch_employee_id::text AND dispatch_assignee.company_id::text = o.company_id::text
     LEFT JOIN LATERAL (
       SELECT pb.id, pb.status,
              EXISTS(SELECT 1 FROM production_reports pr WHERE pr.company_id::text = o.company_id::text AND pr.batch_id = pb.id) AS has_report
@@ -203,6 +208,8 @@ function mapOrder(row) {
     machineName: row.machine_name,
     assignedEmployeeId: row.assigned_employee_id,
     assignedEmployeeName: row.assigned_employee_name,
+    dispatchEmployeeId: row.dispatch_employee_id,
+    dispatchEmployeeName: row.dispatch_employee_name,
     activeBatchId: row.active_batch_id,
     activeBatchHasReport: row.active_batch_has_report,
     latestInspectionResult: row.latest_inspection_result,
@@ -220,7 +227,7 @@ function mapOrder(row) {
 
 async function fetchOrder(client, orderId, companyId, lock = false) {
   const result = await client.query(
-    `SELECT id, company_id, order_number, customer_id, planned_quantity, status, assigned_employee_id,
+    `SELECT id, company_id, order_number, customer_id, planned_quantity, status, assigned_employee_id, dispatch_employee_id,
             machine_id, due_date, updated_at
        FROM production_orders
       WHERE id::text = $1::text AND company_id::text = $2::text${lock ? ' FOR UPDATE' : ''}`,
@@ -349,10 +356,22 @@ router.get('/my-orders', route(async (req) => {
   const user = principal(req);
   if (!EMPLOYEE_ROLES.has(user.role)) { const e = new Error('Only employees can view assigned production orders.'); e.status=403; throw e; }
   const result = await pool.query(
-    `${ORDER_SELECT} AND o.assigned_employee_id::text = $2::text AND o.status NOT IN ('dispatched','cancelled') ORDER BY o.due_date ASC, o.updated_at DESC`,
+    `${ORDER_SELECT} AND (o.assigned_employee_id::text = $2::text OR o.dispatch_employee_id::text = $2::text) AND o.status NOT IN ('cancelled') ORDER BY o.due_date ASC, o.updated_at DESC`,
     [user.companyId, user.id]
   );
-  return { orders: result.rows.map(mapOrder) };
+  const orderIds = result.rows.map((row) => row.id);
+  if (!orderIds.length) return { orders: [] };
+  const [inspections, packingRecords] = await Promise.all([
+    pool.query(`SELECT i.* FROM production_inspections i WHERE i.company_id::text=$1::text AND i.order_id=ANY($2::uuid[]) ORDER BY i.inspected_at DESC`, [user.companyId,orderIds]),
+    pool.query(`SELECT p.*, COALESCE(d.dispatched_quantity,0) AS dispatched_quantity, GREATEST(p.quantity-COALESCE(d.dispatched_quantity,0),0) AS remaining_quantity FROM production_packing_records p LEFT JOIN LATERAL (SELECT SUM(x.quantity) + COALESCE((SELECT SUM(a.quantity_delta) FROM production_dispatch_adjustments a WHERE a.company_id::text=p.company_id::text AND a.dispatch_id IN (SELECT id FROM production_dispatches WHERE company_id::text=p.company_id::text AND packing_record_id=p.id)),0) AS dispatched_quantity FROM production_dispatches x WHERE x.company_id::text=p.company_id::text AND x.packing_record_id=p.id) d ON TRUE WHERE p.company_id::text=$1::text AND p.order_id=ANY($2::uuid[]) ORDER BY p.created_at`, [user.companyId,orderIds]),
+  ]);
+  return { orders: result.rows.map((row) => ({
+    ...mapOrder(row),
+    isAssignedOperator: String(row.assigned_employee_id) === user.id,
+    isAssignedDispatcher: String(row.dispatch_employee_id) === user.id,
+    inspections: inspections.rows.filter((item) => String(item.order_id) === String(row.id)),
+    packingRecords: packingRecords.rows.filter((item) => String(item.order_id) === String(row.id)),
+  })) };
 }));
 
 router.get('/orders/:orderId', route(async (req) => {
@@ -362,18 +381,19 @@ router.get('/orders/:orderId', route(async (req) => {
     const result = await client.query(`${ORDER_SELECT} AND o.id::text = $2::text`, [user.companyId, req.params.orderId]);
     if (!result.rows.length) { const e = new Error('Production order was not found.'); e.status = 404; throw e; }
     const row = result.rows[0];
-    if (!OWNER_ROLES.has(user.role) && !(EMPLOYEE_ROLES.has(user.role) && String(row.assigned_employee_id) === user.id)) {
+    if (!OWNER_ROLES.has(user.role) && !(EMPLOYEE_ROLES.has(user.role) && (String(row.assigned_employee_id) === user.id || String(row.dispatch_employee_id) === user.id))) {
       const e = new Error('Production order was not found.'); e.status = 404; throw e;
     }
-    const [batches, reports, materials, inspections, dispatches, events] = await Promise.all([
+    const [batches, reports, materials, inspections, dispatches, events, packingRecords] = await Promise.all([
       client.query(`SELECT b.*, COALESCE(SUM(r.good_quantity),0) good_quantity, COALESCE(SUM(r.rejected_quantity),0) rejected_quantity, COALESCE(SUM(r.rework_quantity),0) rework_quantity FROM production_batches b LEFT JOIN production_reports r ON r.company_id::text=b.company_id::text AND r.batch_id=b.id WHERE b.company_id::text=$1::text AND b.order_id=$2 GROUP BY b.id ORDER BY b.batch_number`, [user.companyId, req.params.orderId]),
       client.query(`SELECT r.*, r.reported_by_name AS actor_name FROM production_reports r WHERE r.company_id::text=$1::text AND r.order_id=$2 ORDER BY r.reported_at`, [user.companyId, req.params.orderId]),
       client.query(`SELECT m.id, m.inventory_item_id, i.name AS item_name, m.planned_quantity, m.unit FROM production_order_materials m LEFT JOIN inventory_items i ON i.id::text=m.inventory_item_id::text AND i.company_id::text=m.company_id::text WHERE m.company_id::text=$1::text AND m.order_id=$2 ORDER BY m.created_at`, [user.companyId, req.params.orderId]),
       client.query(`SELECT i.* FROM production_inspections i WHERE i.company_id::text=$1::text AND i.order_id=$2 ORDER BY i.inspected_at DESC`, [user.companyId, req.params.orderId]),
       client.query(`SELECT d.* FROM production_dispatches d WHERE d.company_id::text=$1::text AND d.order_id=$2 ORDER BY d.dispatched_at DESC`, [user.companyId, req.params.orderId]),
       client.query(`SELECT e.* FROM production_events e WHERE e.company_id::text=$1::text AND e.order_id=$2 ORDER BY e.created_at`, [user.companyId, req.params.orderId]),
+      client.query(`SELECT p.*, COALESCE(d.dispatched_quantity,0) AS dispatched_quantity, GREATEST(p.quantity-COALESCE(d.dispatched_quantity,0),0) AS remaining_quantity FROM production_packing_records p LEFT JOIN LATERAL (SELECT SUM(x.quantity) + COALESCE((SELECT SUM(a.quantity_delta) FROM production_dispatch_adjustments a WHERE a.company_id::text=p.company_id::text AND a.order_id=p.order_id AND a.dispatch_id IN (SELECT id FROM production_dispatches WHERE company_id::text=p.company_id::text AND packing_record_id=p.id)),0) AS dispatched_quantity FROM production_dispatches x WHERE x.company_id::text=p.company_id::text AND x.packing_record_id=p.id) d ON TRUE WHERE p.company_id::text=$1::text AND p.order_id=$2 ORDER BY p.created_at`, [user.companyId, req.params.orderId]),
     ]);
-    return { order: mapOrder(row), batches: batches.rows, reports: reports.rows, materials: materials.rows, inspections: inspections.rows, dispatches: dispatches.rows, events: events.rows };
+    return { order: mapOrder(row), batches: batches.rows, reports: reports.rows, materials: materials.rows, inspections: inspections.rows, dispatches: dispatches.rows, events: events.rows, packingRecords: packingRecords.rows };
   } finally { client.release(); }
 }));
 
@@ -402,6 +422,10 @@ router.post('/orders', route(async (req, res) => {
       const employee = await client.query(`SELECT id FROM users WHERE id::text=$1::text AND company_id::text=$2::text AND role IN ('employee','staff','technician') AND COALESCE(is_active,TRUE)=TRUE`, [String(body.assignedEmployeeId), user.companyId]);
       if (!employee.rows.length) { const e = new Error('Assigned operator is not available in this company.'); e.status=400; throw e; }
     }
+    if (body.dispatchEmployeeId) {
+      const employee = await client.query(`SELECT id FROM users WHERE id::text=$1::text AND company_id::text=$2::text AND role IN ('employee','staff','technician') AND COALESCE(is_active,TRUE)=TRUE`, [String(body.dispatchEmployeeId), user.companyId]);
+      if (!employee.rows.length) { const e = new Error('Assigned dispatch employee is not available in this company.'); e.status=400; throw e; }
+    }
     if (body.jobId) {
       const job = await client.query(`SELECT id, customer_id FROM jobs WHERE id::text=$1::text AND company_id::text=$2::text`, [String(body.jobId), user.companyId]);
       if (!job.rows.length || (job.rows[0].customer_id && String(job.rows[0].customer_id) !== customerId)) { const e = new Error('Related service job does not belong to the selected customer and company.'); e.status=400; throw e; }
@@ -426,13 +450,13 @@ router.post('/orders', route(async (req, res) => {
     const orderNumber = `PROD-${year}-${String(sequence.rows[0].next_value).padStart(6,'0')}`;
     const inserted = await client.query(
       `INSERT INTO production_orders(company_id, order_number, customer_id, customer_order_reference, component_name, part_number,
-         drawing_number, drawing_revision, planned_quantity, unit, due_date, priority, machine_id, assigned_employee_id,
+         drawing_number, drawing_revision, planned_quantity, unit, due_date, priority, machine_id, assigned_employee_id, dispatch_employee_id,
          job_id, instructions, created_by, updated_by)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::date,$12,$13,$14,$15,$16,$17,$17) RETURNING id`,
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::date,$12,$13,$14,$15,$16,$17,$18,$18) RETURNING id`,
       [user.companyId, orderNumber, customerId, body.customerOrderReference ? String(body.customerOrderReference).trim().slice(0,120) : null,
         componentName, partNumber, body.drawingNumber ? String(body.drawingNumber).trim().slice(0,100) : null,
         body.drawingRevision ? String(body.drawingRevision).trim().slice(0,40) : null, quantity, unit, dueDate, priority,
-        body.machineId ? String(body.machineId) : null, body.assignedEmployeeId || null, body.jobId || null,
+        body.machineId ? String(body.machineId) : null, body.assignedEmployeeId || null, body.dispatchEmployeeId || null, body.jobId || null,
         body.instructions ? String(body.instructions).trim().slice(0,5000) : null, user.id]
     );
     const orderId = inserted.rows[0].id;
@@ -442,12 +466,15 @@ router.post('/orders', route(async (req, res) => {
     }
     await appendEvent(client, user, { orderId, type: 'order_created', toStatus: ORDER_STATUSES.PLANNED, quantity, details: { orderNumber } });
     const order = await client.query(`${ORDER_SELECT} AND o.id=$2`, [user.companyId, orderId]);
-    return { order: mapOrder(order.rows[0]), assignedEmployeeId: body.assignedEmployeeId || null };
+    return { order: mapOrder(order.rows[0]), assignedEmployeeId: body.assignedEmployeeId || null, dispatchEmployeeId: body.dispatchEmployeeId || null };
   });
   if (!created[REPLAYED] && created.assignedEmployeeId) {
     try { await createNotification({ user_id: created.assignedEmployeeId, company_id: user.companyId, type: 'production_assignment', title: 'Production order assigned', message: `${created.order.orderNumber}: ${created.order.componentName}`, priority: created.order.priority, data: { url: '/employee/production', production_order_id: created.order.id } }); } catch (err) { console.error('Production assignment notification failed:', err.message); }
   } else if (!created[REPLAYED]) {
     try { await createNotificationForOwners({ company_id: user.companyId, type: 'production_order_created', title: 'Production order created', message: `${created.order.orderNumber}: ${created.order.componentName}`, data: { url: '/owner/production', production_order_id: created.order.id }, exclude_user_id: user.id }); } catch (err) { console.error('Production order notification failed:', err.message); }
+  }
+  if (!created[REPLAYED] && created.dispatchEmployeeId && created.dispatchEmployeeId !== created.assignedEmployeeId) {
+    try { await createNotification({ user_id: created.dispatchEmployeeId, company_id: user.companyId, type: 'production_dispatch_assignment', title: 'Dispatch work assigned', message: `${created.order.orderNumber}: ${created.order.componentName}`, priority: created.order.priority, data: { url: '/employee/production', production_order_id: created.order.id } }); } catch (err) { console.error('Production dispatch assignment notification failed:', err.message); }
   }
   res.status(201).json({ success: true, data: { order: created.order } });
 }));
@@ -459,23 +486,33 @@ router.post('/orders/:orderId/assignments', route(async (req) => {
     const active = await client.query(`SELECT 1 FROM production_batches WHERE company_id::text=$1::text AND order_id=$2 AND status IN ('in_production','submitted') LIMIT 1`, [user.companyId,order.id]);
     if (active.rows.length) { const e = new Error('Assignment cannot change while a batch is active or awaiting inspection.'); e.status=409; throw e; }
     const employeeId = req.body?.assignedEmployeeId ? String(req.body.assignedEmployeeId) : null;
+    const dispatchEmployeeId = Object.prototype.hasOwnProperty.call(req.body || {}, 'dispatchEmployeeId')
+      ? (req.body.dispatchEmployeeId ? String(req.body.dispatchEmployeeId) : null)
+      : (order.dispatch_employee_id ? String(order.dispatch_employee_id) : null);
     const machineId = req.body?.machineId ? String(req.body.machineId) : null;
     if (employeeId) {
       const employee = await client.query(`SELECT id FROM users WHERE id::text=$1::text AND company_id::text=$2::text AND role IN ('employee','staff','technician') AND COALESCE(is_active,TRUE)=TRUE`, [employeeId,user.companyId]);
       if (!employee.rows.length) { const e = new Error('Assigned operator is not available in this company.'); e.status=400; throw e; }
+    }
+    if (dispatchEmployeeId) {
+      const employee = await client.query(`SELECT id FROM users WHERE id::text=$1::text AND company_id::text=$2::text AND role IN ('employee','staff','technician') AND COALESCE(is_active,TRUE)=TRUE`, [dispatchEmployeeId,user.companyId]);
+      if (!employee.rows.length) { const e = new Error('Assigned dispatch employee is not available in this company.'); e.status=400; throw e; }
     }
     if (machineId) {
       const machine = await client.query(`SELECT id FROM customer_machines WHERE id::text=$1::text AND company_id::text=$2::text AND COALESCE(status,'operational') <> 'decommissioned'`, [machineId,user.companyId]);
       if (!machine.rows.length) { const e = new Error('Machine is not available in this company.'); e.status=400; throw e; }
     }
     const reason = requireText(req.body?.reason, 'Assignment reason', 1000);
-    await client.query(`UPDATE production_orders SET assigned_employee_id=$1,machine_id=$2,updated_by=$3,updated_at=NOW() WHERE id=$4 AND company_id::text=$5::text`, [employeeId,machineId,user.id,order.id,user.companyId]);
-    await appendEvent(client,user,{orderId:order.id,type:'production_assignment_updated',reason,details:{previousEmployeeId:order.assigned_employee_id,assignedEmployeeId:employeeId,previousMachineId:order.machine_id,machineId}});
+    await client.query(`UPDATE production_orders SET assigned_employee_id=$1,machine_id=$2,dispatch_employee_id=$3,updated_by=$4,updated_at=NOW() WHERE id=$5 AND company_id::text=$6::text`, [employeeId,machineId,dispatchEmployeeId,user.id,order.id,user.companyId]);
+    await appendEvent(client,user,{orderId:order.id,type:'production_assignment_updated',reason,details:{previousEmployeeId:order.assigned_employee_id,assignedEmployeeId:employeeId,previousMachineId:order.machine_id,machineId,previousDispatchEmployeeId:order.dispatch_employee_id,dispatchEmployeeId}});
     const refreshed = await client.query(`${ORDER_SELECT} AND o.id=$2`,[user.companyId,order.id]);
-    return { order: mapOrder(refreshed.rows[0]), assignedEmployeeId: employeeId };
+    return { order: mapOrder(refreshed.rows[0]), assignedEmployeeId: employeeId, dispatchEmployeeId };
   });
   if (!result[REPLAYED] && result.assignedEmployeeId) {
     try { await createNotification({ user_id: result.assignedEmployeeId, company_id: user.companyId, type: 'production_assignment', title: 'Production order assigned', message: `${result.order.orderNumber}: ${result.order.componentName}`, priority: result.order.priority, data: { url: '/employee/production', production_order_id: result.order.id } }); } catch (err) { console.error('Production assignment notification failed:', err.message); }
+  }
+  if (!result[REPLAYED] && result.dispatchEmployeeId && result.dispatchEmployeeId !== result.assignedEmployeeId) {
+    try { await createNotification({ user_id: result.dispatchEmployeeId, company_id: user.companyId, type: 'production_dispatch_assignment', title: 'Dispatch work assigned', message: `${result.order.orderNumber}: ${result.order.componentName}`, priority: result.order.priority, data: { url: '/employee/production', production_order_id: result.order.id } }); } catch (err) { console.error('Production dispatch assignment notification failed:', err.message); }
   }
   return { order: result.order };
 }));
@@ -565,11 +602,70 @@ router.post('/batches/:batchId/inspections', route(async (req) => {
   return response;
 }));
 
+router.post('/orders/:orderId/packing-records', route(async (req) => {
+  const user = principal(req);
+  if (!OWNER_ROLES.has(user.role) && !EMPLOYEE_ROLES.has(user.role)) requireRole(user, OWNER_ROLES);
+  return mutate(req, `production-packing:${req.params.orderId}`, async (client) => {
+    const order = await fetchOrder(client, req.params.orderId, user.companyId, true);
+    assertPackingDispatchPermission({ actorRole: user.role, actorId: user.id, assignedDispatchEmployeeId: order.dispatch_employee_id });
+    const inspectionId = requireText(String(req.body?.inspectionId || ''), 'Quality inspection', 100);
+    const quantity = Number(req.body?.quantity);
+    const packageCount = Number(req.body?.packageCount || 1);
+    if (!Number.isInteger(packageCount) || packageCount <= 0 || packageCount > 10000) { const e = new Error('Package count must be a positive whole number.'); e.status=400; throw e; }
+    const inspection = await client.query(`SELECT id,accepted_quantity FROM production_inspections WHERE id::text=$1::text AND company_id::text=$2::text AND order_id=$3 FOR UPDATE`, [inspectionId,user.companyId,order.id]);
+    if (!inspection.rows.length || Number(inspection.rows[0].accepted_quantity) <= 0) { const e = new Error('Select a quality-approved inspection with accepted quantity.'); e.status=400; throw e; }
+    const packed = await client.query(`SELECT
+      COALESCE((SELECT SUM(quantity) FROM production_packing_records WHERE company_id::text=$1::text AND inspection_id=$2),0) AS inspection_packed,
+      COALESCE((SELECT SUM(accepted_quantity) FROM production_inspections WHERE company_id::text=$1::text AND order_id=$3),0) AS order_accepted,
+      COALESCE((SELECT SUM(quantity) FROM production_packing_records WHERE company_id::text=$1::text AND order_id=$3),0) AS order_packed,
+      COALESCE((SELECT SUM(quantity) FROM production_dispatches WHERE company_id::text=$1::text AND order_id=$3),0) + COALESCE((SELECT SUM(quantity_delta) FROM production_dispatch_adjustments WHERE company_id::text=$1::text AND order_id=$3),0) AS order_dispatched`, [user.companyId,inspectionId,order.id]);
+    const packedTotals = packed.rows[0];
+    // Also reserve legacy dispatch rows created before packing records existed.
+    // This prevents the first post-migration pack from duplicating already shipped stock.
+    const unallocatedAccepted = Math.max(0, Number(packedTotals.order_accepted) - Math.max(Number(packedTotals.order_packed), Number(packedTotals.order_dispatched)));
+    const packableInspectionCapacity = Math.min(Number(inspection.rows[0].accepted_quantity), unallocatedAccepted + Number(packedTotals.inspection_packed));
+    const check = assertPackingQuantity({ acceptedQuantity: packableInspectionCapacity, previouslyPackedQuantity: packedTotals.inspection_packed, requestedQuantity: quantity });
+    const actorName = await getActorName(client,user);
+    const inserted = await client.query(`INSERT INTO production_packing_records(company_id,order_id,inspection_id,quantity,package_count,package_type,status,notes,recorded_by,recorded_by_name) VALUES($1,$2,$3,$4,$5,$6,'packing',$7,$8,$9) RETURNING id,quantity,package_count,status,created_at`, [user.companyId,order.id,inspectionId,check.requestedQuantity,packageCount,req.body?.packageType ? String(req.body.packageType).trim().slice(0,100) : null,req.body?.notes ? String(req.body.notes).trim().slice(0,2000) : null,user.id,actorName]);
+    await appendEvent(client,user,{orderId:order.id,type:'packing_started',quantity:check.requestedQuantity,details:{packingRecordId:inserted.rows[0].id,inspectionId,packageCount,packageType:inserted.rows[0].package_type}});
+    return { packingRecord: inserted.rows[0], remainingPackableQuantity: check.remainingPackableQuantity };
+  });
+}));
+
+router.patch('/packing-records/:packingId/status', route(async (req) => {
+  const user = principal(req);
+  if (!OWNER_ROLES.has(user.role) && !EMPLOYEE_ROLES.has(user.role)) requireRole(user, OWNER_ROLES);
+  const result = await mutate(req, `packing-status:${req.params.packingId}`, async (client) => {
+    const recordResult = await client.query(`SELECT p.*,o.dispatch_employee_id,o.order_number FROM production_packing_records p JOIN production_orders o ON o.id=p.order_id AND o.company_id::text=p.company_id::text WHERE p.id::text=$1::text AND p.company_id::text=$2::text FOR UPDATE OF p,o`, [req.params.packingId,user.companyId]);
+    if (!recordResult.rows.length) { const e = new Error('Packing record was not found.'); e.status=404; throw e; }
+    const record = recordResult.rows[0];
+    assertPackingDispatchPermission({ actorRole: user.role, actorId: user.id, assignedDispatchEmployeeId: record.dispatch_employee_id });
+    const transition = assertPackingStatusTransition({ fromStatus: record.status, toStatus: req.body?.status });
+    const updated = await client.query(`UPDATE production_packing_records SET status=$1,updated_at=NOW() WHERE id=$2 AND company_id::text=$3::text RETURNING id,status,updated_at`, [transition.toStatus,record.id,user.companyId]);
+    await appendEvent(client,user,{orderId:record.order_id,type:transition.toStatus==='packed'?'packing_completed':'ready_for_dispatch',fromStatus:transition.fromStatus,toStatus:transition.toStatus,quantity:record.quantity,details:{packingRecordId:record.id,orderNumber:record.order_number}});
+    return { packingRecord: updated.rows[0], orderNumber: record.order_number, ready: transition.toStatus==='ready_for_dispatch' };
+  });
+  if (!result[REPLAYED] && result.ready) {
+    try { await createNotificationForOwners({company_id:user.companyId,type:'production_ready_for_dispatch',title:'Production packed and ready for dispatch',message:`${result.orderNumber} is packed and ready for dispatch.`,data:{url:'/owner/production'}}); } catch (err) { console.error('Production ready notification failed:',err.message); }
+  }
+  return result;
+}));
+
 router.post('/orders/:orderId/dispatches', route(async (req) => {
-  const user = principal(req); requireRole(user, OWNER_ROLES);
+  const user = principal(req);
+  if (!OWNER_ROLES.has(user.role) && !EMPLOYEE_ROLES.has(user.role)) requireRole(user, OWNER_ROLES);
   const response = await mutate(req, `dispatch-order:${req.params.orderId}`, async (client) => {
     if (req.body?.confirmed !== true) { const e = new Error('Explicit dispatch confirmation is required.'); e.status=400; throw e; }
     const order = await fetchOrder(client, req.params.orderId, user.companyId, true);
+    assertPackingDispatchPermission({ actorRole: user.role, actorId: user.id, assignedDispatchEmployeeId: order.dispatch_employee_id });
+    const packingRecordId = requireText(String(req.body?.packingRecordId || ''), 'Ready packing record', 100);
+    const packing = await client.query(`SELECT * FROM production_packing_records WHERE id::text=$1::text AND company_id::text=$2::text AND order_id=$3 FOR UPDATE`, [packingRecordId,user.companyId,order.id]);
+    if (!packing.rows.length || packing.rows[0].status !== 'ready_for_dispatch') { const e = new Error('Dispatch is allowed only from a packing record marked ready for dispatch.'); e.status=409; throw e; }
+    const packingDispatched = await client.query(`SELECT COALESCE((SELECT SUM(d.quantity) FROM production_dispatches d WHERE d.company_id::text=$1::text AND d.packing_record_id=$2),0) + COALESCE((SELECT SUM(a.quantity_delta) FROM production_dispatch_adjustments a JOIN production_dispatches d ON d.id=a.dispatch_id AND d.company_id::text=a.company_id::text WHERE a.company_id::text=$1::text AND d.packing_record_id=$2),0) AS quantity`, [user.companyId,packingRecordId]);
+    const packRemaining = Math.round((Number(packing.rows[0].quantity)-Number(packingDispatched.rows[0].quantity))*1000)/1000;
+    if (packRemaining <= 0) { const e = new Error('This packing record has no remaining quantity to dispatch.'); e.status=409; throw e; }
+    const requestedQuantity = Number(req.body?.quantity);
+    if (!Number.isFinite(requestedQuantity) || requestedQuantity - packRemaining > 0.000001) { const e = new Error('Dispatch quantity exceeds the remaining quantity in this ready packing record.'); e.status=400; throw e; }
     const totals = await client.query(`SELECT COALESCE((SELECT SUM(accepted_quantity) FROM production_inspections WHERE company_id::text=$1::text AND order_id=$2),0) accepted, COALESCE((SELECT SUM(quantity) FROM production_dispatches WHERE company_id::text=$1::text AND order_id=$2),0) dispatched, COALESCE((SELECT SUM(quantity_delta) FROM production_dispatch_adjustments WHERE company_id::text=$1::text AND order_id=$2),0) adjustments`, [user.companyId, order.id]);
     const t = totals.rows[0];
     const check = assertDispatchQuantity({ acceptedQuantity: t.accepted, previouslyDispatchedQuantity: Number(t.dispatched) + Number(t.adjustments), requestedQuantity: req.body?.quantity });
@@ -577,15 +673,18 @@ router.post('/orders/:orderId/dispatches', route(async (req) => {
     const sequence = await client.query(`INSERT INTO production_sequences(company_id,sequence_kind,sequence_year,next_value) VALUES($1,'dispatch',$2,1) ON CONFLICT(company_id,sequence_kind,sequence_year) DO UPDATE SET next_value=production_sequences.next_value+1 RETURNING next_value`, [user.companyId, dispatchYear]);
     const reference = `DSP-${dispatchYear}-${String(sequence.rows[0].next_value).padStart(6,'0')}`;
     const confirmedByName = await getActorName(client,user);
-    const inserted = await client.query(`INSERT INTO production_dispatches(company_id,order_id,dispatch_reference,quantity,delivery_reference,carrier,transport_details,notes,confirmed_by,confirmed_by_name) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id,quantity,dispatched_at`, [user.companyId, order.id, reference, check.requestedQuantity, req.body?.deliveryReference ? String(req.body.deliveryReference).trim().slice(0,120) : null, req.body?.carrier ? String(req.body.carrier).trim().slice(0,120) : null, req.body?.transportDetails ? String(req.body.transportDetails).trim().slice(0,1000) : null, req.body?.notes ? String(req.body.notes).trim().slice(0,2000) : null, user.id, confirmedByName]);
+    const inserted = await client.query(`INSERT INTO production_dispatches(company_id,order_id,packing_record_id,dispatch_reference,quantity,delivery_reference,carrier,transport_details,notes,confirmed_by,confirmed_by_name) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id,quantity,dispatched_at`, [user.companyId, order.id, packingRecordId, reference, check.requestedQuantity, req.body?.deliveryReference ? String(req.body.deliveryReference).trim().slice(0,120) : null, req.body?.carrier ? String(req.body.carrier).trim().slice(0,120) : null, req.body?.transportDetails ? String(req.body.transportDetails).trim().slice(0,1000) : null, req.body?.notes ? String(req.body.notes).trim().slice(0,2000) : null, user.id, confirmedByName]);
     const nextStatus = deriveDispatchStatus({ acceptedQuantity: t.accepted, dispatchedQuantity: Number(t.dispatched) + Number(t.adjustments) + check.requestedQuantity });
     await client.query(`UPDATE production_orders SET status=$1,updated_by=$2,updated_at=NOW() WHERE id=$3 AND company_id::text=$4::text`, [nextStatus, user.id, order.id, user.companyId]);
-    await appendEvent(client, user, { orderId: order.id, type: 'dispatch_confirmed', fromStatus: order.status, toStatus: nextStatus, quantity: check.requestedQuantity, details: { reference } });
+    await appendEvent(client, user, { orderId: order.id, type: 'dispatch_confirmed', fromStatus: order.status, toStatus: nextStatus, quantity: check.requestedQuantity, details: { reference, packingRecordId } });
     return { dispatch: { id: inserted.rows[0].id, reference, quantity: Number(inserted.rows[0].quantity), dispatchedAt: inserted.rows[0].dispatched_at, remainingAcceptedQuantity: check.remainingDispatchableQuantity } };
   });
   const assigned = await pool.query(`SELECT assigned_employee_id FROM production_orders WHERE id::text=$1::text AND company_id::text=$2::text`, [req.params.orderId, user.companyId]).catch(() => ({ rows: [] }));
-  if (!response[REPLAYED] && assigned.rows[0]?.assigned_employee_id) {
+  if (!response[REPLAYED] && assigned.rows[0]?.assigned_employee_id && String(assigned.rows[0].assigned_employee_id) !== user.id) {
     try { await createNotification({ user_id: assigned.rows[0].assigned_employee_id, company_id: user.companyId, type: 'production_dispatch_confirmed', title: 'Production dispatch confirmed', message: `Dispatch ${response.dispatch.reference} has been confirmed.`, data: { url: '/employee/production' } }); } catch (err) { console.error('Production dispatch notification failed:', err.message); }
+  }
+  if (!response[REPLAYED] && EMPLOYEE_ROLES.has(user.role)) {
+    try { await createNotificationForOwners({ company_id: user.companyId, type: 'production_dispatch_confirmed', title: 'Employee confirmed a production dispatch', message: `${response.dispatch.reference} was confirmed for ${response.dispatch.quantity} units.`, data: { url: '/owner/production' }, exclude_user_id: user.id }); } catch (err) { console.error('Production dispatch owner notification failed:', err.message); }
   }
   return response;
 }));
@@ -602,6 +701,10 @@ router.post('/dispatches/:dispatchId/corrections', route(async (req) => {
     const totals = await client.query(`SELECT COALESCE((SELECT SUM(accepted_quantity) FROM production_inspections WHERE company_id::text=$1::text AND order_id=$2),0) accepted, COALESCE((SELECT SUM(quantity) FROM production_dispatches WHERE company_id::text=$1::text AND order_id=$2),0) dispatched, COALESCE((SELECT SUM(quantity_delta) FROM production_dispatch_adjustments WHERE company_id::text=$1::text AND order_id=$2),0) adjustments`, [user.companyId,record.order_id]);
     const after = Number(totals.rows[0].dispatched)+Number(totals.rows[0].adjustments)+delta;
     if (after < 0 || after - Number(totals.rows[0].accepted) > 0.000001) { const e = new Error('Correction would make dispatched quantity negative or greater than released quantity.'); e.status=409; throw e; }
+    if (record.packing_record_id) {
+      const packedUsage = await client.query(`SELECT p.quantity, COALESCE((SELECT SUM(d.quantity) FROM production_dispatches d WHERE d.company_id::text=$1::text AND d.packing_record_id=p.id),0) + COALESCE((SELECT SUM(a.quantity_delta) FROM production_dispatch_adjustments a JOIN production_dispatches d ON d.id=a.dispatch_id AND d.company_id::text=a.company_id::text WHERE a.company_id::text=$1::text AND d.packing_record_id=p.id),0) AS dispatched FROM production_packing_records p WHERE p.id=$2 AND p.company_id::text=$1::text FOR UPDATE`, [user.companyId,record.packing_record_id]);
+      if (!packedUsage.rows.length || Number(packedUsage.rows[0].dispatched) + delta < -0.000001 || Number(packedUsage.rows[0].dispatched) + delta - Number(packedUsage.rows[0].quantity) > 0.000001) { const e = new Error('Correction would exceed or invalidate the quantity in its packing record.'); e.status=409; throw e; }
+    }
     const inserted = await client.query(`INSERT INTO production_dispatch_adjustments(company_id,dispatch_id,order_id,quantity_delta,reason,actor_id) VALUES($1,$2,$3,$4,$5,$6) RETURNING id,created_at`, [user.companyId,record.id,record.order_id,delta,reason,user.id]);
     const next = deriveDispatchStatus({ acceptedQuantity: totals.rows[0].accepted, dispatchedQuantity: after });
     await client.query(`UPDATE production_orders SET status=COALESCE($1,status),updated_by=$2,updated_at=NOW() WHERE id=$3 AND company_id::text=$4::text`, [next,user.id,record.order_id,user.companyId]);

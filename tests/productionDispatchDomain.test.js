@@ -6,6 +6,9 @@ const {
   assertProductionReport,
   assertQualityOutcome,
   assertDispatchQuantity,
+  assertPackingQuantity,
+  assertPackingStatusTransition,
+  assertPackingDispatchPermission,
   assertStatusTransition,
   deriveDispatchStatus,
 } = require('../services/productionDispatchDomain');
@@ -68,6 +71,30 @@ test('partial and final dispatches reconcile only accepted, undispatched quantit
 test('dispatch ledger inconsistencies fail closed', () => {
   expectCode(() => assertDispatchQuantity({ acceptedQuantity: 10, previouslyDispatchedQuantity: 9, cancelledQuantity: 2, requestedQuantity: 1 }), 'DISPATCH_LEDGER_INCONSISTENT');
   expectCode(() => deriveDispatchStatus({ acceptedQuantity: 10, dispatchedQuantity: 8, cancelledQuantity: 3 }), 'DISPATCH_LEDGER_INCONSISTENT');
+});
+
+test('packing quantity is bounded by quality-accepted quantity and existing packs', () => {
+  assert.deepEqual(assertPackingQuantity({ acceptedQuantity: 20, previouslyPackedQuantity: 8, requestedQuantity: 12 }), {
+    acceptedQuantity: 20, previouslyPackedQuantity: 8, requestedQuantity: 12, remainingPackableQuantity: 0,
+  });
+  expectCode(() => assertPackingQuantity({ acceptedQuantity: 20, previouslyPackedQuantity: 12, requestedQuantity: 9 }), 'PACKING_QUANTITY_EXCEEDED');
+  expectCode(() => assertPackingQuantity({ acceptedQuantity: 10, previouslyPackedQuantity: 11, requestedQuantity: 1 }), 'PACKING_LEDGER_INCONSISTENT');
+  expectCode(() => assertPackingQuantity({ acceptedQuantity: 10, requestedQuantity: 1.0001 }), 'INVALID_QUANTITY_PRECISION');
+});
+
+test('packing records advance only from packing to packed to ready for dispatch', () => {
+  assert.equal(assertPackingStatusTransition({ fromStatus: 'packing', toStatus: 'packed' }).toStatus, 'packed');
+  assert.equal(assertPackingStatusTransition({ fromStatus: 'packed', toStatus: 'ready_for_dispatch' }).toStatus, 'ready_for_dispatch');
+  expectCode(() => assertPackingStatusTransition({ fromStatus: 'packing', toStatus: 'ready_for_dispatch' }), 'INVALID_PACKING_TRANSITION');
+  expectCode(() => assertPackingStatusTransition({ fromStatus: 'ready_for_dispatch', toStatus: 'packed' }), 'INVALID_PACKING_TRANSITION');
+});
+
+test('packing and dispatch are restricted to Owner/Admin or the assigned dispatch employee', () => {
+  assert.equal(assertPackingDispatchPermission({ actorRole: 'employee', actorId: 'worker-1', assignedDispatchEmployeeId: 'worker-1' }), true);
+  assert.equal(assertPackingDispatchPermission({ actorRole: 'owner', actorId: 'owner-1' }), true);
+  assert.equal(assertPackingDispatchPermission({ actorRole: 'admin', actorId: 'admin-1' }), true);
+  expectCode(() => assertPackingDispatchPermission({ actorRole: 'employee', actorId: 'worker-2', assignedDispatchEmployeeId: 'worker-1' }), 'DISPATCH_ROLE_FORBIDDEN');
+  expectCode(() => assertPackingDispatchPermission({ actorRole: 'employee', actorId: 'worker-1', assignedDispatchEmployeeId: null }), 'DISPATCH_ROLE_FORBIDDEN');
 });
 
 test('dispatch status derives from recorded quantities and partial shipment', () => {

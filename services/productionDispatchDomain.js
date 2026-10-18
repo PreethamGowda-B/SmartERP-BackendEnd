@@ -71,10 +71,11 @@ const PRIVILEGED_ROLES = new Set([ROLE.OWNER, ROLE.ADMIN, ROLE.HR]);
 const INSPECTOR_ROLES = new Set([ROLE.OWNER, ROLE.ADMIN, ROLE.QUALITY]);
 
 class ProductionRuleError extends Error {
-  constructor(message, code = 'PRODUCTION_RULE_VIOLATION') {
+  constructor(message, code = 'PRODUCTION_RULE_VIOLATION', status = 400) {
     super(message);
     this.name = 'ProductionRuleError';
     this.code = code;
+    this.status = status;
   }
 }
 
@@ -164,6 +165,40 @@ function assertDispatchQuantity({ acceptedQuantity, previouslyDispatchedQuantity
   return Object.freeze({ acceptedQuantity: accepted, previouslyDispatchedQuantity: dispatched, cancelledQuantity: cancelled, requestedQuantity: requested, remainingDispatchableQuantity: remaining, complete: remaining === 0 });
 }
 
+function assertPackingQuantity({ acceptedQuantity, previouslyPackedQuantity = 0, requestedQuantity }) {
+  const accepted = quantity(acceptedQuantity, 'acceptedQuantity');
+  const packed = quantity(previouslyPackedQuantity, 'previouslyPackedQuantity');
+  const requested = quantity(requestedQuantity, 'requestedQuantity', { allowZero: false });
+  const available = Math.max(0, Math.round((accepted - packed) * 1000) / 1000);
+  if (packed - accepted > 0.000001) {
+    throw new ProductionRuleError('Existing packing quantity exceeds accepted inspection quantity.', 'PACKING_LEDGER_INCONSISTENT');
+  }
+  if (requested - available > 0.000001) {
+    throw new ProductionRuleError('Packing quantity exceeds accepted, unpacked quantity.', 'PACKING_QUANTITY_EXCEEDED');
+  }
+  return Object.freeze({ acceptedQuantity: accepted, previouslyPackedQuantity: packed, requestedQuantity: requested, remainingPackableQuantity: Math.round((available - requested) * 1000) / 1000 });
+}
+
+function assertPackingStatusTransition({ fromStatus, toStatus }) {
+  const from = String(fromStatus || '').toLowerCase();
+  const to = String(toStatus || '').toLowerCase();
+  const transitions = { packing: 'packed', packed: 'ready_for_dispatch' };
+  if (transitions[from] !== to) {
+    throw new ProductionRuleError('Packing must move from packing to packed, then to ready for dispatch.', 'INVALID_PACKING_TRANSITION');
+  }
+  return Object.freeze({ fromStatus: from, toStatus: to });
+}
+
+function assertPackingDispatchPermission({ actorRole, actorId, assignedDispatchEmployeeId }) {
+  const role = String(actorRole || '').toLowerCase();
+  const isOwner = ['owner', 'admin'].includes(role);
+  const isEmployee = ['employee', 'staff', 'technician'].includes(role);
+  if (!isOwner && !(isEmployee && String(actorId || '') === String(assignedDispatchEmployeeId || ''))) {
+    throw new ProductionRuleError('Only an Owner/Admin or the employee assigned to dispatch this order can pack or dispatch it.', 'DISPATCH_ROLE_FORBIDDEN', 403);
+  }
+  return true;
+}
+
 function assertStatusTransition({ fromStatus, toStatus, actorRole, actorId, assignedEmployeeId, reason = '', hasProductionReport = false, qualityReleasedQuantity = 0, dispatchRecorded = false }) {
   const from = String(fromStatus || '').toLowerCase();
   const to = String(toStatus || '').toLowerCase();
@@ -226,6 +261,9 @@ module.exports = {
   assertProductionReport,
   assertQualityOutcome,
   assertDispatchQuantity,
+  assertPackingQuantity,
+  assertPackingStatusTransition,
+  assertPackingDispatchPermission,
   assertStatusTransition,
   deriveDispatchStatus,
 };

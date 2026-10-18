@@ -63,12 +63,6 @@ async function requestAccess(client, req) {
     });
     return null;
   }
-  if (!isApprover(req.user) && String(request.requested_by || '') !== userIdOf(req.user)) {
-    console.warn('Material purchase request access denied: requester mismatch', {
-      requestId: String(request.id), role: String(req.user?.role || ''),
-    });
-    return null;
-  }
   return request;
 }
 
@@ -136,7 +130,7 @@ router.post('/', upload.single('invoice'), requireValidFileSignature({ allowedMi
   }
   const userId = userIdOf(req.user);
   const companyId = companyIdOf(req.user);
-  if (!userId || !companyId || isApprover(req.user)) return res.status(403).json({ message: 'Only the requesting employee can upload a bill for this request.' });
+  if (!userId || !companyId) return res.status(401).json({ message: 'Authentication and company context are required to upload a purchase bill.' });
 
   const fileName = sanitizeFileName(file.originalname);
   const fileSha256 = crypto.createHash('sha256').update(file.buffer).digest('hex');

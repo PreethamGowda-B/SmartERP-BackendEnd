@@ -21,13 +21,16 @@ function resolveSsl() {
 
 function cleanConnectionString(url) {
   if (!url) return url;
-  // Automatically rewrite IPv6-only direct Supabase host to verified IPv4 Pooler host for Render compatibility
+// Rewrite the IPv6-only direct Supabase host to the IPv4 session pooler for Render.
+// This backend relies on session-scoped SET ROLE and app.* RLS settings between
+// statements, so the transaction pooler (6543) is not compatible; use session
+// mode (5432) to keep those settings on the same PostgreSQL connection.
   const supabaseDirectMatch = url.match(/postgresql:\/\/postgres(?:\.([a-z0-9]+))?:([^@]+)@db\.([a-z0-9]+)\.supabase\.co(?::\d+)?\/(.+)/i);
   if (supabaseDirectMatch) {
     const projectRef = supabaseDirectMatch[3] || supabaseDirectMatch[1];
     const password = supabaseDirectMatch[2];
     const dbPath = supabaseDirectMatch[4];
-    url = `postgresql://postgres.${projectRef}:${password}@aws-0-ap-northeast-1.pooler.supabase.com:6543/${dbPath}`;
+    url = `postgresql://postgres.${projectRef}:${password}@aws-0-ap-northeast-1.pooler.supabase.com:5432/${dbPath}`;
   }
   return url.replace(/sslmode=(prefer|require|verify-ca)/gi, 'sslmode=verify-full');
 }
@@ -59,4 +62,4 @@ pool.on('error', (err) => {
   console.error('Unexpected error on idle PostgreSQL client', err.message);
 });
 
-module.exports = { pool };
+module.exports = { pool, cleanConnectionString };

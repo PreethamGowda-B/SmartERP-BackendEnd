@@ -484,10 +484,14 @@ async function runDatabaseInitialization() {
     await fixDatabaseConstraints();
 
     // 2. Auto-migrate schema
-    const { fixMaterialRequestsSchema, setupDocumentsTable, runNumberedMigrations } = require('./migrations/autoMigrate');
+    const { fixMaterialRequestsSchema, setupDocumentsTable } = require('./migrations/autoMigrate');
     await fixMaterialRequestsSchema();
     await setupDocumentsTable();
-    await runNumberedMigrations();
+    const { runProductionDispatchMigration } = require('./migrations/runProductionDispatch');
+    const productionMigrations = await runProductionDispatchMigration();
+    for (const migration of productionMigrations) {
+      console.log(`✅ ${migration.migrationId}: ${migration.status}`);
+    }
 
     // 2b. Ensure all CNC tables & SLA columns exist
     let initClient;
@@ -807,6 +811,7 @@ async function runDatabaseInitialization() {
     }
   } catch (err) {
     console.error('❌ Database Initialization failed:', err.message);
+    throw err;
   }
 }
 
@@ -1022,6 +1027,9 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
       );
     } catch (err) {
       console.error('❌ Master DB Init Error:', err.message);
+      // Do not serve a deployment whose required schema migration failed.
+      process.exit(1);
+      return;
     }
 
     for (let i = 0; i < WORKER_COUNT; i++) {

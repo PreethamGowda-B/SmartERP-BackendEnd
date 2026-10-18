@@ -146,12 +146,32 @@ async function alterToUuid() {
         // Drop the old constraints/indexes first
         await client.query(`DROP INDEX IF EXISTS idx_material_requests_requested_by`);
 
-        // ALTER column — drop NOT NULL first so we can set to NULL during cast
+        // ALTER column — drop NOT NULL first so we can safely cast
         await client.query(`ALTER TABLE material_requests ALTER COLUMN requested_by DROP NOT NULL`);
-        await client.query(`ALTER TABLE material_requests ALTER COLUMN requested_by TYPE UUID USING NULL`);
+        await client.query(`
+            ALTER TABLE material_requests
+            ALTER COLUMN requested_by TYPE UUID
+            USING (
+                CASE
+                    WHEN requested_by::text ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+                    THEN requested_by::text::uuid
+                    ELSE NULL
+                END
+            )
+        `);
 
         await client.query(`ALTER TABLE material_requests ALTER COLUMN reviewed_by DROP NOT NULL`);
-        await client.query(`ALTER TABLE material_requests ALTER COLUMN reviewed_by TYPE UUID USING NULL`);
+        await client.query(`
+            ALTER TABLE material_requests
+            ALTER COLUMN reviewed_by TYPE UUID
+            USING (
+                CASE
+                    WHEN reviewed_by::text ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+                    THEN reviewed_by::text::uuid
+                    ELSE NULL
+                END
+            )
+        `);
 
         // Recreate index
         await client.query(`CREATE INDEX IF NOT EXISTS idx_material_requests_requested_by ON material_requests(requested_by)`);
@@ -198,8 +218,9 @@ async function setupDocumentsTable() {
 }
 
 /**
- * Numbered SQL migrations — run in order on server startup.
- * Each file uses IF NOT EXISTS guards so it is safe to re-run.
+ * Legacy numbered migrations are retained for explicitly tracked historical
+ * upgrades. Production startup uses the separate allow-listed forward runner;
+ * this legacy runner refuses to invent a baseline when its ledger is absent.
  */
 const NUMBERED_MIGRATIONS = [
     '001_hardening_indexes_and_migration.sql',
@@ -236,49 +257,101 @@ const NUMBERED_MIGRATIONS = [
     '030_invoice_idempotency.sql',
     '031_material_request_job_scope.sql',
     '032_attendance_runtime_and_corrections.sql',
-    '033_production_dispatch.sql',
 ];
 
 async function runNumberedMigrations() {
     return storage.run({ bypassRls: true }, async () => {
         let setupClient;
+        const appliedSet = new Set();
+        const failedMigrations = [];
         try {
             setupClient = await pool.connect();
-            await setupClient.query('RESET ROLE').catch(() => {});
-            await setupClient.query('GRANT ALL ON SCHEMA public TO PUBLIC').catch(() => {});
-        } catch (_) {} finally {
+            await setupClient.query('RESET ROLE');
+            const ledgerCheck = await setupClient.query(
+                "SELECT to_regclass('public.schema_migrations') IS NOT NULL AS exists"
+            );
+            if (!ledgerCheck.rows[0]?.exists) {
+                return {
+                    success: false,
+                    appliedMigrations: [],
+                    skippedMigrations: [],
+                    failedMigrations: [{
+                        filename: 'schema_migrations',
+                        error: 'Legacy migration history is absent; refusing to replay historical migrations.',
+                    }],
+                };
+            }
+            const existingRows = await setupClient.query('SELECT name FROM schema_migrations');
+            if (existingRows.rows.length === 0) {
+                return {
+                    success: false,
+                    appliedMigrations: [],
+                    skippedMigrations: [],
+                    failedMigrations: [{
+                        filename: 'schema_migrations',
+                        error: 'Legacy migration history is empty; refusing to replay historical migrations.',
+                    }],
+                };
+            }
+            for (const row of existingRows.rows) {
+                appliedSet.add(row.name);
+            }
+        } catch (setupErr) {
+            return {
+                success: false,
+                appliedMigrations: [],
+                skippedMigrations: [],
+                failedMigrations: [{ filename: 'schema_migrations', error: setupErr.message }],
+            };
+        } finally {
             if (setupClient) setupClient.release();
         }
 
         const appliedMigrations = [];
-        const failedMigrations = [];
+        const skippedMigrations = [];
 
         for (const filename of NUMBERED_MIGRATIONS) {
+            if (appliedSet.has(filename)) {
+                skippedMigrations.push(filename);
+                continue;
+            }
+
             const filePath = path.join(__dirname, filename);
             let client;
             try {
-                const sql = fs.readFileSync(filePath, 'utf8');
+                const rawSql = fs.readFileSync(filePath, 'utf8');
+                // Strip outermost BEGIN and COMMIT so the runner client controls the transaction atomically
+                const cleanSql = rawSql
+                    .replace(/^\s*BEGIN\s*;/im, '-- BEGIN;')
+                    .replace(/COMMIT\s*;\s*$/im, '-- COMMIT;');
+
                 client = await pool.connect();
                 await client.query('RESET ROLE').catch(() => {});
                 await client.query('BEGIN');
-                await client.query(sql);
+                await client.query(cleanSql);
+                await client.query(
+                    'INSERT INTO schema_migrations (name) VALUES ($1) ON CONFLICT (name) DO NOTHING',
+                    [filename]
+                );
                 await client.query('COMMIT');
                 appliedMigrations.push(filename);
+                appliedSet.add(filename);
                 console.log(`✅ Migration applied: ${filename}`);
             } catch (err) {
                 if (client) {
                     try { await client.query('ROLLBACK'); } catch (_) {}
                 }
                 failedMigrations.push({ filename, error: err.message });
-                // Log but don't crash the server — each migration is independently guarded
-                console.error(`⚠️  Migration failed (${filename}):`, err.message);
+                console.error(`❌ Migration failed (${filename}):`, err.message);
+                // Fail closed: Stop subsequent migrations from running if a prerequisite migration fails
+                break;
             } finally {
                 if (client) client.release();
             }
         }
 
         const success = failedMigrations.length === 0;
-        return { success, appliedMigrations, failedMigrations };
+        return { success, appliedMigrations, skippedMigrations, failedMigrations };
     });
 }
 

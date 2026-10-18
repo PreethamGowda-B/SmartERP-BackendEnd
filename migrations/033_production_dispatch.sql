@@ -1,10 +1,10 @@
--- SmartERP Production & Dispatch schema proposal (additive only).
---
--- IMPORTANT: Do not add this file to the server-startup migration list or execute
--- it until the supported schema baseline and a disposable PostgreSQL test target
--- have been approved. External legacy IDs are stored as text because the tracked
--- schema and migrations disagree about their concrete types. The API validates
--- every external reference against the authenticated company before writing.
+-- ==============================================================================
+-- SmartERP Migration 033: Production & Dispatch System
+-- ==============================================================================
+-- Forward-only, additive schema migration for Production & Dispatch workflows.
+-- Includes order tracking, batch control, production reports, QA inspections,
+-- dispatch manifests, audit ledger, and tenant Row-Level Security (RLS).
+-- ==============================================================================
 
 BEGIN;
 

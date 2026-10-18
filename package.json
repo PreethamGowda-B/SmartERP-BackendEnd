@@ -11,7 +11,8 @@
     "smoke-test": "node scripts/smoke-test.js",
     "create-admin": "node scripts/createAdmin.js",
     "run-schema": "node scripts/runSchema.js",
-    "migrate": "node migrations/autoMigrate.js"
+    "migrate": "node migrations/runProductionDispatch.js",
+    "migrate:production-dispatch": "node migrations/runProductionDispatch.js"
   },
   "dependencies": {
     "@sentry/node": "^10.43.0",

@@ -236,6 +236,7 @@ const NUMBERED_MIGRATIONS = [
     '030_invoice_idempotency.sql',
     '031_material_request_job_scope.sql',
     '032_attendance_runtime_and_corrections.sql',
+    '033_production_dispatch.sql',
 ];
 
 async function runNumberedMigrations() {

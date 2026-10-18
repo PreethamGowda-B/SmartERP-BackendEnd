@@ -156,7 +156,7 @@ async function processCompanyDate(companyId, workDate, queryable, now = new Date
     return { date: workDate, due: false, auto_clocked_out: 0, marked_absent: 0, records_locked: 0 };
   }
   const employees = await queryable.query("SELECT id FROM users WHERE role = 'employee' AND company_id::text = $1::text ORDER BY id", [String(companyId)]);
-  const counts = { date: workDate, due: true, auto_clocked_out: 0, marked_absent: 0, records_locked: 0, duplicate_records: 0 };
+  const counts = { date: workDate, due: true, auto_clocked_out: 0, marked_absent: 0, records_locked: 0, duplicate_records: 0, invalid_time_ranges: 0 };
   for (const employee of employees.rows) {
     const userId = employee.id;
     await queryable.query('SELECT pg_advisory_xact_lock(hashtext($1))', [lockKey(userId, companyId, workDate)]);
@@ -168,6 +168,11 @@ async function processCompanyDate(companyId, workDate, queryable, now = new Date
     let record = found.rows[0];
     if (record?.check_in_time && !record.check_out_time && !policy.automaticClockOutEnabled) continue;
     if (record?.check_in_time && !record.check_out_time && !record.is_processed && policy.automaticClockOutEnabled) {
+      const checkInMs = new Date(record.check_in_time).getTime();
+      if (!Number.isFinite(checkInMs) || checkInMs > cutoff.getTime()) {
+        counts.invalid_time_ranges += 1;
+        continue;
+      }
       const hours = calculateWorkingHours(record.check_in_time, cutoff, policy);
       const status = classifyStatus(record.check_in_time, cutoff, policy);
       const updated = await queryable.query(`UPDATE attendance SET check_out_time = $1, working_hours = $2, status = $3, is_auto_clocked_out = TRUE, clock_out_method = 'automatic', updated_at = NOW() WHERE id = $4 AND company_id::text = $5::text AND check_out_time IS NULL RETURNING id`, [cutoff, hours, status, record.id, String(companyId)]);

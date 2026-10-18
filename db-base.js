@@ -51,8 +51,10 @@ const pool = new Pool({
   connectionString: cleanConnectionString(process.env.DATABASE_URL),
   ssl: resolveSsl(),
   lookup: ipv4Lookup,
-  // Default pool max is 10 connections
-  max: parseInt(process.env.DB_POOL_MAX || '10'),
+  // Render runs two clustered workers by default. Keep their combined default
+  // (10 connections) below the Supabase session pooler's 15-client limit.
+  // DB_POOL_MAX remains available for deployments with a larger verified pool.
+  max: parseInt(process.env.DB_POOL_MAX || '5'),
   idleTimeoutMillis: parseInt(process.env.DB_IDLE_TIMEOUT_MS || '10000'),
   connectionTimeoutMillis: 15000, // 15s connection queue timeout under load
   statement_timeout: 15000,      // 15s query safety limit

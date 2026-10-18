@@ -17,6 +17,13 @@
  */
 
 const { test, describe, before, after } = require('node:test');
+
+if (process.env.SMARTERP_DISPOSABLE_TEST_DB !== 'true') {
+  test('RLS Integration Tests [SKIPPED]', (t) => {
+    t.skip('Requires SMARTERP_DISPOSABLE_TEST_DB=true with confirmed disposable test database');
+  });
+} else {
+
 const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
@@ -247,3 +254,4 @@ describe('RLS: Fail-Closed Isolation', () => {
   });
 
 });
+}

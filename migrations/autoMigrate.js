@@ -56,8 +56,8 @@ async function fixMaterialRequestsSchema() {
         const isWrongType = requestedByType && requestedByType !== 'uuid' && requestedByType !== 'character varying';
 
         if (missingCols.length > 0) {
-            console.log(`⚠️  Missing columns: ${missingCols.join(', ')} — recreating table...`);
-            await recreateTable();
+            console.log(`⚠️  Missing columns: ${missingCols.join(', ')} — adding missing columns...`);
+            await addMissingColumns(missingCols);
         } else if (isWrongType) {
             console.log(`⚠️  requested_by is ${requestedByType} — expected UUID — running ALTER...`);
             await alterToUuid();
@@ -68,6 +68,47 @@ async function fixMaterialRequestsSchema() {
     } catch (err) {
         console.error('❌ Error fixing material_requests schema:', err.message);
         // Don't crash the server - just log the error
+    }
+}
+
+async function addMissingColumns(missingCols) {
+    const COLUMN_DEFINITIONS = {
+        item_name: 'VARCHAR(255) NOT NULL DEFAULT \'\'',
+        quantity: 'INTEGER NOT NULL DEFAULT 1',
+        urgency: 'VARCHAR(50) DEFAULT \'Medium\'',
+        description: 'TEXT',
+        status: 'VARCHAR(50) DEFAULT \'pending\'',
+        requested_by: 'UUID',
+        requested_by_name: 'VARCHAR(255)',
+        created_at: 'TIMESTAMP DEFAULT NOW()',
+        updated_at: 'TIMESTAMP DEFAULT NOW()',
+        reviewed_by: 'UUID',
+        reviewed_at: 'TIMESTAMP',
+        job_id: 'INTEGER',
+        material_id: 'INTEGER',
+        company_id: 'INTEGER',
+        unit: 'VARCHAR(20)',
+        notes: 'TEXT'
+    };
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        for (const col of missingCols) {
+            const def = COLUMN_DEFINITIONS[col] || 'TEXT';
+            await client.query(`ALTER TABLE material_requests ADD COLUMN IF NOT EXISTS ${col} ${def}`);
+        }
+        await client.query('CREATE INDEX IF NOT EXISTS idx_material_requests_status ON material_requests(status)');
+        await client.query('CREATE INDEX IF NOT EXISTS idx_material_requests_requested_by ON material_requests(requested_by)');
+        await client.query('CREATE INDEX IF NOT EXISTS idx_material_requests_created_at ON material_requests(created_at DESC)');
+        await client.query('COMMIT');
+        console.log(`✅ Added missing columns to material_requests: ${missingCols.join(', ')}`);
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('❌ Failed to add missing columns to material_requests:', err.message);
+        throw err;
+    } finally {
+        client.release();
     }
 }
 
@@ -120,46 +161,6 @@ async function alterToUuid() {
     } catch (err) {
         await client.query('ROLLBACK');
         console.error('❌ Failed to alter material_requests columns to UUID:', err.message);
-        // Last resort: drop and recreate
-        console.log('⚠️  Falling back to table recreation...');
-        await recreateTable();
-    } finally {
-        client.release();
-    }
-}
-
-async function recreateTable() {
-    // Use a transaction so we don't leave a half-broken state
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
-        await client.query('DROP TABLE IF EXISTS material_requests CASCADE');
-        await client.query(`
-            CREATE TABLE material_requests (
-                id SERIAL PRIMARY KEY,
-                item_name VARCHAR(255) NOT NULL,
-                quantity INTEGER NOT NULL,
-                urgency VARCHAR(50) DEFAULT 'Medium',
-                description TEXT,
-                status VARCHAR(50) DEFAULT 'pending',
-                requested_by UUID,
-                requested_by_name VARCHAR(255),
-                created_at TIMESTAMP DEFAULT NOW(),
-                updated_at TIMESTAMP DEFAULT NOW(),
-                reviewed_by UUID,
-                reviewed_at TIMESTAMP
-            )
-        `);
-        await client.query(`
-            CREATE INDEX idx_material_requests_status ON material_requests(status);
-            CREATE INDEX idx_material_requests_requested_by ON material_requests(requested_by);
-            CREATE INDEX idx_material_requests_created_at ON material_requests(created_at DESC);
-        `);
-        await client.query('COMMIT');
-        console.log('✅ material_requests table recreated with UUID schema');
-    } catch (err) {
-        await client.query('ROLLBACK');
-        console.error('❌ Failed to recreate material_requests table:', err.message);
         throw err;
     } finally {
         client.release();
@@ -212,14 +213,18 @@ const NUMBERED_MIGRATIONS = [
     '009_payroll_validation.sql',
     '010_crm_sales_agent.sql',
     '011_standardize_uuid_and_core_rls.sql',
+    '012_fix_company_settings_company_id_type.sql',
+    '013_feedback_enhanced_columns.sql',
+    '014_job_actions_system.sql',
     '015_finance_and_invoicing_system.sql',
+    '016_direct_walkin_invoices.sql',
+    '016b_unified_work_requests.sql',
     '017_enterprise_rbac_and_state_machine.sql',
     '018_ai_copilot_and_audit_logs.sql',
     '019_workforce_gatekeeper_audit_logs.sql',
     '020_cnc_service_edition.sql',
     '021_cnc_phase2.sql',
-    // Upgrade existing installs whose 009 table predates the persisted pre-run audit fields.
-    '021_payroll_pre_run_audit_engine.sql',
+    '021b_payroll_pre_run_audit_engine.sql',
     '022_cnc_phase3.sql',
     '023_cnc_master_release.sql',
     '024_secure_account_deletion.sql',
@@ -230,6 +235,7 @@ const NUMBERED_MIGRATIONS = [
     '029_customer_notification_read_state.sql',
     '030_invoice_idempotency.sql',
     '031_material_request_job_scope.sql',
+    '032_attendance_runtime_and_corrections.sql',
 ];
 
 async function runNumberedMigrations() {
@@ -243,6 +249,9 @@ async function runNumberedMigrations() {
             if (setupClient) setupClient.release();
         }
 
+        const appliedMigrations = [];
+        const failedMigrations = [];
+
         for (const filename of NUMBERED_MIGRATIONS) {
             const filePath = path.join(__dirname, filename);
             let client;
@@ -253,18 +262,23 @@ async function runNumberedMigrations() {
                 await client.query('BEGIN');
                 await client.query(sql);
                 await client.query('COMMIT');
+                appliedMigrations.push(filename);
                 console.log(`✅ Migration applied: ${filename}`);
             } catch (err) {
                 if (client) {
                     try { await client.query('ROLLBACK'); } catch (_) {}
                 }
+                failedMigrations.push({ filename, error: err.message });
                 // Log but don't crash the server — each migration is independently guarded
                 console.error(`⚠️  Migration failed (${filename}):`, err.message);
             } finally {
                 if (client) client.release();
             }
         }
+
+        const success = failedMigrations.length === 0;
+        return { success, appliedMigrations, failedMigrations };
     });
 }
 
-module.exports = { fixMaterialRequestsSchema, setupDocumentsTable, runNumberedMigrations };
+module.exports = { fixMaterialRequestsSchema, setupDocumentsTable, runNumberedMigrations, NUMBERED_MIGRATIONS };

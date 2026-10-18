@@ -1,4 +1,11 @@
 const test = require('node:test');
+
+if (process.env.SMARTERP_DISPOSABLE_TEST_DB !== 'true') {
+  test('PostgreSQL Core Tables Row-Level Security (RLS) & Tenant Isolation [SKIPPED]', (t) => {
+    t.skip('Requires SMARTERP_DISPOSABLE_TEST_DB=true with confirmed disposable test database');
+  });
+} else {
+
 const assert = require('node:assert/strict');
 const { pool } = require('../db');
 
@@ -89,3 +96,4 @@ test.describe('PostgreSQL Core Tables Row-Level Security (RLS) & Tenant Isolatio
   });
 
 });
+}

@@ -132,10 +132,40 @@ CREATE TABLE IF NOT EXISTS attendance (
   status VARCHAR(50) DEFAULT 'present',
   clock_in TIMESTAMP,
   clock_out TIMESTAMP,
+  check_in_time TIMESTAMP WITH TIME ZONE,
+  check_out_time TIMESTAMP WITH TIME ZONE,
   working_hours NUMERIC DEFAULT 0,
+  is_late BOOLEAN DEFAULT FALSE,
+  is_manual BOOLEAN DEFAULT FALSE,
+  edited_by UUID REFERENCES users(id),
+  clock_in_method VARCHAR(50) DEFAULT 'manual',
+  clock_out_method VARCHAR(50) DEFAULT 'manual',
+  is_auto_clocked_out BOOLEAN DEFAULT FALSE,
+  is_processed BOOLEAN DEFAULT FALSE,
+  processed_at TIMESTAMP WITH TIME ZONE,
+  biometric_device_id VARCHAR(100),
+  shift_start TIME DEFAULT '09:00:00',
+  shift_end TIME DEFAULT '19:00:00',
   location VARCHAR(255),
   notes TEXT,
-  created_at TIMESTAMP DEFAULT NOW()
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Attendance corrections table
+CREATE TABLE IF NOT EXISTS attendance_corrections (
+  id                  SERIAL PRIMARY KEY,
+  attendance_id       UUID REFERENCES attendance(id) ON DELETE SET NULL,
+  user_id             UUID REFERENCES users(id) ON DELETE CASCADE,
+  requested_check_in  TIMESTAMP WITH TIME ZONE NOT NULL,
+  requested_check_out TIMESTAMP WITH TIME ZONE,
+  reason              TEXT,
+  status              VARCHAR(50) DEFAULT 'pending',
+  reviewed_by         UUID REFERENCES users(id) ON DELETE SET NULL,
+  reviewed_at         TIMESTAMP WITH TIME ZONE,
+  rejection_reason    TEXT,
+  created_at          TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  updated_at          TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
 -- Inventory items
@@ -297,6 +327,12 @@ CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
 CREATE INDEX IF NOT EXISTS idx_jobs_company_id ON jobs(company_id);
 CREATE INDEX IF NOT EXISTS idx_attendance_user_id ON attendance(user_id);
 CREATE INDEX IF NOT EXISTS idx_attendance_company_id ON attendance(company_id);
+CREATE INDEX IF NOT EXISTS idx_attendance_user_date ON attendance(user_id, date);
+CREATE INDEX IF NOT EXISTS idx_attendance_company_date ON attendance(company_id, date);
+CREATE INDEX IF NOT EXISTS idx_attendance_company_processed ON attendance(company_id, is_processed);
+CREATE INDEX IF NOT EXISTS idx_attendance_corrections_att_id ON attendance_corrections(attendance_id);
+CREATE INDEX IF NOT EXISTS idx_attendance_corrections_user_id ON attendance_corrections(user_id);
+CREATE INDEX IF NOT EXISTS idx_attendance_corrections_status ON attendance_corrections(status);
 CREATE INDEX IF NOT EXISTS idx_inventory_company_id ON inventory_items(company_id);
 CREATE INDEX IF NOT EXISTS idx_payroll_company_id ON payroll(company_id);
 CREATE INDEX IF NOT EXISTS idx_payroll_employee_id ON payroll(employee_id);

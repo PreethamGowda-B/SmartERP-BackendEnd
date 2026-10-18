@@ -31,6 +31,7 @@
 22. [August 2026 Supabase Migration, IPv4 Socket Routing & Flagship Enterprise Evolution](#22-august-2026-supabase-migration-ipv4-socket-routing--flagship-enterprise-evolution)
 23. [August 2026 Production Security Hardening, Multi-Tenant RLS & Privacy Erasure System](#23-august-2026-production-security-hardening-multi-tenant-rls--privacy-erasure-system)
 24. [October 16 to 18, 2026 Recent Implementation Addendum](#24-october-16-to-18-2026-recent-implementation-addendum)
+25. [October 2026 Second-Pass Source Audit Corrections](#25-october-2026-second-pass-source-audit-corrections)
 
 ---
 
@@ -54,7 +55,7 @@ SmartERP (branded as **Prozync**) is a cloud-based, multi-tenant Enterprise Reso
 | State Management | React Context API + Redux Toolkit (limited) |
 | Backend Framework | Node.js 22 + Express.js |
 | Backend Language | JavaScript (CommonJS) |
-| Database | Neon PostgreSQL (Serverless, via `pg` driver) |
+| Database | PostgreSQL via `pg`; current deployed provider/target is not verified from source |
 | Caching / Pub-Sub | Upstash Redis (ioredis, serverless) |
 | Background Jobs | BullMQ + node-cron |
 | Authentication | JWT (jsonwebtoken) + bcrypt |
@@ -62,7 +63,7 @@ SmartERP (branded as **Prozync**) is a cloud-based, multi-tenant Enterprise Reso
 | Push Notifications | Firebase Admin SDK (FCM) |
 | Email | Resend (transactional emails) |
 | File Storage | Cloudinary (images + documents) |
-| AI | **Google Gemini 1.5 Flash / Pro** (`@google/generative-ai`) |
+| AI | Groq provider abstraction (`groq-sdk`); configured model is environment-dependent |
 | Payments | Razorpay |
 | Error Monitoring | Sentry (@sentry/node + @sentry/nextjs) |
 | Deployment (Backend) | Render.com (Docker container, single instance) |
@@ -71,7 +72,7 @@ SmartERP (branded as **Prozync**) is a cloud-based, multi-tenant Enterprise Reso
 | CI/CD | GitHub → Render / Vercel (auto-deploy on push to main) |
 | Load Testing | Artillery |
 
-> **AI Provider Update (August 2026):** The platform migrated from **Groq Llama 3.3 70B** to **Google Gemini 1.5 Flash/Pro** via the `@google/generative-ai` SDK. The provider abstraction layer (`ai/providers/`) was updated to wrap the Gemini API.
+> **Provider note:** An earlier architecture revision described a Gemini migration. The current source inspected in October 2026 contains `groq-sdk`, `ai/providers/groq.provider.js`, and a provider factory that selects Groq; no Gemini provider package/implementation was found. Which provider/model is active in deployment depends on configuration and was not verified.
 
 ### Domains
 
@@ -438,9 +439,9 @@ SmartERP-Frontend/
 #### `attendance`
 - **Purpose**: Daily clock-in/clock-out records per employee
 - **Primary Key**: `id UUID`
-- **Key Columns**: `user_id` (FK→users), `company_id` (FK→companies), `date`, `check_in_time`, `check_out_time`, `working_hours`, `status` (present/late/half_day/absent), `is_late`, `is_auto_clocked_out`, `is_manual`, `is_processed`
-- **Unique Constraint**: `(user_id, date)` — one record per employee per day
-- **Indexes**: `idx_attendance_user_id`, `idx_attendance_company_id`
+- **Runtime fields used by attendance code** include `user_id`, `company_id`, `date`, `check_in_time`, `check_out_time`, `working_hours`, `status`, `is_late`, `is_auto_clocked_out`, `is_manual`, and `is_processed`.
+- **Schema caveat:** Tracked `schema.sql` instead declares `clock_in`/`clock_out` and does not establish the runtime column contract or the claimed `(user_id, date)` unique constraint. Attendance correction DDL and deployed indexes/RLS are also unverified. See `SMARTERP_ATTENDANCE_SCHEMA_BASELINE_REPORT.md` and `SMARTERP_ATTENDANCE_INTEGRATION_VERIFICATION_REPORT.md` before relying on database enforcement.
+- **Indexes/constraints:** Do not infer runtime attendance indexes or uniqueness from this baseline; verify against a confirmed supported schema and disposable database first.
 - **Referenced By**: attendance_corrections, payroll (aggregated)
 
 #### `employee_profiles`
@@ -782,7 +783,7 @@ pool.query = async function(text, params) {
 };
 ```
 
-This sets the PostgreSQL session variable `app.current_company_id` before every query, enabling optional RLS policies (`migrations/rls_policies.sql`).
+This sets the PostgreSQL session variable `app.current_company_id` in the relevant application context. RLS policy files and middleware do not prove that policies are installed, enabled, or effective in a deployed database; inspect the attendance schema baseline report for the current verification boundary.
 
 ### Layer 3: Explicit WHERE Clauses
 
@@ -819,7 +820,7 @@ The customer portal has a completely separate auth system (`customers` table). C
 
 ### Potential Security Risks
 
-1. **No database-level RLS enforcement**: RLS policies exist in `rls_policies.sql` but may not be enforced by default — isolation relies entirely on application-level `WHERE company_id = $1` clauses.
+1. **Database RLS state is unverified**: SQL policy definitions exist, but the supported/deployed database and effective policy/role configuration were not inspected. Application authorization and explicit company predicates must still be reviewed route by route.
 2. **Type inconsistency**: `company_id` has historically been both INTEGER and UUID in some tables — `db.js` handles both via regex but adds complexity.
 3. **Super admin bypass**: The `super_admin` role skips company isolation checks entirely, giving full platform access.
 4. **Shared Redis namespace**: Redis keys use `plan:{companyId}` format — correct but relies on companyId uniqueness.
@@ -1026,7 +1027,7 @@ Features controlled by plan:
 | Notifications | `/customer/notifications` | Customer notifications |
 | Profile | `/customer/profile` | Customer profile management |
 
-**Real-time**: Customer portal uses SSE (`useSSE` hook) to receive live job events (accepted, progress, completed, chat messages) without polling.
+**Updates**: Customer portal subscribes to SSE (`useSSE`) and also uses refresh/polling paths as fallback or for data not covered by the event stream. Presence of the stream does not prove delivery in a deployed environment.
 
 **API Usage**: Uses `authenticateCustomer` middleware (separate from `authenticateToken`). Scoped to customer's `company_id`.
 
@@ -1079,7 +1080,7 @@ Features controlled by plan:
   - Employee sees job in list → accepts (atomic UPDATE with race condition guard)
   - Employee updates progress (0–100%) → at 100%, status auto-sets to `completed`
   - Customer-submitted jobs go through `approval_status=pending_approval` → Owner approves/rejects
-  - On completion: invoice generated, owner notified via SSE + FCM + email
+  - On completion: job state and customer/owner notifications are updated; invoice issuance is a separate Owner review/issue action through the invoice editor. Completion/sign-off does not automatically issue a customer invoice.
 - **Backend**: `routes/jobs.js` — CRUD + `/accept`, `/decline`, `/progress`, `/chat-unread-count`
 - **Customer job approval**: `routes/customerJobApproval.js`
 - **Frontend pages**: `app/owner/jobs/`, `app/employee/jobs/`
@@ -2092,7 +2093,7 @@ Render.com uses ephemeral filesystem — local documents are lost on redeploy. F
 7. Employee sets progress to 100:
    POST /api/jobs/:id/progress { progress: 100 }
    → status = 'completed', employee_status = 'completed'
-   → Invoice generated (billingService.generateInvoice)
+   → No automatic invoice issue: Owner reviews the completed job in its invoice editor, then finalizes/issues via the canonical invoice service.
    → Owner notified via SSE + FCM + email
    → Customer notified via SSE: job_completed event
 8. Customer submits review → POST /api/customer/jobs/:id/review
@@ -2344,9 +2345,9 @@ Strong reuse on the frontend:
 
 3. **Schema type inconsistency** — `company_id` was historically INTEGER in some tables, UUID in others. The codebase handles this with workarounds (`company_id::text = $1`, `safeCompanyId()` helper). The root type should be standardized to UUID across all tables.
 
-4. **No database-level RLS enforcement** — RLS policies exist in `rls_policies.sql` but isolation depends entirely on application-level WHERE clauses. A miscoded query could leak cross-tenant data.
+4. **Database RLS state not verified** — policy definitions and application tenant-context code are present, but effective policies/roles in the supported deployed database were not inspected. Application query authorization still requires route-by-route review.
 
-5. **Single unit test file** — `tests/unit.test.js` exists but coverage is minimal. No integration tests.
+5. **Test coverage and safety** — current source includes 40 `*.test.js` files, but `npm test` runs only `tests/unit.test.js`; broader tests require per-suite review because some may use a database. No claim of safe full integration coverage is made here.
 
 6. **`server.js` startup mutations** — Running ALTER TABLE, UPDATE, and index creation at every server start (inside `fixDatabaseConstraints()`) is functional but not ideal for production environments where DB state should be managed purely via versioned migrations.
 
@@ -2907,6 +2908,8 @@ ORDER BY created_at DESC
 
 ### 22.1 Database Provider Migration (Neon → Supabase)
 
+> **Second-pass verification note (October 2026):** This heading and the deployment narrative below record an earlier architecture assertion, not a current source-verified provider. The checked-in database layer supports PostgreSQL access through `pg`; environment files and deployed database metadata were intentionally not inspected. Treat the named provider, migration completion, restored-row count, and live networking claims below as unverified historical claims until independently confirmed.
+
 **Context & Problem Solved:**
 Neon PostgreSQL free tier reaches a hard limit of 100 compute hours/month, causing database suspension and 500 error cascades across the platform.
 
@@ -3132,12 +3135,9 @@ sequenceDiagram
 
 ### 24.4 Current local edits not represented by recent commits
 
-The Frontend worktree inspected October 18 contains these additional uncommitted changes. They are local source work, not a pushed or deployed release:
+At the October 18 second-pass inspection, the Frontend worktree had one pre-existing uncommitted edit: `SmartERP-Frontend/contexts/clock-in-gatekeeper-context.tsx`. It checks the server attendance row before protected employee actions and avoids authorizing from a stale browser marker when attendance cannot be fetched. This audit did not modify it or independently rerun its checks. The AI panel and robot reference-alignment files are part of the current Frontend HEAD (`c819528`), not uncommitted edits; visual rendering remains unverified as recorded in the AI reference-match report.
 
-1. `SmartERP-Frontend/contexts/clock-in-gatekeeper-context.tsx` now checks the server attendance row before protected employee actions. It aligns automatic and manual clock-out behavior with the backend `check_out_time IS NULL` gate and does not authorize an action from a stale browser marker when attendance cannot be fetched. TypeScript and `git diff --check` passed for this local edit. It does not repair a dropped API connection; `/api/attendance/*` connection failures still require backend host logs.
-2. `SmartERP-Frontend/components/smart-ai-panel.tsx`, `components/smart-ai-robot.tsx`, and the local `SMARTERP_AI_CHATBOT_REFERENCE_MATCH_REPORT.md` contain in-progress reference-alignment changes described above. Browser visual verification and a successful production build are not established.
-
-The Frontend worktree also had existing uncommitted AI-panel changes when this documentation update began. The BackendEnd worktree contains pre-existing `hackerai/` deletions whose origin and timing are unknown; they are not treated as SmartERP portal feature work here and were not changed.
+The BackendEnd worktree has pre-existing `hackerai/` deletions and an unrelated modification to `routes/materialPurchaseWorkflow.js`; their origin and timing are unknown. They were not changed or treated as SmartERP audit work.
 
 ### 24.5 Confirmed boundaries and outstanding verification
 
@@ -3149,4 +3149,33 @@ The Frontend worktree also had existing uncommitted AI-panel changes when this d
 6. AI reference visual inspection and full live-portal workflow coverage remain outstanding; compilation and unit checks do not substitute for those checks.
 
 This addendum records recent implemented scope only. It does not add proposed features, alter unaffected API/schema sections, or assert an overall production-readiness score.
+
+## 25. October 2026 Second-Pass Source Audit Corrections
+
+> **Evidence boundary:** This section is based on local BackendEnd and Frontend source, tracked SQL/migrations, prior implementation reports, and Git metadata inspected on October 18, 2026. No production API/database was accessed and no test was run during this second-pass audit. Source presence is not proof of runtime success.
+
+### 25.1 Corrections to older architecture claims
+
+- **Attendance database contract:** The older table description claimed `check_in_time`/`check_out_time` and a unique `(user_id, date)` key as if established schema. Tracked `schema.sql` uses `clock_in`/`clock_out`; the supported runtime schema, correction-table DDL, constraints, and effective RLS state remain unestablished. Attendance integration verification is **NO-GO** until a documented authoritative schema and disposable database are supplied. Do not add a uniqueness migration based only on the old description.
+- **Invoice lifecycle:** Job completion changes job state and emits workflow notifications/events. It does not issue an invoice. The Owner reviews and issues from the job-context invoice editor; `services/invoiceService.js` is the canonical issuance path. Customer sign-off is not invoice issuance.
+- **Customer live updates:** Customer SSE is present, alongside polling/refresh fallbacks. Employee/Owner chat also uses refresh intervals in addition to event delivery. The architecture must not describe these as proven instantaneous or production-live.
+- **AI provider:** Current source includes a Groq provider implementation and SDK. Gemini migration claims in earlier text are not supported by the checked-in provider factory/dependencies. Actual deployed provider/model was not inspected.
+- **Database vendor:** Source uses PostgreSQL via `pg`, with provider selection/configuration outside the inspected safe boundary. Earlier Neon→Supabase migration statements are historical and not verified by current source.
+- **Portal route count:** Current Frontend source contains 144 `app/**/page.tsx` route files: Owner 50, Employee 17, HR 21, Customer 19, Super Admin fixed tree 13, dynamic Super Admin slug tree 13, and public/shared 11. A route file does not prove a fully connected or tested feature. The earlier architecture page inventory is not exhaustive; see `SMARTERP_FEATURE_VERIFICATION_MATRIX.md`.
+- **CNC status:** Machine registry/history, SLA and operational summaries have source-backed routes, while several neighboring screens contain placeholder or incomplete actions. See `SMARTERP_CNC_CAPABILITY_GAP_ANALYSIS.md`; these pages should not be represented uniformly as complete CNC operations.
+- **Tests:** Prior reports contain historical local test counts, including different attendance-focused counts in reports produced at different stages. This audit did not rerun them. The feature matrix and workflow report distinguish recorded test evidence from runtime and production verification.
+
+### 25.2 Current module and connection map
+
+Use `SMARTERP_FEATURE_VERIFICATION_MATRIX.md` as the current portal/route inventory, `SMARTERP_END_TO_END_WORKFLOW_AUDIT.md` for connected and incomplete business sequences, and `SMARTERP_CNC_CAPABILITY_GAP_ANALYSIS.md` for detailed CNC classifications and priorities. Existing `/api` and `/api/v1` aliases and the fixed plus dynamic Super Admin page trees are retained in the source inventory; neither is evidence of duplicate persisted business workflows by itself.
+
+### 25.3 Open architecture verification gates
+
+1. **Attendance schema / RLS / concurrency:** documented go/no-go blocker; no supported runtime schema or disposable DB established.
+2. **Request-time DDL:** `routes/reports.js` calls `ensureReportColumns()` in report request paths. Schema mutation therefore exists in the ordinary request code path; removal requires a separate reviewed migration/initialization change and was not performed here.
+3. **External integrations:** Groq, Redis, Firebase, email, Cloudinary, Razorpay, Google OAuth, WhatsApp and mapping dependencies are visible in source, but credential validity, deployed configuration and delivery were not checked.
+4. **CNC hardware:** no verified CNC controller telemetry ingestion/gateway is connected to the predictive maintenance score. Machine health/spindle fields and related calculations do not establish hardware connectivity.
+5. **Current worktrees:** Frontend has the pre-existing clock-in gatekeeper edit; BackendEnd has a large pre-existing `hackerai/` deletion set and `routes/materialPurchaseWorkflow.js` modification. These remain untouched and unrelated to this documentation update.
+
+This section supersedes conflicting older claims above only where explicitly stated. It does not certify production readiness or change application behavior.
 

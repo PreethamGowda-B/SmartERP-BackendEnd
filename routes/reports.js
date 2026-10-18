@@ -8,29 +8,6 @@ const { cacheMiddleware } = require('../middleware/cache');
 const AttendancePolicy = require('../services/attendancePolicyService');
 const { dateRangeForWorkDate } = require('../services/attendanceAccess');
 
-// ─── Startup: ensure all columns used by reports exist ───────────────────────
-async function ensureReportColumns() {
-    try {
-        // Attendance
-        await pool.query('ALTER TABLE attendance ADD COLUMN IF NOT EXISTS working_hours NUMERIC');
-        await pool.query('ALTER TABLE attendance ADD COLUMN IF NOT EXISTS is_late BOOLEAN DEFAULT false');
-        
-        // Jobs
-        await pool.query('ALTER TABLE jobs ADD COLUMN IF NOT EXISTS employee_status VARCHAR(50)');
-        await pool.query('ALTER TABLE jobs ADD COLUMN IF NOT EXISTS accepted_at TIMESTAMP');
-        await pool.query('ALTER TABLE jobs ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP');
-        await pool.query('ALTER TABLE jobs ADD COLUMN IF NOT EXISTS progress INTEGER DEFAULT 0');
-        
-        // Material Requests
-        await pool.query('ALTER TABLE material_requests ADD COLUMN IF NOT EXISTS unit VARCHAR(20)');
-        await pool.query('ALTER TABLE material_requests ADD COLUMN IF NOT EXISTS notes TEXT');
-        
-        // Inventory
-        await pool.query('ALTER TABLE inventory_items ADD COLUMN IF NOT EXISTS unit VARCHAR(20)');
-    } catch (err) {
-        console.error('⚠️  ensureReportColumns warning:', err.message);
-    }
-}
 
 
 
@@ -83,7 +60,6 @@ router.get('/attendance', authenticateToken, loadPlan, requireFeature('advanced_
         if (req.user.role !== 'owner' && req.user.role !== 'admin') {
             return res.status(403).json({ message: 'Access denied' });
         }
-        await ensureReportColumns();
 
         const companyId = req.user.companyId;
         const period = req.query.period || 'month';
@@ -140,7 +116,6 @@ router.get('/jobs', authenticateToken, loadPlan, requireFeature('advanced_report
         if (req.user.role !== 'owner' && req.user.role !== 'admin') {
             return res.status(403).json({ message: 'Access denied' });
         }
-        await ensureReportColumns();
 
         const companyId = req.user.companyId;
         const period = req.query.period || 'month';
@@ -207,7 +182,6 @@ router.get('/employees', authenticateToken, loadPlan, requireFeature('advanced_r
         if (req.user.role !== 'owner' && req.user.role !== 'admin') {
             return res.status(403).json({ message: 'Access denied' });
         }
-        await ensureReportColumns();
 
         const companyId = req.user.companyId;
         const period = req.query.period || 'month';
@@ -279,7 +253,6 @@ router.get('/materials', authenticateToken, loadPlan, requireFeature('advanced_r
         if (req.user.role !== 'owner' && req.user.role !== 'admin') {
             return res.status(403).json({ message: 'Access denied' });
         }
-        await ensureReportColumns();
 
         const companyId = req.user.companyId;
         const period = req.query.period || 'month';
@@ -335,7 +308,6 @@ router.get('/inventory', authenticateToken, loadPlan, requireFeature('advanced_r
         if (req.user.role !== 'owner' && req.user.role !== 'admin') {
             return res.status(403).json({ message: 'Access denied' });
         }
-        await ensureReportColumns();
 
         const companyId = req.user.companyId;
 
@@ -393,7 +365,6 @@ router.get('/inventory', authenticateToken, loadPlan, requireFeature('advanced_r
  */
 router.get('/my-attendance', authenticateToken, async (req, res) => {
     try {
-        await ensureReportColumns();
         const userId = req.user.userId || req.user.id;
         const companyId = req.user.companyId || req.user.company_id;
         const period = req.query.period || 'month';
@@ -440,7 +411,6 @@ router.get('/my-attendance', authenticateToken, async (req, res) => {
  */
 router.get('/my-jobs', authenticateToken, async (req, res) => {
     try {
-        await ensureReportColumns();
         const userId = req.user.userId || req.user.id;
         const period = req.query.period || 'month';
         const { clause, params } = dateRangeFilter(period, 'created_at', 2);
@@ -483,7 +453,6 @@ router.get('/my-jobs', authenticateToken, async (req, res) => {
  */
 router.get('/my-materials', authenticateToken, async (req, res) => {
     try {
-        await ensureReportColumns();
         const userId = req.user.userId || req.user.id;
         const period = req.query.period || 'month';
         const { clause, params } = dateRangeFilter(period, 'created_at', 2);

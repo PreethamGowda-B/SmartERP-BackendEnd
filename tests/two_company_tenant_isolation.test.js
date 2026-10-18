@@ -15,6 +15,13 @@
 'use strict';
 
 const test = require('node:test');
+
+if (process.env.SMARTERP_DISPOSABLE_TEST_DB !== 'true') {
+  test('🔒 Two-Company Cross-Tenant Security & Invoice System Isolation [SKIPPED]', (t) => {
+    t.skip('Requires SMARTERP_DISPOSABLE_TEST_DB=true with confirmed disposable test database');
+  });
+} else {
+
 const assert = require('node:assert/strict');
 const jwt = require('jsonwebtoken');
 const { pool } = require('../db');
@@ -373,3 +380,4 @@ test('🔒 Two-Company Cross-Tenant Security & Invoice System Isolation', async 
     });
   });
 });
+}

@@ -891,6 +891,7 @@ v1Router.use("/finance", require("./routes/finance"));
 v1Router.use("/work-requests", require("./routes/workRequests"));
 v1Router.use("/machines", require("./routes/machines"));
 v1Router.use("/plants", require("./routes/plants"));
+v1Router.use("/production", require("./routes/production"));
 v1Router.use("/quotations", require("./routes/quotations"));
 v1Router.use("/remote-support", require("./routes/remoteSupport"));
 v1Router.use("/command-center", require("./routes/commandCenter"));

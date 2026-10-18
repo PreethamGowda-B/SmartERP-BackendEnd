@@ -108,3 +108,20 @@ test('terminal dispatched and cancelled orders cannot transition again', () => {
   expectCode(() => assertStatusTransition({ fromStatus: S.DISPATCHED, toStatus: S.ON_HOLD, actorRole: 'owner', reason: 'test' }), 'INVALID_STATUS_TRANSITION');
   expectCode(() => assertStatusTransition({ fromStatus: S.CANCELLED, toStatus: S.PLANNED, actorRole: 'owner' }), 'INVALID_STATUS_TRANSITION');
 });
+
+test('accepted work awaiting dispatch can continue production against the remaining planned quantity', () => {
+  assert.equal(assertStatusTransition({
+    fromStatus: S.READY_FOR_DISPATCH,
+    toStatus: S.IN_PRODUCTION,
+    actorRole: 'employee',
+    actorId: 'u-1',
+    assignedEmployeeId: 'u-1',
+  }).toStatus, S.IN_PRODUCTION);
+  assert.equal(assertStatusTransition({
+    fromStatus: S.PARTIALLY_DISPATCHED,
+    toStatus: S.IN_PRODUCTION,
+    actorRole: 'employee',
+    actorId: 'u-1',
+    assignedEmployeeId: 'u-1',
+  }).toStatus, S.IN_PRODUCTION);
+});

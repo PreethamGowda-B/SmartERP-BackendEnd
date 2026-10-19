@@ -612,24 +612,46 @@ router.get('/audit-trail', async (req, res) => {
 router.patch('/companies/:id/plan', async (req, res) => {
   const { id } = req.params;
   const { plan_id, expires_at, note } = req.body;
+  const planId = Number(plan_id);
+  const plan = getPlan(planId);
+  const expiresAt = expires_at == null || expires_at === '' ? null : new Date(expires_at);
+  if (!plan || ![1, 2, 3].includes(planId)) return res.status(400).json({ message: 'Invalid subscription plan.' });
+  if (planId > 1 && !expiresAt) return res.status(400).json({ message: 'Paid plan overrides require an explicit expiry date.' });
+  if (expiresAt && (!Number.isFinite(expiresAt.getTime()) || expiresAt.getTime() <= Date.now())) {
+    return res.status(400).json({ message: 'Subscription expiry must be a valid future date or empty.' });
+  }
 
-  if (!plan_id) return res.status(400).json({ message: 'plan_id is required' });
-
+  const client = await pool.connect();
   try {
-    const result = await pool.query(
+    await client.query('BEGIN');
+    await client.query("SELECT pg_advisory_xact_lock(hashtext('sub_upgrade_' || $1))", [String(id)]);
+    const before = await client.query('SELECT id, plan_id FROM companies WHERE id = $1 FOR UPDATE', [id]);
+    if (!before.rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Company not found.' });
+    }
+    const result = await client.query(
       `UPDATE companies 
-       SET plan_id = $1, subscription_expires_at = $2, is_on_trial = FALSE, 
+       SET plan_id = $1, subscription_expires_at = $2, is_on_trial = FALSE,
            subscription_status = 'active', updated_at = NOW()
        WHERE id = $3 RETURNING id, company_name, plan_id`,
-      [plan_id, expires_at || null, id]
+      [planId, expiresAt, id]
     );
-    if (result.rows.length === 0) return res.status(404).json({ message: 'Company not found' });
-    
-    console.log(`🛡️ SuperAdmin plan override: company ${id} → plan ${plan_id}${note ? ` (${note})` : ''}`);
+    await client.query(
+      `INSERT INTO subscription_events (company_id, event_type, old_plan_id, new_plan_id, metadata, created_at)
+       VALUES ($1, 'admin_plan_override', $2, $3, $4, NOW())`,
+      [id, before.rows[0].plan_id, planId, JSON.stringify({ actor_user_id: req.user?.id || null, note: note || null, expires_at: expiresAt?.toISOString() || null })]
+    );
+    await client.query('COMMIT');
+    require('../middleware/planMiddleware').invalidatePlanCache(id);
+    console.log(`🛡️ SuperAdmin plan override: company ${id} → plan ${planId}${note ? ` (${note})` : ''}`);
     res.json({ ok: true, company: result.rows[0] });
   } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
     console.error('❌ Plan override error:', err);
     res.status(500).json({ message: 'Server error' });
+  } finally {
+    client.release();
   }
 });
 
@@ -1172,21 +1194,10 @@ router.get('/payments', async (req, res) => {
 // ─── POST /api/admin/payments/:id/refund ─────────────────────────────────────
 // Record payment refund
 router.post('/payments/:id/refund', async (req, res) => {
-  const { id } = req.params;
-  const { reason } = req.body;
-
-  try {
-    const result = await pool.query(
-      `UPDATE subscriptions SET status = 'refunded' WHERE id = $1 RETURNING *`,
-      [id]
-    );
-    if (result.rows.length === 0) return res.status(404).json({ message: 'Transaction not found' });
-
-    console.log(`🛡️ SuperAdmin refunded payment ${id}: ${reason || 'Admin refund'}`);
-    res.json({ ok: true, payment: result.rows[0], message: 'Payment marked as refunded' });
-  } catch (err) {
-    res.status(500).json({ message: 'Server error' });
-  }
+  return res.status(409).json({
+    code: 'PAYMENT_REFERENCE_REQUIRED',
+    message: 'No refund was issued. This subscription record has no verified Razorpay payment reference to refund safely.'
+  });
 });
 
 module.exports = router;

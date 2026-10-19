@@ -232,7 +232,6 @@ const NUMBERED_MIGRATIONS = [
     '007_inventory_forecasting.sql',
     '008_ar_collections.sql',
     '009_payroll_validation.sql',
-    '010_crm_sales_agent.sql',
     '011_standardize_uuid_and_core_rls.sql',
     '012_fix_company_settings_company_id_type.sql',
     '013_feedback_enhanced_columns.sql',
@@ -257,6 +256,10 @@ const NUMBERED_MIGRATIONS = [
     '030_invoice_idempotency.sql',
     '031_material_request_job_scope.sql',
     '032_attendance_runtime_and_corrections.sql',
+    '033_production_dispatch.sql',
+    '034_production_dispatch_privileges.sql',
+    '035_production_packing_workflow.sql',
+    '036_customer_manufacturing_requests.sql',
 ];
 
 async function runNumberedMigrations() {

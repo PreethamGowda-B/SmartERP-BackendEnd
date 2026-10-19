@@ -454,15 +454,9 @@ open → pending (assigned) → in_progress / active → completed
 
 ---
 
-### 2.15 CRM / Sales Pipeline
+### 2.15 CRM / Sales Pipeline (Retired)
 
-**Purpose:** Track leads, deals, and sales funnel.
-
-**APIs Used:**
-- `GET /api/v1/crm-sales` — pipeline view
-- `POST /api/v1/crm-sales` — add deal
-
-**Status:** ✅ Working
+The Owner Portal Sales Pipeline, its API, and CRM AI tools have been removed. The legacy migration and any existing database records are retained for history; no records are deleted by this retirement.
 
 ---
 
@@ -1342,7 +1336,6 @@ All AI runs on **Google Gemini 1.5 Flash** (default) or **Gemini 1.5 Pro** (comp
 | Jobs AI | `jobs.plugin.js` | Job status, assignments, completion rates |
 | Employee AI | `employee.plugin.js` | Employee info, attendance, performance |
 | Attendance AI | `attendance.plugin.js` | Attendance analytics |
-| CRM/Sales AI | `crm.plugin.js` | Lead conversion, sales pipeline |
 | Customer AI | `customer.plugin.js` | Customer job history, satisfaction |
 | GST AI | `gstReconciliation.plugin.js` | GST reconciliation, tax queries |
 | Navigation AI | `navigation.plugin.js` | "Go to X" navigation commands |
@@ -1578,7 +1571,6 @@ Or valid HTTP-only cookie.
 | Customer SSE | `/api/v1/customer/sse` | Customer only | Real-time events |
 | GST | `/api/v1/gst-reconciliation` | Yes | GST tools |
 | AR Collections | `/api/v1/ar-collections` | Yes | Receivables |
-| CRM | `/api/v1/crm-sales` | Yes | Sales pipeline |
 | Webhook | `/api/v1/webhook` | Signature | Razorpay events |
 | Health | `/api/health` | No | Health check |
 
@@ -1837,7 +1829,7 @@ SENTRY_DSN=...
 | Location Tracking | ✅ Working | Pro only |
 | GST Reconciliation | ✅ Working | |
 | AR Collections | ✅ Working | |
-| CRM / Sales | ✅ Working | |
+| CRM / Sales | Retired | UI, API, and AI integration removed; legacy schema/data retained |
 | Documents | ✅ Working | |
 | Settings | ✅ Working | |
 | **EMPLOYEE PORTAL** | | |

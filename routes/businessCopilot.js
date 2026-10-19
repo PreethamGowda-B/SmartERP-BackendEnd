@@ -2,9 +2,33 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
+const { loadPlan } = require('../middleware/planMiddleware');
+const { requireFeature } = require('../middleware/featureGuard');
+const { consumeAIRequest } = require('../services/aiQuota');
+const { resolvePlanTier } = require('../services/subscriptionCatalog');
+const { redisClient } = require('../utils/redis');
+const { checkPlanLimit } = require('../middleware/planMiddleware');
+
+async function requireAIQuota(req, res, next) {
+  const quota = await consumeAIRequest(redisClient, req.user?.userId || req.user?.id, resolvePlanTier(req.plan));
+  if (!quota.allowed) return res.status(quota.status).json({
+    code: quota.status === 429 ? 'PLAN_LIMIT_REACHED' : 'PLAN_LIMIT_CHECK_UNAVAILABLE',
+    error: quota.error,
+    message: quota.error,
+    retryAfter: quota.retryAfter,
+    ...(quota.status === 429 ? { details: { limitType: 'ai_messages', currentCount: quota.count, maxLimit: quota.limit, currentPlan: req.plan?.name || 'Starter' } } : {})
+  });
+  next();
+}
+
+function requireJobQuotaForCopilot(req, res, next) {
+  const prompt = String(req.body?.prompt || '').toLowerCase();
+  const createsJob = prompt.includes('create job') || prompt.includes('breakdown job') || prompt.includes('schedule pm');
+  return createsJob ? checkPlanLimit('job')(req, res, next) : next();
+}
 
 // ─── POST /api/ai/copilot (Enterprise AI Operations Copilot & Multi-Step Workflows) ───
-router.post('/', authenticateToken, async (req, res) => {
+router.post('/', authenticateToken, loadPlan, requireFeature('ai_assistant', 'AI assistant'), requireAIQuota, requireJobQuotaForCopilot, async (req, res) => {
   try {
     const companyId = req.user.companyId || req.user.company_id;
     if (!companyId && req.user.role !== 'super_admin') {
@@ -146,7 +170,7 @@ router.post('/', authenticateToken, async (req, res) => {
 });
 
 // ─── GET /api/ai/copilot/activity (AI Activity Center Log) ─────────────────
-router.get('/activity', authenticateToken, async (req, res) => {
+router.get('/activity', authenticateToken, loadPlan, requireFeature('ai_assistant', 'AI assistant'), async (req, res) => {
   try {
     const companyId = req.user.companyId || req.user.company_id;
     if (!companyId && req.user.role !== 'super_admin') {

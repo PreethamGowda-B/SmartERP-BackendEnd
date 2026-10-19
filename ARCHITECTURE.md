@@ -2703,22 +2703,9 @@ The following 5 Tier-S enterprise AI features have been built, integrated, teste
 
 ---
 
-### 5. Feature #5 — Autonomous CRM Pipeline & AI Sales Conversion Agent
-- **Database Schema ([migrations/010_crm_sales_agent.sql](file:///c:/Users/mrpre/Desktop/SMARTERP/SmartERP-Backend/migrations/010_crm_sales_agent.sql))**:
-  - Tables: `crm_leads_enhanced`, `crm_lead_activities`.
-  - Custom ENUMs: `lead_stage_enum` (`new_lead`, `contacted`, `proposal_sent`, `negotiation`, `closed_won`, `closed_lost`), `lead_priority_enum` (`cold`, `warm`, `hot`).
-  - Composite indexes: `idx_crm_leads_company_stage`, `idx_crm_leads_score`, `idx_crm_activities_lead`.
-  - Enforced PostgreSQL Row-Level Security (RLS) policies.
-- **Domain Service ([services/crmSalesService.js](file:///c:/Users/mrpre/Desktop/SMARTERP/SmartERP-Backend/services/crmSalesService.js))**:
-  - **Predictive Lead Scoring Engine**: Calculates score (0–100) and priority category (`hot` $\ge 75$, `warm` $40–74$, `cold` $<40$) based on deal size, company profile, and email responsiveness.
-  - **Kanban Pipeline Aggregator**: Groups leads into 5 deal stages with monetary stage totals.
-  - **Groq Llama 3.3 70B AI Integration**: Generates formal B2B sales proposals and records activity audit logs.
-- **REST Router ([routes/crmSales.js](file:///c:/Users/mrpre/Desktop/SMARTERP/SmartERP-Backend/routes/crmSales.js))**:
-  - Mounted at `/api/v1/crm-sales` in [server.js](file:///c:/Users/mrpre/Desktop/SMARTERP/SmartERP-Backend/server.js). Exposes endpoints for pipeline summaries, lead creation with predictive scoring, stage updates, and AI proposals.
-- **AI Plugin ([ai/plugins/crm.plugin.js](file:///c:/Users/mrpre/Desktop/SMARTERP/SmartERP-Backend/ai/plugins/crm.plugin.js))**:
-  - Registered in [ai/plugins/index.js](file:///c:/Users/mrpre/Desktop/SMARTERP/SmartERP-Backend/ai/plugins/index.js) with tool `get_crm_pipeline_summary`.
-- **Frontend Workspace ([app/owner/crm/pipeline/page.tsx](file:///c:/Users/mrpre/Desktop/SMARTERP/SmartERP-Frontend/app/owner/crm/pipeline/page.tsx))**:
-  - Next.js 14 Radix UI page featuring KPI header cards, 5-Column Kanban Board, Lead Cards with predictive score badges, stage transition controls, and 1-Click AI Proposal Drawer. API client: [lib/crmSalesApi.ts](file:///c:/Users/mrpre/Desktop/SMARTERP/SmartERP-Frontend/lib/crmSalesApi.ts).
+### 5. Feature #5 — CRM Sales Pipeline (Retired)
+
+The Owner Portal Sales Pipeline, its `/api/v1/crm-sales` endpoints, and its AI plugin were retired on 2026-10-19. The historical migration `010_crm_sales_agent.sql` and any existing CRM tables/records are preserved; retirement does not drop or alter stored records. Migration 010 is no longer included in active legacy migration registries for fresh upgrades.
 
 ---
 
@@ -2732,7 +2719,6 @@ The following 5 Tier-S enterprise AI features have been built, integrated, teste
 | **Groq API Load Safeguard** | **PASS** | HTTP 429 errors captured safely in `try/catch` blocks with deterministic default fallback strings |
 | **Inventory PO Guardrail** | **PASS** | Created with `status = 'draft'`; explicit `/approve` endpoint call required |
 | **AR Offer Guardrail** | **PASS** | Payment plan proposal text returned to rep for review; no automated background discount dispatch |
-| **CRM Proposal Guardrail** | **PASS** | Saved in `ai_proposal_text` field; rep reviews in drawer before manual export |
 | **Payroll Disbursal Guardrail** | **PASS** | Unresolved CRITICAL flags hard-block `approveRun` until explicit owner resolution |
 | **End-to-End Smoke Test** | **PASS** | `scripts/e2e_verification.js` verified 100% match between hand-calculated math vectors and system outputs |
 

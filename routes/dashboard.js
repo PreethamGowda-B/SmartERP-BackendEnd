@@ -19,29 +19,14 @@ router.get('/owner/metrics', authenticateToken, cacheMiddleware(300), async (req
         const policy = companyId ? await AttendancePolicy.getCompanyPolicy(companyId, pool) : AttendancePolicy.DEFAULT_ATTENDANCE_POLICY;
         const today = AttendancePolicy.localDate(new Date(), policy.timezone);
 
-        // 🚀 Parallelize all 4 independent queries for sub-second dashboard load
-        const [jobsResult, employeesResult, attResult, projectsResult] = await Promise.all([
+        // 🚀 Consolidated into 2 parallel queries (aggregated counts + projects) to reduce connection acquisition
+        const [countsResult, projectsResult] = await Promise.all([
             pool.query(
-                `SELECT COUNT(*) AS count
-                 FROM jobs
-                 WHERE status IN ('active', 'in_progress', 'open', 'accepted')
-                   AND company_id = $1`,
-                [companyId]
-            ),
-            pool.query(
-                `SELECT COUNT(*) AS count
-                 FROM users
-                 WHERE role = 'employee'
-                   AND company_id = $1`,
-                [companyId]
-            ),
-            pool.query(
-                `SELECT COUNT(DISTINCT user_id) AS count
-                 FROM attendance
-                 WHERE date = $1
-                   AND company_id = $2
-                   AND status IN ('present', 'half_day', 'late')`,
-                [today, companyId]
+                `SELECT
+                   (SELECT COUNT(*) FROM jobs WHERE status IN ('active', 'in_progress', 'open', 'accepted') AND company_id = $1) AS active_jobs,
+                   (SELECT COUNT(*) FROM users WHERE role = 'employee' AND company_id = $1) AS active_employees,
+                   (SELECT COUNT(DISTINCT user_id) FROM attendance WHERE date = $2 AND company_id = $1 AND status IN ('present', 'half_day', 'late')) AS today_attendance`,
+                [companyId, today]
             ),
             pool.query(
                 `SELECT j.id, j.title, j.description, j.status,
@@ -63,10 +48,11 @@ router.get('/owner/metrics', authenticateToken, cacheMiddleware(300), async (req
             ),
         ]);
 
+        const counts = countsResult.rows[0] || {};
         res.json({
-            activeJobs: parseInt(jobsResult.rows[0]?.count || 0),
-            activeEmployees: parseInt(employeesResult.rows[0]?.count || 0),
-            todayAttendance: parseInt(attResult.rows[0]?.count || 0),
+            activeJobs: parseInt(counts.active_jobs || 0, 10),
+            activeEmployees: parseInt(counts.active_employees || 0, 10),
+            todayAttendance: parseInt(counts.today_attendance || 0, 10),
             budgetUtilization: '0.0',
             totalBudget: 0,
             totalSpent: 0,

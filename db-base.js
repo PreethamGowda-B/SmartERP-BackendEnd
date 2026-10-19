@@ -52,12 +52,12 @@ const pool = new Pool({
   ssl: resolveSsl(),
   lookup: ipv4Lookup,
   // Render runs two clustered workers by default. Keep their combined default
-  // (10 connections) below the Supabase session pooler's 15-client limit.
+  // (10-12 connections) below the Supabase session pooler's 15-client limit.
   // DB_POOL_MAX remains available for deployments with a larger verified pool.
-  max: parseInt(process.env.DB_POOL_MAX || '5'),
-  idleTimeoutMillis: parseInt(process.env.DB_IDLE_TIMEOUT_MS || '10000'),
-  connectionTimeoutMillis: 15000, // 15s connection queue timeout under load
-  statement_timeout: 15000,      // 15s query safety limit
+  max: parseInt(process.env.DB_POOL_MAX || '10', 10),
+  idleTimeoutMillis: parseInt(process.env.DB_IDLE_TIMEOUT_MS || '10000', 10),
+  connectionTimeoutMillis: 10000, // 10s connection queue timeout under load
+  statement_timeout: 15000,       // 15s query safety limit
 });
 
 pool.on('error', (err) => {

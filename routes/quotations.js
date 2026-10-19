@@ -2,6 +2,13 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
+const { loadPlan, checkPlanLimit } = require('../middleware/planMiddleware');
+
+function checkJobPlanLimitForQuotation(req, res, next) {
+  // Super Admin support actions are platform operations without a company plan.
+  if (req.user?.role === 'super_admin' && !req.user?.companyId && !req.user?.company_id) return next();
+  return checkPlanLimit('job')(req, res, next);
+}
 
 // ─── GET /api/quotations ───────────────────────────────────────────────────
 router.get('/', authenticateToken, async (req, res) => {
@@ -134,7 +141,7 @@ router.post('/:id/revise', authenticateToken, async (req, res) => {
 });
 
 // ─── POST /api/quotations/:id/approve (Approve & Convert to Job) ────────────
-router.post('/:id/approve', authenticateToken, async (req, res) => {
+router.post('/:id/approve', authenticateToken, loadPlan, checkJobPlanLimitForQuotation, async (req, res) => {
   try {
     const companyId = req.user.companyId || req.user.company_id;
     if (!companyId && req.user.role !== 'super_admin') {

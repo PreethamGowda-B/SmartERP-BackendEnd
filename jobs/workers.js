@@ -31,49 +31,79 @@ if (redisConnection) {
    */
   const { pool } = require('../db');
   const { invalidatePlanCache } = require('../middleware/planMiddleware');
+  const Razorpay = require('razorpay');
+  const { getPlan, getPricePaise, paymentMatchesOrder, isRazorpayConfigured } = require('../services/subscriptionCatalog');
 
   const webhookWorker = new Worker('webhook-retry', async (job) => {
-    const { companyId, planId, billingCycle, paymentId, orderId, attemptsMade } = job.data;
+    const { companyId, planId, billingCycle, paymentId, orderId, purpose } = job.data;
+
+    // Retry worker only handles plan purchases. Trial activation is handled by
+    // the signature-verified Razorpay webhook and must not be converted into a paid plan.
+    if (purpose !== 'plan_purchase') {
+      console.warn('[Webhook Worker] Skipping retry without an explicit plan_purchase purpose.');
+      return;
+    }
     const currentAttempt = (job.attemptsMade || 0) + 1;
     console.log(`🔄 Webhook Retry Worker | Job ID: ${job.id} | Company: ${companyId} | Attempt ${currentAttempt}/3`);
 
-    try {
-      await pool.query('BEGIN');
-      await pool.query(`SELECT pg_advisory_xact_lock(hashtext('sub_upgrade_' || $1))`, [String(companyId)]);
+    // Queue payloads are not proof of payment. Re-fetch from Razorpay on every retry
+    // before applying any subscription change.
+    if (!companyId || !paymentId || !orderId || ![2, 3].includes(Number(planId)) || !['monthly', 'yearly'].includes(billingCycle)) {
+      throw new Error('Webhook retry is missing valid payment metadata');
+    }
+    if (!isRazorpayConfigured()) throw new Error('Razorpay verification is not configured');
+    const razorpay = new Razorpay({ key_id: process.env.RAZORPAY_KEY_ID, key_secret: process.env.RAZORPAY_KEY_SECRET });
+    const [order, payment] = await Promise.all([
+      razorpay.orders.fetch(orderId),
+      razorpay.payments.fetch(paymentId)
+    ]);
+    if (!paymentMatchesOrder({
+      order, payment, companyId, purpose: 'plan_purchase', planId: Number(planId), billingCycle,
+      expectedAmountPaise: getPricePaise(Number(planId), billingCycle)
+    })) {
+      throw new Error('Provider payment does not match the queued subscription purchase');
+    }
 
-      const compCheck = await pool.query(
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query("SELECT pg_advisory_xact_lock(hashtext('sub_payment_' || $1))", [String(paymentId)]);
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext('sub_upgrade_' || $1))`, [String(companyId)]);
+
+      const compCheck = await client.query(
         `SELECT id FROM companies WHERE id = $1 FOR UPDATE`,
         [companyId]
       );
       if (compCheck.rows.length === 0) {
-        await pool.query('ROLLBACK');
+        await client.query('ROLLBACK');
         throw new Error(`Company ID ${companyId} not found`);
       }
 
       // Check duplicate
-      const duplicateCheck = await pool.query(
-        `SELECT id FROM subscription_events WHERE metadata->>'razorpay_payment_id' = $1 AND event_type = 'upgrade'`,
+      const duplicateCheck = await client.query(
+        `SELECT company_id FROM subscription_events WHERE metadata->>'razorpay_payment_id' = $1`,
         [paymentId]
       );
       if (duplicateCheck.rows.length > 0) {
-        await pool.query('ROLLBACK');
+        await client.query('ROLLBACK');
+        if (String(duplicateCheck.rows[0].company_id) !== String(companyId)) throw new Error('Payment was already applied to another company');
         console.log(`[Webhook Worker] Payment ${paymentId} already processed.`);
         invalidatePlanCache(companyId);
         return;
       }
 
-      await pool.query(
+      await client.query(
         `UPDATE companies 
          SET plan_id = $1, 
              subscription_status = 'active', 
              is_on_trial = FALSE, 
-             subscription_expires_at = COALESCE(GREATEST(subscription_expires_at, NOW()), NOW()) + (CASE WHEN $2 = 'yearly' THEN INTERVAL '1 year' ELSE INTERVAL '1 month' END),
+             subscription_expires_at = (CASE WHEN is_on_trial THEN NOW() WHEN subscription_expires_at > NOW() THEN subscription_expires_at ELSE NOW() END) + (CASE WHEN $2 = 'yearly' THEN INTERVAL '1 year' ELSE INTERVAL '1 month' END),
              updated_at = NOW()
          WHERE id = $3`,
         [planId, billingCycle || 'monthly', companyId]
       );
 
-      await pool.query(
+      await client.query(
         `INSERT INTO subscription_events (company_id, event_type, new_plan_id, metadata, created_at)
          VALUES ($1, 'upgrade', $2, $3, NOW())`,
         [companyId, planId, JSON.stringify({ 
@@ -85,11 +115,11 @@ if (redisConnection) {
         })]
       );
 
-      await pool.query('COMMIT');
+      await client.query('COMMIT');
       invalidatePlanCache(companyId);
       console.log(`✅ Webhook Retry Succeeded on attempt ${currentAttempt} for Company ${companyId}`);
     } catch (err) {
-      await pool.query('ROLLBACK').catch(() => {});
+      await client.query('ROLLBACK').catch(() => {});
       console.error(`❌ Webhook Retry attempt ${currentAttempt} failed:`, err.message);
 
       // Log retry attempt failure to subscription_events table
@@ -104,6 +134,8 @@ if (redisConnection) {
       ).catch(() => {});
 
       throw err; // Trigger BullMQ retry mechanism
+    } finally {
+      client.release();
     }
   }, { connection: redisConnection });
 

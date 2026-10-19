@@ -15,6 +15,7 @@ const crypto = require("crypto");
 const { redisClient } = require("../utils/redis");
 const { storage } = require("../middleware/als");
 const { hashToken } = require("../utils/tokenHash");
+const { getPlan } = require("../services/subscriptionCatalog");
 
 // ✅ RLS bypass — auth routes query users/companies by email BEFORE any company
 // context is known (login lookup, OTP, Google OAuth). They explicitly opt-in to
@@ -141,8 +142,8 @@ passport.use(
               `INSERT INTO companies (company_id, company_name, plan_id, subscription_status,
                                       is_on_trial, trial_started_at, trial_ends_at,
                                       subscription_expires_at, is_first_login, created_at)
-               VALUES ($1, $2, 3, 'trial', TRUE, NOW(), NOW() + INTERVAL '30 days',
-                       NOW() + INTERVAL '30 days', TRUE, NOW())
+                VALUES ($1, $2, 1, 'active', FALSE, NULL, NULL,
+                        NULL, TRUE, NOW())
                RETURNING id, company_id`,
               [companyCode, companyName]
             );
@@ -168,20 +169,20 @@ passport.use(
               `INSERT INTO companies (company_id, company_name, plan_id, subscription_status,
                                       is_on_trial, trial_started_at, trial_ends_at,
                                       subscription_expires_at, is_first_login, created_at)
-               VALUES ($1, $2, 3, 'trial', TRUE, NOW(), NOW() + INTERVAL '30 days',
-                       NOW() + INTERVAL '30 days', TRUE, NOW())
+                VALUES ($1, $2, 1, 'active', FALSE, NULL, NULL,
+                        NULL, TRUE, NOW())
                RETURNING id, company_id`,
               [companyCode, companyName]
             );
             companyId = companyResult.rows[0].id;
 
-            pool.query(
+            await pool.query(
               `INSERT INTO subscription_events (company_id, event_type, old_plan_id, new_plan_id, metadata, created_at)
-               VALUES ($1, 'trial_started', NULL, 3, $2, NOW())`,
-              [companyId, JSON.stringify({ source: 'google_oauth', email })]
+               VALUES ($1, 'company_created_pending_trial_payment', NULL, 1, $2, NOW())`,
+              [companyId, JSON.stringify({ source: 'google_oauth' })]
             ).catch(e => console.error('sub_event log error:', e.message));
 
-            console.log(`✅ Created company ${companyCode} for Google owner ${email} (30-day Pro trial)`);
+            console.log(`✅ Created Starter company ${companyCode} for Google owner`);
           }
 
           if (role === 'employee' && company_code) {
@@ -196,12 +197,47 @@ passport.use(
             }
           }
 
-          const insertResult = await pool.query(
-            `INSERT INTO users (name, email, google_id, role, company_id, company_code, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, NOW()) RETURNING *`,
-            [name, email, googleId, role, companyId, companyCode]
-          );
-          user = insertResult.rows[0];
+          if (role === 'employee' && companyId) {
+            const seatClient = await pool.connect();
+            try {
+              await seatClient.query('BEGIN');
+              await seatClient.query("SELECT pg_advisory_xact_lock(hashtext($1 || $2))", ['employee_seats_', String(companyId)]);
+              const planCheck = await seatClient.query(
+                `SELECT c.plan_id, (SELECT COUNT(*) FROM users WHERE company_id = c.id AND role = 'employee') AS current_count
+                 FROM companies c WHERE c.id = $1 FOR UPDATE`, [companyId]
+              );
+              if (!planCheck.rows.length) throw new Error('Company not found');
+              const employeeLimit = getPlan(planCheck.rows[0].plan_id)?.employeeLimit;
+              if (employeeLimit === undefined) {
+                throw new Error('Company subscription plan is unavailable');
+              }
+              if (employeeLimit !== null && Number(planCheck.rows[0].current_count) >= employeeLimit) {
+                await seatClient.query('ROLLBACK');
+                const err = new Error('Employee limit reached for this company plan');
+                err.code = 'PLAN_LIMIT_REACHED';
+                return done(err, null);
+              }
+              const insertResult = await seatClient.query(
+                `INSERT INTO users (name, email, google_id, role, company_id, company_code, created_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, NOW()) RETURNING *`,
+                [name, email, googleId, role, companyId, companyCode]
+              );
+              user = insertResult.rows[0];
+              await seatClient.query('COMMIT');
+            } catch (seatError) {
+              await seatClient.query('ROLLBACK').catch(() => {});
+              throw seatError;
+            } finally {
+              seatClient.release();
+            }
+          } else {
+            const insertResult = await pool.query(
+              `INSERT INTO users (name, email, google_id, role, company_id, company_code, created_at)
+               VALUES ($1, $2, $3, $4, $5, $6, NOW()) RETURNING *`,
+              [name, email, googleId, role, companyId, companyCode]
+            );
+            user = insertResult.rows[0];
+          }
 
           if (role === 'owner' && companyId) {
             await pool.query('UPDATE companies SET owner_id = $1 WHERE id = $2', [user.id, companyId]);
@@ -910,21 +946,21 @@ router.post("/signup", [
 
       const companyResult = await client.query(
         `INSERT INTO companies (company_id, company_name, plan_id, subscription_status, is_on_trial, trial_started_at, trial_ends_at, subscription_expires_at, is_first_login, created_at)
-         VALUES ($1, $2, 3, 'trial', TRUE, NOW(), NOW() + INTERVAL '30 days', NOW() + INTERVAL '30 days', TRUE, NOW())
+         VALUES ($1, $2, 1, 'active', FALSE, NULL, NULL, NULL, TRUE, NOW())
          RETURNING id`,
         [companyCode, companyName]
       );
       companyId = companyResult.rows[0].id;
 
       await client.query(
-        `INSERT INTO subscriptions (company_id, plan_id, start_date, status) VALUES ($1, 3, NOW(), 'trial')`,
+        `INSERT INTO subscriptions (company_id, plan_id, start_date, status) VALUES ($1, 1, NOW(), 'active')`,
         [companyId]
       );
 
       await client.query(
         `INSERT INTO subscription_events (company_id, event_type, new_plan_id, metadata, created_at)
-         VALUES ($1, 'trial_started', 3, $2, NOW())`,
-        [companyId, JSON.stringify({ source: 'email_signup', email })]
+         VALUES ($1, 'company_created_pending_trial_payment', 1, $2, NOW())`,
+        [companyId, JSON.stringify({ source: 'email_signup' })]
       );
     }
 
@@ -948,18 +984,26 @@ router.post("/signup", [
       companyName = validation.company.company_name;
 
       // Atomic Employee Limit Check
+      await client.query("SELECT pg_advisory_xact_lock(hashtext($1 || $2))", ['employee_seats_', String(companyId)]);
       const planCheck = await client.query(
-        `SELECT p.employee_limit, (SELECT COUNT(*) FROM users WHERE company_id = $1 AND role = 'employee') as current_count
+        `SELECT c.plan_id, p.employee_limit, (SELECT COUNT(*) FROM users WHERE company_id = $1 AND role = 'employee') as current_count
          FROM companies c JOIN plans p ON c.plan_id = p.id WHERE c.id = $1`,
         [companyId]
       );
 
-      if (planCheck.rows.length > 0) {
-        const { employee_limit, current_count } = planCheck.rows[0];
-        if (employee_limit !== null && parseInt(current_count) >= employee_limit) {
-          await client.query("ROLLBACK");
-          return res.status(403).json({ message: "Employee limit reached for this company's plan." });
-        }
+      if (!planCheck.rows.length) {
+        await client.query("ROLLBACK");
+        return res.status(503).json({ message: "Could not verify the company's subscription plan. Please retry." });
+      }
+      const { plan_id, current_count } = planCheck.rows[0];
+      const employee_limit = getPlan(plan_id)?.employeeLimit;
+      if (employee_limit === undefined) {
+        await client.query("ROLLBACK");
+        return res.status(503).json({ message: "Could not verify the company's employee limit. Please retry." });
+      }
+      if (employee_limit !== null && parseInt(current_count) >= employee_limit) {
+        await client.query("ROLLBACK");
+        return res.status(403).json({ message: "Employee limit reached for this company's plan." });
       }
     }
 

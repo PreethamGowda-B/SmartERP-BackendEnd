@@ -5,11 +5,15 @@ const { pool } = require('../db');
 const Sentry = require("@sentry/node");
 const { invalidatePlanCache } = require('../middleware/planMiddleware');
 const { storage } = require('../middleware/als');
+const Razorpay = require('razorpay');
+const { getPlan, getPricePaise, paymentMatchesOrder, isRazorpayConfigured } = require('../services/subscriptionCatalog');
 
 // ✅ RLS bypass — Razorpay webhooks arrive with no user/tenant session.
 router.use((req, res, next) => storage.run({ isWebRequest: true, bypassRls: true }, next));
 
 router.post('/razorpay', async (req, res) => {
+  let verifiedOrderPurpose = null;
+  let verifiedOrderNotes = null;
   try {
     const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
     const signature = req.headers['x-razorpay-signature'];
@@ -56,14 +60,70 @@ router.post('/razorpay', async (req, res) => {
       return res.json({ status: 'ignored' });
     }
 
-    const entity = event.payload.payment.entity;
+    const entity = event.payload?.payment?.entity;
+    if (!entity?.id || !entity?.order_id) return res.status(400).send('Payment payload is incomplete');
     const paymentId = entity.id;
     const orderId = entity.order_id;
-    const notes = entity.notes || {};
-    
-    const companyId = parseInt(notes.companyId, 10);
-    const planIdInput = parseInt(notes.planId, 10);
+    if (!isRazorpayConfigured()) return res.status(503).send('Payment provider is not configured');
+    const razorpay = new Razorpay({ key_id: process.env.RAZORPAY_KEY_ID, key_secret: process.env.RAZORPAY_KEY_SECRET });
+    let order;
+    try { order = await razorpay.orders.fetch(orderId); }
+    catch (error) {
+      console.error('[Razorpay Webhook] Unable to load associated order:', error.message);
+      return res.status(502).send('Could not verify associated order');
+    }
+    const notes = order.notes || {};
+    verifiedOrderNotes = notes;
+    verifiedOrderPurpose = notes.purpose || null;
+    const companyId = String(notes.companyId || '');
+    const planIdInput = Number(notes.planId);
     const billingCycle = notes.billingCycle || 'monthly';
+
+    if (notes.purpose === 'trial_activation') {
+      if (!companyId || !paymentMatchesOrder({ order, payment: entity, companyId, purpose: 'trial_activation', planId: 3, billingCycle: 'trial', expectedAmountPaise: 100 })) {
+        return res.status(400).send('Trial payment does not match the expected order');
+      }
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        await client.query("SELECT pg_advisory_xact_lock(hashtext('trial_payment_' || $1))", [String(paymentId)]);
+        await client.query("SELECT pg_advisory_xact_lock(hashtext('trial_company_' || $1))", [companyId]);
+        const duplicate = await client.query("SELECT company_id FROM subscription_events WHERE metadata->>'razorpay_payment_id' = $1 LIMIT 1", [paymentId]);
+        if (duplicate.rows.length) {
+          await client.query('ROLLBACK');
+          if (String(duplicate.rows[0].company_id) !== companyId) return res.status(403).send('Payment belongs to another company');
+          return res.json({ status: 'ok', message: 'Trial payment already processed' });
+        }
+        const company = await client.query('SELECT id, plan_id, trial_started_at, is_on_trial FROM companies WHERE id = $1 FOR UPDATE', [companyId]);
+        if (!company.rows.length) {
+          await client.query('ROLLBACK');
+          return res.status(404).send('Company not found');
+        }
+        if (company.rows[0].trial_started_at || company.rows[0].is_on_trial) {
+          await client.query('ROLLBACK');
+          return res.json({ status: 'ok', message: 'Company is not eligible for another trial' });
+        }
+        await client.query(
+          `UPDATE companies SET plan_id = 3, subscription_status = 'trial', is_on_trial = TRUE,
+           trial_started_at = NOW(), trial_ends_at = NOW() + INTERVAL '30 days',
+           subscription_expires_at = NOW() + INTERVAL '30 days', updated_at = NOW() WHERE id = $1`, [companyId]
+        );
+        const metadata = JSON.stringify({ razorpay_payment_id: paymentId, razorpay_order_id: orderId, amount_paise: 100, currency: 'INR', duration_days: 30, verified: true, source: 'webhook' });
+        await client.query(`INSERT INTO subscription_events (company_id, event_type, old_plan_id, new_plan_id, metadata, created_at) VALUES ($1, 'trial_payment_verified', 1, 3, $2, NOW())`, [companyId, metadata]);
+        await client.query(`INSERT INTO subscription_events (company_id, event_type, old_plan_id, new_plan_id, metadata, created_at) VALUES ($1, 'trial_started', 1, 3, $2, NOW())`, [companyId, metadata]);
+        await client.query('COMMIT');
+        invalidatePlanCache(companyId);
+        return res.json({ status: 'ok', message: 'Trial activated' });
+      } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw error;
+      } finally {
+        client.release();
+      }
+    }
+
+    // Trial payments never enter the paid plan purchase path.
+    if (notes.purpose !== 'plan_purchase') return res.json({ status: 'ignored' });
 
     if (!companyId || isNaN(planIdInput)) {
       console.error('❌ [Razorpay Webhook] Missing companyId or planId in notes', notes);
@@ -71,6 +131,13 @@ router.post('/razorpay', async (req, res) => {
     }
 
     const planId = planIdInput;
+    const expectedAmountPaise = getPricePaise(planId, billingCycle);
+    if (![2, 3].includes(planId) || expectedAmountPaise == null || !paymentMatchesOrder({
+      order, payment: entity, companyId, purpose: 'plan_purchase', planId, billingCycle, expectedAmountPaise
+    })) {
+      console.error('[Razorpay Webhook] Captured payment does not match a configured company plan order.');
+      return res.status(400).send('Payment does not match expected plan order');
+    }
 
     console.log(`[Razorpay Webhook] Processing capture | Company ID: ${companyId} | Plan ID: ${planId} | Payment ID: ${paymentId}`);
 
@@ -79,6 +146,7 @@ router.post('/razorpay', async (req, res) => {
     try {
       await dbClient.query('BEGIN');
 
+      await dbClient.query("SELECT pg_advisory_xact_lock(hashtext('sub_payment_' || $1))", [String(paymentId)]);
       // Advisory lock per company ID ensures strict serial execution per company
       await dbClient.query(`SELECT pg_advisory_xact_lock(hashtext('sub_upgrade_' || $1))`, [String(companyId)]);
 
@@ -113,7 +181,7 @@ router.post('/razorpay', async (req, res) => {
          SET plan_id = $1, 
              subscription_status = 'active', 
              is_on_trial = FALSE, 
-             subscription_expires_at = COALESCE(GREATEST(subscription_expires_at, NOW()), NOW()) + (CASE WHEN $2 = 'yearly' THEN INTERVAL '1 year' ELSE INTERVAL '1 month' END),
+             subscription_expires_at = (CASE WHEN is_on_trial THEN NOW() WHEN subscription_expires_at > NOW() THEN subscription_expires_at ELSE NOW() END) + (CASE WHEN $2 = 'yearly' THEN INTERVAL '1 year' ELSE INTERVAL '1 month' END),
              updated_at = NOW()
          WHERE id = $3`,
         [planId, billingCycle, companyId]
@@ -145,16 +213,14 @@ router.post('/razorpay', async (req, res) => {
 
     // Generate Invoice & Email Owner
     try {
-      const planNameMap = { 1: 'Free', 2: 'Basic', 3: 'Pro' };
-      const planName = planNameMap[planId] || 'Pro';
+      const planName = getPlan(planId)?.name || 'Enterprise';
       const companyInfo = await pool.query(
-        `SELECT c.company_name, c.subscription_expires_at, u.name as owner_name, u.email as owner_email, p.price_monthly, p.price_yearly
+        `SELECT c.company_name, c.subscription_expires_at, u.name as owner_name, u.email as owner_email
          FROM companies c
          LEFT JOIN users u ON u.company_id = c.id AND u.role = 'owner'
-         LEFT JOIN plans p ON p.id = $1
-         WHERE c.id = $2
+         WHERE c.id = $1
          LIMIT 1`,
-        [planId, companyId]
+        [companyId]
       );
       if (companyInfo.rows.length > 0) {
         const info = companyInfo.rows[0];
@@ -162,7 +228,7 @@ router.post('/razorpay', async (req, res) => {
         if (ownerEmail) {
           const ownerName = info.owner_name || 'Owner';
           const invoiceNumber = `INV-SUB-${new Date().getFullYear()}-${String(companyId).padStart(4, '0')}-${Date.now().toString().slice(-4)}`;
-          const paidAmount = billingCycle === 'yearly' ? info.price_yearly : info.price_monthly;
+          const paidAmount = getPlan(planId)[billingCycle === 'yearly' ? 'priceYearly' : 'priceMonthly'];
 
           const { sendSubscriptionInvoiceEmail } = require('../services/emailNotificationService');
           sendSubscriptionInvoiceEmail({
@@ -187,14 +253,19 @@ router.post('/razorpay', async (req, res) => {
   } catch (err) {
     console.error('❌ [Razorpay Webhook] Error:', err);
 
+    // Trial retries must never fall into the paid-plan worker path.
+    if (verifiedOrderPurpose === 'trial_activation') return res.status(500).send('Trial activation will be retried by the payment provider');
+
     // Enqueue background retry job with BullMQ (3 attempts with exponential backoff)
     try {
       const { enqueueWebhookRetry } = require('../utils/queue');
       const event = req.body || {};
       const entity = event.payload?.payment?.entity || {};
-      const notes = entity.notes || {};
-      const companyId = parseInt(notes.companyId, 10) || 0;
-      const planId = parseInt(notes.planId, 10) || null;
+      // Prefer notes from the provider-fetched order. Payment webhook notes are
+      // not sufficient authority to choose a company or subscription plan.
+      const notes = verifiedOrderNotes || {};
+      const companyId = String(notes.companyId || '');
+      const planId = Number(notes.planId) || null;
 
       await enqueueWebhookRetry({
         companyId,
@@ -202,10 +273,11 @@ router.post('/razorpay', async (req, res) => {
         billingCycle: notes.billingCycle || 'monthly',
         paymentId: entity.id || null,
         orderId: entity.order_id || null,
+        purpose: notes.purpose || verifiedOrderPurpose || null,
         error: err.message
       });
 
-      if (companyId) {
+      if (companyId && notes.purpose === 'plan_purchase' && [2, 3].includes(planId)) {
         await pool.query(
           `INSERT INTO subscription_events (company_id, event_type, new_plan_id, metadata, created_at)
            VALUES ($1, 'webhook_retry_enqueued', $2, $3, NOW())`,

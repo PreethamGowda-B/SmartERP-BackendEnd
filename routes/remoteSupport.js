@@ -2,6 +2,12 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
+const { loadPlan, checkPlanLimit } = require('../middleware/planMiddleware');
+
+function checkJobPlanLimitWhenCreatingJob(req, res, next) {
+  if (req.body?.is_resolved !== false && req.body?.is_resolved !== 'false') return next();
+  return checkPlanLimit('job')(req, res, next);
+}
 
 // ─── GET /api/remote-support ────────────────────────────────────────────────
 router.get('/', authenticateToken, async (req, res) => {
@@ -48,7 +54,7 @@ router.get('/', authenticateToken, async (req, res) => {
 });
 
 // ─── POST /api/remote-support (Log Remote Support Session) ─────────────────
-router.post('/', authenticateToken, async (req, res) => {
+router.post('/', authenticateToken, loadPlan, checkJobPlanLimitWhenCreatingJob, async (req, res) => {
   try {
     const companyId = req.user.companyId || req.user.company_id;
     if (!companyId) {

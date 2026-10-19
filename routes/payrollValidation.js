@@ -2,9 +2,11 @@ const express = require('express');
 const router = express.Router();
 const { authenticateToken } = require('../middleware/authMiddleware');
 const { checkPermission } = require('../middleware/rbac');
+const { loadPlan } = require('../middleware/planMiddleware');
+const { requireFeature } = require('../middleware/featureGuard');
 const PayrollValidationService = require('../services/payrollValidationService');
 
-router.use(authenticateToken);
+router.use(authenticateToken, loadPlan, requireFeature('payroll', 'payroll validation'));
 
 /**
  * POST /api/v1/payroll/validate-pre-run

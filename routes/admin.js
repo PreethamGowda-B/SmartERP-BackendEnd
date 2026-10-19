@@ -3,6 +3,7 @@ const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 const { authenticateSuperAdmin } = require('../middleware/adminMiddleware');
+const { getPlan } = require('../services/subscriptionCatalog');
 
 // All routes in this file require both a valid token AND super_admin privileges
 router.use(authenticateToken);
@@ -212,15 +213,45 @@ router.get('/users', async (req, res) => {
 router.patch('/subscriptions/:companyId', async (req, res) => {
   const { companyId } = req.params;
   const { plan_id, expires_at } = req.body;
+  const planId = Number(plan_id);
+  const plan = getPlan(planId);
+  const expiresAt = expires_at == null || expires_at === '' ? null : new Date(expires_at);
 
+  if (!plan || ![1, 2, 3].includes(planId)) return res.status(400).json({ message: 'Invalid subscription plan.' });
+  if (planId > 1 && (expires_at == null || expires_at === '')) return res.status(400).json({ message: 'Paid plan overrides require an explicit expiry date.' });
+  if (expires_at != null && expires_at !== '' && (!Number.isFinite(expiresAt.getTime()) || expiresAt.getTime() <= Date.now())) {
+    return res.status(400).json({ message: 'Subscription expiry must be a valid future date or empty.' });
+  }
+
+  const client = await pool.connect();
   try {
-    const result = await pool.query(
-      'UPDATE companies SET plan_id = $1, subscription_expires_at = $2, is_on_trial = FALSE WHERE id = $3 RETURNING *',
-      [plan_id, expires_at, companyId]
+    await client.query('BEGIN');
+    await client.query("SELECT pg_advisory_xact_lock(hashtext('sub_upgrade_' || $1))", [String(companyId)]);
+    const before = await client.query('SELECT id, plan_id FROM companies WHERE id = $1 FOR UPDATE', [companyId]);
+    if (!before.rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Company not found.' });
+    }
+    const result = await client.query(
+      `UPDATE companies
+       SET plan_id = $1, subscription_expires_at = $2, subscription_status = 'active', is_on_trial = FALSE, updated_at = NOW()
+       WHERE id = $3 RETURNING *`,
+      [planId, expiresAt, companyId]
     );
+    await client.query(
+      `INSERT INTO subscription_events (company_id, event_type, old_plan_id, new_plan_id, metadata, created_at)
+       VALUES ($1, 'admin_plan_override', $2, $3, $4, NOW())`,
+      [companyId, before.rows[0].plan_id, planId, JSON.stringify({ actor_user_id: req.user?.id || null, expires_at: expiresAt?.toISOString() || null })]
+    );
+    await client.query('COMMIT');
+    require('../middleware/planMiddleware').invalidatePlanCache(companyId);
     res.json(result.rows[0]);
   } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('[Admin subscription override] Failed:', err.message);
     res.status(500).json({ message: 'Server error' });
+  } finally {
+    client.release();
   }
 });
 
@@ -304,16 +335,15 @@ router.get('/companies/:id', async (req, res) => {
 // Platform revenue analytics (MRR, ARR, plan breakdown)
 router.get('/revenue', async (req, res) => {
   try {
-    // Plan pricing (define here, can be moved to DB later)
-    const PLAN_PRICING = { 1: 0, 2: 999, 3: 2499 }; // Free, Basic, Pro (monthly ₹)
-
     const [planDist, recentUpgrades, churnData, monthlyRevenue] = await Promise.all([
       // Active subscriptions by plan
       pool.query(`
         SELECT p.id as plan_id, p.name as plan_name, COUNT(c.id) as company_count
         FROM companies c
         JOIN plans p ON c.plan_id = p.id
-        WHERE c.status != 'suspended' OR c.status IS NULL
+        WHERE (c.status != 'suspended' OR c.status IS NULL)
+          AND c.plan_id > 1 AND COALESCE(c.is_on_trial, FALSE) = FALSE
+          AND (c.subscription_expires_at IS NULL OR c.subscription_expires_at > NOW())
         GROUP BY p.id, p.name
         ORDER BY p.id
       `),
@@ -322,8 +352,9 @@ router.get('/revenue', async (req, res) => {
         SELECT c.company_name, p.name as plan_name, c.updated_at
         FROM companies c
         JOIN plans p ON c.plan_id = p.id
-        WHERE c.plan_id > 1 AND c.updated_at > NOW() - INTERVAL '30 days'
-        ORDER BY c.updated_at DESC
+        JOIN subscription_events se ON se.company_id = c.id AND se.event_type = 'upgrade'
+        WHERE c.plan_id > 1 AND se.created_at > NOW() - INTERVAL '30 days'
+        ORDER BY se.created_at DESC
         LIMIT 10
       `),
       // Churned (expired subscriptions)
@@ -336,10 +367,11 @@ router.get('/revenue', async (req, res) => {
       pool.query(`
         SELECT 
           TO_CHAR(DATE_TRUNC('month', created_at), 'Mon YYYY') as month,
-          COUNT(*) FILTER (WHERE plan_id = 2) as basic_count,
-          COUNT(*) FILTER (WHERE plan_id = 3) as pro_count
-        FROM companies
-        WHERE created_at > NOW() - INTERVAL '6 months'
+          COUNT(*) FILTER (WHERE new_plan_id = 2) as professional_count,
+          COUNT(*) FILTER (WHERE new_plan_id = 3) as enterprise_count
+        FROM subscription_events
+        WHERE event_type = 'upgrade' AND metadata ? 'razorpay_payment_id'
+          AND created_at > NOW() - INTERVAL '6 months'
         GROUP BY DATE_TRUNC('month', created_at)
         ORDER BY DATE_TRUNC('month', created_at) ASC
       `)
@@ -348,11 +380,12 @@ router.get('/revenue', async (req, res) => {
     // Calculate MRR
     let mrr = 0;
     const planBreakdown = planDist.rows.map(row => {
-      const price = PLAN_PRICING[row.plan_id] || 0;
+      const plan = getPlan(row.plan_id);
+      const price = plan?.priceMonthly ?? 0;
       const revenue = price * parseInt(row.company_count);
       mrr += revenue;
       return {
-        plan: row.plan_name,
+        plan: plan?.name || row.plan_name,
         count: parseInt(row.company_count),
         price,
         revenue
@@ -362,14 +395,19 @@ router.get('/revenue', async (req, res) => {
     res.json({
       mrr,
       arr: mrr * 12,
+      revenue_basis: 'estimated_active_subscription_value; billing cycle and collected settlement amounts are not fully reconciled',
+      collected_revenue: null,
       planBreakdown,
       recentUpgrades: recentUpgrades.rows,
       churned: parseInt(churnData.rows[0]?.churned || 0),
       monthlyTrend: monthlyRevenue.rows.map(r => ({
         month: r.month,
-        basicRevenue: parseInt(r.basic_count) * PLAN_PRICING[2],
-        proRevenue: parseInt(r.pro_count) * PLAN_PRICING[3],
-        total: parseInt(r.basic_count) * PLAN_PRICING[2] + parseInt(r.pro_count) * PLAN_PRICING[3]
+        basicRevenue: parseInt(r.professional_count) * (getPlan(2)?.priceMonthly || 0),
+        proRevenue: parseInt(r.enterprise_count) * (getPlan(3)?.priceMonthly || 0),
+        professionalRevenue: parseInt(r.professional_count) * (getPlan(2)?.priceMonthly || 0),
+        enterpriseRevenue: parseInt(r.enterprise_count) * (getPlan(3)?.priceMonthly || 0),
+        total: parseInt(r.professional_count) * (getPlan(2)?.priceMonthly || 0) + parseInt(r.enterprise_count) * (getPlan(3)?.priceMonthly || 0),
+        basis: 'purchase-event count multiplied by current monthly list price; not a settlement ledger'
       }))
     });
   } catch (err) {

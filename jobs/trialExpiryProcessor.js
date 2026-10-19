@@ -109,10 +109,10 @@ async function handleWarning(company, daysLeft, type) {
   if (alreadySent) return; // Already emailed them about this stage!
 
   const isTrial = type === 'trial';
-  let title = `⏳ ${isTrial ? 'Pro Trial' : 'Subscription'} Expiring in ${daysLeft} Days`;
-  if (daysLeft === 1) title = `🔴 ${isTrial ? 'Pro Trial' : 'Subscription'} Ends Tomorrow!`;
+  let title = `⏳ ${isTrial ? 'Enterprise Trial' : 'Subscription'} Expiring in ${daysLeft} Days`;
+  if (daysLeft === 1) title = `🔴 ${isTrial ? 'Enterprise Trial' : 'Subscription'} Ends Tomorrow!`;
   
-  let message = `Your ${isTrial ? 'SmartERP Pro trial' : 'subscription'} ends in ${daysLeft} day${daysLeft === 1 ? '' : 's'}. Renew now to avoid losing access to premium features.`;
+  let message = `Your ${isTrial ? 'SmartERP Enterprise trial' : 'subscription'} ends in ${daysLeft} day${daysLeft === 1 ? '' : 's'}. Review available plans before expiry.`;
   
   // 1. Send In-App Notification
   try {
@@ -132,7 +132,7 @@ async function handleWarning(company, daysLeft, type) {
   // 2. Send Email
   if (company.owner_email) {
     const subject = `Your SmartERP ${isTrial ? 'Trial' : 'Subscription'} is Expiring Soon`;
-    await sendExpiryEmail(company.owner_email, subject, message, isTrial ? 'Pro (Trial)' : 'Premium');
+    await sendExpiryEmail(company.owner_email, subject, message, isTrial ? 'Enterprise trial' : 'Premium');
   }
 
   // 3. Mark as sent
@@ -189,9 +189,9 @@ async function processSubscriptionLifecycle() {
           if (email) {
             await sendExpiryEmail(
               email, 
-              'Your SmartERP Pro Trial Has Ended', 
-              'Your 30-day Pro trial has expired. You have been downgraded to the Free plan. Renew now to restore all premium features.', 
-              'Free (Downgraded)'
+              'Your SmartERP Enterprise Trial Has Ended',
+              'Your 30-day Enterprise trial has expired. Your company is now on the Starter plan. Choose a paid plan to restore additional entitlements.',
+              'Starter (Downgraded)'
             );
           }
           // App notif
@@ -199,8 +199,8 @@ async function processSubscriptionLifecycle() {
             user_id: company.owner_id,
             company_id: company.id,
             type: 'trial_expired',
-            title: '🔔 Your Pro Trial Has Ended',
-            message: 'Your 30-day Pro trial has expired. You are now on the Free plan. Upgrade anytime.',
+            title: '🔔 Your Enterprise Trial Has Ended',
+            message: 'Your 30-day Enterprise trial has expired. You are now on the Starter plan. Upgrade anytime.',
             priority: 'high',
             data: { upgrade_url: '/owner/billing' }
           }).catch(e => {});
@@ -236,8 +236,8 @@ async function processSubscriptionLifecycle() {
             await sendExpiryEmail(
               email, 
               'Your SmartERP Subscription Has Expired', 
-              'Your paid subscription has ended. You have been moved to the Free plan. Renew your subscription immediately to avoid data access interruptions.', 
-              'Free (Expired)'
+              'Your paid subscription has ended. Your company has moved to the Starter plan. Renew your subscription to restore paid entitlements.',
+              'Starter (Expired)'
             );
           }
           await createNotification({
@@ -245,7 +245,7 @@ async function processSubscriptionLifecycle() {
             company_id: company.id,
             type: 'subscription_expired',
             title: '⚠️ Subscription Expired',
-            message: 'Your SmartERP subscription has expired. You are now on the Free plan. Renew now to restore full access.',
+            message: 'Your SmartERP subscription has expired. You are now on the Starter plan. Renew to restore paid entitlements.',
             priority: 'high',
             data: { upgrade_url: '/owner/billing' }
           }).catch(e => {});

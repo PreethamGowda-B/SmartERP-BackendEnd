@@ -57,32 +57,24 @@ function buildRlsConfig() {
  */
 async function applyRlsToClient(client) {
   const { bypassRls, role, companyId } = buildRlsConfig();
-
-  // Always reset role back to session user (postgres) first
-  await client.query('RESET ROLE').catch(() => {});
+  const safeCompany = companyId || '';
+  const safeRole = String(role || '').replace(/[^a-zA-Z0-9_-]/g, '');
 
   if (bypassRls) {
-    // Explicit bypass context (migrations, background jobs, auth routes)
+    // Single round-trip: reset role + apply bypass session config
     await client.query(
-      `SELECT
-         set_config('app.bypass_rls',         'on', false),
-         set_config('app.current_company_id', $1,   false),
-         set_config('app.current_role',       $2,   false)`,
-      [companyId || '', role || '']
+      `RESET ROLE; SELECT set_config('app.bypass_rls', 'on', false), set_config('app.current_company_id', '${safeCompany}', false), set_config('app.current_role', '${safeRole}', false);`
     ).catch(() => {});
   } else {
-    // Set session variables for row-level security (persists on client for current checkout)
+    // Single round-trip: reset role + apply RLS session config + assume smarterp_app role
     await client.query(
-      `SELECT
-         set_config('app.bypass_rls',         'off', false),
-         set_config('app.current_company_id', $1,    false),
-         set_config('app.current_role',       $2,    false)`,
-      [companyId || '', role || '']
-    ).catch(() => {});
-
-    // Structurally enforce RLS by assuming smarterp_app (which lacks BYPASSRLS)
-    await client.query('SET ROLE smarterp_app').catch((err) => {
-      console.warn('⚠️ Failed to SET ROLE smarterp_app:', err.message);
+      `RESET ROLE; SELECT set_config('app.bypass_rls', 'off', false), set_config('app.current_company_id', '${safeCompany}', false), set_config('app.current_role', '${safeRole}', false); SET ROLE smarterp_app;`
+    ).catch(async (err) => {
+      // Fallback in environments where smarterp_app role has not been provisioned
+      console.warn('⚠️ applyRlsToClient fallback:', err.message);
+      await client.query(
+        `RESET ROLE; SELECT set_config('app.bypass_rls', 'off', false), set_config('app.current_company_id', '${safeCompany}', false), set_config('app.current_role', '${safeRole}', false);`
+      ).catch(() => {});
     });
   }
 }

@@ -3,6 +3,9 @@ const router = express.Router();
 
 const { authenticateToken } = require("../middleware/authMiddleware");
 const { loadPlan } = require("../middleware/planMiddleware");
+const { requireFeature } = require("../middleware/featureGuard");
+const { resolvePlanTier } = require("../services/subscriptionCatalog");
+const { consumeAIRequest } = require("../services/aiQuota");
 
 const ContextEngine = require("../ai/context/context.engine");
 const SecurityShield = require("../ai/gateway/security.shield");
@@ -20,25 +23,31 @@ try {
   // Redis optional
 }
 
-/**
- * Resolves requesting user's plan tier with strict fail-closed fallback to "free".
- * @param {Object} req - Express Request
- * @returns {"free" | "basic" | "pro"} Lowercase plan tier
- */
-function getPlanTier(req) {
-  if (!req.plan || !req.plan.id) {
-    return "free";
-  }
-  const planId = String(req.plan.id).toLowerCase();
-  const planName = String(req.plan.name || "").toLowerCase();
-
-  if (planId.includes("pro") || planName.includes("pro")) return "pro";
-  if (planId.includes("basic") || planName.includes("basic")) return "basic";
-  return "free";
+async function enforceAIRequestQuota(req, res, next) {
+  const quota = await consumeAIRequest(redisClient, req.user?.userId || req.user?.id, getPlanTier(req));
+  if (!quota.allowed) return res.status(quota.status).json({
+    code: quota.status === 429 ? 'PLAN_LIMIT_REACHED' : 'PLAN_LIMIT_CHECK_UNAVAILABLE',
+    error: quota.error,
+    message: quota.error,
+    retryAfter: quota.retryAfter,
+    planTier: getPlanTier(req),
+    ...(quota.status === 429 ? { details: { limitType: 'ai_messages', currentCount: quota.count, maxLimit: quota.limit, currentPlan: req.plan?.name || 'Starter' } } : {})
+  });
+  next();
 }
 
-// Pro-only capability keyword/phrase list for rule-based classification
-const PRO_CAPABILITY_KEYWORDS = [
+/**
+ * Resolves the backend-authoritative plan row to its stable subscription tier.
+ * @param {Object} req - Express Request
+ * @returns {"starter" | "professional" | "enterprise"} Stable plan tier
+ */
+function getPlanTier(req) {
+  return resolvePlanTier(req.plan);
+}
+
+// Enterprise-only AI topics remain a secondary guard; requireFeature below is
+// the authoritative direct-API entitlement check.
+const ENTERPRISE_CAPABILITY_KEYWORDS = [
   "forecast",
   "forecasting",
   "executive report",
@@ -60,10 +69,10 @@ const PRO_CAPABILITY_KEYWORDS = [
  * @param {string} prompt - User message prompt
  * @returns {string|null} Matched keyword or null
  */
-function checkProCapabilityKeyword(prompt) {
+function checkEnterpriseCapabilityKeyword(prompt) {
   if (!prompt || typeof prompt !== "string") return null;
   const lower = prompt.toLowerCase();
-  for (const keyword of PRO_CAPABILITY_KEYWORDS) {
+  for (const keyword of ENTERPRISE_CAPABILITY_KEYWORDS) {
     if (lower.includes(keyword)) {
       return keyword;
     }
@@ -71,19 +80,14 @@ function checkProCapabilityKeyword(prompt) {
   return null;
 }
 
-// Rate limit caps per plan tier (requests per hour)
-const TIER_RATE_LIMITS = {
-  free: 5,
-  basic: 15,
-  pro: 30,
-};
-
 // ── POST /api/ai/agent ────────────────────────────────────────────────────────
 // Enterprise Subscription-Aware, Permission-Aware, Context-Aware AI Agent Endpoint
 router.post(
   "/agent",
   authenticateToken,
   loadPlan,
+  requireFeature('ai_assistant', 'AI assistant'),
+  enforceAIRequestQuota,
   async (req, res) => {
     const startTime = Date.now();
     try {
@@ -102,7 +106,7 @@ router.post(
         return res.status(400).json({ error: "Message prompt is required." });
       }
 
-      // 1. Resolve Plan Tier (Fail-closed to "free" if plan missing/null)
+      // 1. Resolve stable plan tier from the loaded company plan row.
       const planTier = getPlanTier(req);
 
       // 2. Sanitize & Defend Input
@@ -322,33 +326,9 @@ router.post(
         });
       }
 
-      // 3. Plan-Tier Scaled Rate Limiting (Free: 5/hr, Basic: 15/hr, Pro: 30/hr)
-      if (redisClient && redisClient.status === "ready") {
-        const userId = req.user?.userId || req.user?.id;
-        const rateLimitKey = `ai_agent:${userId}`;
-        const maxAllowed = TIER_RATE_LIMITS[planTier] || 5;
-
-        try {
-          const count = await redisClient.incr(rateLimitKey);
-          if (count === 1) {
-            await redisClient.expire(rateLimitKey, 3600);
-          }
-          if (count > maxAllowed) {
-            const ttl = await redisClient.ttl(rateLimitKey);
-            return res.status(429).json({
-              error: `AI rate limit reached (${maxAllowed} requests/hour for ${planTier.toUpperCase()} plan). Upgrade to increase limits.`,
-              retryAfter: ttl,
-              planTier,
-            });
-          }
-        } catch (redisErr) {
-          console.warn("⚠️ AI rate limit Redis error:", redisErr.message);
-        }
-      }
-
-      // 4. Rule-Based Interception for Pro-Only Capabilities on Free/Basic Plans
-      if (planTier === "free" || planTier === "basic") {
-        const matchedKeyword = checkProCapabilityKeyword(cleanMessage);
+      // 4. Secondary topic filter for Enterprise-only capabilities.
+      if (planTier !== "enterprise") {
+        const matchedKeyword = checkEnterpriseCapabilityKeyword(cleanMessage);
         if (matchedKeyword) {
           const userContext = ContextEngine.buildContext(
             req,
@@ -364,14 +344,14 @@ router.post(
           });
 
           return res.json({
-            text: "This feature requires the Pro Plan. Upgrade to unlock AI business analysis, forecasting, company insights, and advanced automation.",
+            text: "This AI capability is not included in your current plan. Review available plans with your company owner.",
             widget: null,
-            navigation: { path: "/owner/billing", label: "Upgrade to Pro Plan" },
+            navigation: { path: "/owner/billing", label: "Review available plans" },
             confidenceScore: 1.0,
             sources: ["Subscription Guard"],
             intercepted: true,
             matchedKeyword,
-            suggestedFollowUps: ["View pricing plans", "What's included in Pro?"],
+            suggestedFollowUps: ["View pricing plans", "What features are available?"],
           });
         }
       }
@@ -521,6 +501,8 @@ router.post(
   "/confirm-action",
   authenticateToken,
   loadPlan,
+  requireFeature('ai_assistant', 'AI assistant'),
+  enforceAIRequestQuota,
   async (req, res) => {
     try {
       const { toolName, params = {} } = req.body;
@@ -602,6 +584,8 @@ router.post(
   "/chat",
   authenticateToken,
   loadPlan,
+  requireFeature('ai_assistant', 'AI assistant'),
+  enforceAIRequestQuota,
   async (req, res) => {
     try {
       const { message } = req.body;

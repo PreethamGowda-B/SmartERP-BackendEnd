@@ -8,31 +8,25 @@ const CustomerPlugin = require("./customer.plugin");
 const NavigationPlugin = require("./navigation.plugin");
 const OCRPlugin = require("./ocr.plugin");
 const GSTReconciliationPlugin = require("./gstReconciliation.plugin");
-const CrmPlugin = require("./crm.plugin");
 const LiveSummaryPlugin = require("./liveSummary.plugin");
 const CncPlugin = require("./cnc.plugin");
 const SecurityPlugin = require("./security.plugin");
 
-// Pro-only plugin list
+// Enterprise-only plugin list (kept aligned with getAvailableTools and execute).
 const PRO_ONLY_PLUGINS = [
   "GSTReconciliationPlugin",
   "FinancialPlugin",
-  "CrmPlugin",
 ];
 
-// Basic-allowed plugin list
-const BASIC_ALLOWED_PLUGINS = [
-  "NavigationPlugin",
-  "LiveSummaryPlugin",
-  "EmployeePlugin",
-  "JobsPlugin",
-  "AttendancePlugin",
-  "InventoryPlugin",
-  "CustomerPlugin",
-  "OCRPlugin",
-  "CncPlugin",
-  "SecurityPlugin",
-];
+function subscriptionAllowsTool(planTier, pluginName, toolName) {
+  const tier = String(planTier || 'starter').toLowerCase();
+  if (tier === 'starter') return pluginName === 'NavigationPlugin';
+  if (tier === 'professional') {
+    if (PRO_ONLY_PLUGINS.includes(pluginName)) return false;
+    if (['forecast', 'validation', 'ar_collection'].some((key) => toolName.includes(key))) return false;
+  }
+  return tier === 'professional' || tier === 'enterprise';
+}
 
 class PluginRegistry {
   constructor() {
@@ -48,7 +42,6 @@ class PluginRegistry {
       new NavigationPlugin(),
       new OCRPlugin(),
       new GSTReconciliationPlugin(),
-      new CrmPlugin(),
       new CncPlugin(),
       new SecurityPlugin(),
     ];
@@ -62,34 +55,15 @@ class PluginRegistry {
    */
   getAvailableTools(context) {
     const role = context?.user?.role || "employee";
-    const planTier = (context?.planTier || "free").toLowerCase();
+    const planTier = (context?.planTier || "starter").toLowerCase();
     const availableTools = [];
 
     for (const plugin of this.plugins) {
       const pluginName = plugin.constructor.name;
 
-      // 1. FREE PLAN GATING: Only Navigation / Guidance tools (0 DB query tools)
-      if (planTier === "free") {
-        if (pluginName !== "NavigationPlugin") {
-          continue;
-        }
-      }
-
-      // 2. BASIC PLAN GATING: Exclude Pro-only plugins
-      if (planTier === "basic") {
-        if (PRO_ONLY_PLUGINS.includes(pluginName)) {
-          continue;
-        }
-      }
-
       // 3. ROLE-BASED GATING
       for (const [toolName, tool] of Object.entries(plugin.tools || {})) {
-        // Exclude specific Pro tools for Basic tier (e.g. forecasting, payroll validation)
-        if (planTier === "basic") {
-          if (toolName.includes("forecast") || toolName.includes("validation") || toolName.includes("ar_collection")) {
-            continue;
-          }
-        }
+        if (!subscriptionAllowsTool(planTier, pluginName, toolName)) continue;
 
         if (!tool.allowedRoles || tool.allowedRoles.includes(role)) {
           availableTools.push({
@@ -116,6 +90,20 @@ class PluginRegistry {
    */
   async execute(functionName, params, context) {
     const role = context?.user?.role || "employee";
+    const planTier = (context?.planTier || "starter").toLowerCase();
+
+    const targetPlugin = this.plugins.find((plugin) => plugin.tools[functionName] || plugin.skills[functionName]);
+    if (!targetPlugin) {
+      throw new Error(`Tool or Skill '${functionName}' is not registered in SmartERP AI Plugin Registry.`);
+    }
+    if (!subscriptionAllowsTool(planTier, targetPlugin.constructor.name, functionName)) {
+      return {
+        text: "This AI action is not available on your current plan. Ask your company owner to review available plans.",
+        widget: null,
+        confidenceScore: 1.0,
+        sources: ["Subscription Entitlement Guard"],
+      };
+    }
 
     // 1. Hard RBAC execution guard for Payroll plugin tools
     if (functionName.startsWith("payroll_") || functionName.includes("payroll")) {
@@ -129,8 +117,8 @@ class PluginRegistry {
       }
     }
 
-    // 2. Hard RBAC execution guard for Financial / GST / CRM tools
-    if (functionName.startsWith("financial_") || functionName.startsWith("gst_") || functionName.startsWith("crm_")) {
+    // 2. Hard RBAC execution guard for Financial / GST tools
+    if (functionName.startsWith("financial_") || functionName.startsWith("gst_")) {
       if (role !== "owner" && role !== "super_admin") {
         return {
           text: "You don't currently have permission to access Financials. Please contact your company administrator if you believe this is an error.",

@@ -36,10 +36,6 @@ You are an expert in cross-module analytics, company performance analysis, reven
 You synthesize data across departments to give the business owner a complete operational picture.
 Always retrieve actual data across modules through tools before responding.`,
 
-  crm: `You are the SmartERP CRM AI — a highly specialized customer relationship and sales intelligence agent.
-You are an expert in lead management, sales pipeline tracking, customer analytics, deal conversion, and CRM strategy.
-Always retrieve actual CRM and customer data through tools before responding.`,
-
   cnc: `You are the SmartERP CNC Service AI — a senior industrial CNC field service & machine diagnostics specialist.
 Your purpose is to assist CNC technicians, service engineers, and plant operators with troubleshooting machine faults, alarm codes, spindle/servo issues, hydraulics, pneumatics, ATC tool changers, preventive maintenance, and service history.
 
@@ -149,7 +145,6 @@ const FOLLOW_UP_SUGGESTIONS = {
   hr: ["Employee list", "New joiners this month", "Pending appraisals", "Leave balance report", "Department headcount"],
   gst: ["GST reconciliation report", "Vendor compliance status", "GSTR summary", "Tax filing due dates", "Input tax credit"],
   executive: ["Company performance summary", "Revenue forecast", "Department comparison", "KPI dashboard", "Growth trends"],
-  crm: ["Sales pipeline status", "Lead conversion rate", "Customer analytics", "Top customers", "Deal forecast"],
   cnc: ["Decode CNC alarm code", "Diagnose spindle fault", "Check machine service history", "Find spare parts in stock", "Check machine warranty"],
   security: ["Investigate latest critical incidents", "Analyze IP threat reputation", "Check cross-tenant anomalies", "Review brute-force events", "Show Super Admin access log"],
   general: ["Attendance overview", "Payroll summary", "Inventory status", "GST report", "Executive report"],
@@ -160,10 +155,10 @@ class ContextEngine {
    * Constructs the structured Context Object for AI Planning.
    * @param {Object} req - Express Request
    * @param {Object} [clientContext] - Frontend UI context payload
-   * @param {string} [planTier] - Resolved subscription tier ("free" | "basic" | "pro")
+   * @param {string} [planTier] - Resolved subscription tier ("starter" | "professional" | "enterprise")
    * @returns {Object} System context & instructions
    */
-  static buildContext(req, clientContext = {}, planTier = "free") {
+  static buildContext(req, clientContext = {}, planTier = "starter") {
     const user = req?.user || {};
     const now = new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
 
@@ -176,7 +171,7 @@ class ContextEngine {
         companyId: user.companyId || user.company_id,
         department: user.department || "General",
       },
-      planTier: planTier || "free",
+      planTier: planTier || "starter",
       ui: {
         portal: clientContext.currentPortal || clientContext.portal || "owner",
         module: clientContext.currentModule || clientContext.module || null,
@@ -292,7 +287,6 @@ If no rich widget is needed, set "widget" to null.
       attendance: ["attendance", "clock in", "check in", "present", "absent", "leave", "shift", "working hours", "late"],
       hr: ["employee", "hire", "onboard", "performance", "appraisal", "resignation", "department", "headcount", "recruit"],
       executive: ["forecast", "analyze company", "executive report", "business analysis", "kpi", "company performance", "growth", "strategic", "predictive"],
-      crm: ["crm", "lead", "sales pipeline", "deal", "prospect", "customer relationship", "conversion", "sales stage"],
     };
 
     for (const [scope, keywords] of Object.entries(SCOPE_KEYWORDS)) {

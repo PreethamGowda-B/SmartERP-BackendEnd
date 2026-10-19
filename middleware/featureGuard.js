@@ -29,27 +29,27 @@ function requireFeature(featureKey, featureLabel = 'premium feature') {
 
       if (featureKey === 'ai_assistant') {
         if (userRole === 'owner') {
-          friendlyMessage = "😄 Wow, someone is curious to chat with the AI! But this feature is available only for Pro plan users. Upgrade your company's SmartERP subscription to unlock the AI Assistant.";
+          friendlyMessage = "The AI assistant is not included in your current plan. Review available plans to enable it.";
         } else {
-          friendlyMessage = "🤖 I'd love to chat with you! But your company is currently on the Free plan. Ask your owner to upgrade to the Pro plan to unlock AI features.";
+          friendlyMessage = "The AI assistant is not included in your company's current plan. Ask your owner about available plans.";
         }
       } else if (featureKey === 'location_tracking' || featureKey === 'tracking') {
         if (userRole === 'owner') {
-          friendlyMessage = "🛰️ Trying to see where the magic happens? Precise location tracking is a Pro feature! Upgrade to keep a pulse on your operations.";
+          friendlyMessage = "Location tracking is not included in your current plan. Review available plans to enable it.";
         } else {
-          friendlyMessage = "📍 Location tracking is currently locked for your company. Your owner can unlock this by upgrading to the Pro plan.";
+          friendlyMessage = "Location tracking is not included in your company's current plan. Ask your owner about available plans.";
         }
       } else if (featureKey === 'payroll') {
         if (userRole === 'owner') {
-          friendlyMessage = "💰 Ready to streamline your payday? Automated payroll generation is available on Basic and Pro plans. Upgrade now to save hours of manual work!";
+          friendlyMessage = "Payroll is not included in your current plan. Review available plans to enable it.";
         } else {
-          friendlyMessage = "💸 Payroll features are locked. Ask your owner to upgrade to a paid plan to enable this.";
+          friendlyMessage = "Payroll is not included in your company's current plan. Ask your owner about available plans.";
         }
       } else if (featureKey === 'advanced_reports' || featureKey === 'reports') {
         if (userRole === 'owner') {
-          friendlyMessage = "📊 Hungry for data? Deep analytics and advanced reporting are reserved for our Pro users. Upgrade and start making data-driven decisions!";
+          friendlyMessage = "Advanced reports are not included in your current plan. Review available plans to enable them.";
         } else {
-          friendlyMessage = "📈 Advanced reports are available only on higher plans. Your owner can unlock this for the whole team!";
+          friendlyMessage = "Advanced reports are not included in your company's current plan. Ask your owner about available plans.";
         }
       } else {
         // Generic fallback

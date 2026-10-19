@@ -197,7 +197,7 @@ router.post('/', authenticateToken, loadPlan, requireFeature('payroll'), checkPe
 
 // ─── GET /api/payroll ────────────────────────────────────────────────────────
 // Get payroll records (Owner sees all, Employee sees only their own)
-router.get('/', authenticateToken, async (req, res) => {
+router.get('/', authenticateToken, loadPlan, requireFeature('payroll'), async (req, res) => {
   try {
     const { role, userId } = req.user;
     const { month, year, employee_email } = req.query;

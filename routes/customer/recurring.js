@@ -23,6 +23,7 @@ const { pool }       = require('../../db');
 const errorLogger    = require('../../utils/errorLogger');
 const { dispatchJob } = require('../../services/smartDispatch');
 const { createNotificationForOwners } = require('../../utils/notificationHelpers');
+const { loadPlan, checkPlanLimit } = require('../../middleware/planMiddleware');
 
 function ok(res, data, statusCode = 200) {
   return res.status(statusCode).json({ success: true, data, error: null });
@@ -125,7 +126,7 @@ router.delete('/:id', async (req, res) => {
 });
 
 // ─── POST /:id/run — manually trigger one instance ───────────────────────────
-router.post('/:id/run', async (req, res) => {
+router.post('/:id/run', loadPlan, checkPlanLimit('job'), async (req, res) => {
   const customerId = req.customer.id;
   const companyId  = req.customer.companyId;
   const { id }     = req.params;

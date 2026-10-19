@@ -4,8 +4,10 @@ const { authenticateToken } = require('../middleware/authMiddleware');
 const { checkPermission } = require('../middleware/rbac');
 const { pool } = require('../db');
 const ArCollectionsService = require('../services/arCollectionsService');
+const { loadPlan } = require('../middleware/planMiddleware');
+const { requireFeature } = require('../middleware/featureGuard');
 
-router.use(authenticateToken);
+router.use(authenticateToken, loadPlan, requireFeature('ar_collections', 'accounts receivable collections'));
 
 /**
  * GET /api/v1/ar-collections/summary

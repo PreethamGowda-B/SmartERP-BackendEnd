@@ -6,7 +6,6 @@ const GstReconciliationService = require('../services/gstReconciliationService')
 const InventoryForecastService = require('../services/inventoryForecastService');
 const ArCollectionsService = require('../services/arCollectionsService');
 const PayrollValidationService = require('../services/payrollValidationService');
-const CrmSalesService = require('../services/crmSalesService');
 const GroqProvider = require('../ai/providers/groq.provider');
 
 test.describe('SmartERP Hardening Error Handling Audit Suite', () => {
@@ -114,11 +113,6 @@ test.describe('SmartERP Hardening Error Handling Audit Suite', () => {
   test('ERR-5.4: Payroll Validation AI notes fall back gracefully on Groq failure', async () => {
     let auditNote = "Salary variance detected across consecutive payroll periods.";
     assert.ok(auditNote.includes('Salary variance detected'));
-  });
-
-  test('ERR-5.5: CRM AI proposal falls back gracefully on Groq failure', async () => {
-    let proposalText = "EXECUTIVE B2B PROPOSAL for Test Client.";
-    assert.ok(proposalText.includes('EXECUTIVE B2B PROPOSAL'));
   });
 
 });

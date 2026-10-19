@@ -2,9 +2,11 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
+const { loadPlan } = require('../middleware/planMiddleware');
+const { requireFeature } = require('../middleware/featureGuard');
 
 // ─── GET /api/executive-bi (Executive Business Intelligence Analytics Payload) ─
-router.get('/', authenticateToken, async (req, res) => {
+router.get('/', authenticateToken, loadPlan, requireFeature('advanced_reports', 'executive analytics'), async (req, res) => {
   try {
     const userRole = req.user.role;
     if (!['owner', 'admin', 'super_admin'].includes(userRole)) {

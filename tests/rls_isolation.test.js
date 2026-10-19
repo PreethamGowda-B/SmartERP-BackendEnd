@@ -28,7 +28,7 @@ test.describe('PostgreSQL Core Tables Row-Level Security (RLS) & Tenant Isolatio
         'notifications', 'messages', 'employee_profiles', 'material_requests',
         'employee_documents', 'subscriptions', 'subscription_events', 'activities',
         'gst_company_settings', 'inventory_forecasts', 'ar_collection_schedules',
-        'crm_leads_enhanced', 'payroll_validation_runs'
+        'payroll_validation_runs'
       ];
 
       for (const table of coreTables) {
@@ -59,7 +59,7 @@ test.describe('PostgreSQL Core Tables Row-Level Security (RLS) & Tenant Isolatio
         'notifications', 'messages', 'employee_profiles', 'material_requests',
         'employee_documents', 'subscriptions', 'subscription_events', 'activities',
         'gst_company_settings', 'inventory_forecasts', 'ar_collection_schedules',
-        'crm_leads_enhanced', 'payroll_validation_runs'
+        'payroll_validation_runs'
       ];
 
       for (const table of coreTables) {

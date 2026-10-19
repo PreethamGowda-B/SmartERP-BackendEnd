@@ -10,6 +10,7 @@ const router = express.Router();
 const bcrypt = require('bcrypt');
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
+const { loadPlan, checkPlanLimit } = require('../middleware/planMiddleware');
 
 function requireOwnerOrAdmin(req, res, next) {
   if (!['owner', 'admin'].includes(req.user?.role)) {
@@ -18,8 +19,13 @@ function requireOwnerOrAdmin(req, res, next) {
   next();
 }
 
+function checkEmployeeSeatForUser(req, res, next) {
+  if (req.body?.role && req.body.role !== 'employee') return next();
+  return checkPlanLimit('employee')(req, res, next);
+}
+
 // Create user — owner/admin only, tied to creator's company
-router.post('/', authenticateToken, requireOwnerOrAdmin, async (req, res) => {
+router.post('/', authenticateToken, requireOwnerOrAdmin, loadPlan, checkEmployeeSeatForUser, async (req, res) => {
   const { email, password, role, name } = req.body;
   const companyId = req.user.companyId;
 

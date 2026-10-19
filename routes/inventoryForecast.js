@@ -1,11 +1,13 @@
 const express = require('express');
 const router = express.Router();
 const { authenticateToken } = require('../middleware/authMiddleware');
+const { loadPlan } = require('../middleware/planMiddleware');
+const { requireFeature } = require('../middleware/featureGuard');
 const { checkPermission } = require('../middleware/rbac');
 const { pool } = require('../db');
 const InventoryForecastService = require('../services/inventoryForecastService');
 
-router.use(authenticateToken);
+router.use(authenticateToken, loadPlan, requireFeature('inventory_forecasts', 'inventory forecasting'));
 
 /**
  * GET /api/v1/inventory/forecasts

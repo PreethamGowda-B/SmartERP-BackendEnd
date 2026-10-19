@@ -46,12 +46,11 @@ describe("🛡️ Subscription-Aware, Permission-Aware & Context-Aware AI Securi
 
     const basicTools = pluginRegistry.getAvailableTools(basicContext);
     
-    // Basic tier must NOT contain Pro-only plugins (Financial, GST, CRM)
+    // Basic tier must NOT contain Pro-only plugins (Financial, GST)
     for (const tool of basicTools) {
       const toolName = tool.function.name;
       assert.equal(toolName.startsWith("financial_"), false, "Financial tools excluded from Basic");
       assert.equal(toolName.startsWith("gst_"), false, "GST tools excluded from Basic");
-      assert.equal(toolName.startsWith("crm_"), false, "CRM tools excluded from Basic");
     }
 
     const proContext = {
@@ -60,6 +59,9 @@ describe("🛡️ Subscription-Aware, Permission-Aware & Context-Aware AI Securi
     };
     const proTools = pluginRegistry.getAvailableTools(proContext);
     assert.ok(proTools.length > basicTools.length, "Pro plan must have access to all tools");
+    assert.equal(pluginRegistry.plugins.some((plugin) => plugin.constructor.name === "CrmPlugin"), false, "Retired CRM plugin must not be registered");
+    assert.equal(proTools.some((tool) => tool.function.name.startsWith("crm_")), false, "Retired CRM tools must not be available on any plan");
+    assert.notEqual(ContextEngine.detectModelScope("show me the sales pipeline"), "crm", "Retired CRM scope must not be selected");
   });
 
   // ───────────────────────────────────────────────────────────────────────────

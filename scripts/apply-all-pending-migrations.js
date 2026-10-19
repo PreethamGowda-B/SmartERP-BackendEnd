@@ -1,7 +1,7 @@
 /**
  * scripts/apply-all-pending-migrations.js
  *
- * Runs all pending database migrations (001 - 011) against the active database.
+ * Runs all pending database migrations against the active database.
  * Uses isolated connection transactions to report exact execution status for each migration file.
  */
 
@@ -21,7 +21,6 @@ const ALL_MIGRATIONS = [
   '007_inventory_forecasting.sql',
   '008_ar_collections.sql',
   '009_payroll_validation.sql',
-  '010_crm_sales_agent.sql',
   '011_standardize_uuid_and_core_rls.sql',
 ];
 

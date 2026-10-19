@@ -34,6 +34,7 @@ const { dispatchJob } = require('../../services/smartDispatch');
 const { getSuggestedPriority } = require('../../services/autoPriorityService');
 const auditService = require('../../services/auditService');
 const errorLogger = require('../../utils/errorLogger');
+const { loadPlan, checkPlanLimit } = require('../../middleware/planMiddleware');
 
 // ─── Section 8: Standardized response helpers ─────────────────────────────────
 function ok(res, data, statusCode = 200) {
@@ -107,7 +108,7 @@ router.get('/', async (req, res) => {
 });
 
 // ─── POST / — create a new job ────────────────────────────────────────────────
-router.post('/', [
+router.post('/', loadPlan, checkPlanLimit('job'), [
   body('title').trim().notEmpty().withMessage('Title is required'),
   body('priority')
     .optional()

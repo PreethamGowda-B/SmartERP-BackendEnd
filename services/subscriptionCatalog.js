@@ -1,7 +1,7 @@
 const SUBSCRIPTION_PLANS = Object.freeze({
-  1: Object.freeze({ key: 'starter', name: 'Starter', priceMonthly: 0, priceYearly: 0, employeeLimit: 10 }),
-  2: Object.freeze({ key: 'professional', name: 'Professional', priceMonthly: 999, priceYearly: 9990, employeeLimit: 50 }),
-  3: Object.freeze({ key: 'enterprise', name: 'Enterprise', priceMonthly: 2499, priceYearly: 24990, employeeLimit: null })
+  1: Object.freeze({ key: 'starter', name: 'Starter', priceMonthly: 0, priceYearly: 0, employeeLimit: 10, activeJobsLimit: 15, inventoryItemsLimit: 50, storageBytesLimit: 250 * 1024 * 1024 }),
+  2: Object.freeze({ key: 'professional', name: 'Professional', priceMonthly: 999, priceYearly: 9990, employeeLimit: 50, activeJobsLimit: 100, inventoryItemsLimit: 500, storageBytesLimit: 5 * 1024 * 1024 * 1024 }),
+  3: Object.freeze({ key: 'enterprise', name: 'Enterprise', priceMonthly: 2499, priceYearly: 24990, employeeLimit: null, activeJobsLimit: null, inventoryItemsLimit: null, storageBytesLimit: null })
 });
 
 function getPlan(planId) {
@@ -24,6 +24,11 @@ function isUnlimitedPlan(plan) {
 function getEmployeeLimit(planId) {
   const plan = getPlan(planId);
   return plan ? plan.employeeLimit : undefined;
+}
+
+function getPlanLimit(planId, limitName) {
+  const plan = getPlan(planId);
+  return plan && Object.hasOwn(plan, limitName) ? plan[limitName] : undefined;
 }
 
 function getPricePaise(planId, billingCycle) {
@@ -56,4 +61,4 @@ function paymentMatchesOrder({ order, payment, companyId, purpose, planId, billi
   return true;
 }
 
-module.exports = { SUBSCRIPTION_PLANS, getPlan, resolvePlanTier, isUnlimitedPlan, getEmployeeLimit, getPricePaise, isRazorpayConfigured, verifyCheckoutSignature, paymentMatchesOrder };
+module.exports = { SUBSCRIPTION_PLANS, getPlan, resolvePlanTier, isUnlimitedPlan, getEmployeeLimit, getPlanLimit, getPricePaise, isRazorpayConfigured, verifyCheckoutSignature, paymentMatchesOrder };

@@ -6,6 +6,7 @@ const {
   resolvePlanTier,
   isUnlimitedPlan,
   getEmployeeLimit,
+  getPlanLimit,
   getPricePaise,
   verifyCheckoutSignature,
   paymentMatchesOrder
@@ -35,6 +36,11 @@ test('canonical plan catalog contains the approved customer prices and stable ID
   assert.equal(getEmployeeLimit(2), 50);
   assert.equal(getEmployeeLimit(3), null);
   assert.equal(getEmployeeLimit(99), undefined);
+  assert.equal(getPlanLimit(1, 'activeJobsLimit'), 15);
+  assert.equal(getPlanLimit(2, 'inventoryItemsLimit'), 500);
+  assert.equal(getPlanLimit(2, 'storageBytesLimit'), 5 * 1024 * 1024 * 1024);
+  assert.equal(getPlanLimit(3, 'activeJobsLimit'), null);
+  assert.equal(getPlanLimit(99, 'activeJobsLimit'), undefined);
 });
 
 test('checkout signature verification is timing-safe and rejects malformed or forged input', () => {

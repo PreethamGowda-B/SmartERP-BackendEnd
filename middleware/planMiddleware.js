@@ -5,7 +5,7 @@
 
 const { pool } = require('../db');
 const { redisClient } = require('../utils/redis');
-const { getPlan, isUnlimitedPlan, getEmployeeLimit, resolvePlanTier } = require('../services/subscriptionCatalog');
+const { getPlan, getPlanLimit, isUnlimitedPlan, getEmployeeLimit, resolvePlanTier } = require('../services/subscriptionCatalog');
 const { consumeAIRequest } = require('../services/aiQuota');
 const NodeCache = require('node-cache');
 
@@ -114,6 +114,9 @@ async function loadPlan(req, res, next) {
     }
 
     const data = result.rows[0];
+    if (!getPlan(data.plan_db_id)) {
+      return res.status(503).json({ message: 'Subscription plan data is invalid. Please contact support.' });
+    }
     const now = new Date();
     const trialEnds = data.trial_ends_at ? new Date(data.trial_ends_at) : null;
     const trialActive = data.is_on_trial && trialEnds && trialEnds > now;
@@ -278,7 +281,10 @@ function checkPlanLimit(limitType) {
         currentCount = parseInt(countRes.rows[0]?.count || 0, 10);
         limitLabel = 'Employees';
       } else if (limitType === 'job') {
-        maxLimit = plan.id === 2 ? 100 : 15;
+        maxLimit = getPlanLimit(plan.id, 'activeJobsLimit');
+        if (maxLimit === undefined || maxLimit === null) {
+          return res.status(503).json({ code: 'PLAN_LIMIT_UNAVAILABLE', message: 'Could not verify the active job limit for this plan.' });
+        }
         const countRes = await pool.query(
           `SELECT COUNT(*) AS count FROM jobs WHERE company_id = $1 AND status NOT IN ('completed', 'cancelled')`,
           [companyId]
@@ -286,7 +292,10 @@ function checkPlanLimit(limitType) {
         currentCount = parseInt(countRes.rows[0]?.count || 0, 10);
         limitLabel = 'Active Jobs';
       } else if (limitType === 'inventory') {
-        maxLimit = plan.max_inventory_items ?? (plan.id >= 3 ? Number.POSITIVE_INFINITY : 50);
+        maxLimit = plan.max_inventory_items ?? getPlanLimit(plan.id, 'inventoryItemsLimit');
+        if (maxLimit === undefined || maxLimit === null) {
+          return res.status(503).json({ code: 'PLAN_LIMIT_UNAVAILABLE', message: 'Could not verify the inventory limit for this plan.' });
+        }
         const countRes = await pool.query(
           `SELECT COUNT(*) AS count FROM inventory_items WHERE company_id = $1 AND (is_deleted = FALSE OR is_deleted IS NULL)`,
           [companyId]
@@ -294,8 +303,10 @@ function checkPlanLimit(limitType) {
         currentCount = parseInt(countRes.rows[0]?.count || 0, 10);
         limitLabel = 'Inventory Items';
       } else if (limitType === 'storage') {
-        // Bytes: 250MB vs 5GB
-        maxLimit = plan.id === 2 ? 5 * 1024 * 1024 * 1024 : 250 * 1024 * 1024;
+        maxLimit = getPlanLimit(plan.id, 'storageBytesLimit');
+        if (maxLimit === undefined || maxLimit === null) {
+          return res.status(503).json({ code: 'PLAN_LIMIT_UNAVAILABLE', message: 'Could not verify the storage limit for this plan.' });
+        }
         const countRes = await pool.query(
           `SELECT COALESCE(SUM(file_size), 0) AS bytes FROM documents WHERE company_id = $1`,
           [companyId]

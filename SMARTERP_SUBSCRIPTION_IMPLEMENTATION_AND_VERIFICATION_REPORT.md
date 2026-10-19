@@ -146,4 +146,8 @@ This checkout also contained other intended portal and documentation edits/delet
 7. **Implement or explicitly defer lifecycle policies.** Cancellation, renewal, disputes, and settlement reconciliation need business/provider rules. The current source does not demonstrate these as complete.
 8. **Verify actual UI workflows** against the isolated API and browser after database/provider setup.
 
-**Readiness decision:** source-level safeguards and UI consistency have improved and local checks pass. Feature entitlements, plan rows, payment persistence, and provider/database integration remain incomplete or unverified. Do not market the feature matrix or accept live payments based on this report.
+**Readiness decision:** source-level safeguards and UI consistency have improved and local checks pass. Feature entitlements, plan rows, payment persistence, and provider/database integration remain incomplete or unverified. Do not market the feature matrix or accept live payments based on this report.## 9. Git delivery
+
+- Frontend `main`: `4ef21f0eb31cf53bd066285293d1b3e44eae402e` — removes the unsupported Super Admin refund UI.
+- Backend `main`: `7e1cbcde6202789d8a5679801f1936fd781a47ac` — hardens the alternate plan override and blocks false-success refund mutations; includes this report.
+- The source implementation commits are intended for the repositories' existing `main` branches. Push status is confirmed separately in the completion summary.

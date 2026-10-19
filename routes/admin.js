@@ -68,11 +68,11 @@ router.get('/dashboard', async (req, res) => {
     // 4. Subscription Distribution
     const distQuery = pool.query(`
       SELECT 
-        COALESCE(p.name, 'Free') as name,
+        p.id as plan_id,
         COUNT(c.id) as value
       FROM companies c
       LEFT JOIN plans p ON c.plan_id = p.id
-      GROUP BY p.name
+      GROUP BY p.id
     `);
 
     // 5. Recent System Pulse (10 latest activities)
@@ -114,7 +114,10 @@ router.get('/dashboard', async (req, res) => {
       charts: {
         companyGrowth: growth.rows.map(r => ({ date: r.date.toISOString().split('T')[0], count: parseInt(r.count) })),
         userGrowth: userGrowth.rows.map(r => ({ date: r.date.toISOString().split('T')[0], count: parseInt(r.count) })),
-        subscriptionDistribution: dist.rows.map(r => ({ name: r.name, value: parseInt(r.value) }))
+        subscriptionDistribution: dist.rows.map(r => ({
+          name: getPlan(r.plan_id)?.name || (r.plan_id == null ? 'Unmapped plan (missing)' : `Unmapped plan (${r.plan_id})`),
+          value: parseInt(r.value)
+        }))
       },
       pulse: pulse.rows,
       timestamp: new Date().toISOString()
@@ -140,7 +143,10 @@ router.get('/companies', async (req, res) => {
       LEFT JOIN plans p ON c.plan_id = p.id
       ORDER BY c.created_at DESC
     `);
-    res.json(result.rows);
+    res.json(result.rows.map(row => ({
+      ...row,
+      plan_name: getPlan(row.plan_id)?.name || (row.plan_id == null ? null : `Unmapped plan (${row.plan_id})`)
+    })));
   } catch (err) {
     console.error('❌ Error fetching companies:', err);
     res.status(500).json({ message: 'Server error fetching companies' });
@@ -320,10 +326,17 @@ router.get('/companies/:id', async (req, res) => {
 
     if (companyRes.rows.length === 0) return res.status(404).json({ message: 'Company not found' });
 
+    const company = companyRes.rows[0];
+    company.plan_name = getPlan(company.plan_id)?.name || (company.plan_id == null ? null : `Unmapped plan (${company.plan_id})`);
+    const plans = planRes.rows.map(plan => ({
+      ...plan,
+      name: getPlan(plan.id)?.name || `Unmapped plan (${plan.id})`
+    }));
+
     res.json({
-      company: companyRes.rows[0],
+      company,
       users: usersRes.rows,
-      plans: planRes.rows
+      plans
     });
   } catch (err) {
     console.error('❌ Company detail error:', err);
@@ -349,7 +362,7 @@ router.get('/revenue', async (req, res) => {
       `),
       // Recent upgrades (last 30 days)
       pool.query(`
-        SELECT c.company_name, p.name as plan_name, c.updated_at
+        SELECT c.company_name, p.id as plan_id, p.name as plan_name, c.updated_at
         FROM companies c
         JOIN plans p ON c.plan_id = p.id
         JOIN subscription_events se ON se.company_id = c.id AND se.event_type = 'upgrade'
@@ -398,7 +411,10 @@ router.get('/revenue', async (req, res) => {
       revenue_basis: 'estimated_active_subscription_value; billing cycle and collected settlement amounts are not fully reconciled',
       collected_revenue: null,
       planBreakdown,
-      recentUpgrades: recentUpgrades.rows,
+      recentUpgrades: recentUpgrades.rows.map(row => ({
+        ...row,
+        plan_name: getPlan(row.plan_id)?.name || `Unmapped plan (${row.plan_id})`
+      })),
       churned: parseInt(churnData.rows[0]?.churned || 0),
       monthlyTrend: monthlyRevenue.rows.map(r => ({
         month: r.month,
@@ -922,7 +938,10 @@ router.get('/subscriptions/history', async (req, res) => {
     ]);
 
     res.json({
-      history: result.rows,
+      history: result.rows.map(row => ({
+        ...row,
+        plan_name: getPlan(row.plan_id)?.name || `Unmapped plan (${row.plan_id})`
+      })),
       pagination: { page, limit, total: parseInt(count.rows[0].total), pages: Math.ceil(count.rows[0].total / limit) }
     });
   } catch (err) {

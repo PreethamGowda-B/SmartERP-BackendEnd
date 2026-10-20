@@ -452,3 +452,43 @@ has not been established from this evidence.
 3. Run database-backed subscription lifecycle/payment tests and browser-level
    responsive pricing/checkout tests only after the isolated test database,
    Razorpay test mode, and browser test identity are confirmed.
+
+## 16. Phase 4 — Database-backed verification and current status — 2026-10-20
+
+The user confirmed that the available SmartERP accounts and records are test
+data and authorized work/testing on the existing `main` branches. The configured
+database connection succeeded. It identifies the database as `postgres` and
+the connected role as `postgres`; that role has `BYPASSRLS`. This is not a
+least-privilege migration identity, so no migration was rerun. Migration 037 is
+already present in `app_migration_history` with checksum
+`1901ecd40fdf5e7ebaa9b96b0422cbeded9e2c914af2035f240d9c1f2e01b6f6`.
+
+| Requirement | Status | Evidence / remaining work |
+|---|---|---|
+| Migration 037 | **PASS (recorded as applied)** | Read-only inspection found the migration history row and checksum. No migration was executed in this verification pass. |
+| Canonical subscription plans | **PASS (database read-only check)** | `assertCanonicalPlans` and the migration schema validator passed inside a read-only transaction. Starter, Professional, and Enterprise rows match catalog prices, quotas, and complete feature flags; priority support is disabled on all three. |
+| Subscription schema, RLS and app grants | **PASS (read-only schema check)** | Required storage, payment, and attempt tables/columns, company FK types, forced RLS policies, `smarterp_app` schema/table privileges, and storage-ledger backfill coverage passed the project's schema validator. The `smarterp_app` role is neither superuser nor `BYPASSRLS`. |
+| Cross-company isolation | **PASS (transactional test; no persisted rows)** | Temporary synthetic rows were inserted and rolled back. Under `SET LOCAL ROLE smarterp_app`, each company context saw only its own payment, attempt, and storage rows. |
+| Payment persistence and idempotency | **PASS (transactional test; no persisted rows)** | Actual payment service functions created one payment and one attempt for repeated captured-payment processing, treated repeated pending orders idempotently, and rejected replay under a different company. The transaction was rolled back. |
+| Concurrent storage quota | **PASS (database-backed middleware test)** | Two concurrent requests that together exceeded a bounded plan's remaining storage were serialized: one was allowed and one denied with `PLAN_LIMIT_REACHED`. The temporary ledger row was removed; cleanup reported success. |
+| Inventory direct-API and concurrent quota | **PARTIAL** | Source/unit coverage is present, but this pass did not issue authenticated HTTP inventory creation/restoration requests or a database-backed concurrent inventory request pair. |
+| Trial expiry/cache and monthly/yearly purchase lifecycle | **PARTIAL** | Source-level tests pass. The configured database was not used to exercise a clock-controlled trial expiry/cache invalidation lifecycle, and no purchase lifecycle was driven through the API. |
+| Razorpay provider verification | **NOT TESTED** | A configured key ID is not `rzp_test_` prefixed. No provider or webhook calls were made. Test-mode credentials and webhook configuration are still required to validate real provider order/capture/signature/replay/refund behavior. |
+| Browser and responsive pricing verification | **NOT TESTED** | No Playwright/Cypress runner is configured. The computer-use safety helper could not determine the active browser URL and stopped the UI path; the public pricing URL could not be fetched. No desktop/mobile visual result is claimed. |
+| Test suite/static checks | **PASS (local)** | Backend selected suites: 23/23; backend `npm test`: 84/84; forward-migration/policy suites: 12/12; frontend subscription suite: 2/2; TypeScript and production build passed. Frontend lint exited 0 with existing warnings. Both repositories passed `git diff --check`. |
+| Broad backend `test:all` | **PARTIAL** | The earlier run reported account-deletion failures/database ownership warning and was stopped; it is not a passing result. |
+
+No migration, seed, or permanent test record was created during Phase 4.
+Database-backed checks used transactions and rolled back or explicitly removed
+temporary rows. The checked database identity is the Supabase default
+`postgres` database and `postgres` role. The user confirms the data is test data;
+the identity still does not establish project-level isolation. Do not rerun
+migration 037 as it is recorded as applied. For future migration work, use the
+existing guarded procedure with a non-superuser, non-`BYPASSRLS` role and its
+required identity marker.
+
+The source changes and prior report were pushed on the existing `main` branches
+(`SmartERP-BackendEnd` `b730822`, `SmartERP-Frontend` `37baca8`). The pool fix
+still needs a deployment log check confirming there is no `DB_POOL_MAX` override
+above 4 and that `EMAXCONNSESSION` has stopped. No claim is made that browser or
+Razorpay sandbox acceptance is complete.

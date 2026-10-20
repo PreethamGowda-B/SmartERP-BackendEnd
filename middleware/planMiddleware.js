@@ -29,6 +29,7 @@ async function loadPlan(req, res, next) {
             inventory_images: true, priority_support: true, location_tracking: true,
             ar_collections: true, inventory_forecasts: true
           },
+          support_policy: getPlan(3).supportPolicy,
           is_trial: false,
           days_remaining: 36500,
           trial_ends_at: null,
@@ -107,7 +108,7 @@ async function loadPlan(req, res, next) {
         );
         if (freeResult.rows.length > 0) {
           const starter = getPlan(1);
-          req.plan = { ...freeResult.rows[0], plan_key: starter.key, name: starter.name, employee_limit: starter.employeeLimit, features: starter.features, is_trial: false, days_remaining: 0, trial_ends_at: null };
+          req.plan = applyCanonicalPlanFeatures({ ...freeResult.rows[0], plan_key: starter.key, name: starter.name, employee_limit: starter.employeeLimit, features: starter.features, is_trial: false, days_remaining: 0, trial_ends_at: null });
           return next();
         }
       } catch (fallbackErr) {

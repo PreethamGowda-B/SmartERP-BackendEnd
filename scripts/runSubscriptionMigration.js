@@ -80,10 +80,15 @@ async function runMigration() {
         const sql = fs.readFileSync(path.join(__dirname, '../migrations', migration.file), 'utf8');
         const result = await applyForwardMigration(client, { migrationId: MIGRATION_ID, sql });
 
+        const supportPolicyColumn = await client.query(`
+          SELECT EXISTS (SELECT 1 FROM information_schema.columns
+            WHERE table_schema='public' AND table_name='plans' AND column_name='support_policy') AS present
+        `);
+        const supportPolicySelection = supportPolicyColumn.rows[0]?.present ? ', support_policy' : '';
         const plans = await client.query(
           `SELECT id, name, price_monthly, price_yearly, employee_limit,
                   max_active_jobs, max_inventory_items, max_storage_bytes,
-                  max_material_requests, messages_history_days, features
+                  max_material_requests, messages_history_days, features${supportPolicySelection}
              FROM plans WHERE id IN (1,2,3) ORDER BY id`
         );
         assertCanonicalPlans(plans.rows);

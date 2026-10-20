@@ -20,7 +20,7 @@ const PLAN_FEATURES = Object.freeze({
     export_reports: true,
     advanced_reports: true,
     inventory_images: true,
-    priority_support: false,
+    priority_support: true,
     location_tracking: true,
     ar_collections: true,
     inventory_forecasts: true
@@ -33,21 +33,31 @@ const PLAN_FEATURES = Object.freeze({
     export_reports: true,
     advanced_reports: true,
     inventory_images: true,
-    priority_support: false,
+    priority_support: true,
     location_tracking: true,
     ar_collections: true,
     inventory_forecasts: true
   })
 });
 
+const SUPPORT_HOURS = Object.freeze({
+  timezone: 'Asia/Kolkata',
+  businessDays: Object.freeze([1, 2, 3, 4, 5]),
+  businessHours: Object.freeze({ start: '09:00', end: '18:00' }),
+});
+
 const SUBSCRIPTION_PLANS = Object.freeze({
-  1: Object.freeze({ key: 'starter', name: 'Starter', priceMonthly: 0, priceYearly: 0, employeeLimit: 10, activeJobsLimit: 15, inventoryItemsLimit: 50, storageBytesLimit: 250 * 1024 * 1024, features: PLAN_FEATURES.starter }),
-  2: Object.freeze({ key: 'professional', name: 'Professional', priceMonthly: 999, priceYearly: 9990, employeeLimit: 50, activeJobsLimit: 100, inventoryItemsLimit: 500, storageBytesLimit: 5 * 1024 * 1024 * 1024, features: PLAN_FEATURES.professional }),
-  3: Object.freeze({ key: 'enterprise', name: 'Enterprise', priceMonthly: 2499, priceYearly: 24990, employeeLimit: null, activeJobsLimit: null, inventoryItemsLimit: null, storageBytesLimit: null, features: PLAN_FEATURES.enterprise })
+  1: Object.freeze({ key: 'starter', name: 'Starter', priceMonthly: 0, priceYearly: 0, employeeLimit: 10, activeJobsLimit: 15, inventoryItemsLimit: 50, storageBytesLimit: 250 * 1024 * 1024, features: PLAN_FEATURES.starter, supportPolicy: Object.freeze({ ...SUPPORT_HOURS, channels: Object.freeze(['email']), firstResponseBusinessHours: 18 }) }),
+  2: Object.freeze({ key: 'professional', name: 'Professional', priceMonthly: 999, priceYearly: 9990, employeeLimit: 50, activeJobsLimit: 100, inventoryItemsLimit: 500, storageBytesLimit: 5 * 1024 * 1024 * 1024, features: PLAN_FEATURES.professional, supportPolicy: Object.freeze({ ...SUPPORT_HOURS, channels: Object.freeze(['email', 'whatsapp']), firstResponseBusinessHours: 9 }) }),
+  3: Object.freeze({ key: 'enterprise', name: 'Enterprise', priceMonthly: 2499, priceYearly: 24990, employeeLimit: null, activeJobsLimit: null, inventoryItemsLimit: null, storageBytesLimit: null, features: PLAN_FEATURES.enterprise, supportPolicy: Object.freeze({ ...SUPPORT_HOURS, channels: Object.freeze(['email', 'whatsapp']), firstResponseBusinessHours: 4 }) })
 });
 
 function getPlan(planId) {
   return SUBSCRIPTION_PLANS[Number(planId)] || null;
+}
+
+function getSupportPolicy(planId) {
+  return getPlan(planId)?.supportPolicy || null;
 }
 
 function applyCanonicalPlanFeatures(plan) {
@@ -59,7 +69,8 @@ function applyCanonicalPlanFeatures(plan) {
     plan_key: canonicalPlan.key,
     name: canonicalPlan.name,
     employee_limit: canonicalPlan.employeeLimit,
-    features: canonicalPlan.features
+    features: canonicalPlan.features,
+    support_policy: canonicalPlan.supportPolicy
   };
 }
 
@@ -116,4 +127,4 @@ function paymentMatchesOrder({ order, payment, companyId, purpose, planId, billi
   return true;
 }
 
-module.exports = { PLAN_FEATURES, SUBSCRIPTION_PLANS, getPlan, applyCanonicalPlanFeatures, resolvePlanTier, isUnlimitedPlan, getEmployeeLimit, getPlanLimit, getPricePaise, isRazorpayConfigured, verifyCheckoutSignature, paymentMatchesOrder };
+module.exports = { PLAN_FEATURES, SUPPORT_HOURS, SUBSCRIPTION_PLANS, getPlan, getSupportPolicy, applyCanonicalPlanFeatures, resolvePlanTier, isUnlimitedPlan, getEmployeeLimit, getPlanLimit, getPricePaise, isRazorpayConfigured, verifyCheckoutSignature, paymentMatchesOrder };

@@ -10,6 +10,7 @@ const {
   assertTargetConfiguration,
   assertLegacyPlanMapping,
   assertCanonicalPlans,
+  assertSupportPolicyRows,
   assertNoStorageBackfillGaps,
 } = require('../scripts/subscriptionMigrationChecks');
 const { SUBSCRIPTION_PLANS } = require('../services/subscriptionCatalog');
@@ -42,6 +43,14 @@ test('migration 037 remains explicitly registered but is excluded from startup a
   const autoMigrate = fs.readFileSync(path.join(__dirname, '../migrations/autoMigrate.js'), 'utf8');
   assert.match(autoMigrate, /'037_subscription_catalog_and_storage\.sql'/);
   assert.match(autoMigrate, /filename === '037_subscription_catalog_and_storage\.sql'/);
+});
+
+test('migration 038 support policy is registered for repeatable startup application', () => {
+  assert.ok(FORWARD_MIGRATIONS.some(item => item.id === '038_tiered_support_entitlements'));
+  assert.ok(STARTUP_MIGRATIONS.some(item => item.id === '038_tiered_support_entitlements'));
+  const migration = fs.readFileSync(path.join(__dirname, '../migrations/038_tiered_support_entitlements.sql'), 'utf8');
+  assert.match(migration, /ADD COLUMN IF NOT EXISTS support_policy/);
+  assert.match(migration, /CREATE INDEX IF NOT EXISTS/);
 });
 
 test('explicit migration script validates configured target before creating its connection pool', () => {
@@ -116,6 +125,16 @@ test('canonical migration verification checks every catalog price, quota, and fe
   assert.doesNotThrow(() => assertCanonicalPlans(rows));
   assert.throws(() => assertCanonicalPlans(rows.map(row => row.id === 1 ? { ...row, max_storage_bytes: 123 } : row)), /max_storage_bytes/);
   assert.throws(() => assertCanonicalPlans(rows.map(row => row.id === 2 ? { ...row, features: { ...row.features, payroll: false } } : row)), /feature flags/);
+});
+
+test('support plan migration verifier requires exact channels, response target, and legacy flag', () => {
+  const rows = Object.entries(SUBSCRIPTION_PLANS).map(([id, plan]) => ({
+    id: Number(id), features: { ...plan.features }, support_policy: JSON.parse(JSON.stringify(plan.supportPolicy)),
+  }));
+  assert.doesNotThrow(() => assertSupportPolicyRows(rows));
+  assert.throws(() => assertSupportPolicyRows(rows.map(row => row.id === 2
+    ? { ...row, support_policy: { ...row.support_policy, channels: ['email'] } }
+    : row)), /plan 2/);
 });
 
 test('migration SQL retains transaction-safe and tenant-scoped protections', () => {

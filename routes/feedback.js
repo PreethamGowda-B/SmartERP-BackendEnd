@@ -17,6 +17,10 @@ router.post('/', authenticateToken, async (req, res) => {
   } = req.body;
   const userId = req.user.id;
 
+  if (type === 'support') {
+    return res.status(400).json({ error: 'Create support requests through /api/support/tickets so plan channels and response targets are enforced.' });
+  }
+
   if (!message) {
     return res.status(400).json({ error: 'Message is required' });
   }
@@ -173,6 +177,26 @@ router.patch('/:id/status', authenticateToken, async (req, res) => {
   }
 
   try {
+    if (status === 'replied') {
+      const companyId = req.user.role === 'super_admin'
+        ? null
+        : (req.user.companyId || req.user.company_id);
+      if (req.user.role !== 'super_admin' && !companyId) {
+        return res.status(401).json({ error: 'Unauthorized: Missing company context.' });
+      }
+      const ticket = await pool.query(
+        `SELECT f.type FROM feedback f
+          WHERE f.id = $1
+            AND ($2::text IS NULL OR f.company_id = $2 OR EXISTS (
+              SELECT 1 FROM users u WHERE u.id = f.user_id AND u.company_id::text = $2
+            ))`,
+        [id, companyId ? String(companyId) : null]
+      );
+      if (ticket.rows[0]?.type === 'support') {
+        return res.status(400).json({ error: 'Use the support reply action to record a first response.' });
+      }
+    }
+
     let result;
     if (req.user.role === 'super_admin') {
       result = await pool.query(
@@ -243,13 +267,17 @@ router.patch('/:id/reply', authenticateToken, async (req, res) => {
 
     const updateRes = await pool.query(
       `UPDATE feedback 
-       SET status = 'replied', admin_reply = $1, replied_at = NOW() 
+       SET status = 'replied', admin_reply = $1, replied_at = NOW(),
+           support_first_responded_at = CASE
+             WHEN type = 'support' THEN COALESCE(support_first_responded_at, NOW())
+             ELSE support_first_responded_at
+           END
        WHERE id = $2 
        RETURNING *`,
       [replyMessage, id]
     );
 
-    if (feedback.user_email) {
+    if (feedback.user_email && feedback.support_channel !== 'whatsapp') {
       const { sendFeedbackReplyEmail } = require('../services/emailNotificationService');
       await sendFeedbackReplyEmail({
         email: feedback.user_email,
@@ -275,7 +303,9 @@ router.patch('/:id/reply', authenticateToken, async (req, res) => {
 
     res.json({
       success: true,
-      message: 'Reply sent successfully',
+      message: feedback.support_channel === 'whatsapp'
+        ? 'WhatsApp response recorded successfully.'
+        : 'Reply sent successfully',
       data: updateRes.rows[0]
     });
 

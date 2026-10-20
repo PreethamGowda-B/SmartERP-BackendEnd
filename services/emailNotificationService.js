@@ -238,6 +238,39 @@ async function sendFeedbackReplyEmail({ email, name, subject, originalMessage, r
   }
 }
 
+async function sendSupportTicketNotification({ ticketId, companyId, userName, userEmail, planName, channel, responseDueAt }) {
+  try {
+    const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    })[character]);
+    const dueText = new Date(responseDueAt).toLocaleString('en-IN', {
+      timeZone: 'Asia/Kolkata', dateStyle: 'medium', timeStyle: 'short'
+    });
+    const recipient = process.env.SUPPORT_TICKETS_EMAIL || 'prozyncinnovations@gmail.com';
+    const body = `
+      <h2 style="margin:0 0 12px;color:#1e293b;">New SmartERP support request #${escapeHtml(ticketId)}</h2>
+      <p style="color:#475569;">A customer request is waiting in the Feedback &amp; Support Hub.</p>
+      <ul style="color:#334155;line-height:1.8;">
+        <li>Company: ${escapeHtml(companyId)}</li>
+        <li>Requester: ${escapeHtml(userName)} (${escapeHtml(userEmail)})</li>
+        <li>Plan: ${escapeHtml(planName)}</li>
+        <li>Channel: ${escapeHtml(channel)}</li>
+        <li>First response due: ${escapeHtml(dueText)} IST</li>
+      </ul>
+      <p>Open the SmartERP Feedback &amp; Support Hub to review and respond.</p>
+    `;
+    await resend.emails.send({
+      from: FROM_EMAIL,
+      to: recipient,
+      subject: `SmartERP support request #${ticketId} · ${planName}`,
+      html: htmlWrapper(`New Support Request ${ticketId}`, body),
+    });
+    console.log(`✅ [EmailService] Support ticket notification sent for ticket ${ticketId}`);
+  } catch (err) {
+    console.error('❌ [EmailService] Failed to notify support inbox:', err.message);
+  }
+}
+
 // ─── 6. Subscription Invoice & Receipt Email (to Owner) ────────────────────
 async function sendSubscriptionInvoiceEmail({
   ownerEmail,
@@ -345,5 +378,6 @@ module.exports = {
   sendWelcomeEmail,
   sendJobCompletedEmail,
   sendFeedbackReplyEmail,
+  sendSupportTicketNotification,
   sendSubscriptionInvoiceEmail
 };

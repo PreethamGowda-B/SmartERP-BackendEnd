@@ -492,3 +492,52 @@ The source changes and prior report were pushed on the existing `main` branches
 still needs a deployment log check confirming there is no `DB_POOL_MAX` override
 above 4 and that `EMAXCONNSESSION` has stopped. No claim is made that browser or
 Razorpay sandbox acceptance is complete.
+
+## 17. Tiered support implementation — 2026-10-20
+
+The support policy approved after the screenshot question is now represented
+in the backend catalog, plan API, status API, UI, pricing cards, support request
+workflow, and an additive migration. This section supersedes the earlier
+statement that priority support is disabled for every plan.
+
+| Plan | Allowed channels | First human response target |
+|---|---|---|
+| Starter/basic | Company support email | 18 business hours (two 9-hour business days) |
+| Professional | Company support email and WhatsApp | 9 business hours (one business day) |
+| Enterprise | Company support email and WhatsApp | 4 business hours |
+| ₹1 trial | Enterprise policy while trial is active | 4 business hours |
+
+Business hours are Monday–Friday, 09:00–18:00 Asia/Kolkata. Targets are
+first-response commitments, not resolution-time guarantees. Yearly and monthly
+plans share the same feature policy. Professional and Enterprise set the legacy
+`priority_support` compatibility flag to true; Starter remains false.
+
+Migration 038 (`038_tiered_support_entitlements.sql`) is repeatable, is
+registered as a startup forward migration, requires recorded migration 037,
+updates the three plan support policies, and adds support metadata to existing
+feedback records without replacing their historical content. Migration 037
+itself was not modified or rerun. Migration 038 has not yet been applied or
+verified against a database in this implementation turn; the first deployment
+startup is expected to apply it and the runner will verify plan policy, schema,
+and indexes before recording success.
+
+Support requests are created through an authenticated, company-scoped API. The
+server rejects a channel not included in the active plan, saves a support item
+in the existing feedback history with the plan and calculated due timestamp,
+and notifies the support inbox. The owner and HR support pages use the server
+policy, show only entitled channels, let users review recent requests, and
+display the first-response target. The Super Admin feedback screen shows the
+deadline; email replies are sent by the existing workflow and record the first
+response, while WhatsApp responses can be recorded without sending a duplicate
+email. Live database, provider delivery, and browser workflow checks remain
+separate from these source and unit tests.
+
+| Verification | Status | Evidence |
+|---|---|---|
+| Backend support entitlement and deadline tests | **PASS** | 23 focused subscription/migration/support tests pass. Coverage includes all three tiers, trial policy, channel denial, business-hour deadlines, and migration verification. |
+| Backend existing unit suite | **PASS** | 84/84 tests pass. |
+| Frontend support fallback tests | **PASS** | 4/4 subscription/support UI tests pass. |
+| Frontend typecheck, lint and production build | **PASS** | `tsc --noEmit` and build pass; lint exits 0 with existing unrelated warnings. Build compiled 130 routes. |
+| Live database migration and persisted support request | **NOT TESTED** | No database migration or support request was executed in this implementation pass. |
+| Email delivery, WhatsApp exchange, and SLA operation | **NOT TESTED** | Notification and reply code is wired to existing Resend and contact details, but provider delivery and team response operations were not exercised. |
+| Browser acceptance | **NOT TESTED** | Build and type checks pass; no authenticated browser workflow was run. |

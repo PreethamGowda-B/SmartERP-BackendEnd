@@ -6,6 +6,7 @@ const { SUBSCRIPTION_PLANS, applyCanonicalPlanFeatures } = require('../services/
 const { requireFeature } = require('../middleware/featureGuard');
 
 const migrationSql = fs.readFileSync(path.join(__dirname, '../migrations/037_subscription_catalog_and_storage.sql'), 'utf8');
+const supportMigrationSql = fs.readFileSync(path.join(__dirname, '../migrations/038_tiered_support_entitlements.sql'), 'utf8');
 
 const expectedFeatures = {
   1: {
@@ -17,13 +18,13 @@ const expectedFeatures = {
   2: {
     payroll: true, messages: true, ai_assistant: true, basic_reports: true,
     export_reports: true, advanced_reports: true, inventory_images: true,
-    priority_support: false, location_tracking: true, ar_collections: true,
+    priority_support: true, location_tracking: true, ar_collections: true,
     inventory_forecasts: true,
   },
   3: {
     payroll: true, messages: true, ai_assistant: true, basic_reports: true,
     export_reports: true, advanced_reports: true, inventory_images: true,
-    priority_support: false, location_tracking: true, ar_collections: true,
+    priority_support: true, location_tracking: true, ar_collections: true,
     inventory_forecasts: true,
   },
 };
@@ -40,13 +41,25 @@ function runFeatureGuard(features, feature) {
   return result;
 }
 
-test('catalog and migration 037 define identical plan feature assignments', () => {
+test('support tiers align with the canonical catalog and migration 038 while migration 037 remains immutable', () => {
   for (const [id, expected] of Object.entries(expectedFeatures)) {
     assert.deepEqual(SUBSCRIPTION_PLANS[id].features, expected);
-    assert.ok(migrationSql.includes(`'${JSON.stringify(expected)}'::jsonb`), `migration 037 must seed plan ${id} feature flags`);
+    const legacy = { ...expected, priority_support: false };
+    assert.ok(migrationSql.includes(`'${JSON.stringify(legacy)}'::jsonb`), `migration 037 legacy flags for plan ${id}`);
   }
-  assert.equal(SUBSCRIPTION_PLANS[2].features.priority_support, false);
-  assert.equal(SUBSCRIPTION_PLANS[3].features.priority_support, false);
+  assert.match(supportMigrationSql, /UPDATE plans[\s\S]*support_policy/);
+  assert.match(supportMigrationSql, /to_jsonb\(id IN \(2, 3\)\)/);
+  for (const id of [1, 2, 3]) {
+    assert.equal(SUBSCRIPTION_PLANS[id].supportPolicy.timezone, 'Asia/Kolkata');
+    assert.deepEqual(SUBSCRIPTION_PLANS[id].supportPolicy.businessDays, [1, 2, 3, 4, 5]);
+    assert.deepEqual(SUBSCRIPTION_PLANS[id].supportPolicy.businessHours, { start: '09:00', end: '18:00' });
+  }
+  assert.deepEqual(SUBSCRIPTION_PLANS[1].supportPolicy.channels, ['email']);
+  assert.equal(SUBSCRIPTION_PLANS[1].supportPolicy.firstResponseBusinessHours, 18);
+  assert.deepEqual(SUBSCRIPTION_PLANS[2].supportPolicy.channels, ['email', 'whatsapp']);
+  assert.equal(SUBSCRIPTION_PLANS[2].supportPolicy.firstResponseBusinessHours, 9);
+  assert.deepEqual(SUBSCRIPTION_PLANS[3].supportPolicy.channels, ['email', 'whatsapp']);
+  assert.equal(SUBSCRIPTION_PLANS[3].supportPolicy.firstResponseBusinessHours, 4);
 });
 
 test('Starter, Professional, Enterprise and the Enterprise trial use their assigned gates', () => {

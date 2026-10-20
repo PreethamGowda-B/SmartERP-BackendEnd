@@ -126,8 +126,31 @@ function assertCanonicalPlans(rows) {
       const actual = row[field] == null ? null : Number.isNaN(Number(row[field])) ? row[field] : Number(row[field]);
       if (actual !== value) fail(`Provisioning verification failed: plan ${idText} ${field} does not match the source catalog.`);
     }
-    if (!isDeepStrictEqual(row.features, expected.features)) {
+    // Migration 037 predates the support-policy migration. Its historical
+    // priority_support=false value remains valid until 038 is applied; every
+    // other flag must match exactly in either schema state.
+    const comparableFeatures = { ...(row.features || {}) };
+    const expectedComparableFeatures = { ...expected.features };
+    delete comparableFeatures.priority_support;
+    delete expectedComparableFeatures.priority_support;
+    if (!isDeepStrictEqual(comparableFeatures, expectedComparableFeatures)) {
       fail(`Provisioning verification failed: plan ${idText} feature flags do not match the source catalog.`);
+    }
+    if (row.support_policy != null && (!isDeepStrictEqual(row.support_policy, expected.supportPolicy) ||
+        row.features?.priority_support !== expected.features.priority_support)) {
+      fail(`Provisioning verification failed: plan ${idText} support policy does not match the source catalog.`);
+    }
+  }
+  return true;
+}
+
+function assertSupportPolicyRows(rows) {
+  if (rows.length !== 3) fail('Support policy verification failed: expected plans 1–3.');
+  for (const [idText, expected] of Object.entries(SUBSCRIPTION_PLANS)) {
+    const row = rows.find(item => Number(item.id) === Number(idText));
+    if (!row || !isDeepStrictEqual(row.support_policy, expected.supportPolicy) ||
+        row.features?.priority_support !== expected.features.priority_support) {
+      fail(`Support policy verification failed: plan ${idText} does not match the source catalog.`);
     }
   }
   return true;
@@ -268,6 +291,7 @@ module.exports = {
   assertIsolatedTarget,
   assertLegacyPlanMapping,
   assertCanonicalPlans,
+  assertSupportPolicyRows,
   assertSubscriptionSchema,
   assertNoStorageBackfillGaps,
   assertStorageBackfills,

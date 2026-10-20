@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS plans (
   max_material_requests INTEGER,
   messages_history_days INTEGER,
   features JSONB DEFAULT '{}',
+  support_policy JSONB,
   created_at TIMESTAMP DEFAULT NOW()
 );
 
@@ -293,6 +294,12 @@ CREATE TABLE IF NOT EXISTS feedback (
   status VARCHAR(50) DEFAULT 'new',
   admin_reply TEXT,
   replied_at TIMESTAMP,
+  company_id TEXT,
+  support_plan_id INTEGER,
+  support_channel TEXT,
+  support_first_response_business_hours INTEGER,
+  support_first_response_due_at TIMESTAMPTZ,
+  support_first_responded_at TIMESTAMPTZ,
   created_at TIMESTAMP DEFAULT NOW()
 );
 

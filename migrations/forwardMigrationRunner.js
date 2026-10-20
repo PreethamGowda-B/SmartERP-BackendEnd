@@ -1,5 +1,5 @@
 const crypto = require('crypto');
-const { assertCanonicalPlans, assertSubscriptionSchema } = require('../scripts/subscriptionMigrationChecks');
+const { assertCanonicalPlans, assertSubscriptionSchema, assertSupportPolicyRows } = require('../scripts/subscriptionMigrationChecks');
 
 const PRODUCTION_DISPATCH = {
   id: '033_production_dispatch',
@@ -53,14 +53,20 @@ const SUBSCRIPTION_CATALOG_AND_STORAGE = {
   file: '037_subscription_catalog_and_storage.sql',
 };
 
+const TIERED_SUPPORT_ENTITLEMENTS = {
+  id: '038_tiered_support_entitlements',
+  file: '038_tiered_support_entitlements.sql',
+};
+
 const FORWARD_MIGRATIONS = [
   PRODUCTION_DISPATCH, PRODUCTION_DISPATCH_PRIVILEGES, PRODUCTION_PACKING_WORKFLOW,
   CUSTOMER_MANUFACTURING_REQUESTS, SUBSCRIPTION_CATALOG_AND_STORAGE,
+  TIERED_SUPPORT_ENTITLEMENTS,
 ];
 
-// The subscription migration contains plan upserts and historical storage
-// backfills. It is registered above for the explicitly guarded provisioning
-// command, but is intentionally not part of ordinary application startup.
+// Migration 037 contains plan upserts and historical storage backfills, so it
+// stays on the explicitly guarded provisioning path. Migration 038 is a
+// dependent, additive support-policy change and only runs after 037 is recorded.
 const STARTUP_MIGRATIONS = FORWARD_MIGRATIONS.filter(
   migration => migration.id !== SUBSCRIPTION_CATALOG_AND_STORAGE.id
 );
@@ -265,14 +271,41 @@ async function verifyMigration(client, migrationId) {
     await assertCustomerManufacturingRequestSchema(client);
   }
   if (migrationId === SUBSCRIPTION_CATALOG_AND_STORAGE.id) {
+    const supportPolicyColumn = await client.query(`
+      SELECT EXISTS (SELECT 1 FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='plans' AND column_name='support_policy') AS present
+    `);
+    const supportPolicySelection = supportPolicyColumn.rows[0]?.present ? ', support_policy' : '';
     const plans = await client.query(
       `SELECT id, name, price_monthly, price_yearly, employee_limit,
               max_active_jobs, max_inventory_items, max_storage_bytes,
-              max_material_requests, messages_history_days, features
+              max_material_requests, messages_history_days, features${supportPolicySelection}
          FROM plans WHERE id IN (1,2,3) ORDER BY id`
     );
     assertCanonicalPlans(plans.rows);
     await assertSubscriptionSchema(client);
+  }
+  if (migrationId === TIERED_SUPPORT_ENTITLEMENTS.id) {
+    const plans = await client.query(
+      `SELECT id, features, support_policy FROM plans WHERE id IN (1,2,3) ORDER BY id`
+    );
+    assertSupportPolicyRows(plans.rows);
+    const schema = await client.query(`
+      SELECT
+        (SELECT COUNT(*)::int FROM information_schema.columns
+          WHERE table_schema='public' AND table_name='feedback'
+            AND column_name=ANY($1::text[])) AS feedback_columns,
+        (SELECT COUNT(*)::int FROM pg_indexes
+          WHERE schemaname='public' AND indexname=ANY($2::text[])) AS support_indexes,
+        (SELECT COUNT(*)::int FROM information_schema.columns
+          WHERE table_schema='public' AND table_name='plans' AND column_name='support_policy') AS plan_policy_column
+    `, [
+      ['company_id','support_plan_id','support_channel','support_first_response_business_hours','support_first_response_due_at','support_first_responded_at'],
+      ['idx_feedback_support_company_created','idx_feedback_support_response_due'],
+    ]);
+    if (schema.rows[0]?.feedback_columns !== 6 || schema.rows[0]?.support_indexes !== 2 || schema.rows[0]?.plan_policy_column !== 1) {
+      throw new Error('Tiered support schema verification failed.');
+    }
   }
 }
 
@@ -333,6 +366,16 @@ async function applyForwardMigration(client, { migrationId, sql }) {
       return { migrationId, status: 'adopted_verified_legacy_record', checksum };
     }
 
+    if (migrationId === TIERED_SUPPORT_ENTITLEMENTS.id) {
+      const prerequisite = await client.query(
+        'SELECT 1 FROM app_migration_history WHERE migration_id = $1',
+        [SUBSCRIPTION_CATALOG_AND_STORAGE.id]
+      );
+      if (!prerequisite.rows.length) {
+        throw new Error('Tiered support entitlements require recorded migration 037; refusing to apply 038 before subscription catalog provisioning.');
+      }
+    }
+
     if (migrationId === PRODUCTION_DISPATCH.id) {
       const preexisting = await client.query(`
         SELECT c.relname AS name
@@ -374,6 +417,7 @@ module.exports = {
   PRODUCTION_DISPATCH_PRIVILEGES,
   PRODUCTION_PACKING_WORKFLOW,
   CUSTOMER_MANUFACTURING_REQUESTS,
+  TIERED_SUPPORT_ENTITLEMENTS,
   FORWARD_MIGRATIONS,
   STARTUP_MIGRATIONS,
   stripOuterTransaction,

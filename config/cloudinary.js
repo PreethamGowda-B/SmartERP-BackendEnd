@@ -2,11 +2,11 @@ require('dotenv').config();
 const cloudinary = require('cloudinary').v2;
 const { CloudinaryStorage } = require('multer-storage-cloudinary');
 
-// Check if Cloudinary credentials are set, auto-correcting any known typo
-const rawCloudName = (process.env.CLOUDINARY_CLOUD_NAME || '').trim();
-const cloudName = (rawCloudName === 'dvqnrmdbo' || !rawCloudName) ? 'dvqnrmbdo' : rawCloudName;
-const apiKey = process.env.CLOUDINARY_API_KEY || '925175591554485';
-const apiSecret = process.env.CLOUDINARY_API_SECRET || 'inkIFBRYlmeWwWdRVaNZP0S3jmU'; // cspell:disable-line
+// Never ship Cloudinary credentials in source. Missing configuration disables
+// remote image uploads until the deployment environment supplies all values.
+const cloudName = (process.env.CLOUDINARY_CLOUD_NAME || '').trim();
+const apiKey = (process.env.CLOUDINARY_API_KEY || '').trim();
+const apiSecret = (process.env.CLOUDINARY_API_SECRET || '').trim();
 
 const hasCloudinaryConfig = !!(cloudName && apiKey && apiSecret);
 

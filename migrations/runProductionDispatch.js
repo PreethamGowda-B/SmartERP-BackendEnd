@@ -2,12 +2,12 @@ const fs = require('fs');
 const path = require('path');
 const { pool } = require('../db');
 const { storage } = require('../middleware/als');
-const { FORWARD_MIGRATIONS, applyForwardMigration } = require('./forwardMigrationRunner');
+const { STARTUP_MIGRATIONS, applyForwardMigration } = require('./forwardMigrationRunner');
 
 async function runProductionDispatchMigration() {
   return storage.run({ bypassRls: true }, async () => {
     const results = [];
-    for (const migration of FORWARD_MIGRATIONS) {
+    for (const migration of STARTUP_MIGRATIONS) {
       const sql = fs.readFileSync(path.join(__dirname, migration.file), 'utf8');
       const client = await pool.connect();
       try {

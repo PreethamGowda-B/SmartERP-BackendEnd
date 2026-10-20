@@ -1,11 +1,66 @@
+const PLAN_FEATURES = Object.freeze({
+  starter: Object.freeze({
+    payroll: false,
+    messages: true,
+    ai_assistant: false,
+    basic_reports: true,
+    export_reports: true,
+    advanced_reports: false,
+    inventory_images: false,
+    priority_support: false,
+    location_tracking: false,
+    ar_collections: false,
+    inventory_forecasts: false
+  }),
+  professional: Object.freeze({
+    payroll: true,
+    messages: true,
+    ai_assistant: true,
+    basic_reports: true,
+    export_reports: true,
+    advanced_reports: true,
+    inventory_images: true,
+    priority_support: false,
+    location_tracking: true,
+    ar_collections: true,
+    inventory_forecasts: true
+  }),
+  enterprise: Object.freeze({
+    payroll: true,
+    messages: true,
+    ai_assistant: true,
+    basic_reports: true,
+    export_reports: true,
+    advanced_reports: true,
+    inventory_images: true,
+    priority_support: false,
+    location_tracking: true,
+    ar_collections: true,
+    inventory_forecasts: true
+  })
+});
+
 const SUBSCRIPTION_PLANS = Object.freeze({
-  1: Object.freeze({ key: 'starter', name: 'Starter', priceMonthly: 0, priceYearly: 0, employeeLimit: 10, activeJobsLimit: 15, inventoryItemsLimit: 50, storageBytesLimit: 250 * 1024 * 1024 }),
-  2: Object.freeze({ key: 'professional', name: 'Professional', priceMonthly: 999, priceYearly: 9990, employeeLimit: 50, activeJobsLimit: 100, inventoryItemsLimit: 500, storageBytesLimit: 5 * 1024 * 1024 * 1024 }),
-  3: Object.freeze({ key: 'enterprise', name: 'Enterprise', priceMonthly: 2499, priceYearly: 24990, employeeLimit: null, activeJobsLimit: null, inventoryItemsLimit: null, storageBytesLimit: null })
+  1: Object.freeze({ key: 'starter', name: 'Starter', priceMonthly: 0, priceYearly: 0, employeeLimit: 10, activeJobsLimit: 15, inventoryItemsLimit: 50, storageBytesLimit: 250 * 1024 * 1024, features: PLAN_FEATURES.starter }),
+  2: Object.freeze({ key: 'professional', name: 'Professional', priceMonthly: 999, priceYearly: 9990, employeeLimit: 50, activeJobsLimit: 100, inventoryItemsLimit: 500, storageBytesLimit: 5 * 1024 * 1024 * 1024, features: PLAN_FEATURES.professional }),
+  3: Object.freeze({ key: 'enterprise', name: 'Enterprise', priceMonthly: 2499, priceYearly: 24990, employeeLimit: null, activeJobsLimit: null, inventoryItemsLimit: null, storageBytesLimit: null, features: PLAN_FEATURES.enterprise })
 });
 
 function getPlan(planId) {
   return SUBSCRIPTION_PLANS[Number(planId)] || null;
+}
+
+function applyCanonicalPlanFeatures(plan) {
+  if (!plan) return plan;
+  const canonicalPlan = getPlan(plan.id || plan.plan_db_id || plan.plan_id);
+  if (!canonicalPlan) return plan;
+  return {
+    ...plan,
+    plan_key: canonicalPlan.key,
+    name: canonicalPlan.name,
+    employee_limit: canonicalPlan.employeeLimit,
+    features: canonicalPlan.features
+  };
 }
 
 function resolvePlanTier(plan) {
@@ -61,4 +116,4 @@ function paymentMatchesOrder({ order, payment, companyId, purpose, planId, billi
   return true;
 }
 
-module.exports = { SUBSCRIPTION_PLANS, getPlan, resolvePlanTier, isUnlimitedPlan, getEmployeeLimit, getPlanLimit, getPricePaise, isRazorpayConfigured, verifyCheckoutSignature, paymentMatchesOrder };
+module.exports = { PLAN_FEATURES, SUBSCRIPTION_PLANS, getPlan, applyCanonicalPlanFeatures, resolvePlanTier, isUnlimitedPlan, getEmployeeLimit, getPlanLimit, getPricePaise, isRazorpayConfigured, verifyCheckoutSignature, paymentMatchesOrder };

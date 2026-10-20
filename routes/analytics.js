@@ -8,8 +8,10 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
+const { loadPlan } = require('../middleware/planMiddleware');
+const { requireFeature } = require('../middleware/featureGuard');
 
-router.get('/summary', authenticateToken, async (req, res) => {
+router.get('/summary', authenticateToken, loadPlan, requireFeature('basic_reports', 'basic reports'), async (req, res) => {
   try {
     const companyId = req.user.companyId;
     if (!companyId) {

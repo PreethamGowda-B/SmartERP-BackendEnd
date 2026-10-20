@@ -357,3 +357,98 @@ See the current branch, latest commit, remote synchronization, and exact changed
 1. **Test Database Provisioning:** An isolated development/test database matching `*test*` must be created and configured before running `npm run migrate:subscription` with `SMARTERP_SUBSCRIPTION_SEED_CONFIRM=APPLY_TO_CONFIRMED_TEST_DATABASE`.
 2. **Razorpay Test Mode Credentials:** End-to-end sandbox checkout, webhook dispatch, and provider-side refund testing require active Razorpay test credentials in `.env.local` / `.env`.
 3. **Owner Business Policy Sign-off:** The feature matrix (Starter, Professional, Enterprise, and 30-day ₹1 trial) and quotas are structurally enforced in code, but commercial marketing commitments should be formally approved by the business owner.
+
+## 13. Verification Addendum — 2026-10-20 (workspace recheck)
+
+This addendum records fresh checks against the existing `main` checkouts. No source-code changes, commits, pushes, branch operations, resets, or deployments were made during this verification turn.
+
+| Requirement | Status | Current evidence / remaining work |
+|---|---|---|
+| Inventory and storage quota enforcement | **PARTIAL** | Backend quota suite passed, including direct quota-middleware rejection and simulated concurrent inventory/file requests; the shared advisory-lock path is covered by the unit tests. Direct HTTP/API requests and concurrent writes against PostgreSQL were not exercised because the configured database was unreachable. |
+| Subscription feature matrix and customer-facing limits | **PARTIAL** | Canonical catalog/policy tests and the frontend build pass. Business approval of the commercial matrix is still pending; core ERP modules remain RBAC/company-isolation controlled rather than plan-gated. Do not describe any pending policy choice as approved. |
+| Safe provisioning of Starter, Professional, and Enterprise | **PARTIAL** | Migration 037 remains registered in both migration runners and the guarded seed command is present. It was not applied. The configured URL identifies Supabase database `postgres`, not an isolated test database; a read-only connection attempt returned `ECONNREFUSED`. The previous report's role check found no `CREATEDB` privilege. Do not point the migration at this database. |
+| Payment persistence and idempotency | **PARTIAL** | Local tests pass for timing-safe signature validation and captured-payment matching (provider order, company, purpose, plan, cycle, and INR amount). Database persistence, duplicate-webhook idempotency, and transaction behavior remain unverified without PostgreSQL. Cancellation is natural expiry without auto-renewal; automated retry, provider refund, dispute/chargeback, and settlement reconciliation are not implemented. |
+| Database-backed and browser-level verification | **NOT TESTED** | No database-backed run was possible: the configured DB refused the connection, and no isolated test target was configured. No Playwright/Cypress browser test configuration was found in the backend package/repository scan. Razorpay variables are configured, but the key ID does not use the `rzp_test_` prefix; no provider call was made. Browser checkout, responsive pricing-card feature lists, trial lifecycle, monthly/yearly checkout, invalid signatures/webhooks, duplicate delivery, cross-company access, DB concurrency, and cache invalidation remain unverified end to end. |
+| Preserve role permissions, tenant isolation, history, and unrelated work | **PASS (local evidence)** | The backend suite passed RBAC and tenant-isolation unit cases; payment history is represented in the implementation. Both repositories remained on `main`, clean and synchronized with `origin/main` before this report-only update. No reset, branch, commit, push, or deployment was performed in this turn. |
+| Update the existing report with evidence | **PASS** | This addendum is appended to the workspace report and backend report copy. |
+
+### Fresh local verification run
+
+- Backend command `node --test tests/unit.test.js tests/productionDispatchDomain.test.js tests/subscriptionPolicy.test.js tests/aiQuota.test.js tests/planQuota.test.js`: **PASS — 112 tests, 13 suites, 0 failures**.
+- Frontend `npx tsc --noEmit`: **PASS — exit code 0**.
+- Frontend `npm run lint`: **PASS — exit code 0**, with existing React hook and `<img>` warnings.
+- Frontend `npm run build`: **PASS — exit code 0**, compiled and generated all 130 routes; existing lint warnings were reported during build.
+- `git diff --check` in both repositories: **PASS** before this report addendum.
+- Database probe: **NOT TESTED beyond connectivity** — connection to the configured Supabase `postgres` target returned `ECONNREFUSED`; no migration or data mutation was attempted.
+- Razorpay: **NOT TESTED against provider** — configured key ID is not marked with the `rzp_test_` prefix; no API or webhook request was sent.
+
+### Exact external prerequisites for the remaining integration checks
+
+1. Start/allow connectivity to PostgreSQL and provide a database whose isolated test name is confirmed (for example `smarterp_test`) with `smarterp_app` schema privileges. Configure `DATABASE_URL` and `SMARTERP_SUBSCRIPTION_TEST_DATABASE` to that target only, then run the guarded `npm run migrate:subscription` command with its explicit seed confirmation value.
+2. Configure Razorpay test-mode key ID, key secret, and webhook secret. Do not reuse the currently configured non-test-prefixed key for these checks.
+3. Approve or revise the commercial feature/quota matrix, including the treatment of existing ERP modules, before claiming that the public plan cards represent approved business policy.
+4. Add/enable a browser runner and test identity/data in the isolated test environment to verify responsive pricing-card content and checkout/trial flows.
+
+## 14. Phase 2B — Migration compatibility and startup safety — 2026-10-20
+
+This addendum preserves the existing report and prior uncommitted changes. Both
+repositories were confirmed on their existing `main` branches before editing.
+No migration, database connection, backend startup, commit, push, or deployment
+was performed in this phase.
+
+| Requirement | Status | Evidence / remaining work |
+|---|---|---|
+| Company ID compatibility | **PASS (source-level)** | The earlier read-only audit reported `companies.id` as integer, consistent with legacy application migrations and integer ID handling. Migration 037 now reads the actual `companies.id` type and uses it for both payment table foreign keys; only `integer`, `bigint`, and `uuid` are accepted. `companies.id` and historical rows are not altered. A database-applied FK test remains unverified. |
+| Prevent automatic application of migration 037 | **PASS (source-level)** | 037 stays in the forward allow-list, but `runProductionDispatchMigration()` now iterates only `STARTUP_MIGRATIONS` (033–036). The numbered migration sweep also skips 037. Startup still retains the existing 033–036 behavior; the guarded explicit script is the only supported route to 037. |
+| Isolated test target preflight | **PASS (unit tests); NOT TESTED (database)** | The script requires a separate test URL, application URL, isolated-test environment, expected host/port/database/role/database OID, non-`postgres` database and role, non-superuser/non-`BYPASSRLS` role, and a read-only DBA identity marker row with an approval ID. It rejects the configured application database even if the connection role differs. Tests cover rejection cases. No database was contacted. |
+| Migration verification | **PASS (source-level); NOT TESTED (database)** | The migration's post-check now compares all three plan rows' names, prices, quotas, history value, and complete feature JSON to the backend catalog. It checks required storage/payment tables and columns, company FK type compatibility, forced RLS and policy presence, `smarterp_app` grants, and ledger coverage for legacy inventory images, employee documents and optional attachment sources. Non-positive legacy file sizes are conservatively assigned the route maximum. The check runs inside the forward runner's migration transaction, so a failed verification rolls back. It has not been executed against PostgreSQL. |
+| Legacy plan mapping | **PASS (source-level)** | The explicit preflight accepts stable mappings only: `1 Free -> 1 Starter`, `2 Basic -> 2 Professional`, and `3 Pro -> 3 Enterprise`, or already-canonical labels at those same IDs. It refuses swapped/missing/ambiguous labels. Migration updates IDs 1–3 in place, preserving `companies.plan_id`; other plan IDs and history remain untouched. DBA/business review is still required before any real application. |
+| Embedded Cloudinary credentials | **PASS (source remediation); ROTATION REQUIRED** | Removed source fallbacks from `config/cloudinary.js`; configuration now requires the existing `CLOUDINARY_*` environment variables. `.env.example` contains placeholders and the isolated test setup is documented in `docs/subscription-migration-037-runbook.md`. The Cloudinary API secret was present in source and should be rotated by its owner in the Cloudinary console; update the deployment's `CLOUDINARY_API_SECRET` (and rotate/update the API key too if Cloudinary treats the pair as a unit). Rotation was not performed. |
+| Test coverage | **PASS (source tests)** | `node --test tests/subscriptionMigrationSafety.test.js tests/subscriptionEntitlements.test.js tests/planQuota.test.js`: 20/20 passed. `npm test`: 84/84 passed. `node --check` passed on all changed JavaScript files. `git diff --check` passed in both repositories. Backend `package.json` has no lint or build scripts; frontend source was unchanged in this phase, so frontend build/type checks were not rerun. |
+| Database, payment provider, and browser verification | **NOT TESTED** | No DB connection or migration was attempted. Razorpay was not contacted. No application startup or browser test was run. Existing Phase 1 Razorpay and browser verification gaps remain. |
+
+### DBA/operator prerequisites
+
+1. A DBA must confirm a separate isolated PostgreSQL test database and provision
+   the identity-marker table/row described in
+   `docs/subscription-migration-037-runbook.md`, including its actual database
+   OID and a dedicated non-privileged migration role.
+2. The operator must set the dedicated `SMARTERP_SUBSCRIPTION_TEST_*` values
+   without exposing the connection URL, confirm the old plan IDs/assignments,
+   and explicitly authorize the isolated test run before invoking
+   `npm run migrate:subscription`.
+3. The Cloudinary credential owner must rotate the exposed API secret and update
+   the deployment environment. No automatic rotation or external payment action
+   was performed.
+
+## 15. Phase 3 — Deployment evidence and connection-pool remediation — 2026-10-20
+
+The deployment log supplied after commit `79f78b9` reports
+`037_subscription_catalog_and_storage: applied`, followed by successful
+database initialization and the service becoming live. This is runtime evidence
+that the startup runner applied migration 037; it is not a direct read-only
+verification of plan rows, storage ledger totals, RLS, or grants. The log lists
+`api.prozync.in` as a public service URL, so database isolation from production
+has not been established from this evidence.
+
+| Requirement | Status | Evidence / remaining work |
+|---|---|---|
+| Migration 037 execution | **PASS (deployment log); PARTIAL (database verification)** | The supplied Render log reports 037 as `applied`, then database initialization completed and the service went live. No direct post-migration SQL verification was performed. Confirm the deployment database identity before treating it as an isolated test target. |
+| Session-pool exhaustion | **PARTIAL (source fix; deployment verification pending)** | The log reports `EMAXCONNSESSION` errors affecting SLA, geofence, retention, and OTP work against a 15-client session pool. `db-base.js` used a default of 10 connections **per Node process** while production starts two workers plus a master. The default is now 4 per process (up to 12 across those processes), leaving three sessions of headroom. An explicit `DB_POOL_MAX` override can still exceed the safe budget; inspect the Render environment and keep the value at or below 4 for this one-instance/two-worker topology. Runtime confirmation requires the next deployment logs. |
+| Subscription feature and quota unit tests | **PASS (local)** | The focused pool-configuration, subscription, migration-safety, quota, and storage-concurrency suites passed 23/23. The backend unit suite passed 84/84. The frontend subscription fallback suite passed 2/2. |
+| Frontend static verification | **PASS (local)** | TypeScript check and production build passed. ESLint exited successfully with existing React dependency and `<img>` warnings. |
+| Database-backed, Razorpay sandbox, and browser verification | **NOT TESTED** | The deployment log alone does not verify trial expiry, payment idempotency, cross-company access, database concurrency, Razorpay test-mode behavior, or browser responsiveness. These checks still require a confirmed isolated database, Razorpay test credentials, and an authenticated browser test environment. |
+| Broad backend suite | **PARTIAL** | A broad `npm run test:all` attempt started account-deletion tests, reported failures and a database ownership warning, and was stopped to avoid further database activity. It is not counted as a pass. |
+
+### Next-phase gates
+
+1. After deploying the pool-default change, confirm Render has no `DB_POOL_MAX`
+   override above 4 for the current two-worker service and verify that the
+   `EMAXCONNSESSION` errors stop.
+2. Perform read-only checks of the connected database identity, canonical plan
+   rows, payment/storage schema, RLS policies, and application-role grants using
+   an approved isolated test target. The public API hostname in the supplied
+   log is insufficient proof of database isolation.
+3. Run database-backed subscription lifecycle/payment tests and browser-level
+   responsive pricing/checkout tests only after the isolated test database,
+   Razorpay test mode, and browser test identity are confirmed.

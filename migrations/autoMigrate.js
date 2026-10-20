@@ -315,6 +315,13 @@ async function runNumberedMigrations() {
         const skippedMigrations = [];
 
         for (const filename of NUMBERED_MIGRATIONS) {
+            // Migration 037 contains subscription plan rewrites and legacy file
+            // usage backfills. The separately guarded script is its only
+            // supported executor; never apply it as part of an automatic sweep.
+            if (filename === '037_subscription_catalog_and_storage.sql') {
+                skippedMigrations.push(filename);
+                continue;
+            }
             if (appliedSet.has(filename)) {
                 skippedMigrations.push(filename);
                 continue;

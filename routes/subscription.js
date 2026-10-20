@@ -24,7 +24,7 @@ router.get('/plans', async (req, res) => {
       ...byId.get(Number(id)), id: Number(id), plan_key: plan.key, name: plan.name,
       price_monthly: plan.priceMonthly, price_yearly: plan.priceYearly, employee_limit: plan.employeeLimit,
       max_active_jobs: plan.activeJobsLimit, max_inventory_items: plan.inventoryItemsLimit,
-      max_storage_bytes: plan.storageBytesLimit
+      max_storage_bytes: plan.storageBytesLimit, features: plan.features
     })));
   } catch (err) {
     console.error('❌ Fetch Plans Error:', err.message);
@@ -60,7 +60,8 @@ router.get('/status', loadPlan, async (req, res) => {
           features: {
             payroll: true, messages: true, ai_assistant: true,
             basic_reports: true, export_reports: true, advanced_reports: true,
-            inventory_images: true, priority_support: true, location_tracking: true
+            inventory_images: true, priority_support: true, location_tracking: true,
+            ar_collections: true, inventory_forecasts: true
           }
         },
         usage: { employees: 0, inventory_items: 0 },

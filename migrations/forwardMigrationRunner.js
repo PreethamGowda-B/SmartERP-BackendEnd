@@ -1,4 +1,5 @@
 const crypto = require('crypto');
+const { assertCanonicalPlans, assertSubscriptionSchema } = require('../scripts/subscriptionMigrationChecks');
 
 const PRODUCTION_DISPATCH = {
   id: '033_production_dispatch',
@@ -56,6 +57,13 @@ const FORWARD_MIGRATIONS = [
   PRODUCTION_DISPATCH, PRODUCTION_DISPATCH_PRIVILEGES, PRODUCTION_PACKING_WORKFLOW,
   CUSTOMER_MANUFACTURING_REQUESTS, SUBSCRIPTION_CATALOG_AND_STORAGE,
 ];
+
+// The subscription migration contains plan upserts and historical storage
+// backfills. It is registered above for the explicitly guarded provisioning
+// command, but is intentionally not part of ordinary application startup.
+const STARTUP_MIGRATIONS = FORWARD_MIGRATIONS.filter(
+  migration => migration.id !== SUBSCRIPTION_CATALOG_AND_STORAGE.id
+);
 
 function stripOuterTransaction(sql) {
   return sql
@@ -256,6 +264,16 @@ async function verifyMigration(client, migrationId) {
     await assertProductionPackingWorkflowSchema(client);
     await assertCustomerManufacturingRequestSchema(client);
   }
+  if (migrationId === SUBSCRIPTION_CATALOG_AND_STORAGE.id) {
+    const plans = await client.query(
+      `SELECT id, name, price_monthly, price_yearly, employee_limit,
+              max_active_jobs, max_inventory_items, max_storage_bytes,
+              max_material_requests, messages_history_days, features
+         FROM plans WHERE id IN (1,2,3) ORDER BY id`
+    );
+    assertCanonicalPlans(plans.rows);
+    await assertSubscriptionSchema(client);
+  }
 }
 
 async function applyForwardMigration(client, { migrationId, sql }) {
@@ -357,6 +375,7 @@ module.exports = {
   PRODUCTION_PACKING_WORKFLOW,
   CUSTOMER_MANUFACTURING_REQUESTS,
   FORWARD_MIGRATIONS,
+  STARTUP_MIGRATIONS,
   stripOuterTransaction,
   migrationChecksum,
   assertProductionDispatchSchema,

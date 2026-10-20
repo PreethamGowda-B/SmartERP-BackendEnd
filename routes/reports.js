@@ -363,7 +363,7 @@ router.get('/inventory', authenticateToken, loadPlan, requireFeature('advanced_r
 /**
  * GET /api/reports/my-attendance?period=week|month|quarter|year
  */
-router.get('/my-attendance', authenticateToken, async (req, res) => {
+router.get('/my-attendance', authenticateToken, loadPlan, requireFeature('basic_reports', 'basic reports'), async (req, res) => {
     try {
         const userId = req.user.userId || req.user.id;
         const companyId = req.user.companyId || req.user.company_id;
@@ -409,7 +409,7 @@ router.get('/my-attendance', authenticateToken, async (req, res) => {
 /**
  * GET /api/reports/my-jobs?period=week|month|quarter|year
  */
-router.get('/my-jobs', authenticateToken, async (req, res) => {
+router.get('/my-jobs', authenticateToken, loadPlan, requireFeature('basic_reports', 'basic reports'), async (req, res) => {
     try {
         const userId = req.user.userId || req.user.id;
         const period = req.query.period || 'month';
@@ -451,7 +451,7 @@ router.get('/my-jobs', authenticateToken, async (req, res) => {
 /**
  * GET /api/reports/my-materials?period=week|month|quarter|year
  */
-router.get('/my-materials', authenticateToken, async (req, res) => {
+router.get('/my-materials', authenticateToken, loadPlan, requireFeature('basic_reports', 'basic reports'), async (req, res) => {
     try {
         const userId = req.user.userId || req.user.id;
         const period = req.query.period || 'month';

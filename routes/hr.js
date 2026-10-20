@@ -2,6 +2,8 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
+const { loadPlan } = require('../middleware/planMiddleware');
+const { requireFeature } = require('../middleware/featureGuard');
 const { createNotification } = require('../utils/notificationHelpers');
 const EventMessagingService = require('../services/eventMessagingService');
 const AttendancePolicy = require('../services/attendancePolicyService');
@@ -51,7 +53,7 @@ async function logHrAudit({ companyId, performedBy, performedByName, action, tar
 }
 
 // ── 1. GET /api/hr/analytics — Master HR Executive Dashboard Metrics ─────────
-router.get('/analytics', authenticateToken, async (req, res) => {
+router.get('/analytics', authenticateToken, loadPlan, requireFeature('basic_reports', 'basic reports'), async (req, res) => {
   if (!canAccessHrAnalytics(req.user.role)) return res.status(403).json({ message: 'Access denied' });
   try {
     const companyId = req.user.companyId;

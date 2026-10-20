@@ -2,6 +2,8 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
+const { loadPlan } = require('../middleware/planMiddleware');
+const { requireFeature } = require('../middleware/featureGuard');
 const { createNotification, createNotificationForOwners } = require('../utils/notificationHelpers');
 const AttendancePolicy = require('../services/attendancePolicyService');
 const { redisClient } = require('../utils/redis');
@@ -877,7 +879,7 @@ router.patch('/:id', authenticateToken, async (req, res) => {
  * GET /api/attendance/report
  * Generate attendance report (Owner only)
  */
-router.get('/report', authenticateToken, async (req, res) => {
+router.get('/report', authenticateToken, loadPlan, requireFeature('basic_reports', 'basic reports'), async (req, res) => {
   try {
     if (req.user.role !== 'owner' && req.user.role !== 'admin') {
       return res.status(403).json({ message: 'Access denied' });

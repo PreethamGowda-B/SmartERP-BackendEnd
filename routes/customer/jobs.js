@@ -35,6 +35,7 @@ const { getSuggestedPriority } = require('../../services/autoPriorityService');
 const auditService = require('../../services/auditService');
 const errorLogger = require('../../utils/errorLogger');
 const { loadPlan, checkPlanLimit } = require('../../middleware/planMiddleware');
+const { requireFeature } = require('../../middleware/featureGuard');
 
 // ─── Section 8: Standardized response helpers ─────────────────────────────────
 function ok(res, data, statusCode = 200) {
@@ -348,7 +349,7 @@ router.get('/:id', async (req, res) => {
 });
 
 // ─── GET /:id/tracking — employee GPS location ────────────────────────────────
-router.get('/:id/tracking', async (req, res) => {
+router.get('/:id/tracking', loadPlan, requireFeature('location_tracking', 'location tracking'), async (req, res) => {
   const customerId = req.customer.id;
   const companyId = req.customer.companyId;
   const { id } = req.params;

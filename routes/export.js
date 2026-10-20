@@ -6,6 +6,8 @@
 const express = require('express');
 const router = express.Router();
 const { authenticateToken } = require('../middleware/authMiddleware');
+const { loadPlan } = require('../middleware/planMiddleware');
+const { requireFeature } = require('../middleware/featureGuard');
 const DataExportService = require('../services/dataExportService');
 const { pool } = require('../db');
 
@@ -23,7 +25,7 @@ const requireOwner = (req, res, next) => {
  * GET /api/export/company-backup
  * Streams a compressed .ZIP file with all company CSVs and metadata.
  */
-router.get('/company-backup', authenticateToken, requireOwner, async (req, res) => {
+router.get('/company-backup', authenticateToken, loadPlan, requireFeature('export_reports', 'report and company exports'), requireOwner, async (req, res) => {
   try {
     const companyId = req.user.companyId || req.user.company_id;
     if (!companyId) {

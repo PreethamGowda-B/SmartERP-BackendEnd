@@ -6,6 +6,13 @@ if (dns.setDefaultResultOrder) {
 const { Pool } = require('pg');
 require('dotenv').config();
 
+const DEFAULT_DB_POOL_MAX = 4;
+
+function resolvePoolMax(value = process.env.DB_POOL_MAX) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_DB_POOL_MAX;
+}
+
 // SSL configuration driven by explicit env vars rather than URL string matching.
 function resolveSsl() {
   if (process.env.DATABASE_URL?.includes('sslmode=disable')) return false;
@@ -51,10 +58,11 @@ const pool = new Pool({
   connectionString: cleanConnectionString(process.env.DATABASE_URL),
   ssl: resolveSsl(),
   lookup: ipv4Lookup,
-  // Render runs two clustered workers by default. Keep their combined default
-  // (10-12 connections) below the Supabase session pooler's 15-client limit.
-  // DB_POOL_MAX remains available for deployments with a larger verified pool.
-  max: parseInt(process.env.DB_POOL_MAX || '10', 10),
+  // pg Pool is process-local. Production runs a master plus two workers by
+  // default, so four per process allows up to 12 sessions and leaves headroom
+  // under Supabase's 15-client session-pool cap. Override only after sizing
+  // against every process and service instance sharing that database role.
+  max: resolvePoolMax(),
   idleTimeoutMillis: parseInt(process.env.DB_IDLE_TIMEOUT_MS || '10000', 10),
   connectionTimeoutMillis: 10000, // 10s connection queue timeout under load
   statement_timeout: 15000,       // 15s query safety limit
@@ -64,4 +72,4 @@ pool.on('error', (err) => {
   console.error('Unexpected error on idle PostgreSQL client', err.message);
 });
 
-module.exports = { pool, cleanConnectionString };
+module.exports = { pool, cleanConnectionString, resolvePoolMax, DEFAULT_DB_POOL_MAX };

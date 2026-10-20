@@ -5,7 +5,7 @@
 
 const { pool } = require('../db');
 const { redisClient } = require('../utils/redis');
-const { getPlan, getPlanLimit, isUnlimitedPlan, getEmployeeLimit, resolvePlanTier } = require('../services/subscriptionCatalog');
+const { getPlan, getPlanLimit, isUnlimitedPlan, getEmployeeLimit, resolvePlanTier, applyCanonicalPlanFeatures } = require('../services/subscriptionCatalog');
 const { consumeAIRequest } = require('../services/aiQuota');
 const NodeCache = require('node-cache');
 
@@ -26,7 +26,8 @@ async function loadPlan(req, res, next) {
           features: {
             payroll: true, messages: true, ai_assistant: true,
             basic_reports: true, export_reports: true, advanced_reports: true,
-            inventory_images: true, priority_support: true, location_tracking: true
+            inventory_images: true, priority_support: true, location_tracking: true,
+            ar_collections: true, inventory_forecasts: true
           },
           is_trial: false,
           days_remaining: 36500,
@@ -46,7 +47,8 @@ async function loadPlan(req, res, next) {
       const trialExpiryMs = memCached.is_trial && memCached.trial_ends_at ? new Date(memCached.trial_ends_at).getTime() : null;
       const paidExpiryMs = !memCached.is_trial && memCached.subscription_expires_at ? new Date(memCached.subscription_expires_at).getTime() : null;
       if ((trialExpiryMs === null || trialExpiryMs > nowMs) && (paidExpiryMs === null || paidExpiryMs > nowMs)) {
-        req.plan = memCached;
+        req.plan = applyCanonicalPlanFeatures(memCached);
+        if (req.plan !== memCached) memPlanCache.set(cacheKey, req.plan, 60);
         return next();
       }
       memPlanCache.del(cacheKey);
@@ -62,8 +64,9 @@ async function loadPlan(req, res, next) {
           const trialExpiryMs = cachedPlan.is_trial && cachedPlan.trial_ends_at ? new Date(cachedPlan.trial_ends_at).getTime() : null;
           const paidExpiryMs = !cachedPlan.is_trial && cachedPlan.subscription_expires_at ? new Date(cachedPlan.subscription_expires_at).getTime() : null;
           if ((trialExpiryMs === null || trialExpiryMs > nowMs) && (paidExpiryMs === null || paidExpiryMs > nowMs)) {
-            memPlanCache.set(cacheKey, cachedPlan, 60);
-            req.plan = cachedPlan;
+            const authoritativePlan = applyCanonicalPlanFeatures(cachedPlan);
+            memPlanCache.set(cacheKey, authoritativePlan, 60);
+            req.plan = authoritativePlan;
             return next();
           }
           await redisClient.del(cacheKey);
@@ -104,7 +107,7 @@ async function loadPlan(req, res, next) {
         );
         if (freeResult.rows.length > 0) {
           const starter = getPlan(1);
-          req.plan = { ...freeResult.rows[0], plan_key: starter.key, name: starter.name, employee_limit: starter.employeeLimit, is_trial: false, days_remaining: 0, trial_ends_at: null };
+          req.plan = { ...freeResult.rows[0], plan_key: starter.key, name: starter.name, employee_limit: starter.employeeLimit, features: starter.features, is_trial: false, days_remaining: 0, trial_ends_at: null };
           return next();
         }
       } catch (fallbackErr) {
@@ -178,12 +181,10 @@ async function loadPlan(req, res, next) {
       };
     }
 
-    const canonicalPlan = getPlan(planObj.id);
-    if (canonicalPlan) {
-      planObj.plan_key = canonicalPlan.key;
-      planObj.name = canonicalPlan.name;
-      planObj.employee_limit = canonicalPlan.employeeLimit;
-    }
+    // Feature entitlements are code-defined and mirrored in migration 037.
+    // Do not let stale/malformed database or cache JSON grant a capability that
+    // the current backend catalog denies (or hide one that it explicitly grants).
+    planObj = applyCanonicalPlanFeatures(planObj);
 
     const remainingSeconds = planObj.is_trial && planObj.trial_ends_at
       ? Math.max(1, Math.ceil((new Date(planObj.trial_ends_at).getTime() - Date.now()) / 1000))

@@ -8,6 +8,8 @@ const { createNotification, createNotificationForOwners } = require("../utils/no
 const EventMessagingService = require('../services/eventMessagingService');
 const { storage } = require('../middleware/als');
 const { detectFileSignature } = require('../utils/fileValidation');
+const { loadPlan, checkPlanLimit } = require('../middleware/planMiddleware');
+const { recordCompanyStorageUsage } = require('../services/companyStorage');
 
 const STAFF_ROLES = new Set(['owner', 'admin', 'employee', 'hr', 'manager', 'technician']);
 
@@ -101,7 +103,12 @@ async function ensureDbInitialized() {
 }
 // ── 1. POST /api/jobs/:id/proof-of-work ─────────────────────────────────────
 // Submit site photo, progress notes, and GPS check-in (Field Technicians)
-router.post("/:id/proof-of-work", authenticateToken, requireClockIn, async (req, res) => {
+router.post("/:id/proof-of-work", authenticateToken, requireClockIn, loadPlan, checkPlanLimit('storage', {
+  getRequestedUsage: (req) => {
+    const match = typeof req.body?.photo_url === 'string' && req.body.photo_url.match(/^data:image\/(?:jpeg|png|webp);base64,([A-Za-z0-9+/]+={0,2})$/i);
+    return match ? Buffer.from(match[1], 'base64').length : 0;
+  }
+}), async (req, res) => {
   try {
     await ensureDbInitialized();
     const jobId = req.params.id;
@@ -166,14 +173,30 @@ router.post("/:id/proof-of-work", authenticateToken, requireClockIn, async (req,
       ? client_submission_id
       : null;
 
-    const result = await pool.query(
-      `INSERT INTO job_proof_of_work 
-       (job_id, company_id, uploaded_by_id, uploaded_by_name, photo_url, notes, gps_latitude, gps_longitude, stage, client_submission_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-       ON CONFLICT (company_id, client_submission_id) WHERE client_submission_id IS NOT NULL DO NOTHING
-       RETURNING *`,
-      [jobId, effectiveCompanyId, userId, userName, photo_url || null, notes || null, gps_latitude ?? null, gps_longitude ?? null, stage, submissionId]
-    );
+    const photoMatch = typeof photo_url === 'string' && photo_url.match(/^data:image\/(?:jpeg|png|webp);base64,([A-Za-z0-9+/]+={0,2})$/i);
+    const photoBytes = photoMatch ? Buffer.from(photoMatch[1], 'base64').length : 0;
+    const proofClient = await pool.connect();
+    let result;
+    try {
+      await proofClient.query('BEGIN');
+      result = await proofClient.query(
+        `INSERT INTO job_proof_of_work
+         (job_id, company_id, uploaded_by_id, uploaded_by_name, photo_url, notes, gps_latitude, gps_longitude, stage, client_submission_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         ON CONFLICT (company_id, client_submission_id) WHERE client_submission_id IS NOT NULL DO NOTHING
+         RETURNING *`,
+        [jobId, effectiveCompanyId, userId, userName, photo_url || null, notes || null, gps_latitude ?? null, gps_longitude ?? null, stage, submissionId]
+      );
+      if (result.rows[0] && photoBytes > 0) {
+        await recordCompanyStorageUsage(effectiveCompanyId, `job-proof:${result.rows[0].id}`, photoBytes, 'job_proof_image', proofClient);
+      }
+      await proofClient.query('COMMIT');
+    } catch (error) {
+      await proofClient.query('ROLLBACK').catch(() => {});
+      throw error;
+    } finally {
+      proofClient.release();
+    }
     const inserted = result.rows[0];
     const persisted = inserted || (submissionId
       ? (await pool.query(

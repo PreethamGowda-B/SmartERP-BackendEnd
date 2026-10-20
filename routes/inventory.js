@@ -1,12 +1,16 @@
 const express = require('express');
+const crypto = require('crypto');
 const router = express.Router();
 const multer = require('multer');
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
+const { loadPlan, checkPlanLimit } = require('../middleware/planMiddleware');
 const { cloudinary, hasCloudinaryConfig } = require('../config/cloudinary');
 const { trackCreation, trackAllChanges, trackDeletion, trackRestoration, getItemHistory } = require('../utils/inventoryHistory');
 const { checkPermission } = require('../middleware/rbac');
 const { requireValidFileSignature } = require('../utils/fileValidation');
+const { requireFeature } = require('../middleware/featureGuard');
+const { recordCompanyStorageUsage, removeCompanyStorageUsage } = require('../services/companyStorage');
 
 // Configure multer with memory storage for server-side magic byte inspection
 const upload = multer({
@@ -40,6 +44,24 @@ async function uploadInventoryImage(file, companyId) {
 // Predefined categories and units
 const VALID_CATEGORIES = ['Raw Materials', 'Finished Goods', 'Tools', 'Supplies', 'Uncategorized'];
 const VALID_UNITS = ['bags', 'kg', 'pieces', 'liters', 'boxes', 'meters', 'units'];
+const requireInventoryImageEntitlement = (req, res, next) => {
+    if (!req.file) return next();
+    return requireFeature('inventory_images', 'inventory images')(req, res, next);
+};
+const loadInventoryImageForStorageReplacement = async (req, res, next) => {
+    if (!req.file || !req.user?.companyId || !req.params?.id) return next();
+    try {
+        const result = await pool.query(
+            'SELECT id, image_url, image_storage_key, image_size_bytes FROM inventory_items WHERE id = $1 AND company_id = $2',
+            [req.params.id, req.user.companyId]
+        );
+        req.inventoryQuotaOldItem = result.rows[0] || null;
+        return next();
+    } catch (error) {
+        console.error('Could not load current inventory image for storage quota:', error.code || error.name);
+        return res.status(503).json({ code: 'PLAN_LIMIT_CHECK_UNAVAILABLE', message: 'Could not verify the storage limit. Please retry shortly.' });
+    }
+};
 
 const { body, validationResult } = require('express-validator');
 
@@ -48,12 +70,16 @@ const { body, validationResult } = require('express-validator');
 router.post(
   '/',
   authenticateToken,
+  loadPlan,
+  checkPlanLimit('inventory'),
   upload.single('image'),
   requireValidFileSignature({
     allowedMimes: ['image/jpeg', 'image/png', 'image/webp'],
     fieldName: 'image',
     required: false
   }),
+  requireInventoryImageEntitlement,
+  checkPlanLimit('storage', { getRequestedUsage: (req) => req.file?.size || 0 }),
   [
   body('name').trim().notEmpty().withMessage('Item name is required').escape(),
   body('description').optional({ checkFalsy: true }).trim().escape(),
@@ -85,8 +111,15 @@ router.post(
 
         // Get image URL from Cloudinary if file was uploaded
         let imageUrl = null;
+        let imageStorageKey = null;
         if (req.file) {
+            imageStorageKey = `inventory-image:${crypto.randomUUID()}`;
+            await recordCompanyStorageUsage(req.user.companyId, imageStorageKey, req.file.size, 'inventory_image');
             imageUrl = await uploadInventoryImage(req.file, req.user.companyId);
+            if (!imageUrl) {
+                await removeCompanyStorageUsage(req.user.companyId, imageStorageKey);
+                imageStorageKey = null;
+            }
         }
 
         // Get employee name
@@ -100,8 +133,9 @@ router.post(
         const result = await pool.query(
             `INSERT INTO inventory_items 
        (name, description, quantity, image_url, created_by, employee_name, 
-        category, unit, min_quantity, supplier_name, supplier_contact, supplier_email, company_id, source_type, source_reference, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'manual_inventory_entry', 'MANUAL', NOW())
+        category, unit, min_quantity, supplier_name, supplier_contact, supplier_email, company_id, source_type, source_reference, created_at,
+        image_storage_key, image_size_bytes)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'manual_inventory_entry', 'MANUAL', NOW(), $14, $15)
        RETURNING *`,
             [
                 name.trim(),
@@ -116,7 +150,9 @@ router.post(
                 supplier_name?.trim() || null,
                 supplier_contact?.trim() || null,
                 supplier_email?.trim() || null,
-                req.user.companyId || null
+                req.user.companyId || null,
+                imageStorageKey,
+                imageStorageKey ? req.file.size : null
             ]
         );
 
@@ -296,6 +332,13 @@ router.put(
     fieldName: 'image',
     required: false
   }),
+  loadPlan,
+  requireInventoryImageEntitlement,
+  loadInventoryImageForStorageReplacement,
+  checkPlanLimit('storage', {
+    getRequestedUsage: (req) => req.file?.size || 0,
+    getReplacementKey: (req) => req.file ? (req.inventoryQuotaOldItem?.image_storage_key || null) : null,
+  }),
   [
   body('name').optional({ checkFalsy: true }).trim().escape(),
   body('description').optional({ checkFalsy: true }).trim().escape(),
@@ -336,9 +379,16 @@ router.put(
 
         // Handle image upload
         let imageUrl = oldItem.image_url;
+        let imageStorageKey = null;
         if (req.file) {
+            imageStorageKey = `inventory-image:${crypto.randomUUID()}`;
+            await recordCompanyStorageUsage(req.user.companyId, imageStorageKey, req.file.size, 'inventory_image');
             const uploadedUrl = await uploadInventoryImage(req.file, req.user.companyId);
             if (uploadedUrl) imageUrl = uploadedUrl;
+            else {
+                await removeCompanyStorageUsage(req.user.companyId, imageStorageKey);
+                imageStorageKey = null;
+            }
         }
 
         // Get user name
@@ -354,7 +404,8 @@ router.put(
              SET name = $1, description = $2, quantity = $3, image_url = $4,
                  category = $5, unit = $6, min_quantity = $7,
                  supplier_name = $8, supplier_contact = $9, supplier_email = $10,
-                 updated_by = $11, updated_at = NOW()
+                 updated_by = $11, updated_at = NOW(),
+                 image_storage_key = $14, image_size_bytes = $15
              WHERE id = $12 AND company_id = $13
              RETURNING *`,
             [
@@ -370,11 +421,17 @@ router.put(
                 supplier_email?.trim() || oldItem.supplier_email,
                 userId,
                 id,
-                req.user.companyId
+                req.user.companyId,
+                imageStorageKey || oldItem.image_storage_key || null,
+                imageStorageKey ? req.file.size : oldItem.image_size_bytes || null
             ]
         );
 
         const newItem = result.rows[0];
+        const oldImageStorageKey = oldItem.image_storage_key || (oldItem.image_url ? `inventory-image:${oldItem.id}` : null);
+        if (imageStorageKey && imageUrl && oldImageStorageKey && oldImageStorageKey !== imageStorageKey) {
+            await removeCompanyStorageUsage(req.user.companyId, oldImageStorageKey);
+        }
 
         // Track changes in history
         await trackAllChanges(id, oldItem, newItem, userId, userName);
@@ -448,7 +505,6 @@ router.patch('/:id/archive', authenticateToken, async (req, res) => {
         if (result.rows.length === 0) {
             return res.status(404).json({ message: 'Inventory item not found or access denied' });
         }
-
         // Track deletion in history
         await trackDeletion(id, userId, userName);
 
@@ -461,7 +517,7 @@ router.patch('/:id/archive', authenticateToken, async (req, res) => {
 
 // ─── PATCH /api/inventory/:id/restore ────────────────────────────────────────
 // Restore archived inventory item (owner only)
-router.patch('/:id/restore', authenticateToken, async (req, res) => {
+router.patch('/:id/restore', authenticateToken, loadPlan, checkPlanLimit('inventory'), async (req, res) => {
     try {
         const { id } = req.params;
         const role = req.user.role;

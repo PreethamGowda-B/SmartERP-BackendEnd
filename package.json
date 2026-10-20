@@ -12,7 +12,8 @@
     "create-admin": "node scripts/createAdmin.js",
     "run-schema": "node scripts/runSchema.js",
     "migrate": "node migrations/runProductionDispatch.js",
-    "migrate:production-dispatch": "node migrations/runProductionDispatch.js"
+    "migrate:production-dispatch": "node migrations/runProductionDispatch.js",
+    "migrate:subscription": "node scripts/runSubscriptionMigration.js"
   },
   "dependencies": {
     "@sentry/node": "^10.43.0",

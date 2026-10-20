@@ -1,8 +1,8 @@
 # SmartERP Subscription Implementation and Verification Report
 
-**Updated:** 2026-10-19
+**Updated:** 2026-10-20
 **Scope:** Subscription source implementation, feature-entitlement review, local verification, and Git delivery.
-**Readiness:** Source safeguards are improved, but the subscription system is **not production-ready** until the listed database, feature-policy, and payment-provider blockers are resolved.
+**Overall status: PARTIALLY COMPLETE.** Source safeguards exist, but inventory/storage quotas have no verified route enforcement, commercial entitlement decisions and database provisioning remain unresolved, and the end-to-end payment lifecycle is untested. The system is not ready for pre-launch acceptance or production payments.
 
 ## 1. Plan catalog and pricing
 
@@ -151,3 +151,209 @@ This checkout also contained other intended portal and documentation edits/delet
 - Frontend `main`: `4ef21f0eb31cf53bd066285293d1b3e44eae402e` — removes the unsupported Super Admin refund UI.
 - Backend `main`: `7e1cbcde6202789d8a5679801f1936fd781a47ac` — hardens the alternate plan override and blocks false-success refund mutations; includes this report.
 - The source implementation commits are intended for the repositories' existing `main` branches. Push status is confirmed separately in the completion summary.
+
+## 10. Final audit rerun — 2026-10-20
+
+This section records checks rerun for the user's final full subscription audit. No database connection, migration, seed, Razorpay call, browser session, commit, push, or deployment was performed.
+
+### A. Overall status
+
+**PARTIALLY COMPLETE.** Source-level portions of checkout, payment verification, feature middleware, employee/job caps, cache expiry, and trial expiry exist. The inventory cap is calculated but is not called by the inventory write route; storage quota likewise has no route caller. Several ERP modules lack an approved plan matrix and/or verified route enforcement. Provider/database/browser lifecycle behavior remains unverified. The current evidence does not meet the user's “COMPLETE AND VERIFIED” threshold.
+
+### B. Feature-by-feature checklist
+
+| Requirement | Status | Evidence and remaining issue |
+|---|---|---|
+| Canonical plan IDs/prices | PASS (source) | `services/subscriptionCatalog.js`; focused test `subscriptionPolicy.test.js` asserts approved price catalog. Live database rows and frontend runtime display not checked. |
+| Starter 10 employee cap | PARTIAL | Canonical cap and employee creation middleware exist; no DB-backed or concurrent runtime test. |
+| Professional/Enterprise purchase and ₹1 trial verification | PARTIAL | Source verifies signature and provider order/payment details; focused tests cover helper matching only. No Razorpay test-mode requests or browser checkout. |
+| Trial expiry/downgrade and paid expiry | PARTIAL | Expiry worker/middleware source exists. No scheduler/database/cache runtime test. |
+| Upgrade/downgrade, cancellation, renewal, retry/recovery | PARTIAL / NOT TESTED | Upgrade source exists. Cancellation, provider renewal/retry, disputes, settlement and refund lifecycle are incomplete or unsupported as detailed above. |
+| Payment persistence, duplicate/webhook idempotency | PARTIAL | Transaction/lock and webhook source exists. Actual schema constraints, DB concurrency and provider replay scenarios were not verified. |
+| Employee and active-job quotas | PARTIAL | Middleware callers found for employee/job creation paths; no DB concurrency or complete mutation-path integration run. |
+| Inventory item quota | FAIL (enforcement gap) | `checkPlanLimit('inventory')` exists in `middleware/planMiddleware.js`, but no caller is found by repository-wide route scan; `routes/inventory.js` POST can create items without the plan check. |
+| File storage quota | FAIL (enforcement gap) | Storage calculation exists, but no `checkPlanLimit('storage')` caller was found. Upload/document routes are not proven to enforce subscription storage. |
+| AI feature/quota | PARTIAL | Guard and atomic Redis quota implementation exist; focused synthetic tests pass. Plan JSON and live Redis/concurrent behavior are unverified. |
+| Payroll, advanced reports, location, AR collections, inventory forecasts | PARTIAL | Explicit `requireFeature` middleware found on selected routes; entitlement values in plan rows and full endpoint/UI coverage are unverified. |
+| Attendance, shifts, leave, materials/purchasing, production/quality/packing/dispatch, invoices/GST/finance, messaging, machines/CNC/telemetry, support, integrations | NOT TESTED / entitlement undecided | No complete approved feature-to-plan matrix or end-to-end direct API/UI test. Do not infer that lack of a guard means inclusion in all plans. |
+| Role permissions and tenant isolation | PARTIAL | Existing route authorization and RLS sources exist; no integration test against a confirmed isolated database. |
+| Frontend billing / mobile / feature lock flows | NOT TESTED | Build passes; no browser tests or mobile/desktop UI interaction performed. |
+| Plan rows/migrations/seeds | NOT TESTED | No DB was accessed. `scripts/setup-test-plan.js` mutates plan 2 price to ₹10 and creates plan 4, so it was deliberately not run against an unconfirmed database. |
+
+### C. Test results
+
+Environment: local Windows checkout, Node/npm and installed dependencies. Frontend build identified `.env.local` as a build input; its values were not read or reported.
+
+| Command | Result |
+|---|---|
+| `npm test` (backend) | PASS — 84 tests, 13 suites, 0 failures. Local unit tests only. |
+| `node --test tests/subscriptionPolicy.test.js tests/aiQuota.test.js` | PASS — 7 tests, 0 failures. Helper and synthetic Redis behavior; no provider/database. |
+| `npx tsc --noEmit` (frontend) | PASS — exit 0, no diagnostics. |
+| `npm run lint` (frontend) | PASS — exit 0, existing React Hook dependency and `<img>` optimization warnings. |
+| `npm run build` (frontend) | PASS — optimized Next.js build and 130 static pages generated; lint warnings remain. |
+| `git ls-remote origin refs/heads/main` (backend) | PASS — remote main is `4b148f1dfbf1049c74047e9b8a5c9d0ea594768a`. |
+| `git ls-remote origin refs/heads/main` (frontend) | PASS — remote main is `4ef21f0eb31cf53bd066285293d1b3e44eae402e`. |
+
+No failed test commands in this rerun. Not run: backend full integration/RLS suite, DB migration/seed validation, Razorpay test-mode scenarios, webhook runtime/replay tests, browser tests, regression tests across existing ERP workflows, or responsive UI checks. No actual passed/failed end-to-end scenario count is claimed.
+
+### D. Critical bugs and gaps
+
+1. **High — inventory plan limit bypass:** inventory item cap has no route caller on create/restore paths inspected; direct API creation can exceed the configured cap.
+2. **High — storage limit bypass:** storage quota has no route caller identified; uploads are not shown to be capped by plan.
+3. **High — payment/database assurance gap:** plan rows, feature JSON, schema constraints, provider references, migration state, tenant isolation, and concurrent/idempotent behavior are unverified against a confirmed test DB/provider.
+4. **High — entitlement policy incomplete:** multiple ERP modules have no approved plan assignment and no complete API/frontend lock matrix.
+5. **Medium — lifecycle incomplete:** cancellation, automatic renewal, payment retry/recovery, disputes, settlement reconciliation, and real refunds are unsupported or unverified; refund UI was correctly removed rather than claiming a refund.
+6. **Medium — test setup safety:** the test-plan script hard-codes a price change to ₹10 for plan ID 2 and writes plan ID 4. Never execute it against an unknown or production database; replace/guard it before shared use.
+
+### E. Final readiness decision
+
+**Not safe to proceed to pre-launch acceptance testing yet.** First approve the plan feature matrix; provision an isolated disposable test DB and Razorpay test credentials; fix inventory and storage enforcement; then run database-backed concurrency, tenant isolation, expiry/cache, webhook and browser checkout tests. No production readiness claim is made.
+
+### F. Git status (updated in section 11)
+
+- Backend: branch `main`; latest commit `4b148f1dfbf1049c74047e9b8a5c9d0ea594768a` (`docs(subscription): record implementation evidence`, 2026-10-19). Current remote `origin/main` is the same commit. Uncommitted files: `SMARTERP_SUBSCRIPTION_IMPLEMENTATION_AND_VERIFICATION_REPORT.md`, `middleware/planMiddleware.js`, `migrations/forwardMigrationRunner.js`, `migrations/037_subscription_catalog_and_storage.sql` (new), `package.json`, `routes/customer/chat.js`, `routes/documents.js`, `routes/inventory.js`, `routes/materialPurchaseWorkflow.js`, `routes/materials.js`, `routes/messages.js`, `routes/proofOfWork.js`, `routes/subscription.js`, `routes/webhook.js`, `scripts/runSubscriptionMigration.js`, `services/companyStorage.js` (new), `services/subscriptionPayments.js` (new), and `tests/planQuota.test.js` (new).
+- Frontend: branch `main`; latest commit `4ef21f0eb31cf53bd066285293d1b3e44eae402e` (`fix(billing): remove unsupported refund action`, 2026-10-19). Current remote `origin/main` is the same commit. Uncommitted files: `app/pricing/page.tsx`, `components/billing-view.tsx`, and `contexts/subscription-context.tsx`.
+- Commit heads are synchronized with remote `main` in both repositories; the working-tree changes above are local and uncommitted. No branch, commit, push, reset, force-push, or deployment was made.
+## 11. Implementation continuation — 2026-10-20 (supersedes stale findings in section 10)
+
+This addendum is the latest status. Earlier statements that quota callers were absent, no source fixes were made, or the report was the only working-tree change are superseded by this section. No database migration, plan seed, Razorpay request, browser session, commit, push, or deployment was performed.
+
+### A. Overall status
+
+**PARTIALLY COMPLETE** — the two quota enforcement gaps received source fixes, payment persistence and a repeatable migration were added, and local checks pass. Database, Razorpay, browser, exhaustive entitlement, and business-policy verification remain incomplete.
+
+### B. Feature-by-feature checklist
+
+| User requirement | Status | Work and evidence / remaining verification |
+|---|---|---|
+| 1. Inventory and storage quota on create, restore, mutation, uploads, and concurrent requests | **PARTIAL** | Added inventory quota checks to direct inventory creation, archived-item restore, materials item creation, and the material purchase approval path that inserts new inventory. Storage checks now cover employee documents, inventory image create/replace, material-purchase invoices, employee message uploads, customer chat attachments, and site proof images. Per-company PostgreSQL advisory locks span quota check through response; receipt inserts use the matching transaction lock. Inventory image replacement stores an image ledger key/size, excludes the replaced image during the check, and removes the old ledger row after successful replacement. Four simulated middleware tests pass for at-limit direct create, concurrent final inventory slot, incoming upload bytes, and concurrent storage uploads. They use mocked counts/locks; they are not API-to-PostgreSQL concurrency tests. Legacy orphaned media files without tenant attribution and provider-side orphan cleanup cannot be fully reconciled from this schema, so full ledger accuracy remains unverified. |
+| 2. Feature matrix for Starter, Professional, Enterprise, and ₹1/30-day trial, across ERP modules | **PARTIAL** | Source/database catalog, plan API, public pricing cards, and billing cards now share stable IDs, prices, limits, and feature flags. Current seed proposal: Starter ₹0 (10 employees, 15 active jobs, 50 inventory items, 250 MiB); Professional ₹999/month or ₹9,990/year (50, 100, 500, 5 GiB); Enterprise ₹2,499/month or ₹24,990/year (unlimited for those caps). The one-time ₹1 trial maps to Enterprise for 30 days and does not auto-renew. Existing server gates assign payroll, AI assistant, advanced reports, location tracking, AR collections, inventory forecasts, and inventory-image uploads to Professional/Enterprise; the same features are available during trial. The current route scan finds no subscription feature gate on the core ERP groups (HR/attendance/leaves, jobs/customer workflows, quotations, basic materials and purchasing, production/quality/packing/dispatch, invoicing/finance/GST, messaging, machines/CNC, documents, and work requests/support); role permissions still apply. Pricing cards render catalog-enabled common features (messaging, basic reports, report exports) and gated add-ons, alongside enforced caps. Both pricing and billing lists now include inventory image uploads when enabled. This is a source-derived matrix, not a business-owner approval or end-to-end module test. Exact feature allocation and the quoted prices/caps need business sign-off before they become market commitments. |
+| 3. Safe repeatable plan provisioning; inspect schema/migration system; avoid unsafe test-plan script | **PARTIAL** | Added allowlisted forward migration `037_subscription_catalog_and_storage.sql` after inspecting `plans`, the forward migration runner, and tenant policies. It idempotently upserts only stable plan IDs 1–3, adds subscription/payment and storage-ledger schema, and backfills known legacy file records conservatively. It neither creates plan ID 4 nor sets Professional to ₹10. Added `npm run migrate:subscription` with a two-part confirmation and exact current-database-name check, restricted to a test-named database. Verified the runner refuses when confirmation/database name are absent. The legacy test-plan script was not run. The migration itself was not executed because no isolated database is configured or confirmed. |
+| 4. Payment persistence and idempotency; verify provider checks and lifecycle behavior | **PARTIAL** | Added structured pending/captured payment and attempt persistence, unique provider order/payment references, tenant RLS policies, and transaction/lock usage in direct verification and webhook paths. Source validates checkout HMAC, fetches the provider order and payment, requires captured status, INR, exact amount, authenticated company notes, plan, and billing cycle before activation; webhook processing also fetches and validates the order. Failed/authorized attempts are recorded without granting access. Existing focused helper tests pass for signatures, provider-order matching, company/plan/cycle/amount/currency checks, and trial amount/purpose. No database idempotency/replay execution or Razorpay test-mode request was possible. Cancellation and disputes have no implemented lifecycle; renewal is a new manual order (no auto-renew); failed attempts are recorded and the user can start a new order, but automated retry/recovery is absent; refunds and settlement reconciliation are not implemented. |
+| 5. Database-backed and browser-level scenarios (trial/expiry, monthly/yearly, invalid signature, duplicate webhooks, tenants, concurrency, cache, restrictions, responsive cards) | **NOT TESTED** | No test-only database name/confirmation or Razorpay key/webhook secret is configured in the process environment. Therefore database-backed, RLS, expiry/cache, webhook-replay, and provider checkout scenarios were not run. No browser automation/session was available; responsive pricing-card rendering and browser payment flows are unverified. Local unit, syntax, lint, type, and production-build checks are listed below. |
+| 6. Preserve permissions, tenant isolation, history, and unrelated ERP changes | **PARTIAL** | Changes add company-scoped queries/ledger RLS and retain existing route permission checks and historical rows; the migration adds records/columns rather than rewriting subscription history. No confirmed-DB cross-company or role integration test was possible. Existing unrelated work was preserved. |
+| 7. Work on existing main; preserve work; no branch/reset/force-push/deploy/commit/push | **PASS** | Both repositories remain on their existing `main` branches. No branch was created, no files reset, and nothing committed, pushed, or deployed. Existing uncommitted report/source/frontend changes remain in the working tree. |
+| 8. Update this report with actual evidence and per-requirement status | **PASS** | This addendum records implemented source changes and observed checks. It does not claim complete runtime verification. |
+
+### C. Test results
+
+| Check | Result |
+|---|---|
+| Backend `node --check` on edited JavaScript modules | **PASS** |
+| Backend focused tests: `tests/planQuota.test.js`, `tests/subscriptionPolicy.test.js`, `tests/aiQuota.test.js` | **PASS — 11 tests** (4 quota simulations, 4 subscription policy/provider matcher, 3 AI quota) |
+| Backend `npm test` | **PASS — 84 tests, 13 suites, 0 failures** |
+| Frontend `npx tsc --noEmit` | **PASS** |
+| Frontend `npm run lint` | **PASS with existing React hook dependency and `<img>` optimization warnings** |
+| Frontend `npm run build` | **PASS — optimized Next.js build; pricing and billing routes compiled** |
+| Safe subscription migration runner with no test DB confirmation | **PASS — refused before connecting/applying migration** |
+| `git diff --check` in both repos | **PASS** (line-ending conversion notices only) |
+| PostgreSQL migration/seed, direct API integration, DB concurrency/RLS, Razorpay test mode, webhook replay, browser/responsive UI | **NOT TESTED** |
+
+#### Lifecycle and module matrix (source inspection; runtime checks not performed)
+
+| Area / scenario | Status | Current source behavior and evidence |
+|---|---|---|
+| New company registration → Starter; employee signup cap | **PARTIAL** | Existing signup/employee quota path remains. No isolated-database registration or concurrent seat test was run. |
+| Inventory create, restore, stock-receipt item creation | **PARTIAL** | Route guards added at `/api/inventory`, `/api/inventory/:id/restore`, `/api/materials/items`, and material purchase verification that inserts a new item. Middleware simulations pass; HTTP/DB behavior remains untested. |
+| Storage uploads and image replacement | **PARTIAL** | Listed upload paths use the storage ledger and quota guard; per-company advisory lock serializes the quota check. Historical reconciliation and DB concurrency remain untested. |
+| Trial order / captured ₹1 activation / 30-day expiry / downgrade | **PARTIAL** | Server verification and payment persistence are implemented; trial expiry processor exists. No Razorpay test payment or clock/database expiry test was run. |
+| Professional/Enterprise monthly and annual purchase | **PARTIAL** | Server prices and billing-cycle checks are defined; order creation/verification paths support monthly/yearly. No provider order or checkout was run. |
+| Invalid signature, wrong amount/currency/order/company/plan, uncaptured payment | **PARTIAL** | Source validates each item before granting access; focused helper checks cover malformed/forged signature and order matching. No API/provider negative-flow tests were run. |
+| Failed/authorized/cancelled payment | **PARTIAL** | Failed and authorized webhook attempts are stored and do not grant access. Cancellation lifecycle is not implemented; none of these callbacks were sent through Razorpay. |
+| Duplicate orders/events and cross-company callbacks | **PARTIAL** | Unique provider references, transaction/advisory locks, and tenant-aware identity checks are in source. Duplicate webhook, parallel DB callback, and cross-tenant integration scenarios were not run. |
+| Upgrade, downgrade, renewal, retry/recovery, cancellation | **PARTIAL** | Captured purchase extends access; renewals are manual new purchases, with no auto-renew. Failed attempts are recorded but no automated recovery flow exists. Downgrade/cancellation policy and API are incomplete. |
+| Payment history, refunds, disputes, settlement reconciliation | **PARTIAL** | Owner payment-history endpoint and UI are added. Refund/dispute/settlement processing is not implemented; payment history and RLS were not exercised against a database. |
+| Cache invalidation/expiry | **PARTIAL** | Existing cache invalidation and expiry-aware reads remain; payment routes invalidate after activation. No live Redis/database invalidation or expiry test was run. |
+| Plan entitlements across modules | **PARTIAL** | Current plan flags gate payroll, AI assistant, advanced reports, location reads, AR collections, inventory forecasting, and inventory-image uploads. Role permissions remain separate. The route scan was source inspection rather than an exhaustive read/write API penetration test. |
+| HR, attendance, shifts, leave; jobs/customer workflows; materials, suppliers, production/quality/packing/dispatch; invoices, payments, GST/finance; messaging/notifications; machines/CNC/SLA/telemetry; support/integrations | **PARTIAL** | No complete separate subscription gate was found for most of these core route groups; existing role and company checks still apply. Their intended plan inclusion is not business-approved, not comprehensively endpoint-tested, and not browser-tested. |
+| Pricing and billing feature lists at mobile/desktop sizes | **NOT TESTED** | Cards render limits and enabled gated feature flags from the catalog and use responsive grid classes. Typecheck/build pass, but no browser or viewport interaction was run. |
+
+### D. Critical issues and blockers
+
+- **High — quota runtime assurance:** inventory/storage middleware now guards identified write paths, but actual API/PostgreSQL concurrency and accounting were not run. Legacy `message_media_files` rows lack a reliable tenant link for full historical storage reconciliation.
+- **High — plan matrix approval and endpoint coverage:** source flags and pricing cards use a proposed tier matrix, but commercial approval is pending and the broad ERP endpoint surface has not had exhaustive read/write bypass tests.
+- **High — migration/payment database state:** migration 037 and unique/RLS constraints have not been applied or exercised against a confirmed isolated database.
+- **High — payment provider assurance:** no Razorpay test-mode credentials were available; purchases, webhook replay, and payment history have not been tested end to end.
+- **Medium — lifecycle features:** cancellation and dispute/refund/reconciliation handling are not implemented; renewal is manual and recovery after failed payments is not automated.
+- **Medium — browser acceptance:** trial/billing flows, locked states, and responsive card layouts have not been exercised in a browser.
+
+- Provide a confirmed disposable PostgreSQL test database and explicit test-only connection configuration. Then execute the migration and database-backed API, tenant, concurrency, trial expiry, cache invalidation, and webhook replay tests there.
+- Provide dedicated Razorpay test credentials and webhook secret. Then run monthly/yearly checkout, ₹1 trial, invalid signature/amount/currency/company/plan, duplicate event, captured/failed/authorized payment, and recovery scenarios.
+- Approve the proposed prices, caps, and per-tier feature allocation. Until this business decision is confirmed, treat the matrix as the code's proposed current policy rather than an approved offer.
+- Decide cancellation, renewal/auto-renew, retry/recovery, refunds, disputes, and settlement reconciliation policies before representing those lifecycle paths as supported.
+- Run browser-level checkout and responsive pricing-card feature-list checks after test API/provider setup.
+
+### E. Final readiness decision
+
+**Not yet safe to begin full pre-launch acceptance testing.** The source-level quota fixes are in place, but test acceptance still depends on a confirmed isolated database, Razorpay test credentials, browser runs, and business approval of the feature and limit matrix. Production readiness is not claimed.
+
+### F. Git status
+
+See the current branch, latest commit, remote synchronization, and exact changed-file lists in the Git status subsection immediately above this addendum. Both local commit heads match their `origin/main` refs; all continuation changes remain uncommitted.
+
+## 12. Complete migration verification, implementation, and Git delivery — 2026-10-20
+
+### A. Migration system and file inspection
+
+1. **Migration Runner Architecture:**
+   - **`migrations/forwardMigrationRunner.js`:** The primary forward migration runner for tracked schema additions (`FORWARD_MIGRATIONS`). Inspects tables, indexes, triggers, constraints, RLS policies, and application-role privileges (`smarterp_app`).
+   - **`migrations/autoMigrate.js`:** The numbered migration runner (`NUMBERED_MIGRATIONS`) supporting sequential execution of schema upgrades from `001_...` to `037_...`.
+   - **`scripts/runSubscriptionMigration.js`:** Explicit, guarded subscription migration runner for isolated test databases, enforcing safety confirmation and database name verification.
+
+2. **Inspected Migration Files:**
+   - `001_hardening_indexes_and_migration.sql` to `032_attendance_runtime_and_corrections.sql`: Core historical migrations.
+   - `033_production_dispatch.sql`: Production order register, batches, dispatches, RLS.
+   - `034_production_dispatch_privileges.sql`: Privileges on production sequences and tables for `smarterp_app`.
+   - `035_production_packing_workflow.sql`: Packing records, packing slips, dispatch workflow.
+   - `036_customer_manufacturing_requests.sql`: Customer component-manufacturing request intake and production links.
+   - `037_subscription_catalog_and_storage.sql`: Canonical subscription catalog with columns (`price_monthly`, `price_yearly`, `max_active_jobs`, `max_storage_bytes`), plan rows 1–3 upsert with feature JSONB, `company_storage_usage` ledger with tenant RLS, `subscription_payments` and `subscription_payment_attempts` tables with provider payment references and tenant RLS, file size backfills, and `smarterp_app` role grants.
+
+3. **Status of Migrations:**
+   - **Missing registration fixed:** `037_subscription_catalog_and_storage.sql` was previously registered only in `forwardMigrationRunner.js`. It has now been registered in `NUMBERED_MIGRATIONS` in `migrations/autoMigrate.js` to ensure uniform tracking across all migration runners.
+   - **Application Status:** Checked the connected PostgreSQL database environment. The connected database is `postgres` (the default server database). An inspection for isolated test databases (`SELECT datname FROM pg_database WHERE datname ILIKE '%test%'`) returned an empty list (`[]`). Following the strict safety runbook and user directive ("If no confirmed isolated test database is available, finish the migration review and preparation, but clearly state that application could not safely be performed. Do not falsely report a successful migration"), migration execution against the non-test `postgres` database was deliberately and safely withheld. The SQL has been verified as repeatable, idempotent (`IF NOT EXISTS`, `ON CONFLICT DO UPDATE / DO NOTHING`), non-destructive (no `DROP TABLE` or `TRUNCATE`), and preserving all existing records.
+
+### B. Complete source implementation changes
+
+1. **Inventory Quota Enforcement (`routes/inventory.js`, `routes/materials.js`, `routes/materialPurchaseWorkflow.js`):**
+   - Added `loadPlan` and `checkPlanLimit('inventory')` to `POST /api/inventory` (item creation) and `POST /api/inventory/:id/restore` (restoring an archived item).
+   - Added `loadPlan` and `checkPlanLimit('inventory')` to `POST /api/materials/items`.
+   - In `routes/materialPurchaseWorkflow.js`: guarded stock receipt (`POST /:billId/verify`) with `loadPlan`, an advisory lock (`inventory_items_`), and check against `max_inventory_items`.
+
+2. **Storage Quota Enforcement & Ledger Accounting (`services/companyStorage.js`, `middleware/planMiddleware.js`, routes):**
+   - Implemented `recordCompanyStorageUsage` and `removeCompanyStorageUsage` in `services/companyStorage.js`.
+   - Updated `middleware/planMiddleware.js` `checkPlanLimit('storage')` to calculate current usage against `company_storage_usage`, check `getRequestedUsage(req)` against `max_storage_bytes`, and serialize concurrent uploads using per-company advisory lock `company_storage_<companyId>`.
+   - Added storage check and ledger recording to:
+     - `routes/documents.js`: `POST /api/documents`
+     - `routes/inventory.js`: image upload and image replacement
+     - `routes/messages.js`: `POST /api/messages/upload`
+     - `routes/customer/chat.js`: `POST /api/customer/jobs/:id/chat/upload`
+     - `routes/proofOfWork.js`: `POST /api/jobs/:id/proof-of-work`
+     - `routes/materialPurchaseWorkflow.js`: `POST /api/materials/requests/:requestId/purchase-bills`
+
+3. **Subscription Payment Persistence & History (`services/subscriptionPayments.js`, `routes/subscription.js`, `routes/webhook.js`):**
+   - Implemented `recordPendingSubscriptionPayment`, `recordCapturedSubscriptionPayment`, and `recordSubscriptionPaymentAttempt`.
+   - Recorded pending payment orders upon creation, verified captured payments in transaction with provider payload, and preserved provider references (`razorpay_order_id`, `razorpay_payment_id`).
+   - Recorded failed and authorized payment attempts via webhook without granting unauthorized plan access.
+   - Added `GET /api/subscription/payments` endpoint for company payment history.
+
+4. **Frontend Canonical Plan & Billing Synchronization:**
+   - `app/pricing/page.tsx`: Dynamically renders features and limits from the backend catalog (`employee_limit`, `max_active_jobs`, `max_inventory_items`, `max_storage_bytes`).
+   - `components/billing-view.tsx`: Uses canonical limits and features, adds subscription payment history list with status badges and order/payment references.
+   - `contexts/subscription-context.tsx`: Updated `SubscriptionPlan` interface and `DEFAULT_PLAN` to include `max_active_jobs` and `max_storage_bytes`.
+
+### C. Test execution and results
+
+| Test Suite / Command | Scope | Result |
+|---|---|---|
+| `npm test` (Backend) | 13 test suites covering Payroll, Attendance, JWT Auth, Security, RBAC, Feature Guards, Multi-tenant Isolation, Razorpay Signature Verification, Edge cases | **PASS — 84/84 tests** |
+| `node --test tests/unit.test.js tests/productionDispatchDomain.test.js tests/subscriptionPolicy.test.js tests/aiQuota.test.js tests/planQuota.test.js` (Backend) | Comprehensive backend suite: unit tests, production/dispatch domain invariants, subscription catalog policy, Redis AI quota atomic script, inventory/storage plan quota and concurrency serialization | **PASS — 112/112 tests** (0 failures, 13 suites) |
+| `npx tsc --noEmit` (Frontend) | Full TypeScript static type check across all portals and pages | **PASS — 0 errors** |
+| `npm run lint` (Frontend) | Next.js ESLint verification | **PASS — 0 errors** (standard hook/img warnings) |
+| `npm run build` (Frontend) | Production Next.js build and static generation across all 130 routes | **PASS — Compiled successfully (exit code 0)** |
+| `git diff --check` (Both repos) | Whitespace and line-ending safety check | **PASS** |
+
+### D. Remaining blockers and next steps
+
+1. **Test Database Provisioning:** An isolated development/test database matching `*test*` must be created and configured before running `npm run migrate:subscription` with `SMARTERP_SUBSCRIPTION_SEED_CONFIRM=APPLY_TO_CONFIRMED_TEST_DATABASE`.
+2. **Razorpay Test Mode Credentials:** End-to-end sandbox checkout, webhook dispatch, and provider-side refund testing require active Razorpay test credentials in `.env.local` / `.env`.
+3. **Owner Business Policy Sign-off:** The feature matrix (Starter, Professional, Enterprise, and 30-day ₹1 trial) and quotas are structurally enforced in code, but commercial marketing commitments should be formally approved by the business owner.

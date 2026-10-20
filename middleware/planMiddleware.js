@@ -14,7 +14,7 @@ const memPlanCache = new NodeCache({ stdTTL: 60, checkperiod: 120, maxKeys: 1000
 
 async function loadPlan(req, res, next) {
   try {
-    const companyId = req.user?.companyId || req.user?.company_id || req.customer?.companyId || req.customer?.company_id;
+    const companyId = req.user?.companyId || req.user?.company_id || req.customer?.companyId || req.customer?.company_id || req.proofCaller?.companyId || req.proofCaller?.company_id;
     if (!companyId) {
       if (req.user?.role === 'super_admin') {
         req.plan = {
@@ -84,6 +84,8 @@ async function loadPlan(req, res, next) {
          p.max_inventory_items,
          p.max_material_requests,
          p.messages_history_days,
+         p.max_active_jobs,
+         p.max_storage_bytes,
          p.features,
          c.subscription_expires_at
        FROM companies c
@@ -98,7 +100,7 @@ async function loadPlan(req, res, next) {
       console.warn(`⚠️ planMiddleware: No plan found for company ${companyId}. Falling back to Free plan.`);
       try {
         const freeResult = await pool.query(
-          `SELECT id, name, employee_limit, max_inventory_items, max_material_requests, messages_history_days, features FROM plans WHERE id = 1`
+          `SELECT id, name, employee_limit, max_inventory_items, max_material_requests, messages_history_days, max_active_jobs, max_storage_bytes, features FROM plans WHERE id = 1`
         );
         if (freeResult.rows.length > 0) {
           const starter = getPlan(1);
@@ -128,7 +130,7 @@ async function loadPlan(req, res, next) {
 
     if (isActuallyExpired) {
       const freeResult = await pool.query(
-        `SELECT id, name, employee_limit, max_inventory_items, max_material_requests, messages_history_days, features
+        `SELECT id, name, employee_limit, max_inventory_items, max_material_requests, messages_history_days, max_active_jobs, max_storage_bytes, features
          FROM plans WHERE id = 1`
       );
       const free = freeResult.rows[0];
@@ -141,7 +143,7 @@ async function loadPlan(req, res, next) {
       };
     } else if (trialActive) {
       const proResult = await pool.query(
-        `SELECT id, name, employee_limit, max_inventory_items, max_material_requests, messages_history_days, features
+        `SELECT id, name, employee_limit, max_inventory_items, max_material_requests, messages_history_days, max_active_jobs, max_storage_bytes, features
          FROM plans WHERE id = 3`
       );
       const pro = proResult.rows[0];
@@ -166,6 +168,8 @@ async function loadPlan(req, res, next) {
         max_inventory_items: data.max_inventory_items,
         max_material_requests: data.max_material_requests,
         messages_history_days: data.messages_history_days,
+        max_active_jobs: data.max_active_jobs,
+        max_storage_bytes: data.max_storage_bytes,
         features: data.features,
         is_trial: false,
         days_remaining: daysRemaining,
@@ -214,13 +218,13 @@ async function loadPlan(req, res, next) {
  * Professional: 50 Employees, 100 Jobs, 500 Items, 5GB Storage
  * Enterprise: Unlimited
  */
-function checkPlanLimit(limitType) {
+function checkPlanLimit(limitType, options = {}) {
   return async (req, res, next) => {
     let quotaLockClient = null;
     let releaseWithResponse = false;
     let releasePromise = null;
     try {
-      const companyId = req.user?.companyId || req.user?.company_id || req.customer?.companyId || req.customer?.company_id;
+      const companyId = req.user?.companyId || req.user?.company_id || req.customer?.companyId || req.customer?.company_id || req.proofCaller?.companyId || req.proofCaller?.company_id;
       if (companyId && !req.plan) {
         return res.status(503).json({ code: 'PLAN_CHECK_UNAVAILABLE', message: 'Could not verify your subscription. Please retry shortly.' });
       }
@@ -232,6 +236,14 @@ function checkPlanLimit(limitType) {
       if (isUnlimitedPlan(plan)) {
         if (limitType !== 'ai_messages') return next();
       }
+
+      const requestedUsage = typeof options.getRequestedUsage === 'function'
+        ? Number(options.getRequestedUsage(req) || 0)
+        : 0;
+      if (!Number.isFinite(requestedUsage) || requestedUsage < 0) {
+        return res.status(400).json({ code: 'INVALID_QUOTA_USAGE', message: 'The requested quota usage is invalid.' });
+      }
+      if (limitType === 'storage' && requestedUsage === 0) return next();
 
       if (limitType === 'ai_messages') {
         const quota = await consumeAIRequest(redisClient, req.user?.userId || req.user?.id, resolvePlanTier(plan));
@@ -245,7 +257,7 @@ function checkPlanLimit(limitType) {
       // active jobs across workers. The lock stays held until the route has
       // completed its write and sent a response. Signup uses the matching
       // transaction-scoped employee lock.
-      const lockName = limitType === 'employee' ? 'employee_seats_' : limitType === 'job' ? 'active_jobs_' : null;
+      const lockName = limitType === 'employee' ? 'employee_seats_' : limitType === 'job' ? 'active_jobs_' : limitType === 'inventory' ? 'inventory_items_' : limitType === 'storage' ? 'company_storage_' : null;
       if (companyId && lockName) {
         quotaLockClient = await pool.connect();
         await quotaLockClient.query("SELECT pg_advisory_lock(hashtext($1 || $2))", [lockName, String(companyId)]);
@@ -303,28 +315,35 @@ function checkPlanLimit(limitType) {
         currentCount = parseInt(countRes.rows[0]?.count || 0, 10);
         limitLabel = 'Inventory Items';
       } else if (limitType === 'storage') {
-        maxLimit = getPlanLimit(plan.id, 'storageBytesLimit');
+        maxLimit = plan.max_storage_bytes ?? getPlanLimit(plan.id, 'storageBytesLimit');
         if (maxLimit === undefined || maxLimit === null) {
           return res.status(503).json({ code: 'PLAN_LIMIT_UNAVAILABLE', message: 'Could not verify the storage limit for this plan.' });
         }
         const countRes = await pool.query(
-          `SELECT COALESCE(SUM(file_size), 0) AS bytes FROM documents WHERE company_id = $1`,
-          [companyId]
+          `SELECT COALESCE(SUM(file_size_bytes), 0) AS bytes FROM company_storage_usage
+            WHERE company_id = $1 AND ($2::text IS NULL OR storage_key <> $2)`,
+          [companyId, typeof options.getReplacementKey === 'function' ? options.getReplacementKey(req) : null]
         );
         currentCount = parseInt(countRes.rows[0]?.bytes || 0, 10);
         limitLabel = 'Storage Space';
-        unit = 'MB';
+        unit = ' bytes';
+      } else {
+        return res.status(400).json({ code: 'UNKNOWN_PLAN_LIMIT', message: 'This subscription limit is not supported.' });
       }
 
-      if (currentCount >= maxLimit) {
+      const wouldExceed = limitType === 'storage'
+        ? BigInt(currentCount) + BigInt(Math.ceil(requestedUsage)) > BigInt(maxLimit)
+        : currentCount >= maxLimit;
+      if (wouldExceed) {
         console.warn(`[Limit Enforcement] Blocked ${limitType} creation | Company: ${companyId} | Count: ${currentCount} / Limit: ${maxLimit}`);
         return res.status(403).json({
           code: 'PLAN_LIMIT_REACHED',
-          message: `Your ${plan.name || 'Free'} Plan limit for ${limitLabel} (${maxLimit}${unit}) has been reached.`,
+          message: `Your ${plan.name || 'Starter'} plan limit for ${limitLabel} (${maxLimit}${unit}) would be exceeded.`,
           details: {
             limitType,
             currentCount,
             maxLimit,
+            requestedUsage: limitType === 'storage' ? Math.ceil(requestedUsage) : undefined,
             currentPlan: plan.name || 'Starter',
             recommendedPlan: plan.id === 2 ? 'Enterprise' : 'Professional'
           }

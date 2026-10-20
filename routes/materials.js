@@ -2,10 +2,10 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
-const { loadPlan } = require('../middleware/planMiddleware');
+const { loadPlan, checkPlanLimit } = require('../middleware/planMiddleware');
 
 // Create inventory item
-router.post('/items', authenticateToken, async (req, res) => {
+router.post('/items', authenticateToken, loadPlan, checkPlanLimit('inventory'), async (req, res) => {
   const companyId = req.user.companyId;
   if (!companyId) return res.status(400).json({ message: 'No company associated with your account' });
   if (req.user.role !== 'owner' && req.user.role !== 'admin') {

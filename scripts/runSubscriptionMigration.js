@@ -1,40 +1,50 @@
-/**
- * Run subscription plans migration
- * Usage: node scripts/runSubscriptionMigration.js
- */
+'use strict';
+
+// Explicit, repeatable provisioning for an isolated subscription test DB only.
+// Production/staging startup uses the reviewed forward migration runner.
 const fs = require('fs');
 const path = require('path');
 const { pool } = require('../db');
+const { storage } = require('../middleware/als');
+const { applyForwardMigration } = require('../migrations/forwardMigrationRunner');
 
 async function runMigration() {
-  console.log('🚀 Running subscription migration...');
-  const sql = fs.readFileSync(
-    path.join(__dirname, '../migrations/subscriptionPlans.sql'),
-    'utf8'
-  );
-
-  try {
-    await pool.query(sql);
-    console.log('✅ Subscription migration completed successfully!');
-
-    // Verify plans were seeded
-    const plans = await pool.query('SELECT id, name, employee_limit, max_inventory_items FROM plans ORDER BY id');
-    console.log('\n📋 Plans seeded:');
-    plans.rows.forEach(p =>
-      console.log(`  • Plan ${p.id}: ${p.name} | Employees: ${p.employee_limit ?? 'Unlimited'} | Inventory: ${p.max_inventory_items ?? 'Unlimited'}`)
-    );
-
-    // Verify companies columns
-    const cols = await pool.query(
-      `SELECT column_name FROM information_schema.columns WHERE table_name = 'companies' AND column_name IN ('trial_ends_at','is_on_trial','is_first_login')`
-    );
-    console.log('\n📋 New companies columns:', cols.rows.map(r => r.column_name).join(', '));
-
-    process.exit(0);
-  } catch (err) {
-    console.error('❌ Migration failed:', err.message);
-    process.exit(1);
+  const confirmation = process.env.SMARTERP_SUBSCRIPTION_SEED_CONFIRM;
+  const expectedDatabase = process.env.SMARTERP_SUBSCRIPTION_TEST_DATABASE;
+  if (confirmation !== 'APPLY_TO_CONFIRMED_TEST_DATABASE' || !expectedDatabase || !/test/i.test(expectedDatabase)) {
+    throw new Error('Refusing to run. Set SMARTERP_SUBSCRIPTION_SEED_CONFIRM=APPLY_TO_CONFIRMED_TEST_DATABASE and SMARTERP_SUBSCRIPTION_TEST_DATABASE to the exact isolated test database name.');
   }
+
+  return storage.run({ bypassRls: true }, async () => {
+    const client = await pool.connect();
+    try {
+    await client.query('RESET ROLE');
+    const target = await client.query('SELECT current_database() AS database_name');
+    if (target.rows[0]?.database_name !== expectedDatabase) {
+      throw new Error(`Connected database name does not match the confirmed test database (${expectedDatabase}); no migration was applied.`);
+    }
+
+    const sql = fs.readFileSync(path.join(__dirname, '../migrations/037_subscription_catalog_and_storage.sql'), 'utf8');
+    const result = await applyForwardMigration(client, { migrationId: '037_subscription_catalog_and_storage', sql });
+    const plans = await client.query(
+      `SELECT id, name, price_monthly, price_yearly, employee_limit,
+              max_active_jobs, max_inventory_items, max_storage_bytes, features
+         FROM plans WHERE id IN (1,2,3) ORDER BY id`
+    );
+    if (plans.rows.length !== 3) throw new Error('Provisioning verification failed: expected exactly three canonical plan rows.');
+    console.log(`Subscription provisioning ${result.status} in confirmed test database ${expectedDatabase}.`);
+    for (const plan of plans.rows) {
+      console.log(`${plan.id} ${plan.name}: ₹${plan.price_monthly}/month, ₹${plan.price_yearly}/year; seats=${plan.employee_limit ?? 'unlimited'}, jobs=${plan.max_active_jobs ?? 'unlimited'}, inventory=${plan.max_inventory_items ?? 'unlimited'}, storage=${plan.max_storage_bytes ?? 'unlimited'} bytes`);
+    }
+    } finally {
+      client.release();
+      await pool.end();
+    }
+  });
 }
 
-runMigration();
+runMigration().catch(async (error) => {
+  console.error(`Subscription migration not applied: ${error.message}`);
+  try { await pool.end(); } catch (_) { /* preserve migration result */ }
+  process.exitCode = 1;
+});

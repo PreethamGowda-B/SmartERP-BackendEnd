@@ -7,6 +7,7 @@ const Sentry = require("@sentry/node");
 const { authenticateToken } = require('../middleware/authMiddleware');
 const { loadPlan, invalidatePlanCache } = require('../middleware/planMiddleware');
 const { SUBSCRIPTION_PLANS, getPlan, getPricePaise, isRazorpayConfigured, verifyCheckoutSignature, paymentMatchesOrder } = require('../services/subscriptionCatalog');
+const { recordPendingSubscriptionPayment, recordCapturedSubscriptionPayment } = require('../services/subscriptionPayments');
 
 function getRazorpay() {
   if (!isRazorpayConfigured()) return null;
@@ -16,12 +17,14 @@ function getRazorpay() {
 // Public plan catalog. Values and stable names are served from the canonical catalog.
 router.get('/plans', async (req, res) => {
   try {
-    const result = await pool.query('SELECT id, features, employee_limit, max_inventory_items, max_material_requests, messages_history_days FROM plans WHERE id = ANY($1::int[]) ORDER BY id ASC', [[1, 2, 3]]);
+    const result = await pool.query('SELECT id, features, employee_limit, max_inventory_items, max_material_requests, messages_history_days, max_active_jobs, max_storage_bytes FROM plans WHERE id = ANY($1::int[]) ORDER BY id ASC', [[1, 2, 3]]);
     const byId = new Map(result.rows.map((row) => [Number(row.id), row]));
     if ([1, 2, 3].some((id) => !byId.has(id))) return res.status(503).json({ message: 'Subscription plan catalog is not fully configured.' });
     return res.json(Object.entries(SUBSCRIPTION_PLANS).map(([id, plan]) => ({
       ...byId.get(Number(id)), id: Number(id), plan_key: plan.key, name: plan.name,
-      price_monthly: plan.priceMonthly, price_yearly: plan.priceYearly, employee_limit: plan.employeeLimit
+      price_monthly: plan.priceMonthly, price_yearly: plan.priceYearly, employee_limit: plan.employeeLimit,
+      max_active_jobs: plan.activeJobsLimit, max_inventory_items: plan.inventoryItemsLimit,
+      max_storage_bytes: plan.storageBytesLimit
     })));
   } catch (err) {
     console.error('❌ Fetch Plans Error:', err.message);
@@ -75,7 +78,7 @@ router.get('/status', loadPlan, async (req, res) => {
     }
 
     // Live usage counts
-    const [empResult, invResult, companyResult, subEventResult] = await Promise.all([
+    const [empResult, invResult, storageResult, companyResult, subEventResult] = await Promise.all([
       pool.query(
         `SELECT COUNT(*) AS count FROM users WHERE company_id = $1 AND role = 'employee'`,
         [companyId]
@@ -84,6 +87,7 @@ router.get('/status', loadPlan, async (req, res) => {
         `SELECT COUNT(*) AS count FROM inventory_items WHERE company_id = $1 AND (is_deleted = FALSE OR is_deleted IS NULL)`,
         [companyId]
       ),
+      pool.query('SELECT COALESCE(SUM(file_size_bytes), 0)::text AS bytes FROM company_storage_usage WHERE company_id = $1', [companyId]),
       pool.query(
         `SELECT is_on_trial, trial_ends_at, trial_started_at, subscription_expires_at, is_first_login, billing_cycle, subscription_status
          FROM companies WHERE id = $1`,
@@ -104,6 +108,7 @@ router.get('/status', loadPlan, async (req, res) => {
 
     const employeeCount = parseInt(empResult.rows[0]?.count || 0, 10);
     const inventoryCount = parseInt(invResult.rows[0]?.count || 0, 10);
+    const storageBytes = Number(storageResult.rows[0]?.bytes || 0);
     const company = companyResult.rows[0] || {};
 
     const employeeLimit = plan.employee_limit;
@@ -139,16 +144,20 @@ router.get('/status', loadPlan, async (req, res) => {
         trial_ends_at: plan.trial_ends_at || null,
         employee_limit: employeeLimit,
         max_inventory_items: inventoryLimit,
+        max_active_jobs: plan.max_active_jobs,
+        max_storage_bytes: plan.max_storage_bytes,
         messages_history_days: plan.messages_history_days,
         features: plan.features
       },
       usage: {
         employees: employeeCount,
-        inventory_items: inventoryCount
+        inventory_items: inventoryCount,
+        storage_bytes: storageBytes
       },
       limits: {
         employees_remaining: employeeLimit === null ? null : Math.max(0, employeeLimit - employeeCount),
-        inventory_remaining: inventoryLimit === null ? null : Math.max(0, inventoryLimit - inventoryCount)
+        inventory_remaining: inventoryLimit === null ? null : Math.max(0, inventoryLimit - inventoryCount),
+        storage_bytes_remaining: plan.max_storage_bytes == null ? null : Math.max(0, Number(plan.max_storage_bytes) - storageBytes)
       },
       billing_cycle: effectiveBillingCycle,
       trial_started_at: company.trial_started_at || null,
@@ -160,6 +169,33 @@ router.get('/status', loadPlan, async (req, res) => {
   } catch (err) {
     console.error('❌ Subscription Status Fetch Error:', err);
     res.status(500).json({ message: 'Failed to fetch subscription status.' });
+  }
+});
+
+router.get('/payments', requireOwner, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT p.id, p.purpose, p.plan_id, p.billing_cycle,
+              p.razorpay_order_id, p.razorpay_payment_id, p.amount_paise,
+              p.currency, p.status, p.provider_status, p.captured_at, p.created_at,
+              COALESCE((
+                SELECT jsonb_agg(jsonb_build_object(
+                  'payment_id', a.razorpay_payment_id, 'status', a.status,
+                  'amount_paise', a.amount_paise, 'created_at', a.created_at
+                ) ORDER BY a.created_at DESC)
+                FROM subscription_payment_attempts a
+                WHERE a.razorpay_order_id = p.razorpay_order_id AND a.company_id = p.company_id
+              ), '[]'::jsonb) AS attempts
+         FROM subscription_payments p
+        WHERE p.company_id = $1
+        ORDER BY p.created_at DESC
+        LIMIT 100`,
+      [req.user.companyId]
+    );
+    return res.json(result.rows);
+  } catch (error) {
+    console.error('[Subscription] Payment history unavailable:', error.message);
+    return res.status(503).json({ message: 'Subscription payment history is unavailable.' });
   }
 });
 
@@ -243,6 +279,10 @@ router.post('/trial/create-order', requireOwner, async (req, res) => {
        VALUES ($1, 'trial_payment_order_created', 3, $2, NOW())`,
       [companyId, JSON.stringify({ razorpay_order_id: order.id, amount_paise: 100, currency: 'INR' })]
     );
+    await recordPendingSubscriptionPayment(client, {
+      companyId, purpose: 'trial_activation', planId: 3, billingCycle: 'trial',
+      order, amountPaise: 100, currency: 'INR'
+    });
     await client.query('COMMIT');
     return res.json({ id: order.id, amount: order.amount, currency: order.currency, key: process.env.RAZORPAY_KEY_ID });
   } catch (err) {
@@ -296,6 +336,11 @@ router.post('/trial/verify-payment', requireOwner, async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(409).json({ message: 'This company has already used its trial.' });
     }
+    await recordCapturedSubscriptionPayment(client, {
+      companyId, purpose: 'trial_activation', planId: 3, billingCycle: 'trial',
+      orderId, paymentId, amountPaise: 100, currency: 'INR', providerStatus: payment.status,
+      providerPayload: { orderId, paymentId, status: payment.status, captured: payment.captured }
+    });
     await client.query(
       `UPDATE companies SET plan_id = 3, subscription_status = 'trial', is_on_trial = TRUE,
        trial_started_at = NOW(), trial_ends_at = NOW() + INTERVAL '30 days',
@@ -317,6 +362,9 @@ router.post('/trial/verify-payment', requireOwner, async (req, res) => {
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     console.error('[Trial] Activation transaction failed:', err.message);
+    if (err.code === 'SUBSCRIPTION_PAYMENT_IDENTITY_CONFLICT' || err.code === 'SUBSCRIPTION_PAYMENT_ORDER_CONFLICT') {
+      return res.status(403).json({ message: 'Provider payment is already associated with a different subscription order.' });
+    }
     return res.status(500).json({ message: 'Trial activation could not be completed.' });
   } finally {
     client.release();
@@ -371,7 +419,50 @@ router.post('/create-order', requireOwner, async (req, res) => {
       }
     };
 
-    const order = await razorpay.orders.create(options);
+    const client = await pool.connect();
+    let order;
+    try {
+      await client.query('BEGIN');
+      const companyRow = await client.query('SELECT id FROM companies WHERE id = $1 FOR UPDATE', [companyId]);
+      if (!companyRow.rows.length) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ message: 'Company not found.' });
+      }
+      const pending = await client.query(
+        `SELECT razorpay_order_id, status FROM subscription_payments
+          WHERE company_id = $1 AND purpose = 'plan_purchase' AND plan_id = $2
+            AND billing_cycle = $3 AND status IN ('created', 'authorized')
+            AND created_at > NOW() - INTERVAL '30 minutes'
+          ORDER BY created_at DESC LIMIT 1`,
+        [companyId, Number(planId), billingCycle]
+      );
+      if (pending.rows[0]?.razorpay_order_id) {
+        if (pending.rows[0].status === 'authorized') {
+          await client.query('ROLLBACK');
+          return res.status(409).json({ message: 'A payment is authorized and awaiting capture. Refresh subscription status or contact support before retrying.' });
+        }
+        let existingOrder;
+        try { existingOrder = await razorpay.orders.fetch(pending.rows[0].razorpay_order_id); }
+        catch (error) {
+          await client.query('ROLLBACK');
+          return res.status(502).json({ message: 'Could not safely confirm the previous payment order. Please retry later.' });
+        }
+        await client.query('ROLLBACK');
+        if (existingOrder.status === 'created') return res.json({ ...existingOrder, key: process.env.RAZORPAY_KEY_ID });
+        if (existingOrder.status === 'paid') return res.status(409).json({ message: 'A payment is already captured and awaiting verification. Refresh subscription status.' });
+      }
+      order = await razorpay.orders.create(options);
+      await recordPendingSubscriptionPayment(client, {
+        companyId, purpose: 'plan_purchase', planId: Number(planId), billingCycle,
+        order, amountPaise, currency: 'INR'
+      });
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw error;
+    } finally {
+      client.release();
+    }
     console.log(`[Razorpay] Order Created Successfully | Order ID: ${order.id} | Amount: ₹${amount} (${options.amount} paise)`);
 
     res.json({ ...order, key: process.env.RAZORPAY_KEY_ID });
@@ -485,6 +576,14 @@ router.post('/verify-payment', requireOwner, async (req, res) => {
         });
       }
 
+      await recordCapturedSubscriptionPayment(dbClient, {
+        companyId, purpose: 'plan_purchase', planId: verifiedPlanId, billingCycle,
+        orderId: razorpay_order_id, paymentId: razorpay_payment_id,
+        amountPaise: getPricePaise(verifiedPlanId, billingCycle), currency: 'INR',
+        providerStatus: payment.status,
+        providerPayload: { orderId: order.id, paymentId: payment.id, status: payment.status, captured: payment.captured }
+      });
+
       // 4. Update Company Plan & Subscription Expiry Dates
       console.log(`[Subscription] Updating Companies Table... Target Plan = ${verifiedPlanId}`);
       const updateResult = await dbClient.query(
@@ -516,6 +615,9 @@ router.post('/verify-payment', requireOwner, async (req, res) => {
       console.log(`[Subscription] Commit Successful`);
     } catch (txErr) {
       await dbClient.query('ROLLBACK').catch(() => {});
+      if (txErr.code === 'SUBSCRIPTION_PAYMENT_IDENTITY_CONFLICT' || txErr.code === 'SUBSCRIPTION_PAYMENT_ORDER_CONFLICT') {
+        return res.status(403).json({ message: 'Provider payment is already associated with a different subscription order.' });
+      }
       throw txErr;
     } finally {
       dbClient.release();

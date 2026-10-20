@@ -1,12 +1,15 @@
 const express = require('express');
 const router = express.Router();
 const multer = require('multer');
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 const { cloudinary, hasCloudinaryConfig } = require('../config/cloudinary');
 const { requireValidFileSignature } = require('../utils/fileValidation');
+const { loadPlan, checkPlanLimit } = require('../middleware/planMiddleware');
+const { recordCompanyStorageUsage, removeCompanyStorageUsage } = require('../services/companyStorage');
 
 // Use in-memory storage — we upload directly to Cloudinary, no local disk needed
 const upload = multer({
@@ -28,12 +31,14 @@ const upload = multer({
 router.post(
     '/',
     authenticateToken,
+    loadPlan,
     upload.single('file'),
     requireValidFileSignature({
         allowedMimes: ['image/jpeg', 'image/png', 'application/pdf'],
         fieldName: 'file',
         required: true
     }),
+    checkPlanLimit('storage', { getRequestedUsage: (req) => req.file?.size || 0 }),
     async (req, res) => {
     try {
         const { role, companyId, userId } = req.user;
@@ -63,6 +68,9 @@ router.post(
         if (empCheck.rows.length === 0) {
             return res.status(404).json({ message: 'Employee not found in your company' });
         }
+
+        const storageKey = `employee-document:${crypto.randomUUID()}`;
+        await recordCompanyStorageUsage(companyId, storageKey, req.file.size, 'employee_document');
 
         // Upload buffer to Cloudinary or fallback to local disk
         const isImage = req.file.mimetype.startsWith('image/');
@@ -111,6 +119,7 @@ router.post(
 
         // Reject only if both cloud and database fallback failed
         if (!fileUrl) {
+            await removeCompanyStorageUsage(companyId, storageKey);
             return res.status(502).json({ 
                 message: 'Failed to upload document to secure cloud storage. Please verify file format and try again.' 
             });
@@ -118,10 +127,10 @@ router.post(
 
         const result = await pool.query(
             `INSERT INTO employee_documents 
-             (company_id, employee_id, document_type, file_url, notes, uploaded_by)
-             VALUES ($1, $2, $3, $4, $5, $6)
+             (company_id, employee_id, document_type, file_url, notes, uploaded_by, file_size_bytes, storage_key)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              RETURNING *`,
-            [companyId, employee_id, document_type, fileUrl, notes || null, userId]
+            [companyId, employee_id, document_type, fileUrl, notes || null, userId, req.file.size, storageKey]
         );
 
         res.status(201).json(result.rows[0]);
@@ -201,7 +210,7 @@ router.delete('/:id', authenticateToken, async (req, res) => {
         }
 
         const docResult = await pool.query(
-            'SELECT file_url FROM employee_documents WHERE id = $1 AND company_id = $2',
+            'SELECT file_url, storage_key, id FROM employee_documents WHERE id = $1 AND company_id = $2',
             [id, companyId]
         );
 
@@ -209,7 +218,7 @@ router.delete('/:id', authenticateToken, async (req, res) => {
             return res.status(404).json({ message: 'Document not found' });
         }
 
-        const { file_url } = docResult.rows[0];
+        const { file_url, storage_key: storageKey } = docResult.rows[0];
 
         // Delete from DB first (always succeeds)
         await pool.query('DELETE FROM employee_documents WHERE id = $1', [id]);
@@ -224,9 +233,11 @@ router.delete('/:id', authenticateToken, async (req, res) => {
                     // public_id is everything after /upload/vXXXXX/ without extension
                     const publicIdWithExt = urlParts.slice(uploadIndex + 2).join('/');
                     const publicId = publicIdWithExt.replace(/\.[^.]+$/, '');
-                    await cloudinary.uploader.destroy(publicId, { resource_type: 'raw' }).catch(() =>
-                        cloudinary.uploader.destroy(publicId, { resource_type: 'image' }).catch(() => {})
-                    );
+                    const rawDelete = await cloudinary.uploader.destroy(publicId, { resource_type: 'raw' }).catch(() => null);
+                    const imageDelete = rawDelete?.result ? null : await cloudinary.uploader.destroy(publicId, { resource_type: 'image' }).catch(() => null);
+                    if (rawDelete?.result === 'ok' || rawDelete?.result === 'not found' || imageDelete?.result === 'ok' || imageDelete?.result === 'not found') {
+                        await removeCompanyStorageUsage(companyId, storageKey || `employee-document:${id}`);
+                    }
                 }
             } catch (cloudErr) {
                 console.warn('⚠️ Could not delete from Cloudinary (non-fatal):', cloudErr.message);

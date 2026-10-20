@@ -15,10 +15,13 @@
 const express = require('express');
 const router  = express.Router({ mergeParams: true });
 const multer = require('multer');
+const crypto = require('crypto');
 const { pool } = require('../../db');
 const redisClient = require('../../utils/redis');
 const { createNotification } = require('../../utils/notificationHelpers');
 const { requireValidFileSignature } = require('../../utils/fileValidation');
+const { loadPlan, checkPlanLimit } = require('../../middleware/planMiddleware');
+const { recordCompanyStorageUsage } = require('../../services/companyStorage');
 
 const chatUpload = multer({
   storage: multer.memoryStorage(),
@@ -72,7 +75,7 @@ router.post('/upload', chatUpload.single('attachment'), requireValidFileSignatur
   allowedMimes: ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'],
   fieldName: 'attachment',
   required: true,
-}), async (req, res) => {
+}), loadPlan, checkPlanLimit('storage', { getRequestedUsage: (req) => req.file?.size || 0 }), async (req, res) => {
   const customerId = req.customer.id;
   const companyId = req.customer.companyId;
   const jobId = req.params.id;
@@ -85,6 +88,8 @@ router.post('/upload', chatUpload.single('attachment'), requireValidFileSignatur
     );
     if (!jobResult.rows.length) return fail(res, 'Chat upload is unavailable for this job', 403);
     const file = req.file;
+    const storageKey = `customer-chat:${crypto.randomUUID()}`;
+    await recordCompanyStorageUsage(companyId, storageKey, file.size, 'customer_chat_attachment');
     const inserted = await pool.query(
       `INSERT INTO message_media_files (file_name, file_type, file_size, data)
        VALUES ($1, $2, $3, $4) RETURNING id`,

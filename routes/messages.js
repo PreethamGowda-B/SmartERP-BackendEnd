@@ -1,13 +1,15 @@
 const express = require('express');
 const router = express.Router();
+const crypto = require('crypto');
 const multer = require('multer');
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 const { createNotification, broadcastToUser } = require('../utils/notificationHelpers');
-const { loadPlan } = require('../middleware/planMiddleware');
+const { loadPlan, checkPlanLimit } = require('../middleware/planMiddleware');
 const redisClient = require('../utils/redis');
 const { cloudinary, hasCloudinaryConfig } = require('../config/cloudinary');
 const { requireValidFileSignature } = require('../utils/fileValidation');
+const { recordCompanyStorageUsage } = require('../services/companyStorage');
 
 // Multer setup for message attachments (in-memory, then we upload manually)
 const uploadMiddleware = multer({
@@ -1077,6 +1079,7 @@ router.post(
     fieldName: 'attachment',
     required: true
   }),
+  checkPlanLimit('storage', { getRequestedUsage: (req) => req.file?.size || 0 }),
   async (req, res) => {
     try {
       if (!req.file) {
@@ -1088,6 +1091,9 @@ router.post(
       const isImage = cleanMime.startsWith('image/');
       const isAudio = cleanMime.startsWith('audio/');
       const folder = 'smarterp/messages';
+      const companyId = req.user?.companyId || req.user?.company_id;
+      const storageKey = `message-upload:${crypto.randomUUID()}`;
+      await recordCompanyStorageUsage(companyId, storageKey, size, 'message_attachment');
 
       let fileUrl = null;
 

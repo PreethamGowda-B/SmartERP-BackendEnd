@@ -260,6 +260,7 @@ const NUMBERED_MIGRATIONS = [
     '034_production_dispatch_privileges.sql',
     '035_production_packing_workflow.sql',
     '036_customer_manufacturing_requests.sql',
+    '037_subscription_catalog_and_storage.sql',
 ];
 
 async function runNumberedMigrations() {

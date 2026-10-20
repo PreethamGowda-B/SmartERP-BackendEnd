@@ -7,6 +7,7 @@ const { invalidatePlanCache } = require('../middleware/planMiddleware');
 const { storage } = require('../middleware/als');
 const Razorpay = require('razorpay');
 const { getPlan, getPricePaise, paymentMatchesOrder, isRazorpayConfigured } = require('../services/subscriptionCatalog');
+const { recordPendingSubscriptionPayment, recordCapturedSubscriptionPayment, recordSubscriptionPaymentAttempt } = require('../services/subscriptionPayments');
 
 // ✅ RLS bypass — Razorpay webhooks arrive with no user/tenant session.
 router.use((req, res, next) => storage.run({ isWebRequest: true, bypassRls: true }, next));
@@ -55,8 +56,9 @@ router.post('/razorpay', async (req, res) => {
 
     const event = req.body;
     
-    // We only care about payment.captured
-    if (event.event !== 'payment.captured') {
+    // Subscription access is granted only for captured payments. Persist
+    // authorized/failed attempts for retry support, but never activate access.
+    if (!['payment.captured', 'payment.authorized', 'payment.failed'].includes(event.event)) {
       return res.json({ status: 'ignored' });
     }
 
@@ -78,6 +80,42 @@ router.post('/razorpay', async (req, res) => {
     const companyId = String(notes.companyId || '');
     const planIdInput = Number(notes.planId);
     const billingCycle = notes.billingCycle || 'monthly';
+
+    if (event.event !== 'payment.captured') {
+      const expectedAmountPaise = notes.purpose === 'trial_activation' && billingCycle === 'trial' && planIdInput === 3
+        ? 100
+        : notes.purpose === 'plan_purchase' && [2, 3].includes(planIdInput)
+          ? getPricePaise(planIdInput, billingCycle)
+          : null;
+      if (!companyId || expectedAmountPaise == null || String(entity.order_id) !== String(order.id) ||
+          Number(entity.amount) !== Number(expectedAmountPaise) || Number(order.amount) !== Number(expectedAmountPaise) ||
+          entity.currency !== 'INR' || order.currency !== 'INR' ||
+          (notes.purpose === 'trial_activation' && !paymentMatchesOrder({ order, payment: { ...entity, status: 'captured' }, companyId, purpose: 'trial_activation', planId: 3, billingCycle: 'trial', expectedAmountPaise: 100 })) ||
+          (notes.purpose === 'plan_purchase' && !paymentMatchesOrder({ order, payment: { ...entity, status: 'captured' }, companyId, purpose: 'plan_purchase', planId: planIdInput, billingCycle, expectedAmountPaise }))) {
+        return res.status(400).send('Payment attempt does not match a configured company plan order');
+      }
+      const attemptClient = await pool.connect();
+      try {
+        await attemptClient.query('BEGIN');
+        await attemptClient.query("SELECT pg_advisory_xact_lock(hashtext('sub_payment_' || $1))", [String(paymentId)]);
+        await recordPendingSubscriptionPayment(attemptClient, {
+          companyId, purpose: notes.purpose, planId: planIdInput, billingCycle,
+          order, amountPaise: expectedAmountPaise, currency: 'INR'
+        });
+        await recordSubscriptionPaymentAttempt(attemptClient, {
+          companyId, orderId, paymentId, status: event.event === 'payment.failed' ? 'failed' : 'authorized',
+          amountPaise: expectedAmountPaise, currency: 'INR',
+          providerPayload: { event: event.event, orderId, paymentId, status: entity.status, errorCode: entity.error_code || null }
+        });
+        await attemptClient.query('COMMIT');
+        return res.json({ status: 'ok', message: `Payment ${event.event.split('.')[1]} attempt recorded; no subscription access granted.` });
+      } catch (error) {
+        await attemptClient.query('ROLLBACK').catch(() => {});
+        throw error;
+      } finally {
+        attemptClient.release();
+      }
+    }
 
     if (notes.purpose === 'trial_activation') {
       if (!companyId || !paymentMatchesOrder({ order, payment: entity, companyId, purpose: 'trial_activation', planId: 3, billingCycle: 'trial', expectedAmountPaise: 100 })) {
@@ -103,6 +141,11 @@ router.post('/razorpay', async (req, res) => {
           await client.query('ROLLBACK');
           return res.json({ status: 'ok', message: 'Company is not eligible for another trial' });
         }
+        await recordCapturedSubscriptionPayment(client, {
+          companyId, purpose: 'trial_activation', planId: 3, billingCycle: 'trial',
+          orderId, paymentId, amountPaise: 100, currency: 'INR', providerStatus: entity.status,
+          providerPayload: { orderId, paymentId, status: entity.status, captured: entity.captured, source: 'webhook' }
+        });
         await client.query(
           `UPDATE companies SET plan_id = 3, subscription_status = 'trial', is_on_trial = TRUE,
            trial_started_at = NOW(), trial_ends_at = NOW() + INTERVAL '30 days',
@@ -174,6 +217,13 @@ router.post('/razorpay', async (req, res) => {
         invalidatePlanCache(companyId);
         return res.json({ status: 'ok', message: 'Already processed' });
       }
+
+      await recordCapturedSubscriptionPayment(dbClient, {
+        companyId, purpose: 'plan_purchase', planId, billingCycle,
+        orderId, paymentId, amountPaise: expectedAmountPaise, currency: 'INR',
+        providerStatus: entity.status,
+        providerPayload: { orderId, paymentId, status: entity.status, captured: entity.captured, source: 'webhook' }
+      });
 
       // Update Company Plan & Subscription Expiry Dates
       await dbClient.query(
@@ -252,6 +302,10 @@ router.post('/razorpay', async (req, res) => {
     res.json({ status: 'ok', message: 'Subscription activated via webhook' });
   } catch (err) {
     console.error('❌ [Razorpay Webhook] Error:', err);
+
+    if (err.code === 'SUBSCRIPTION_PAYMENT_IDENTITY_CONFLICT' || err.code === 'SUBSCRIPTION_PAYMENT_ORDER_CONFLICT') {
+      return res.status(403).send('Payment is already associated with another subscription order');
+    }
 
     // Trial retries must never fall into the paid-plan worker path.
     if (verifiedOrderPurpose === 'trial_activation') return res.status(500).send('Trial activation will be retried by the payment provider');

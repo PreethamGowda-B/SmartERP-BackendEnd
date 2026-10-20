@@ -6,7 +6,10 @@ const crypto = require('crypto');
 const path = require('path');
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
+const { loadPlan, checkPlanLimit } = require('../middleware/planMiddleware');
+const { getPlanLimit } = require('../services/subscriptionCatalog');
 const { requireValidFileSignature } = require('../utils/fileValidation');
+const { recordCompanyStorageUsage } = require('../services/companyStorage');
 const OCRService = require('../services/ocrService');
 const { normalizedName, compareInvoice, canFinalize } = require('../services/materialPurchaseRules');
 const { createNotificationForOwners } = require('../utils/notificationHelpers');
@@ -106,7 +109,7 @@ async function notifyUser(payload) {
 }
 
 // Employee uploads. Requester/company authorization is checked inside a transaction before storing any bill.
-router.post('/', upload.single('invoice'), requireValidFileSignature({ allowedMimes, fieldName: 'invoice', required: true }), async (req, res) => {
+router.post('/', loadPlan, upload.single('invoice'), requireValidFileSignature({ allowedMimes, fieldName: 'invoice', required: true }), checkPlanLimit('storage', { getRequestedUsage: (req) => req.file?.size || 0 }), async (req, res) => {
   const file = req.file;
   if (!file || !allowedMimes.includes(file.validatedMime)) return res.status(400).json({ message: 'Upload a valid PDF, JPG, JPEG or PNG invoice.' });
   if (String(file.mimetype).toLowerCase() !== file.validatedMime) return res.status(400).json({ message: 'The file extension or declared media type does not match its content.' });
@@ -193,6 +196,7 @@ router.post('/', upload.single('invoice'), requireValidFileSignature({ allowedMi
         req.body.supplier_gstin?.trim() || null, req.body.notes?.trim()?.slice(0, 1000) || null]
     );
     bill = inserted.rows[0];
+    await recordCompanyStorageUsage(companyId, `purchase-bill:${bill.id}`, file.size, 'material_purchase_bill', client);
     await client.query(`UPDATE material_requests SET purchase_status = 'processing', updated_at = NOW() WHERE id = $1`, [request.id]);
     await appendEvent(client, { companyId, requestId: request.id, billId: bill.id, actorId: userId, type: 'bill_uploaded', details: { version, file_name: fileName, file_sha256: fileSha256 } });
     await client.query('COMMIT');
@@ -377,7 +381,7 @@ router.get('/:billId/file', async (req, res) => {
 });
 
 // Final stock receipt: owner confirmation, stock update, receipt ledger and bill finalization commit atomically.
-router.post('/:billId/verify', async (req, res) => {
+router.post('/:billId/verify', loadPlan, async (req, res) => {
   if (!isApprover(req.user)) return res.status(403).json({ message: 'Only an owner or authorized administrator may verify purchase bills.' });
   const companyId = companyIdOf(req.user);
   const actorId = userIdOf(req.user);
@@ -385,6 +389,8 @@ router.post('/:billId/verify', async (req, res) => {
   let finalized;
   try {
     await client.query('BEGIN');
+    // Serialize inventory item creation with all quota-checked inventory APIs.
+    await client.query("SELECT pg_advisory_xact_lock(hashtext('inventory_items_' || $1))", [companyId]);
     const requestResult = await client.query(
       `SELECT * FROM material_requests WHERE id::text = $1 AND company_id::text = $2 FOR UPDATE`,
       [req.params.requestId, companyId]
@@ -440,6 +446,24 @@ router.post('/:billId/verify', async (req, res) => {
     }
 
     if (!inventoryItem) {
+      const inventoryLimit = req.plan?.max_inventory_items ?? getPlanLimit(req.plan?.id, 'inventoryItemsLimit');
+      if (inventoryLimit === undefined || inventoryLimit === null) {
+        await client.query('ROLLBACK');
+        return res.status(503).json({ code: 'PLAN_LIMIT_UNAVAILABLE', message: 'Could not verify the inventory limit for this plan.' });
+      }
+      const inventoryCount = await client.query(
+        `SELECT COUNT(*)::int AS count FROM inventory_items
+          WHERE company_id::text = $1 AND (is_deleted = FALSE OR is_deleted IS NULL)`,
+        [companyId]
+      );
+      if (Number(inventoryCount.rows[0]?.count || 0) >= Number(inventoryLimit)) {
+        await client.query('ROLLBACK');
+        return res.status(403).json({
+          code: 'PLAN_LIMIT_REACHED',
+          message: `Your ${req.plan?.name || 'Starter'} plan inventory item limit (${inventoryLimit}) has been reached.`,
+          details: { limitType: 'inventory', currentCount: Number(inventoryCount.rows[0]?.count || 0), maxLimit: Number(inventoryLimit) },
+        });
+      }
       const created = await client.query(
         `INSERT INTO inventory_items(name, description, quantity, created_by, employee_name, category, unit,
            min_quantity, supplier_name, company_id, created_at, updated_at, source_type, source_reference)

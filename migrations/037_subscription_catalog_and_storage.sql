@@ -45,23 +45,60 @@ CREATE TABLE IF NOT EXISTS company_storage_usage (
   PRIMARY KEY (company_id, storage_key)
 );
 
-CREATE TABLE IF NOT EXISTS subscription_payments (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  company_id UUID NOT NULL REFERENCES companies(id) ON DELETE RESTRICT,
-  purpose TEXT NOT NULL CHECK (purpose IN ('plan_purchase', 'trial_activation')),
-  plan_id INTEGER NOT NULL REFERENCES plans(id),
-  billing_cycle TEXT NOT NULL CHECK (billing_cycle IN ('monthly', 'yearly', 'trial')),
-  razorpay_order_id TEXT NOT NULL UNIQUE,
-  razorpay_payment_id TEXT,
-  amount_paise BIGINT NOT NULL CHECK (amount_paise > 0),
-  currency CHAR(3) NOT NULL CHECK (currency = 'INR'),
-  status TEXT NOT NULL CHECK (status IN ('created', 'authorized', 'captured', 'failed', 'refunded', 'disputed')),
-  provider_status TEXT,
-  captured_at TIMESTAMPTZ,
-  provider_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
+-- companies.id is UUID in newer schema variants and INTEGER in the deployed
+-- legacy schema. Match its actual PostgreSQL type so the FK remains enforced in
+-- either supported deployment shape; do not coerce or rewrite company IDs.
+DO $$
+DECLARE
+  company_id_type TEXT;
+BEGIN
+  SELECT format_type(a.atttypid, a.atttypmod)
+    INTO company_id_type
+    FROM pg_attribute a
+   WHERE a.attrelid = 'public.companies'::regclass
+     AND a.attname = 'id'
+     AND a.attnum > 0
+     AND NOT a.attisdropped;
+
+  IF company_id_type IS NULL OR company_id_type NOT IN ('integer', 'bigint', 'uuid') THEN
+    RAISE EXCEPTION 'Unsupported companies.id type for subscription payment FKs: %', company_id_type;
+  END IF;
+
+  EXECUTE format($ddl$
+    CREATE TABLE IF NOT EXISTS subscription_payments (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id %s NOT NULL REFERENCES public.companies(id) ON DELETE RESTRICT,
+      purpose TEXT NOT NULL CHECK (purpose IN ('plan_purchase', 'trial_activation')),
+      plan_id INTEGER NOT NULL REFERENCES public.plans(id),
+      billing_cycle TEXT NOT NULL CHECK (billing_cycle IN ('monthly', 'yearly', 'trial')),
+      razorpay_order_id TEXT NOT NULL UNIQUE,
+      razorpay_payment_id TEXT,
+      amount_paise BIGINT NOT NULL CHECK (amount_paise > 0),
+      currency CHAR(3) NOT NULL CHECK (currency = 'INR'),
+      status TEXT NOT NULL CHECK (status IN ('created', 'authorized', 'captured', 'failed', 'refunded', 'disputed')),
+      provider_status TEXT,
+      captured_at TIMESTAMPTZ,
+      provider_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  $ddl$, company_id_type);
+
+  EXECUTE format($ddl$
+    CREATE TABLE IF NOT EXISTS subscription_payment_attempts (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id %s NOT NULL REFERENCES public.companies(id) ON DELETE RESTRICT,
+      razorpay_order_id TEXT NOT NULL REFERENCES public.subscription_payments(razorpay_order_id) ON DELETE RESTRICT,
+      razorpay_payment_id TEXT NOT NULL UNIQUE,
+      status TEXT NOT NULL CHECK (status IN ('authorized', 'captured', 'failed')),
+      amount_paise BIGINT NOT NULL CHECK (amount_paise > 0),
+      currency CHAR(3) NOT NULL CHECK (currency = 'INR'),
+      provider_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  $ddl$, company_id_type);
+END $$;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_subscription_payments_provider_payment
   ON subscription_payments(razorpay_payment_id)
@@ -69,18 +106,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_subscription_payments_provider_payment
 CREATE INDEX IF NOT EXISTS idx_subscription_payments_company_created
   ON subscription_payments(company_id, created_at DESC);
 
-CREATE TABLE IF NOT EXISTS subscription_payment_attempts (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  company_id UUID NOT NULL REFERENCES companies(id) ON DELETE RESTRICT,
-  razorpay_order_id TEXT NOT NULL REFERENCES subscription_payments(razorpay_order_id) ON DELETE RESTRICT,
-  razorpay_payment_id TEXT NOT NULL UNIQUE,
-  status TEXT NOT NULL CHECK (status IN ('authorized', 'captured', 'failed')),
-  amount_paise BIGINT NOT NULL CHECK (amount_paise > 0),
-  currency CHAR(3) NOT NULL CHECK (currency = 'INR'),
-  provider_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
 CREATE INDEX IF NOT EXISTS idx_subscription_payment_attempts_company_created
   ON subscription_payment_attempts(company_id, created_at DESC);
 
@@ -160,11 +185,11 @@ ALTER TABLE employee_documents ADD COLUMN IF NOT EXISTS file_size_bytes BIGINT;
 ALTER TABLE employee_documents ADD COLUMN IF NOT EXISTS storage_key TEXT;
 
 UPDATE inventory_items SET image_size_bytes = 5242880
- WHERE image_url IS NOT NULL AND image_size_bytes IS NULL;
+ WHERE image_url IS NOT NULL AND COALESCE(image_size_bytes, 0) <= 0;
 UPDATE inventory_items SET image_storage_key = 'inventory-image:' || id::text
  WHERE image_url IS NOT NULL AND image_storage_key IS NULL;
 UPDATE employee_documents SET file_size_bytes = 10485760
- WHERE file_url IS NOT NULL AND file_size_bytes IS NULL;
+ WHERE file_url IS NOT NULL AND COALESCE(file_size_bytes, 0) <= 0;
 UPDATE employee_documents SET storage_key = 'employee-document:' || id::text
  WHERE file_url IS NOT NULL AND storage_key IS NULL;
 

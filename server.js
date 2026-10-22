@@ -1027,6 +1027,10 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
           catch (err) { reject(err); }
         })
       );
+      // The parent only coordinates schema initialization. Release its idle
+      // pool before forking workers so it does not consume session-pool slots.
+      await pool.end();
+      console.log('✅ Master DB pool closed before worker startup');
     } catch (err) {
       console.error('❌ Master DB Init Error:', err.message);
       // Do not serve a deployment whose required schema migration failed.

@@ -268,7 +268,6 @@ function start() {
 
   // Section 9: Audit log retention — run once per day
   _retentionTimer = setInterval(purgeOldAuditLogs, RETENTION_INTERVAL_MS);
-  purgeOldAuditLogs(); // Run once on startup
 }
 
 function stop() {

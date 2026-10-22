@@ -1,10 +1,12 @@
 const express = require('express');
 const router = express.Router();
+const cluster = require('node:cluster');
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 const { requireClockIn } = require('../middleware/attendanceGatekeeperMiddleware');
 const { createNotificationForOwners, createNotification } = require('../utils/notificationHelpers');
 const invoiceService = require('../services/invoiceService');
+const { createWorkRequestsTableInitializer } = require('../utils/workRequestsTableInitializer');
 
 const WORK_REQUEST_TRANSITIONS = Object.freeze({
   pending: new Set(['approve', 'reject', 'reply', 'request_info']),
@@ -18,83 +20,10 @@ function canTransitionWorkRequest(currentStatus, action) {
   return WORK_REQUEST_TRANSITIONS[String(currentStatus || '').toLowerCase()]?.has(action) === true;
 }
 
-let isTableInitialized = false;
-
-async function ensureWorkRequestsTable() {
-  if (isTableInitialized) return;
-  let client;
-  try {
-    client = await pool.connect();
-
-    // 1. Create Base Table if missing
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS work_requests (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        company_id TEXT,
-        request_type VARCHAR(100) NOT NULL,
-        category VARCHAR(50) DEFAULT 'jobs',
-        urgency VARCHAR(20) DEFAULT 'normal',
-        status VARCHAR(20) DEFAULT 'pending',
-        submitted_by_id TEXT,
-        submitted_by_name VARCHAR(255),
-        submitted_by_role VARCHAR(50),
-        job_id TEXT,
-        invoice_id TEXT,
-        material_request_id TEXT,
-        leave_request_id TEXT,
-        title VARCHAR(255) NOT NULL,
-        reason TEXT,
-        response_notes TEXT,
-        owner_response TEXT,
-        actioned_by_id TEXT,
-        actioned_by_name VARCHAR(255),
-        actioned_at TIMESTAMP WITH TIME ZONE,
-        resolved_by_id TEXT,
-        resolved_by_name VARCHAR(255),
-        resolved_at TIMESTAMP WITH TIME ZONE,
-        evidence_urls JSONB DEFAULT '[]'::jsonb,
-        payload JSONB DEFAULT '{}'::jsonb,
-        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-      );
-    `).catch((err) => {
-      console.warn('ensureWorkRequestsTable base table note:', err.message);
-    });
-
-    // 2. Independently add each column with fail-safe guards
-    const safeAlterColumns = [
-      "ALTER TABLE work_requests ADD COLUMN IF NOT EXISTS owner_response TEXT;",
-      "ALTER TABLE work_requests ADD COLUMN IF NOT EXISTS response_notes TEXT;",
-      "ALTER TABLE work_requests ADD COLUMN IF NOT EXISTS actioned_by_id TEXT;",
-      "ALTER TABLE work_requests ADD COLUMN IF NOT EXISTS actioned_by_name VARCHAR(255);",
-      "ALTER TABLE work_requests ADD COLUMN IF NOT EXISTS actioned_at TIMESTAMP WITH TIME ZONE;",
-      "ALTER TABLE work_requests ADD COLUMN IF NOT EXISTS resolved_by_id TEXT;",
-      "ALTER TABLE work_requests ADD COLUMN IF NOT EXISTS resolved_by_name VARCHAR(255);",
-      "ALTER TABLE work_requests ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMP WITH TIME ZONE;",
-      "CREATE INDEX IF NOT EXISTS idx_work_requests_company ON work_requests(company_id);",
-      "CREATE INDEX IF NOT EXISTS idx_work_requests_status ON work_requests(status);",
-      "CREATE INDEX IF NOT EXISTS idx_work_requests_job ON work_requests(job_id);"
-    ];
-
-    for (const sql of safeAlterColumns) {
-      await client.query(sql).catch((err) => {
-        // Safe check for already-existing columns/indexes
-        if (!['42701', '42P07'].includes(err?.code)) {
-          console.warn('ensureWorkRequestsTable alter column warning:', err.message);
-        }
-      });
-    }
-
-    isTableInitialized = true;
-  } catch (err) {
-    console.warn('ensureWorkRequestsTable initialization failed:', err.message);
-  } finally {
-    if (client) client.release();
-  }
-}
+const ensureWorkRequestsTable = createWorkRequestsTableInitializer({ db: pool });
 
 // Auto-run on router load (disabled during unit testing to prevent accidental DB connections)
-if (process.env.NODE_ENV !== 'test') {
+if (process.env.NODE_ENV !== 'test' && !(process.env.NODE_ENV === 'production' && cluster.isPrimary)) {
   ensureWorkRequestsTable().catch(() => {});
 }
 

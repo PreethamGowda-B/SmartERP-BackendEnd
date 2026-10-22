@@ -14,6 +14,11 @@ function isRoleScopedAIRoute(path) {
   return matchesPath(path, "/api/ai") || matchesPath(path, "/api/v1/ai");
 }
 
+function isNotificationsSseRoute(path) {
+  const normalizedPath = String(path || "").replace(/\/+$/, "");
+  return normalizedPath === "/api/notifications/sse" || normalizedPath === "/api/v1/notifications/sse";
+}
+
 /**
  * Select credentials without letting a stale superadmin cookie override the
  * explicitly authenticated Owner/Employee session on shared AI endpoints.
@@ -31,7 +36,9 @@ function selectRequestAuthToken(req) {
     return authHeader.slice("Bearer ".length);
   }
 
-  if (req.query?.token) return req.query.token;
+  // Notifications use credentialed EventSource cookies. Never accept a JWT
+  // from this endpoint's query string, where it can leak into logs/history.
+  if (!isNotificationsSseRoute(path) && req.query?.token) return req.query.token;
 
   if (isRoleScopedAIRoute(path)) {
     // AI is available to multiple staff roles. Without a Bearer token, use the
@@ -42,4 +49,4 @@ function selectRequestAuthToken(req) {
   return cookies.superadmin_access_token || cookies.user_access_token || cookies.access_token || null;
 }
 
-module.exports = { getRequestPath, isSuperAdminRoute, isRoleScopedAIRoute, selectRequestAuthToken };
+module.exports = { getRequestPath, isSuperAdminRoute, isRoleScopedAIRoute, isNotificationsSseRoute, selectRequestAuthToken };

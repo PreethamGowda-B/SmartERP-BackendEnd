@@ -76,6 +76,32 @@ test('protected account check propagates database errors and falls back to the d
   assert.deepEqual(redisUnavailable, { allowed: true, reason: null });
 });
 
+test('simultaneous cold-cache checks for one user share an in-flight database lookup', async () => {
+  let queryCount = 0;
+  let finishQuery;
+  const pool = {
+    query() {
+      queryCount += 1;
+      if (queryCount > 1) return Promise.resolve({ rows: [{ is_active: true, status: 'active' }] });
+      return new Promise((resolve) => { finishQuery = resolve; });
+    },
+  };
+  const check = () => verifyAccessAccountState({ pool, userId: 'same-user', tokenIssuedAt: 100 });
+
+  const first = check();
+  const second = check();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(queryCount, 1);
+  finishQuery({ rows: [{ is_active: true, status: 'active' }] });
+  assert.deepEqual(await Promise.all([first, second]), [
+    { allowed: true, reason: null },
+    { allowed: true, reason: null },
+  ]);
+
+  await check();
+  assert.equal(queryCount, 2, 'completed account state is not cached in process');
+});
+
 test('password login, refresh, and protected requests enforce persisted account state', () => {
   const authRoute = fs.readFileSync(path.join(__dirname, '..', 'routes', 'auth.js'), 'utf8');
   const authMiddleware = fs.readFileSync(path.join(__dirname, '..', 'middleware', 'authMiddleware.js'), 'utf8');

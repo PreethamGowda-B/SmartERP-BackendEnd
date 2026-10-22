@@ -18,9 +18,7 @@ test('work request schema initialization is single-flight and stops after owner 
         async query(sql) {
           queryCount += 1;
           if (sql.includes('ALTER TABLE work_requests')) {
-            const error = new Error('must be owner of table work_requests');
-            error.code = '42501';
-            throw error;
+            throw new Error('must be owner of table work_requests');
           }
           return { rows: [] };
         },

@@ -71,7 +71,7 @@ function createWorkRequestsTableInitializer({ db, warn = console.warn } = {}) {
           await client.query(sql);
         } catch (err) {
           if (['42701', '42P07'].includes(err?.code)) continue;
-          if (err?.code === '42501') {
+          if (err?.code === '42501' || /must be owner of table/i.test(err?.message || '')) {
             // Owner-controlled DDL cannot be repaired by the app role. Avoid
             // retrying on every request; a table owner must apply the changes.
             warn('ensureWorkRequestsTable: app role cannot alter the table; apply required schema changes with the table owner.');

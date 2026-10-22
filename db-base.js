@@ -6,7 +6,7 @@ if (dns.setDefaultResultOrder) {
 const { Pool } = require('pg');
 require('dotenv').config();
 
-const DEFAULT_DB_POOL_MAX = 4;
+const DEFAULT_DB_POOL_MAX = 2;
 
 function resolvePoolMax(value = process.env.DB_POOL_MAX) {
   const parsed = Number.parseInt(value, 10);
@@ -58,10 +58,10 @@ const pool = new Pool({
   connectionString: cleanConnectionString(process.env.DATABASE_URL),
   ssl: resolveSsl(),
   lookup: ipv4Lookup,
-  // pg Pool is process-local. Production runs a master plus two workers by
-  // default, so four per process allows up to 12 sessions and leaves headroom
-  // under Supabase's 15-client session-pool cap. Override only after sizing
-  // against every process and service instance sharing that database role.
+  // pg Pool is process-local. With two web workers per Render instance, a
+  // default of two keeps the app to four sessions per instance and leaves
+  // more room under the shared Supabase session-pool limit. Override only
+  // after sizing every process and service instance using the same database.
   max: resolvePoolMax(),
   idleTimeoutMillis: parseInt(process.env.DB_IDLE_TIMEOUT_MS || '10000', 10),
   connectionTimeoutMillis: 10000, // 10s connection queue timeout under load

@@ -38,3 +38,33 @@ test('query-token authentication remains available for existing SSE routes', () 
   });
   assert.equal(token, 'sse-session');
 });
+
+test('notifications SSE ignores query tokens and uses the authenticated staff cookie', () => {
+  const token = selectRequestAuthToken({
+    originalUrl: '/api/notifications/sse?token=leaked-session',
+    headers: {},
+    query: { token: 'leaked-session' },
+    cookies: { user_access_token: 'staff-cookie-session' },
+  });
+  assert.equal(token, 'staff-cookie-session');
+});
+
+test('versioned notifications SSE also rejects query tokens when no cookie is present', () => {
+  const token = selectRequestAuthToken({
+    originalUrl: '/api/v1/notifications/sse?token=leaked-session',
+    headers: {},
+    query: { token: 'leaked-session' },
+    cookies: {},
+  });
+  assert.equal(token, null);
+});
+
+test('trailing slash notifications SSE cannot re-enable query-token authentication', () => {
+  const token = selectRequestAuthToken({
+    originalUrl: '/api/notifications/sse/?token=leaked-session',
+    headers: {},
+    query: { token: 'leaked-session' },
+    cookies: {},
+  });
+  assert.equal(token, null);
+});

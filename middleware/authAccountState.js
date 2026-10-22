@@ -1,9 +1,30 @@
 'use strict';
 
 const ACCOUNT_STATE_CACHE_TTL = 60; // 60-second Redis cache to avoid heavy DB overhead
+const accountStateLookupsByPool = new WeakMap();
 
 function isUserAccountActive(user) {
   return Boolean(user) && user.is_active === true && user.status !== 'suspended';
+}
+
+function loadAccountStateOnce(pool, userId) {
+  let lookups = accountStateLookupsByPool.get(pool);
+  if (!lookups) {
+    lookups = new Map();
+    accountStateLookupsByPool.set(pool, lookups);
+  }
+
+  const key = String(userId);
+  const existing = lookups.get(key);
+  if (existing) return existing;
+
+  const lookup = Promise.resolve()
+    .then(() => pool.query('SELECT is_active, status, role FROM users WHERE id = $1', [userId]))
+    .finally(() => {
+      if (lookups.get(key) === lookup) lookups.delete(key);
+    });
+  lookups.set(key, lookup);
+  return lookup;
 }
 
 async function verifyAccessAccountState({ pool, redisClient, userId, tokenIssuedAt }) {
@@ -39,7 +60,10 @@ async function verifyAccessAccountState({ pool, redisClient, userId, tokenIssued
   }
 
   // 2. Query database for current account status
-  const result = await pool.query('SELECT is_active, status, role FROM users WHERE id = $1', [userId]);
+  // Collapse simultaneous cold-cache requests for the same user into one DB
+  // lookup. Completed results are not retained, so account changes remain
+  // visible on the next request.
+  const result = await loadAccountStateOnce(pool, userId);
   if (!result.rows.length) return { allowed: false, reason: 'user_missing' };
 
   const user = result.rows[0];

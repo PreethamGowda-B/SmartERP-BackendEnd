@@ -4,20 +4,15 @@ const { setTenantContext } = require("./tenantContext");
 const { getRequestPath, isSuperAdminRoute, selectRequestAuthToken } = require("./requestAuthToken");
 const { storage } = require('./als');
 const { verifyAccessAccountState } = require('./authAccountState');
+const { createCompanySuspensionChecker } = require('./companySuspensionState');
 
-async function isCompanySuspended(companyId) {
-  if (!companyId) return false;
-  // Read the authoritative status on each authenticated request so a newly
-  // suspended company cannot retain access through a stale cache entry.
+const isCompanySuspended = createCompanySuspensionChecker(async (companyId) => {
   const { pool } = require("../db");
-  const companyRes = await pool.query(
+  return pool.query(
     "SELECT status, COALESCE(NULLIF(to_jsonb(c)->>'is_suspended', ''), 'false') as is_susp FROM companies c WHERE id = $1",
     [companyId]
   );
-  return companyRes.rows.length > 0 && (
-    companyRes.rows[0].status === "suspended" || companyRes.rows[0].is_susp === "true"
-  );
-}
+});
 
 async function authenticateToken(req, res, next) {
   const token = selectRequestAuthToken(req);
@@ -28,7 +23,7 @@ async function authenticateToken(req, res, next) {
     // Only log in debug mode — these are normal during token refresh cycles
     if (process.env.LOG_AUTH_FAILURES === 'true') {
       const hasCookies = req.cookies && Object.keys(req.cookies).length > 0;
-      console.log(`ℹ️ No token found for ${req.method} ${req.originalUrl} (Origin: ${req.headers.origin || req.headers.host}${hasCookies ? ' | Has Cookies' : ''})`);
+      console.log(`ℹ️ No token found for ${req.method} ${requestPath} (Origin: ${req.headers.origin || req.headers.host}${hasCookies ? ' | Has Cookies' : ''})`);
     }
     return res.status(401).json({ message: "Not authenticated" });
   }
@@ -59,7 +54,7 @@ async function authenticateToken(req, res, next) {
       severity: 'low',
       ipAddress: req.ip || req.headers['x-forwarded-for'],
       userAgent: req.headers['user-agent'],
-      endpoint: req.originalUrl || req.path,
+      endpoint: requestPath,
       httpMethod: req.method,
       statusCode: 401,
       metadata: {
@@ -78,7 +73,7 @@ async function authenticateToken(req, res, next) {
         severity: 'medium',
         ipAddress: req.ip || req.headers['x-forwarded-for'],
         userAgent: req.headers['user-agent'],
-        endpoint: req.originalUrl || req.path,
+        endpoint: requestPath,
         httpMethod: req.method,
         statusCode: 403,
         metadata: {
@@ -130,7 +125,8 @@ async function authenticateToken(req, res, next) {
       return res.status(503).json({ message: 'Unable to verify account status. Please retry.' });
     }
 
-    // Check if company is suspended (Only if not super_admin) — Redis-cached with 60s TTL
+    // Check authoritative company status each request; simultaneous requests
+    // share only the in-flight query, never a completed status value.
     if (payload.role !== 'super_admin' && companyId) {
       try {
         const suspended = await storage.run(
@@ -146,7 +142,7 @@ async function authenticateToken(req, res, next) {
             severity: 'medium',
             ipAddress: req.ip || req.headers['x-forwarded-for'],
             userAgent: req.headers['user-agent'],
-            endpoint: req.originalUrl || req.path,
+            endpoint: requestPath,
             httpMethod: req.method,
             statusCode: 403,
             metadata: {

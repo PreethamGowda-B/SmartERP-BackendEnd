@@ -9,7 +9,7 @@ const { createCompanySuspensionChecker } = require('./companySuspensionState');
 const isCompanySuspended = createCompanySuspensionChecker(async (companyId) => {
   const { pool } = require("../db");
   return pool.query(
-    "SELECT status, COALESCE(NULLIF(to_jsonb(c)->>'is_suspended', ''), 'false') as is_susp FROM companies c WHERE id = $1",
+    "SELECT status, COALESCE(NULLIF(to_jsonb(c)->>'is_suspended', ''), 'false') as is_susp FROM companies c WHERE c.id::text = $1::text OR to_jsonb(c)->>'company_id' = $1::text LIMIT 1",
     [companyId]
   );
 });
@@ -121,7 +121,7 @@ async function authenticateToken(req, res, next) {
         });
       }
     } catch (error) {
-      console.error('Authentication account-state check failed:', error?.code || 'ACCOUNT_STATE_UNAVAILABLE');
+      console.error('Authentication account-state check failed:', error?.message || error?.code || 'ACCOUNT_STATE_UNAVAILABLE');
       return res.status(503).json({ message: 'Unable to verify account status. Please retry.' });
     }
 
@@ -156,7 +156,7 @@ async function authenticateToken(req, res, next) {
           });
         }
       } catch (e) {
-        console.error("Error checking suspension status:", e?.code || 'COMPANY_STATUS_UNAVAILABLE');
+        console.error("Error checking suspension status:", e?.message || e?.code || 'COMPANY_STATUS_UNAVAILABLE');
         return res.status(503).json({ message: 'Unable to verify company status. Please retry.' });
       }
     }

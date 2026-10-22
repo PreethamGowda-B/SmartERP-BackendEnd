@@ -355,7 +355,7 @@ router.get('/google/callback', (req, res, next) => {
       }
       if (user.role !== 'super_admin' && user.company_id) {
         const companyRes = await pool.query(
-          "SELECT status, COALESCE(NULLIF(to_jsonb(c)->>'is_suspended', ''), 'false') as is_susp FROM companies c WHERE id = $1",
+          "SELECT status, COALESCE(NULLIF(to_jsonb(c)->>'is_suspended', ''), 'false') as is_susp FROM companies c WHERE c.id::text = $1::text OR to_jsonb(c)->>'company_id' = $1::text LIMIT 1",
           [user.company_id]
         );
         if (companyRes.rows.length > 0 && (companyRes.rows[0].status === 'suspended' || companyRes.rows[0].is_susp === 'true')) {
@@ -1097,7 +1097,7 @@ router.post("/login", async (req, res) => {
     // Check if company is suspended (Only if not super_admin)
     if (user.role !== 'super_admin' && user.company_id) {
       const companyRes = await pool.query(
-        "SELECT status, COALESCE(NULLIF(to_jsonb(c)->>'is_suspended', ''), 'false') as is_susp FROM companies c WHERE id = $1",
+        "SELECT status, COALESCE(NULLIF(to_jsonb(c)->>'is_suspended', ''), 'false') as is_susp FROM companies c WHERE c.id::text = $1::text OR to_jsonb(c)->>'company_id' = $1::text LIMIT 1",
         [user.company_id]
       );
       if (companyRes.rows.length > 0 && (companyRes.rows[0].status === 'suspended' || companyRes.rows[0].is_susp === 'true')) {
@@ -1351,7 +1351,7 @@ router.post("/refresh", async (req, res) => {
     // 5. Check Suspension
     if (user.role !== 'super_admin' && user.company_id) {
       const compRes = await client.query(
-        "SELECT status, COALESCE(NULLIF(to_jsonb(c)->>'is_suspended', ''), 'false') as is_susp FROM companies c WHERE id = $1",
+        "SELECT status, COALESCE(NULLIF(to_jsonb(c)->>'is_suspended', ''), 'false') as is_susp FROM companies c WHERE c.id::text = $1::text OR to_jsonb(c)->>'company_id' = $1::text LIMIT 1",
         [user.company_id]
       );
       if (compRes.rows.length > 0 && (compRes.rows[0].status === 'suspended' || compRes.rows[0].is_susp === 'true')) {

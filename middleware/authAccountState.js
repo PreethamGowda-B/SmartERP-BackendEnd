@@ -4,7 +4,10 @@ const ACCOUNT_STATE_CACHE_TTL = 60; // 60-second Redis cache to avoid heavy DB o
 const accountStateLookupsByPool = new WeakMap();
 
 function isUserAccountActive(user) {
-  return Boolean(user) && user.is_active === true && user.status !== 'suspended';
+  if (!user) return false;
+  if (user.is_active !== true && user.is_active !== 'true') return false;
+  if (user.status && (user.status === 'suspended' || user.status === 'inactive')) return false;
+  return true;
 }
 
 function loadAccountStateOnce(pool, userId) {
@@ -19,7 +22,10 @@ function loadAccountStateOnce(pool, userId) {
   if (existing) return existing;
 
   const lookup = Promise.resolve()
-    .then(() => pool.query('SELECT is_active, status, role FROM users WHERE id = $1', [userId]))
+    .then(() => pool.query(
+      "SELECT is_active, COALESCE(NULLIF(to_jsonb(u)->>'status', ''), 'active') AS status FROM users u WHERE id = $1",
+      [userId]
+    ))
     .finally(() => {
       if (lookups.get(key) === lookup) lookups.delete(key);
     });

@@ -9,7 +9,7 @@ const { isUserAccountActive, verifyAccessAccountState } = require('../middleware
 function accountPool(row = { is_active: true }) {
   return {
     async query(sql, params) {
-      assert.equal(sql, 'SELECT is_active, status, role FROM users WHERE id = $1');
+      assert.equal(sql, "SELECT is_active, COALESCE(NULLIF(to_jsonb(u)->>'status', ''), 'active') AS status FROM users u WHERE id = $1");
       assert.deepEqual(params, ['user-1']);
       return { rows: row ? [row] : [] };
     },
@@ -19,6 +19,9 @@ function accountPool(row = { is_active: true }) {
 test('only explicitly active user state is authoritative for password and protected access checks', () => {
   assert.equal(isUserAccountActive({ is_active: false }), false);
   assert.equal(isUserAccountActive({ is_active: true }), true);
+  assert.equal(isUserAccountActive({ is_active: 'true' }), true);
+  assert.equal(isUserAccountActive({ is_active: true, status: 'inactive' }), false);
+  assert.equal(isUserAccountActive({ is_active: true, status: 'suspended' }), false);
   assert.equal(isUserAccountActive({}), false);
   assert.equal(isUserAccountActive(null), false);
 });
@@ -74,6 +77,25 @@ test('protected account check propagates database errors and falls back to the d
     userId: 'user-1', tokenIssuedAt: 100,
   });
   assert.deepEqual(redisUnavailable, { allowed: true, reason: null });
+});
+
+test('account-state query treats status as an optional legacy column while keeping is_active mandatory', async () => {
+  const queries = [];
+  const pool = {
+    async query(sql, params) {
+      queries.push({ sql, params });
+      return { rows: [{ is_active: true, status: 'active' }] };
+    },
+  };
+
+  const result = await verifyAccessAccountState({ pool, userId: 'user-1', tokenIssuedAt: 100 });
+  assert.deepEqual(result, { allowed: true, reason: null });
+  assert.match(queries[0].sql, /SELECT is_active,/);
+  assert.match(queries[0].sql, /to_jsonb\(u\)->>'status'/);
+  assert.doesNotMatch(queries[0].sql, /SELECT\s+is_active\s*,\s*(?:u\.)?status\b/i);
+  assert.doesNotMatch(queries[0].sql, /u\.status\b/i);
+  assert.doesNotMatch(queries[0].sql, /\brole\b/i);
+  assert.deepEqual(queries[0].params, ['user-1']);
 });
 
 test('simultaneous cold-cache checks for one user share an in-flight database lookup', async () => {

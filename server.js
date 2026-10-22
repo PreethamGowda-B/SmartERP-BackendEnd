@@ -339,8 +339,8 @@ async function fixDatabaseConstraints() {
 
     // Step 1: Update any existing jobs with invalid status to 'open'
     const updateResult = await client.query(`
-      UPDATE jobs 
-      SET status = 'open' 
+      UPDATE jobs
+      SET status = 'open'
       WHERE status NOT IN ('open', 'pending', 'in_progress', 'active', 'completed', 'closed', 'cancelled')
     `);
     if (updateResult.rowCount > 0) {
@@ -423,8 +423,8 @@ async function fixDatabaseConstraints() {
     setInterval(async () => {
       try {
         const cleanupResult = await pool.query(`
-          DELETE FROM refresh_tokens 
-          WHERE expires_at < NOW() 
+          DELETE FROM refresh_tokens
+          WHERE expires_at < NOW()
           OR (revoked = TRUE AND created_at < NOW() - INTERVAL '30 days')
         `);
         if (cleanupResult.rowCount > 0) {
@@ -632,7 +632,7 @@ async function runDatabaseInitialization() {
           replied_at TIMESTAMP,
           created_at TIMESTAMP DEFAULT NOW()
         );
-        
+
         ALTER TABLE feedback ADD COLUMN IF NOT EXISTS admin_reply TEXT;
         ALTER TABLE feedback ADD COLUMN IF NOT EXISTS replied_at TIMESTAMP;
 
@@ -1051,9 +1051,14 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
   app.listen(PORT, () => {
     console.log(`🚀 SmartERP worker ${process.pid} running on port ${PORT}`);
 
-    // Only run background workers on the designated primary worker (set via IS_PRIMARY_WORKER env)
-    if (process.env.IS_PRIMARY_WORKER === 'true') {
-      console.log("🛠️ Starting background processors and workers on primary worker...");
+    // Start background processors on primary cluster worker, or on any single-process deployment
+    const shouldStartWorkers = process.env.IS_PRIMARY_WORKER === 'true' ||
+      !cluster.isWorker ||
+      process.env.NODE_ENV !== 'production' ||
+      process.env.ENABLE_BACKGROUND_WORKERS === 'true';
+
+    if (shouldStartWorkers) {
+      console.log("🛠️ Starting background processors and workers...");
 
       require('./jobs/workers'); // Initialize BullMQ workers
 
@@ -1071,7 +1076,7 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
         console.error('❌ Failed to start trial expiry processor:', err.message);
       }
 
-      // 🔔 Smart Notification Service: Migrated to Node-Cron 
+      // 🔔 Smart Notification Service: Migrated to Node-Cron
       try {
         const { startSmartNotificationProcessor } = require('./jobs/smartNotificationProcessor');
         startSmartNotificationProcessor();

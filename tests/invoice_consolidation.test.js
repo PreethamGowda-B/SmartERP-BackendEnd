@@ -263,7 +263,13 @@ test('an already-issued or paid invoice is not rewritten during editor finalizat
 test('direct invoice idempotency replay returns the first invoice without a second stock movement', async () => {
   const originalConnect = pool.connect;
   const executed = [];
-  const prior = { id: 'direct-1', company_id: 'company-1', job_id: null, idempotency_key: 'key-1', pdf_url: '/api/invoices/direct-1/pdf' };
+  const replayPayload = { idempotency_key: 'key-12345678', lineItems: [] };
+  const prior = {
+    id: 'direct-1', company_id: 'company-1', job_id: null,
+    idempotency_key: replayPayload.idempotency_key,
+    request_fingerprint: invoiceService.directInvoiceFingerprint('company-1', replayPayload),
+    pdf_url: '/api/invoices/direct-1/pdf',
+  };
   const client = { query: async (sql) => {
     executed.push(sql);
     if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') return { rows: [] };
@@ -273,7 +279,7 @@ test('direct invoice idempotency replay returns the first invoice without a seco
   }, release() {} };
   pool.connect = async () => client;
   try {
-    const result = await invoiceService.createDirectInvoice({ companyId: 'company-1', invoiceData: { idempotency_key: 'key-1' } });
+    const result = await invoiceService.createDirectInvoice({ companyId: 'company-1', invoiceData: replayPayload });
     assert.equal(result.invoice.id, 'direct-1');
     assert.equal(result.invoice.job_id, null);
     assert.equal(result.idempotentReplay, true);

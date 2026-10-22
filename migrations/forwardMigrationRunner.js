@@ -58,17 +58,49 @@ const TIERED_SUPPORT_ENTITLEMENTS = {
   file: '038_tiered_support_entitlements.sql',
 };
 
+const INVOICE_PAYMENT_IDEMPOTENCY = {
+  id: '039_invoice_payment_idempotency',
+  file: '039_invoice_payment_idempotency.sql',
+};
+
+const SUPERADMIN_ANNOUNCEMENTS_SETTINGS = {
+  id: '041_superadmin_announcements_and_system_settings',
+  file: '041_superadmin_announcements_and_system_settings.sql',
+};
+
+const STAFF_PASSWORD_RESET_OTP_SCOPE = {
+  id: '042_staff_password_reset_otp_scope',
+  file: '042_staff_password_reset_otp_scope.sql',
+};
+
+const SECURITY_INFRASTRUCTURE_HARDENING_AND_RLS = {
+  id: '043_security_infrastructure_hardening_and_rls',
+  file: '043_security_infrastructure_hardening_and_rls.sql',
+  tables: ['security_events', 'security_incidents', 'security_actions'],
+};
+
 const FORWARD_MIGRATIONS = [
   PRODUCTION_DISPATCH, PRODUCTION_DISPATCH_PRIVILEGES, PRODUCTION_PACKING_WORKFLOW,
   CUSTOMER_MANUFACTURING_REQUESTS, SUBSCRIPTION_CATALOG_AND_STORAGE,
-  TIERED_SUPPORT_ENTITLEMENTS,
+  TIERED_SUPPORT_ENTITLEMENTS, INVOICE_PAYMENT_IDEMPOTENCY, SUPERADMIN_ANNOUNCEMENTS_SETTINGS,
+  STAFF_PASSWORD_RESET_OTP_SCOPE, SECURITY_INFRASTRUCTURE_HARDENING_AND_RLS,
 ];
 
-// Migration 037 contains plan upserts and historical storage backfills, so it
-// stays on the explicitly guarded provisioning path. Migration 038 is a
-// dependent, additive support-policy change and only runs after 037 is recorded.
+// Subscription migrations 037/038/039 and the newer 041/042/043 changes require
+// an explicitly reviewed rollout. 038 depends on the controlled 037 ledger;
+// 037 upserts plans and backfills storage; 039 changes payment idempotency;
+// 041/042/043 schema, privilege, and security baselines have not been verified. Keep them
+// allow-listed for controlled execution, but never apply them on startup.
+const CONTROLLED_MIGRATION_IDS = new Set([
+  SUBSCRIPTION_CATALOG_AND_STORAGE.id,
+  TIERED_SUPPORT_ENTITLEMENTS.id,
+  INVOICE_PAYMENT_IDEMPOTENCY.id,
+  SUPERADMIN_ANNOUNCEMENTS_SETTINGS.id,
+  STAFF_PASSWORD_RESET_OTP_SCOPE.id,
+  SECURITY_INFRASTRUCTURE_HARDENING_AND_RLS.id,
+]);
 const STARTUP_MIGRATIONS = FORWARD_MIGRATIONS.filter(
-  migration => migration.id !== SUBSCRIPTION_CATALOG_AND_STORAGE.id
+  migration => !CONTROLLED_MIGRATION_IDS.has(migration.id)
 );
 
 function stripOuterTransaction(sql) {
@@ -258,8 +290,138 @@ async function assertCustomerManufacturingRequestSchema(client) {
   return row;
 }
 
+async function assertSuperAdminAnnouncementsSettingsSchema(client) {
+  const result = await client.query(`
+    SELECT
+      (SELECT COUNT(*)::int FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+       WHERE n.nspname='public' AND c.relkind IN ('r','p')
+         AND c.relname=ANY(ARRAY['announcements','system_settings']::text[])) AS table_count,
+      (SELECT COUNT(*)::int FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+       WHERE n.nspname='public' AND c.relkind IN ('r','p') AND c.relrowsecurity AND c.relforcerowsecurity
+         AND c.relname=ANY(ARRAY['announcements','system_settings']::text[])) AS rls_count,
+      (SELECT COUNT(*)::int FROM pg_policies
+       WHERE schemaname='public' AND policyname=ANY(ARRAY[
+         'smarterp_041_announcements_superadmin',
+         'smarterp_041_announcements_company_read',
+         'smarterp_041_announcements_company_insert',
+         'smarterp_041_announcements_company_delete',
+         'smarterp_041_system_settings_superadmin',
+         'smarterp_041_maintenance_status_read'
+       ]::text[])) AS policy_count,
+      (SELECT COUNT(*)::int FROM pg_indexes
+       WHERE schemaname='public' AND indexname=ANY(ARRAY[
+         'idx_announcements_created_at','idx_notifications_idempotency'
+       ]::text[])) AS index_count,
+      (SELECT COUNT(*)::int FROM information_schema.columns
+       WHERE table_schema='public' AND (
+         (table_name='announcements' AND column_name=ANY(ARRAY['id','title','content','priority','created_by','created_at','company_id','target_role']::text[]))
+         OR (table_name='system_settings' AND column_name=ANY(ARRAY['key','value','updated_at']::text[]))
+         OR (table_name='notifications' AND column_name=ANY(ARRAY['data','idempotency_key']::text[]))
+       )) AS column_count,
+      EXISTS (SELECT 1 FROM pg_roles WHERE rolname='smarterp_app' AND NOT rolsuper AND NOT rolbypassrls) AS app_role_safe,
+      has_table_privilege('smarterp_app','public.announcements','SELECT') AS announcements_select,
+      has_table_privilege('smarterp_app','public.announcements','INSERT') AS announcements_insert,
+      has_table_privilege('smarterp_app','public.announcements','DELETE') AS announcements_delete,
+      has_table_privilege('smarterp_app','public.announcements','UPDATE') AS announcements_update,
+      has_table_privilege('smarterp_app','public.system_settings','SELECT') AS settings_select,
+      has_table_privilege('smarterp_app','public.system_settings','INSERT') AS settings_insert,
+      has_table_privilege('smarterp_app','public.system_settings','UPDATE') AS settings_update,
+      has_sequence_privilege('smarterp_app','public.announcements_id_seq','USAGE') AS announcements_sequence_usage,
+      (SELECT COUNT(*)::int FROM pg_roles r
+       CROSS JOIN (VALUES ('announcements'),('system_settings')) AS t(table_name)
+       WHERE r.rolname=ANY(ARRAY['anon','authenticated','service_role']::name[])
+         AND (has_table_privilege(r.oid, 'public.' || quote_ident(t.table_name), 'SELECT')
+           OR has_table_privilege(r.oid, 'public.' || quote_ident(t.table_name), 'INSERT')
+           OR has_table_privilege(r.oid, 'public.' || quote_ident(t.table_name), 'UPDATE')
+           OR has_table_privilege(r.oid, 'public.' || quote_ident(t.table_name), 'DELETE'))) AS external_role_privileges,
+      (SELECT COUNT(*)::int FROM pg_roles r
+       WHERE r.rolname=ANY(ARRAY['anon','authenticated','service_role']::name[])
+         AND has_sequence_privilege(r.oid, 'public.announcements_id_seq', 'USAGE')) AS external_sequence_privileges
+  `);
+  const row = result.rows[0] || {};
+  const expected = { table_count: 2, rls_count: 2, policy_count: 6, index_count: 2, column_count: 13, external_role_privileges: 0, external_sequence_privileges: 0 };
+  const failures = Object.entries(expected)
+    .filter(([key, value]) => Number(row[key]) !== value)
+    .map(([key, value]) => `${key}: expected ${value}, got ${row[key] ?? 'missing'}`);
+  if (!row.app_role_safe) failures.push('smarterp_app must exist without SUPERUSER or BYPASSRLS');
+  for (const key of ['announcements_select','announcements_insert','announcements_delete','settings_select','settings_insert','settings_update','announcements_sequence_usage']) {
+    if (!row[key]) failures.push(`application privilege ${key} is missing`);
+  }
+  if (row.announcements_update) failures.push('announcements UPDATE must not be granted to the application role');
+  if (failures.length) throw new Error(`Super Admin schema verification failed: ${failures.join('; ')}`);
+  return row;
+}
+
+async function inspectInvoicePaymentIdempotencySchema(client) {
+  const result = await client.query(`
+    SELECT
+      to_regclass('public.invoice_payments') IS NOT NULL AS payment_table_exists,
+      (SELECT COUNT(*)::int FROM information_schema.columns
+       WHERE table_schema='public' AND table_name='invoice_payments'
+         AND is_nullable='YES'
+         AND (
+           (column_name='idempotency_key' AND data_type='text') OR
+           (column_name='request_fingerprint' AND data_type='character' AND character_maximum_length=64) OR
+           (column_name='result_status' AND data_type='character varying' AND character_maximum_length=30) OR
+           (column_name IN ('result_amount_paid','result_amount_due') AND data_type='numeric'
+             AND numeric_precision=15 AND numeric_scale=2)
+         )) AS nullable_columns,
+      EXISTS (
+        SELECT 1 FROM pg_index i
+        JOIN pg_class ix ON ix.oid=i.indexrelid
+        JOIN pg_class tbl ON tbl.oid=i.indrelid
+        JOIN pg_namespace ns ON ns.oid=tbl.relnamespace
+        WHERE ns.nspname='public' AND tbl.relname='invoice_payments'
+          AND ix.relname='idx_invoice_payments_company_idempotency'
+          AND i.indisunique AND i.indisvalid AND i.indpred IS NOT NULL
+          AND pg_get_indexdef(i.indexrelid, 1, true)='company_id'
+          AND pg_get_indexdef(i.indexrelid, 2, true)='idempotency_key'
+          AND regexp_replace(lower(pg_get_expr(i.indpred, i.indrelid)), '[()[:space:]]', '', 'g')
+              = 'idempotency_keyisnotnull'
+      ) AS company_unique_partial_index,
+      (SELECT pg_get_constraintdef(c.oid, true)
+       FROM pg_constraint c
+       WHERE c.conrelid=to_regclass('public.invoice_payments')
+         AND c.conname='invoice_payments_idempotency_result_check'
+         AND c.contype='c'
+       LIMIT 1) AS result_check_definition
+  `);
+  return result.rows[0] || {};
+}
+
+async function assertInvoicePaymentIdempotencySchema(client) {
+  const row = await inspectInvoicePaymentIdempotencySchema(client);
+  const failures = [];
+  if (!row.payment_table_exists) failures.push('invoice_payments table is missing');
+  if (Number(row.nullable_columns) !== 5) failures.push('all five nullable idempotency columns must exist');
+  if (!row.company_unique_partial_index) failures.push('company-scoped unique partial idempotency index is missing or has an unexpected definition');
+
+  const definition = String(row.result_check_definition || '').toLowerCase().replace(/"/g, '');
+  const compact = definition.replace(/[()\s]/g, '');
+  const requiredTerms = [
+    'idempotency_keyisnull', 'request_fingerprintisnull', 'result_statusisnull',
+    'result_amount_paidisnull', 'result_amount_dueisnull', 'idempotency_keyisnotnull',
+    'lengthidempotency_key', 'request_fingerprint', 'result_status',
+    'result_amount_paid', 'result_amount_due',
+  ];
+  if (!definition || requiredTerms.some(term => !compact.includes(term))) {
+    failures.push('idempotency result check constraint is missing required null-state and result fields');
+  }
+  const boundedKeyLength = compact.includes('lengthidempotency_keybetween8and128') ||
+    (compact.includes('lengthidempotency_key>=8') && compact.includes('lengthidempotency_key<=128'));
+  if (!boundedKeyLength) failures.push('idempotency key length bounds are missing');
+  if (!compact.includes('lengthrequest_fingerprint=64') && !compact.includes('char_lengthrequest_fingerprint=64')) {
+    failures.push('request fingerprint length check is missing');
+  }
+  if (!compact.includes('or') || !compact.includes('and')) failures.push('idempotency result check is not a two-state constraint');
+  if (failures.length) throw new Error(`Invoice payment idempotency schema verification failed: ${failures.join('; ')}`);
+  return row;
+}
+
 async function verifyMigration(client, migrationId) {
-  await assertProductionDispatchSchema(client);
+  if (![INVOICE_PAYMENT_IDEMPOTENCY.id, SUPERADMIN_ANNOUNCEMENTS_SETTINGS.id, STAFF_PASSWORD_RESET_OTP_SCOPE.id].includes(migrationId)) {
+    await assertProductionDispatchSchema(client);
+  }
   if (migrationId === PRODUCTION_DISPATCH_PRIVILEGES.id) {
     await assertProductionDispatchPrivileges(client);
   }
@@ -305,6 +467,28 @@ async function verifyMigration(client, migrationId) {
     ]);
     if (schema.rows[0]?.feedback_columns !== 6 || schema.rows[0]?.support_indexes !== 2 || schema.rows[0]?.plan_policy_column !== 1) {
       throw new Error('Tiered support schema verification failed.');
+    }
+  }
+  if (migrationId === SUPERADMIN_ANNOUNCEMENTS_SETTINGS.id) {
+    await assertSuperAdminAnnouncementsSettingsSchema(client);
+  }
+  if (migrationId === INVOICE_PAYMENT_IDEMPOTENCY.id) {
+    await assertInvoicePaymentIdempotencySchema(client);
+  }
+  if (migrationId === STAFF_PASSWORD_RESET_OTP_SCOPE.id) {
+    const schema = await client.query(`
+      SELECT
+        (SELECT data_type FROM information_schema.columns
+          WHERE table_schema='public' AND table_name='email_otps' AND column_name='otp_code') AS otp_code_type,
+        (SELECT COUNT(*)::int FROM information_schema.columns
+          WHERE table_schema='public' AND table_name='email_otps'
+            AND column_name='purpose' AND is_nullable='NO') AS purpose_column,
+        (SELECT COUNT(*)::int FROM pg_indexes
+          WHERE schemaname='public' AND indexname='idx_email_otps_staff_purpose_lookup') AS purpose_index
+    `);
+    const row = schema.rows[0] || {};
+    if (row.otp_code_type !== 'text' || row.purpose_column !== 1 || row.purpose_index !== 1) {
+      throw new Error('Staff password-reset OTP schema verification failed.');
     }
   }
 }
@@ -366,6 +550,28 @@ async function applyForwardMigration(client, { migrationId, sql }) {
       return { migrationId, status: 'adopted_verified_legacy_record', checksum };
     }
 
+    if (migrationId === INVOICE_PAYMENT_IDEMPOTENCY.id) {
+      const schema = await inspectInvoicePaymentIdempotencySchema(client);
+      const hasAnyMigrationArtifacts = Number(schema.nullable_columns || 0) > 0 ||
+        Boolean(schema.company_unique_partial_index) || Boolean(schema.result_check_definition);
+      if (hasAnyMigrationArtifacts) {
+        // Existing objects without a ledger entry are adopted only after the
+        // complete postcondition check. Partial/drifted objects are never
+        // repaired by replaying CREATE IF NOT EXISTS migration SQL.
+        await assertInvoicePaymentIdempotencySchema(client);
+        await client.query(
+          'INSERT INTO app_migration_history (migration_id, checksum_sha256) VALUES ($1, $2)',
+          [migrationId, checksum]
+        );
+        await client.query('COMMIT');
+        inTransaction = false;
+        return { migrationId, status: 'adopted_verified_schema', checksum };
+      }
+      if (!schema.payment_table_exists) {
+        throw new Error('Migration 039 requires the existing invoice_payments base table; refusing to create or infer a financial schema.');
+      }
+    }
+
     if (migrationId === TIERED_SUPPORT_ENTITLEMENTS.id) {
       const prerequisite = await client.query(
         'SELECT 1 FROM app_migration_history WHERE migration_id = $1',
@@ -391,7 +597,7 @@ async function applyForwardMigration(client, { migrationId, sql }) {
         if (preexistingFunction.rows[0]?.exists) names.push('production_reject_history_mutation()');
         throw new Error(`Untracked Production & Dispatch objects already exist (${names.join(', ')}); inspect and reconcile the migration ledger before proceeding.`);
       }
-    } else {
+    } else if (![INVOICE_PAYMENT_IDEMPOTENCY.id, SUPERADMIN_ANNOUNCEMENTS_SETTINGS.id, STAFF_PASSWORD_RESET_OTP_SCOPE.id].includes(migrationId)) {
       await assertProductionDispatchSchema(client);
     }
 
@@ -418,6 +624,9 @@ module.exports = {
   PRODUCTION_PACKING_WORKFLOW,
   CUSTOMER_MANUFACTURING_REQUESTS,
   TIERED_SUPPORT_ENTITLEMENTS,
+  INVOICE_PAYMENT_IDEMPOTENCY,
+  SUPERADMIN_ANNOUNCEMENTS_SETTINGS,
+  STAFF_PASSWORD_RESET_OTP_SCOPE,
   FORWARD_MIGRATIONS,
   STARTUP_MIGRATIONS,
   stripOuterTransaction,
@@ -426,5 +635,8 @@ module.exports = {
   assertProductionDispatchPrivileges,
   assertProductionPackingWorkflowSchema,
   assertCustomerManufacturingRequestSchema,
+  assertSuperAdminAnnouncementsSettingsSchema,
+  inspectInvoicePaymentIdempotencySchema,
+  assertInvoicePaymentIdempotencySchema,
   applyForwardMigration,
 };

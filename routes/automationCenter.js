@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
-const { evaluateAutomationRules } = require('../helpers/evaluateAutomations');
+const { evaluateAutomationRules, SUPPORTED_AUTOMATION_ACTIONS } = require('../helpers/evaluateAutomations');
 const { emitSystemEvent } = require('../helpers/eventBus');
 
 // ─── GET /api/automation-center (Fetch Active Zero-Code Rules) ─────────────
@@ -32,8 +32,15 @@ router.post('/', authenticateToken, async (req, res) => {
     if (!companyId) return res.status(403).json({ message: 'No company associated with this account' });
     const { rule_name, trigger_event, action_type } = req.body;
 
-    if (!rule_name || !trigger_event || !action_type) {
+    if (typeof rule_name !== 'string' || !rule_name.trim() || typeof trigger_event !== 'string' || !trigger_event.trim() || typeof action_type !== 'string') {
       return res.status(400).json({ message: 'rule_name, trigger_event, and action_type are required' });
+    }
+    if (!SUPPORTED_AUTOMATION_ACTIONS.includes(action_type)) {
+      return res.status(400).json({
+        success: false,
+        code: 'UNSUPPORTED_AUTOMATION_ACTION',
+        message: 'This automation action is not supported.',
+      });
     }
 
     const result = await pool.query(
@@ -54,8 +61,8 @@ router.post('/', authenticateToken, async (req, res) => {
 
     res.status(201).json({ success: true, rule: newRule });
   } catch (err) {
-    console.error('❌ Error creating automation rule:', err.message);
-    res.status(500).json({ message: err.message || 'Server error' });
+    console.error('Automation rule creation failed:', err?.code || 'DATABASE_ERROR');
+    res.status(500).json({ message: 'Failed to save automation rule.' });
   }
 });
 
@@ -70,12 +77,15 @@ router.post('/evaluate', authenticateToken, async (req, res) => {
       return res.status(400).json({ message: 'trigger_event is required' });
     }
 
-    await evaluateAutomationRules(trigger_event, { companyId, jobId, machineId, itemId, details });
-
-    res.json({ success: true, message: `Automation rules evaluated for event ${trigger_event}` });
+    const outcome = await evaluateAutomationRules(trigger_event, { companyId, jobId, machineId, itemId, details });
+    return res.status(outcome.success ? 200 : 207).json({
+      success: outcome.success,
+      message: outcome.success ? `Automation rules evaluated for event ${trigger_event}` : 'One or more automation actions failed.',
+      results: outcome.results,
+    });
   } catch (err) {
-    console.error('❌ Error evaluating automation rules:', err.message);
-    res.status(500).json({ message: err.message || 'Server error' });
+    console.error('Automation rule evaluation failed:', err?.code || 'DATABASE_ERROR');
+    res.status(500).json({ success: false, message: 'Failed to evaluate automation rules.' });
   }
 });
 

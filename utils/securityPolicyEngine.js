@@ -155,6 +155,45 @@ function evaluatePolicyForIncident(incident) {
       }
       break;
 
+    case 'PROMPT_INJECTION':
+      // Safe: 30-min IP rate throttle
+      if (sourceIp) {
+        actions.push({
+          actionType: SECURITY_ACTION_TYPES.IP_THROTTLE_TEMPORARY,
+          isAutomated: true,
+          requiresApproval: false,
+          reason: 'Automated 30-min rate-limit quarantine due to adversarial prompt injection attempt.',
+          policyRule: 'RULE_PROMPT_INJECTION_IP_THROTTLE',
+          target: sourceIp,
+          payload: { ipAddress: sourceIp, durationMinutes: 30 },
+        });
+      }
+      // Safe: Invalidate caller session tokens
+      if (targetUserId) {
+        actions.push({
+          actionType: SECURITY_ACTION_TYPES.SESSION_REVOKE_TARGET,
+          isAutomated: true,
+          requiresApproval: false,
+          reason: 'Immediate session invalidation following detected prompt injection vector.',
+          policyRule: 'RULE_PROMPT_INJECTION_SESSION_REVOCATION',
+          target: targetUserId,
+          payload: { userId: targetUserId },
+        });
+      }
+      // Sensitive: Propose account suspension for Super Admin review if critical risk
+      if (targetUserId && riskScore >= 85) {
+        actions.push({
+          actionType: SECURITY_ACTION_TYPES.USER_SUSPEND,
+          isAutomated: false,
+          requiresApproval: true,
+          reason: 'Repeated adversarial prompt injection and system jailbreak attempts require administrative review.',
+          policyRule: 'RULE_PROMPT_INJECTION_SUSPEND_PROPOSAL',
+          target: targetUserId,
+          payload: { userId: targetUserId, companyId },
+        });
+      }
+      break;
+
     default:
       break;
   }
@@ -184,6 +223,15 @@ async function applyRemediationPolicy(incident) {
   const recordedActions = [];
 
   for (const decision of decisions) {
+    // Super Admin Protection Guard: Never propose or apply USER_SUSPEND on Super Admin accounts
+    if (decision.actionType === SECURITY_ACTION_TYPES.USER_SUSPEND && decision.target) {
+      const targetUser = await pool.query('SELECT role FROM users WHERE id = $1', [decision.target]).catch(() => ({ rows: [] }));
+      if (targetUser.rows.length > 0 && targetUser.rows[0].role === 'super_admin') {
+        logger.warn(`[PolicyEngine] Protected Super Admin account ${decision.target} from suspension proposal.`);
+        continue;
+      }
+    }
+
     const idempotencyKey = generateActionIdempotencyKey(
       incident.id,
       decision.actionType,

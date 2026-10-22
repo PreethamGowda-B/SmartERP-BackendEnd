@@ -1,13 +1,31 @@
 const express = require('express');
+const crypto = require('crypto');
 const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 const { authenticateSuperAdmin } = require('../middleware/adminMiddleware');
 const { getPlan } = require('../services/subscriptionCatalog');
+const { redisClient } = require('../utils/redis');
+
+function requireAccountType(req, res, allowedTypes) {
+  const accountType = req.query?.account_type || req.body?.account_type;
+  if (!allowedTypes.includes(accountType)) {
+    res.status(400).json({
+      code: 'ACCOUNT_TYPE_REQUIRED',
+      message: `account_type must be one of: ${allowedTypes.join(', ')}.`,
+    });
+    return null;
+  }
+  return accountType;
+}
 
 // All routes in this file require both a valid token AND super_admin privileges
 router.use(authenticateToken);
 router.use(authenticateSuperAdmin);
+
+router.get('/access', (req, res) => {
+  res.json({ authorized: true, role: req.user?.role || null });
+});
 
 // ─── GET /api/admin/dashboard ────────────────────────────────────────────────
 // Aggregate platform-wide statistics for the Overview page
@@ -159,6 +177,10 @@ router.patch('/companies/:id/status', async (req, res) => {
   const { id } = req.params;
   const { status } = req.body; // 'active', 'suspended'
 
+  if (!['active', 'suspended'].includes(status)) {
+    return res.status(400).json({ message: 'Status must be active or suspended.' });
+  }
+
   try {
     const result = await pool.query(
       'UPDATE companies SET status = $1 WHERE id = $2 RETURNING *',
@@ -264,44 +286,93 @@ router.patch('/subscriptions/:companyId', async (req, res) => {
 // ─── POST /api/admin/announcements ──────────────────────────────────────────
 // Broadcast message to all company owners
 router.post('/announcements', async (req, res) => {
-    const { title, message, priority } = req.body;
+  const { title, message, priority = 'medium', idempotency_key: idempotencyKey } = req.body || {};
+  if (typeof message !== 'string' || !message.trim()) {
+    return res.status(400).json({ message: 'Announcement message is required' });
+  }
+  if (!['low', 'medium', 'high'].includes(priority)) {
+    return res.status(400).json({ message: 'Priority must be low, medium, or high.' });
+  }
+  if (typeof idempotencyKey !== 'string' || !/^[A-Za-z0-9._:-]{8,128}$/.test(idempotencyKey)) {
+    return res.status(400).json({ code: 'IDEMPOTENCY_KEY_REQUIRED', message: 'A valid idempotency_key is required.' });
+  }
 
-    if (!message || !message.trim()) {
-      return res.status(400).json({ message: 'Announcement message is required' });
+  const noteTitle = typeof title === 'string' && title.trim() ? title.trim() : 'System Announcement';
+  const noteMessage = message.trim();
+  const fingerprint = crypto.createHash('sha256')
+    .update(JSON.stringify({ title: noteTitle, message: noteMessage, priority }))
+    .digest('hex');
+  const keyPrefix = `superadmin-broadcast:${idempotencyKey}:`;
+  let client;
+  let transactionStarted = false;
+
+  try {
+    client = await pool.connect();
+    await client.query('BEGIN');
+    transactionStarted = true;
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [keyPrefix]);
+
+    const previous = await client.query(
+      `SELECT data->>'request_fingerprint' AS fingerprint
+       FROM notifications
+       WHERE left(idempotency_key, length($1)) = $1`,
+      [keyPrefix]
+    );
+    if (previous.rows.length > 0) {
+      if (previous.rows.some((row) => row.fingerprint !== fingerprint)) {
+        await client.query('ROLLBACK');
+        transactionStarted = false;
+        return res.status(409).json({ code: 'IDEMPOTENCY_PAYLOAD_MISMATCH', message: 'This broadcast key was already used with different content.' });
+      }
+      await client.query('COMMIT');
+      transactionStarted = false;
+      return res.json({
+        message: `Broadcast already recorded for ${previous.rows.length} active company owners`,
+        sent: previous.rows.length,
+        replayed: true,
+      });
     }
 
-    try {
-        // Fetch all company owners in a single query
-        const owners = await pool.query("SELECT id, company_id FROM users WHERE role = 'owner'");
-        
-        if (owners.rows.length === 0) {
-          return res.json({ message: 'No company owners found to notify', sent: 0 });
-        }
-
-        // Batch INSERT all notifications in a single query using unnest for efficiency
-        const userIds = owners.rows.map(o => o.id);
-        const companyIds = owners.rows.map(o => o.company_id);
-        const noteTitle = title || 'System Announcement';
-        const notePriority = priority || 'medium';
-
-        await pool.query(
-          `INSERT INTO notifications (user_id, company_id, type, title, message, priority, read)
-           SELECT unnest($1::uuid[]), unnest($2::int[]), $3, $4, $5, $6, FALSE`,
-          [userIds, companyIds, 'system_broadcast', noteTitle, message, notePriority]
-        );
-
-        // Also persist in announcements history table
-        await pool.query(
-          `INSERT INTO announcements (title, content, priority, created_by)
-           VALUES ($1, $2, $3, $4)`,
-          [noteTitle, message, notePriority, req.user?.id || userIds[0]]
-        ).catch((err) => console.warn('⚠️ Could not save to announcements table:', err.message));
-
-        res.json({ message: `Broadcast sent to ${owners.rows.length} company owners`, sent: owners.rows.length });
-    } catch (err) {
-        console.error('❌ Announcement broadcast error:', err);
-        res.status(500).json({ message: 'Failed to broadcast announcement' });
+    const owners = await client.query(
+      "SELECT id, company_id FROM users WHERE role = 'owner' AND COALESCE(is_active, TRUE) = TRUE AND company_id IS NOT NULL"
+    );
+    if (owners.rows.length === 0) {
+      await client.query('ROLLBACK');
+      transactionStarted = false;
+      return res.json({ message: 'No active company owners found to notify', sent: 0 });
     }
+
+    const announcement = await client.query(
+      `INSERT INTO announcements (title, content, priority, created_by)
+       VALUES ($1, $2, $3, $4) RETURNING id`,
+      [noteTitle, noteMessage, priority, req.user?.id || req.user?.userId || owners.rows[0].id]
+    );
+
+    for (const owner of owners.rows) {
+      await client.query(
+        `INSERT INTO notifications
+           (user_id, company_id, type, title, message, priority, read, data, idempotency_key)
+         VALUES ($1, $2, 'system_broadcast', $3, $4, $5, FALSE, $6::jsonb, $7)
+         ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING`,
+        [owner.id, owner.company_id, noteTitle, noteMessage,
+          JSON.stringify({ announcement_id: announcement.rows[0]?.id, request_fingerprint: fingerprint }),
+          `${keyPrefix}${owner.id}`]
+      );
+    }
+
+    await client.query('COMMIT');
+    transactionStarted = false;
+    return res.json({ message: `Broadcast sent to ${owners.rows.length} active company owners`, sent: owners.rows.length });
+  } catch (err) {
+    if (transactionStarted) await client.query('ROLLBACK').catch(() => {});
+    console.error('❌ Announcement broadcast failed:', err.message);
+    if (['42703', '42P01', '42P10'].includes(err.code)) {
+      return res.status(503).json({ code: 'ANNOUNCEMENT_SCHEMA_NOT_READY', message: 'Broadcast schema or idempotency support is unavailable; no broadcast was committed.' });
+    }
+    return res.status(500).json({ message: 'Broadcast was not committed. Retry with the same idempotency key.' });
+  } finally {
+    client?.release();
+  }
 });
 
 // ─── GET /api/admin/companies/:id ────────────────────────────────────────────
@@ -691,44 +762,10 @@ router.patch('/companies/:id', async (req, res) => {
 // ─── DELETE /api/admin/companies/:id ─────────────────────────────────────────
 // Permanently delete a company and all associated data (irreversible)
 router.delete('/companies/:id', async (req, res) => {
-  const { id } = req.params;
-  const { confirm } = req.body;
-
-  if (confirm !== 'DELETE') {
-    return res.status(400).json({ message: 'Body must include { confirm: "DELETE" } to prevent accidental deletion' });
-  }
-
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    
-    // Get company info for logging
-    const co = await client.query('SELECT company_name, company_id FROM companies WHERE id = $1', [id]);
-    if (co.rows.length === 0) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ message: 'Company not found' });
-    }
-
-    const { company_name, company_id } = co.rows[0];
-
-    // Delete in dependency order
-    await client.query('DELETE FROM notifications WHERE company_id = $1', [id]);
-    await client.query('DELETE FROM activities WHERE company_id = $1', [id]);
-    await client.query('DELETE FROM feedback WHERE company_id = $1', [id]);
-    await client.query('DELETE FROM users WHERE company_id = $1', [id]);
-    await client.query('DELETE FROM companies WHERE id = $1', [id]);
-
-    await client.query('COMMIT');
-
-    console.log(`🛡️ SuperAdmin DELETED company: ${company_name} (${company_id}), id=${id}`);
-    res.json({ ok: true, message: `Company "${company_name}" permanently deleted` });
-  } catch (err) {
-    await client.query('ROLLBACK');
-    console.error('❌ Company delete error:', err);
-    res.status(500).json({ message: 'Server error during deletion' });
-  } finally {
-    client.release();
-  }
+  return res.status(409).json({
+    code: 'COMPANY_RETENTION_POLICY_REQUIRED',
+    message: 'Permanent company deletion is disabled until business-record retention and foreign-key behavior are reviewed. Suspend the company instead.',
+  });
 });
 
 // ─── GET /api/admin/companies/:id/usage ──────────────────────────────────────
@@ -761,27 +798,37 @@ router.get('/companies/:id/usage', async (req, res) => {
 // Get a specific user's details
 router.get('/users/:id', async (req, res) => {
   const { id } = req.params;
+  const requestedType = req.query.account_type;
+  if (requestedType && !['staff', 'customer'].includes(requestedType)) {
+    return res.status(400).json({ code: 'INVALID_ACCOUNT_TYPE', message: 'account_type must be staff or customer.' });
+  }
   try {
-    const r = await pool.query(
+    const staffQuery = pool.query(
       `SELECT u.id, u.name, u.email, u.role, u.phone, u.position, u.department,
-              u.created_at, u.is_active, c.company_name, c.id as company_id
+              u.created_at, u.is_active, c.company_name, c.id as company_id, 'staff' AS user_type
        FROM users u
        LEFT JOIN companies c ON u.company_id::text = c.id::text
        WHERE u.id::text = $1::text`,
       [id]
     );
-    if (r.rows.length > 0) return res.json(r.rows[0]);
-
-    // Fallback: Check customers table for customer accounts
-    const cust = await pool.query(
+    const customerQuery = pool.query(
       `SELECT c.id, c.name, c.email, 'customer' AS role, c.phone, NULL AS position, NULL AS department,
-              c.created_at, TRUE AS is_active, comp.company_name, comp.id AS company_id
+              c.created_at, TRUE AS is_active, comp.company_name, comp.id AS company_id, 'customer' AS user_type
        FROM customers c
        LEFT JOIN companies comp ON c.company_id::text = comp.id::text
        WHERE c.id::text = $1::text`,
       [id]
     );
-    if (cust.rows.length > 0) return res.json(cust.rows[0]);
+    const [staff, customer] = await Promise.all([staffQuery, customerQuery]);
+    const matches = requestedType === 'staff'
+      ? staff.rows
+      : requestedType === 'customer'
+        ? customer.rows
+        : [...staff.rows, ...customer.rows];
+    if (matches.length > 1) {
+      return res.status(409).json({ code: 'ACCOUNT_ID_COLLISION', message: 'Specify account_type to identify the account safely.' });
+    }
+    if (matches.length === 1) return res.json(matches[0]);
 
     return res.status(404).json({ message: 'User not found' });
   } catch (err) {
@@ -793,12 +840,19 @@ router.get('/users/:id', async (req, res) => {
 // ─── PATCH /api/admin/users/:id ──────────────────────────────────────────────
 // Edit user details (name, role, is_active)
 router.patch('/users/:id', async (req, res) => {
+  if (!requireAccountType(req, res, ['staff'])) return;
   const { id } = req.params;
   const { name, role, is_active, phone, position, department } = req.body;
 
   const validRoles = ['owner', 'hr', 'employee', 'admin'];
-  if (role && !validRoles.includes(role)) {
+  if (role !== undefined && !validRoles.includes(role)) {
     return res.status(400).json({ message: `Invalid role. Must be one of: ${validRoles.join(', ')}` });
+  }
+  if (name !== undefined && (typeof name !== 'string' || !name.trim())) {
+    return res.status(400).json({ message: 'name must be a non-empty string.' });
+  }
+  if (is_active !== undefined && typeof is_active !== 'boolean') {
+    return res.status(400).json({ message: 'is_active must be a boolean.' });
   }
 
   const updates = [];
@@ -821,6 +875,19 @@ router.patch('/users/:id', async (req, res) => {
       values
     );
     if (result.rows.length === 0) return res.status(404).json({ message: 'User not found' });
+    if (is_active === false) {
+      if (redisClient && redisClient.status === 'ready') {
+        await redisClient.set(`user_suspended:${id}`, '1', 'EX', 86400 * 7);
+        await redisClient.set(`token_revoked:${id}`, Date.now().toString(), 'EX', 86400);
+        await redisClient.del(`user_active:${id}`);
+      }
+      await pool.query('UPDATE refresh_tokens SET revoked = TRUE WHERE user_id = $1::uuid AND revoked = FALSE', [id]).catch(() => {});
+    } else if (is_active === true) {
+      if (redisClient && redisClient.status === 'ready') {
+        await redisClient.del(`user_suspended:${id}`);
+        await redisClient.set(`user_active:${id}`, '1', 'EX', 60);
+      }
+    }
     res.json({ ok: true, user: result.rows[0] });
   } catch (err) {
     console.error('❌ User edit error:', err);
@@ -831,36 +898,34 @@ router.patch('/users/:id', async (req, res) => {
 // ─── DELETE /api/admin/users/:id ─────────────────────────────────────────────
 // Soft delete (deactivate) or hard delete a user
 router.delete('/users/:id', async (req, res) => {
+  if (!requireAccountType(req, res, ['staff'])) return;
   const { id } = req.params;
   const { hard_delete } = req.body;
 
+  if (hard_delete !== undefined && typeof hard_delete !== 'boolean') {
+    return res.status(400).json({ message: 'hard_delete must be a boolean.' });
+  }
+
+  if (hard_delete === true) {
+    return res.status(409).json({
+      code: 'USER_RETENTION_POLICY_REQUIRED',
+      message: 'Permanent account deletion is disabled until account-history and retention rules are approved. Deactivate the staff account instead.',
+    });
+  }
+
   try {
-    if (hard_delete === true) {
-      // Hard delete — check user is not the only owner
-      const user = await pool.query('SELECT role, company_id FROM users WHERE id = $1', [id]);
-      if (user.rows.length === 0) return res.status(404).json({ message: 'User not found' });
-
-      if (user.rows[0].role === 'owner') {
-        const ownerCount = await pool.query(
-          "SELECT COUNT(*) as c FROM users WHERE company_id = $1 AND role = 'owner'",
-          [user.rows[0].company_id]
-        );
-        if (parseInt(ownerCount.rows[0].c) <= 1) {
-          return res.status(400).json({ message: 'Cannot delete the sole owner of a company. Transfer ownership first.' });
-        }
-      }
-
-      await pool.query('DELETE FROM users WHERE id = $1', [id]);
-      res.json({ ok: true, deleted: true });
-    } else {
-      // Soft delete — just deactivate
-      const result = await pool.query(
-        'UPDATE users SET is_active = FALSE WHERE id = $1 RETURNING id, name, email, is_active',
-        [id]
-      );
-      if (result.rows.length === 0) return res.status(404).json({ message: 'User not found' });
-      res.json({ ok: true, user: result.rows[0], message: 'User deactivated (soft delete)' });
+    const result = await pool.query(
+      'UPDATE users SET is_active = FALSE WHERE id = $1 RETURNING id, name, email, is_active',
+      [id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ message: 'User not found' });
+    if (redisClient && redisClient.status === 'ready') {
+      await redisClient.set(`user_suspended:${id}`, '1', 'EX', 86400 * 7);
+      await redisClient.set(`token_revoked:${id}`, Date.now().toString(), 'EX', 86400);
+      await redisClient.del(`user_active:${id}`);
     }
+    await pool.query('UPDATE refresh_tokens SET revoked = TRUE WHERE user_id = $1::uuid AND revoked = FALSE', [id]).catch(() => {});
+    res.json({ ok: true, user: result.rows[0], message: 'User deactivated (soft delete)' });
   } catch (err) {
     console.error('❌ User delete error:', err);
     res.status(500).json({ message: 'Server error' });
@@ -870,10 +935,11 @@ router.delete('/users/:id', async (req, res) => {
 // ─── POST /api/admin/users/:id/reset-password ────────────────────────────────
 // Admin-initiated password reset for any user
 router.post('/users/:id/reset-password', async (req, res) => {
+  if (!requireAccountType(req, res, ['staff'])) return;
   const { id } = req.params;
   const { new_password } = req.body;
 
-  if (!new_password || new_password.length < 8) {
+  if (typeof new_password !== 'string' || new_password.length < 8) {
     return res.status(400).json({ message: 'new_password must be at least 8 characters' });
   }
 
@@ -890,7 +956,7 @@ router.post('/users/:id/reset-password', async (req, res) => {
     // Revoke all refresh tokens for security
     await pool.query('UPDATE refresh_tokens SET revoked = TRUE WHERE user_id = $1', [id]).catch(() => {});
 
-    console.log(`🛡️ SuperAdmin reset password for user: ${result.rows[0].email}`);
+    console.log(`🛡️ SuperAdmin reset password for user id=${result.rows[0].id}`);
     res.json({ ok: true, message: `Password reset for ${result.rows[0].name}` });
   } catch (err) {
     console.error('❌ Password reset error:', err);
@@ -933,7 +999,12 @@ router.delete('/announcements/:id', async (req, res) => {
   try {
     const result = await pool.query('DELETE FROM announcements WHERE id = $1 RETURNING id, title', [id]);
     if (result.rows.length === 0) return res.status(404).json({ message: 'Announcement not found' });
-    res.json({ ok: true, deleted: result.rows[0] });
+    res.json({
+      ok: true,
+      deleted: result.rows[0],
+      notifications_recalled: false,
+      message: 'Announcement history entry removed. Previously sent notifications remain in recipient accounts.',
+    });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
   }
@@ -978,7 +1049,7 @@ router.get('/system/status', async (req, res) => {
   try {
     const r = await pool.query(
       "SELECT value FROM system_settings WHERE key = 'maintenance_mode'"
-    ).catch(() => ({ rows: [] }));
+    );
 
     const setting = r.rows[0]?.value || {
       mode: 'disabled', // 'disabled' (normal live), 'enabled' (maintenance), 'read_only', 'emergency'
@@ -988,6 +1059,12 @@ router.get('/system/status', async (req, res) => {
 
     res.json(setting);
   } catch (err) {
+    if (err.code === '42P01' || err.code === '42703') {
+      return res.status(503).json({
+        code: 'MAINTENANCE_SCHEMA_NOT_READY',
+        message: 'Maintenance settings are unavailable because the supported system_settings schema is not installed.',
+      });
+    }
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -1010,15 +1087,6 @@ router.post('/system/maintenance', async (req, res) => {
       updated_by: req.user?.email || 'admin@prozync.in'
     };
 
-    // Ensure table exists
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS system_settings (
-        key VARCHAR(100) PRIMARY KEY,
-        value JSONB NOT NULL,
-        updated_at TIMESTAMP DEFAULT NOW()
-      );
-    `).catch(() => {});
-
     await pool.query(
       `INSERT INTO system_settings (key, value, updated_at)
        VALUES ('maintenance_mode', $1, NOW())
@@ -1030,6 +1098,12 @@ router.post('/system/maintenance', async (req, res) => {
     res.json({ ok: true, maintenance: value });
   } catch (err) {
     console.error('❌ Maintenance mode error:', err);
+    if (err.code === '42P01' || err.code === '42703') {
+      return res.status(503).json({
+        code: 'MAINTENANCE_SCHEMA_NOT_READY',
+        message: 'Maintenance mode was not changed because the supported system_settings schema is not installed.',
+      });
+    }
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -1096,14 +1170,23 @@ router.get('/logs/login', async (req, res) => {
 // ─── POST /api/admin/users/:id/force-logout ──────────────────────────────────
 // Force logout user by revoking all refresh tokens
 router.post('/users/:id/force-logout', async (req, res) => {
+  const accountType = requireAccountType(req, res, ['staff', 'customer']);
+  if (!accountType) return;
   const { id } = req.params;
   try {
-    const [tokens, custTokens] = await Promise.all([
-      pool.query('UPDATE refresh_tokens SET revoked = TRUE WHERE user_id = $1 RETURNING id', [id]),
-      pool.query('UPDATE customer_refresh_tokens SET revoked = TRUE WHERE customer_id = $1 RETURNING id', [id]).catch(() => ({ rows: [] }))
-    ]);
-
-    const count = tokens.rows.length + custTokens.rows.length;
+    if (accountType === 'staff' && (!redisClient || redisClient.status !== 'ready')) {
+      return res.status(503).json({ message: 'Access-session revocation is unavailable. Please retry.' });
+    }
+    const tokenTable = accountType === 'customer' ? 'customer_refresh_tokens' : 'refresh_tokens';
+    const idColumn = accountType === 'customer' ? 'customer_id' : 'user_id';
+    const tokens = await pool.query(
+      `UPDATE ${tokenTable} SET revoked = TRUE WHERE ${idColumn} = $1 RETURNING id`,
+      [id]
+    );
+    const count = tokens.rows.length;
+    if (accountType === 'staff') {
+      await redisClient.set(`token_revoked:${id}`, Date.now().toString(), 'EX', 86400);
+    }
     console.log(`🛡️ SuperAdmin forced logout for user ${id}: ${count} token(s) revoked`);
     res.json({ ok: true, revokedCount: count, message: `Forced logout: ${count} active session(s) revoked` });
   } catch (err) {
@@ -1114,13 +1197,21 @@ router.post('/users/:id/force-logout', async (req, res) => {
 // ─── POST /api/admin/users/:id/restore ───────────────────────────────────────
 // Restore (re-enable) a deactivated user
 router.post('/users/:id/restore', async (req, res) => {
+  if (!requireAccountType(req, res, ['staff'])) return;
   const { id } = req.params;
   try {
+    if (!redisClient || redisClient.status !== 'ready') {
+      return res.status(503).json({ message: 'Session revocation storage is unavailable. Please retry restoration.' });
+    }
+    await redisClient.set(`token_revoked:${id}`, Date.now().toString(), 'EX', 86400);
+    await redisClient.del(`user_suspended:${id}`);
+    await redisClient.set(`user_active:${id}`, '1', 'EX', 60);
     const result = await pool.query(
       'UPDATE users SET is_active = TRUE WHERE id = $1 RETURNING id, name, email, is_active',
       [id]
     );
     if (result.rows.length === 0) return res.status(404).json({ message: 'User not found' });
+    await pool.query('UPDATE refresh_tokens SET revoked = TRUE WHERE user_id = $1::uuid AND revoked = FALSE', [id]);
     res.json({ ok: true, user: result.rows[0], message: 'User account restored' });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
@@ -1130,6 +1221,7 @@ router.post('/users/:id/restore', async (req, res) => {
 // ─── GET /api/admin/users/:id/login-history ──────────────────────────────────
 // Get login history for a specific user
 router.get('/users/:id/login-history', async (req, res) => {
+  if (!requireAccountType(req, res, ['staff'])) return;
   const { id } = req.params;
   try {
     const result = await pool.query(`

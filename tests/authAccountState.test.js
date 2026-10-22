@@ -1,0 +1,94 @@
+'use strict';
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const { isUserAccountActive, verifyAccessAccountState } = require('../middleware/authAccountState');
+
+function accountPool(row = { is_active: true }) {
+  return {
+    async query(sql, params) {
+      assert.equal(sql, 'SELECT is_active, status, role FROM users WHERE id = $1');
+      assert.deepEqual(params, ['user-1']);
+      return { rows: row ? [row] : [] };
+    },
+  };
+}
+
+test('only explicitly active user state is authoritative for password and protected access checks', () => {
+  assert.equal(isUserAccountActive({ is_active: false }), false);
+  assert.equal(isUserAccountActive({ is_active: true }), true);
+  assert.equal(isUserAccountActive({}), false);
+  assert.equal(isUserAccountActive(null), false);
+});
+
+test('protected account check denies deactivated and missing users', async () => {
+  const inactive = await verifyAccessAccountState({
+    pool: accountPool({ is_active: false }), userId: 'user-1', tokenIssuedAt: 100,
+  });
+  const missing = await verifyAccessAccountState({
+    pool: accountPool(null), userId: 'user-1', tokenIssuedAt: 100,
+  });
+  assert.deepEqual(inactive, { allowed: false, reason: 'user_inactive' });
+  assert.deepEqual(missing, { allowed: false, reason: 'user_missing' });
+});
+
+test('protected account check rejects an access token issued before forced logout', async () => {
+  const state = await verifyAccessAccountState({
+    pool: accountPool(),
+    redisClient: {
+      status: 'ready',
+      async get(key) {
+        if (key === 'user_suspended:user-1' || key === 'user_active:user-1') return null;
+        assert.equal(key, 'token_revoked:user-1');
+        return '100000';
+      },
+    },
+    userId: 'user-1',
+    tokenIssuedAt: 100,
+  });
+  assert.deepEqual(state, { allowed: false, reason: 'session_revoked' });
+});
+
+test('protected account check accepts a new token issued after the revocation timestamp', async () => {
+  const state = await verifyAccessAccountState({
+    pool: accountPool(),
+    redisClient: {
+      status: 'ready',
+      async get(key) { return key === 'token_revoked:user-1' ? '100000' : null; },
+    },
+    userId: 'user-1',
+    tokenIssuedAt: 101,
+  });
+  assert.deepEqual(state, { allowed: true, reason: null });
+});
+
+test('protected account check propagates database errors and falls back to the database when Redis is unavailable', async () => {
+  await assert.rejects(verifyAccessAccountState({
+    pool: { async query() { throw new Error('database offline'); } }, userId: 'user-1', tokenIssuedAt: 100,
+  }), /database offline/);
+  const redisUnavailable = await verifyAccessAccountState({
+    pool: accountPool(),
+    redisClient: { status: 'ready', async get() { throw new Error('redis offline'); } },
+    userId: 'user-1', tokenIssuedAt: 100,
+  });
+  assert.deepEqual(redisUnavailable, { allowed: true, reason: null });
+});
+
+test('password login, refresh, and protected requests enforce persisted account state', () => {
+  const authRoute = fs.readFileSync(path.join(__dirname, '..', 'routes', 'auth.js'), 'utf8');
+  const authMiddleware = fs.readFileSync(path.join(__dirname, '..', 'middleware', 'authMiddleware.js'), 'utf8');
+  assert.match(authRoute, /if \(!isUserAccountActive\(user\)\)/);
+  assert.match(authRoute, /SELECT id, role, email, company_id, is_active FROM users/);
+  assert.match(authMiddleware, /verifyAccessAccountState/);
+  assert.match(authMiddleware, /return res\.status\(503\)\.json\(\{ message: 'Unable to verify account status/);
+});
+
+test('approved company suspension uses the same status field that authentication checks', () => {
+  const executor = fs.readFileSync(path.join(__dirname, '..', 'utils', 'securityActionExecutor.js'), 'utf8');
+  const middleware = fs.readFileSync(path.join(__dirname, '..', 'middleware', 'authMiddleware.js'), 'utf8');
+  assert.match(executor, /UPDATE companies SET status = 'suspended'/);
+  assert.doesNotMatch(executor, /companies SET is_suspended/);
+  assert.match(middleware, /SELECT status, COALESCE\(NULLIF\(to_jsonb\(c\)->>'is_suspended'/);
+});

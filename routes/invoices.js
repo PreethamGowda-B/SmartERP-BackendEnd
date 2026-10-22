@@ -12,6 +12,7 @@ const jwt = require('jsonwebtoken');
 const { pool } = require('../db');
 const { storage } = require('../middleware/als');
 const authMiddleware = require('../middleware/authMiddleware');
+const requireFinanceReadAccess = require('../middleware/requireFinanceReadAccess');
 const invoiceService = require('../services/invoiceService');
 const pdfInvoiceService = require('../services/pdfInvoiceService');
 const whatsappService = require('../services/whatsappService');
@@ -58,7 +59,7 @@ function verifyInvoiceAccess(req, invoice) {
     try {
       const decoded = jwt.verify(token, process.env.JWT_SECRET);
       if (decoded.type === 'invoice_pdf' && decoded.invoiceId === invoice.id) {
-        return true;
+        return String(decoded.companyId || decoded.company_id || '') === String(invoice.company_id);
       }
       const tokenCompanyId = decoded.companyId || decoded.company_id;
       const tokenCustomerId = decoded.customerId || decoded.customer_id || decoded.id || decoded.userId;
@@ -68,9 +69,6 @@ function verifyInvoiceAccess(req, invoice) {
         return !!(invoice.customer_id && tokenCustomerId && String(tokenCustomerId) === String(invoice.customer_id));
       }
       if (tokenCompanyId && String(tokenCompanyId) === String(invoice.company_id)) {
-        return true;
-      }
-      if (decoded.role === 'super_admin' || decoded.isSuperAdmin) {
         return true;
       }
       if (invoice.customer_id && tokenCustomerId && String(tokenCustomerId) === String(invoice.customer_id)) {
@@ -88,9 +86,6 @@ function verifyInvoiceAccess(req, invoice) {
       return !!(invoice.customer_id && userCustomerId && String(userCustomerId) === String(invoice.customer_id));
     }
     if (userCompanyId && String(userCompanyId) === String(invoice.company_id)) {
-      return true;
-    }
-    if (req.user.role === 'super_admin') {
       return true;
     }
     const userCustomerId = req.user.customerId || req.user.customer_id || req.user.id;
@@ -119,6 +114,7 @@ function setInvoiceTenantContext(req, res, next) {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     const companyId = decoded.companyId || decoded.company_id;
     const userId = decoded.customerId || decoded.customer_id || decoded.id || decoded.userId;
+    req.invoiceAccessCompanyId = companyId;
     storage.run({
       isWebRequest: true,
       companyId,
@@ -136,7 +132,7 @@ function setInvoiceTenantContext(req, res, next) {
  * GET /api/invoices
  * Lists all invoices for the authenticated user's company.
  */
-router.get('/', authenticate, async (req, res) => {
+router.get('/', authenticate, requireFinanceReadAccess, async (req, res) => {
   try {
     const companyId = req.user.companyId || req.user.company_id;
     const { status, limit = 50, page = 1 } = req.query;
@@ -145,7 +141,7 @@ router.get('/', authenticate, async (req, res) => {
     let query = `
       SELECT i.*, j.title AS job_title
       FROM invoices i
-      LEFT JOIN jobs j ON i.job_id = j.id
+      LEFT JOIN jobs j ON i.job_id = j.id AND j.company_id = i.company_id
       WHERE i.company_id = $1 AND i.is_latest = TRUE
     `;
     const params = [companyId];
@@ -209,7 +205,7 @@ router.post('/production-order/:productionOrderId/draft', authenticate, async (r
  * GET /api/invoices/editor-data/:jobId
  * Pre-populates the Dedicated Invoice Editor Page for a completed job.
  */
-router.get('/editor-data/:jobId', authenticate, async (req, res) => {
+router.get('/editor-data/:jobId', authenticate, requireFinanceReadAccess, async (req, res) => {
   try {
     const companyId = req.user.companyId || req.user.company_id;
     const { jobId } = req.params;
@@ -227,7 +223,7 @@ router.get('/editor-data/:jobId', authenticate, async (req, res) => {
  * GET /api/invoices/job/:jobId
  * Returns the latest invoice linked to a job.
  */
-router.get('/job/:jobId', authenticate, async (req, res) => {
+router.get('/job/:jobId', authenticate, requireFinanceReadAccess, async (req, res) => {
   try {
     const companyId = req.user.companyId || req.user.company_id;
     const { jobId } = req.params;
@@ -235,7 +231,7 @@ router.get('/job/:jobId', authenticate, async (req, res) => {
     const invRes = await pool.query(
       `SELECT i.*, j.title AS job_title
        FROM invoices i
-       LEFT JOIN jobs j ON i.job_id = j.id
+       LEFT JOIN jobs j ON i.job_id = j.id AND j.company_id = i.company_id
        WHERE i.job_id = $1 AND i.company_id = $2 AND i.is_latest = TRUE`,
       [jobId, companyId]
     );
@@ -245,10 +241,10 @@ router.get('/job/:jobId', authenticate, async (req, res) => {
     }
 
     const invoice = invRes.rows[0];
-    const itemsRes = await pool.query(`SELECT * FROM invoice_items WHERE invoice_id = $1`, [invoice.id]);
-    const disputesRes = await pool.query(`SELECT * FROM invoice_disputes WHERE invoice_id = $1 ORDER BY created_at DESC`, [invoice.id]);
-    const logsRes = await pool.query(`SELECT * FROM invoice_activity_logs WHERE invoice_id = $1 ORDER BY created_at DESC`, [invoice.id]);
-    const paymentsRes = await pool.query(`SELECT * FROM invoice_payments WHERE invoice_id = $1 ORDER BY created_at DESC`, [invoice.id]);
+    const itemsRes = await pool.query(`SELECT * FROM invoice_items WHERE invoice_id = $1 AND company_id = $2`, [invoice.id, companyId]);
+    const disputesRes = await pool.query(`SELECT * FROM invoice_disputes WHERE invoice_id = $1 AND company_id = $2 ORDER BY created_at DESC`, [invoice.id, companyId]);
+    const logsRes = await pool.query(`SELECT * FROM invoice_activity_logs WHERE invoice_id = $1 AND company_id = $2 ORDER BY created_at DESC`, [invoice.id, companyId]);
+    const paymentsRes = await pool.query(`SELECT * FROM invoice_payments WHERE invoice_id = $1 AND company_id = $2 ORDER BY created_at DESC`, [invoice.id, companyId]);
 
     return res.json({
       success: true,
@@ -268,7 +264,7 @@ router.get('/job/:jobId', authenticate, async (req, res) => {
  * GET /api/invoices/:id
  * Fetches detailed invoice record by ID.
  */
-router.get('/:id', authenticate, async (req, res) => {
+router.get('/:id', authenticate, requireFinanceReadAccess, async (req, res) => {
   try {
     const companyId = req.user.companyId || req.user.company_id;
     const { id } = req.params;
@@ -276,7 +272,7 @@ router.get('/:id', authenticate, async (req, res) => {
     const invRes = await pool.query(
       `SELECT i.*, j.title AS job_title
        FROM invoices i
-       LEFT JOIN jobs j ON i.job_id = j.id
+       LEFT JOIN jobs j ON i.job_id = j.id AND j.company_id = i.company_id
        WHERE i.id = $1 AND i.company_id = $2`,
       [id, companyId]
     );
@@ -286,10 +282,10 @@ router.get('/:id', authenticate, async (req, res) => {
     }
 
     const invoice = invRes.rows[0];
-    const itemsRes = await pool.query(`SELECT * FROM invoice_items WHERE invoice_id = $1`, [invoice.id]);
-    const disputesRes = await pool.query(`SELECT * FROM invoice_disputes WHERE invoice_id = $1 ORDER BY created_at DESC`, [invoice.id]);
-    const logsRes = await pool.query(`SELECT * FROM invoice_activity_logs WHERE invoice_id = $1 ORDER BY created_at DESC`, [invoice.id]);
-    const paymentsRes = await pool.query(`SELECT * FROM invoice_payments WHERE invoice_id = $1 ORDER BY created_at DESC`, [invoice.id]);
+    const itemsRes = await pool.query(`SELECT * FROM invoice_items WHERE invoice_id = $1 AND company_id = $2`, [invoice.id, companyId]);
+    const disputesRes = await pool.query(`SELECT * FROM invoice_disputes WHERE invoice_id = $1 AND company_id = $2 ORDER BY created_at DESC`, [invoice.id, companyId]);
+    const logsRes = await pool.query(`SELECT * FROM invoice_activity_logs WHERE invoice_id = $1 AND company_id = $2 ORDER BY created_at DESC`, [invoice.id, companyId]);
+    const paymentsRes = await pool.query(`SELECT * FROM invoice_payments WHERE invoice_id = $1 AND company_id = $2 ORDER BY created_at DESC`, [invoice.id, companyId]);
 
     // Fetch company details dynamically from DB
     const compRes = await pool.query(`SELECT id, company_name, address, phone, contact_email, settings FROM companies WHERE id = $1`, [invoice.company_id]);
@@ -471,33 +467,42 @@ router.post('/direct-create', authenticate, async (req, res) => {
  * POST /api/invoices/:id/record-payment
  * Records counter / office payment (Cash, POS Card, UPI QR, Bank Transfer, Cheque).
  */
-router.post('/:id/record-payment', authenticate, async (req, res) => {
-  try {
-    const companyId = req.user.companyId || req.user.company_id;
-    const userId = req.user.id || req.user.userId;
-    const { id } = req.params;
-    const { paymentMethod, transactionReference, amount, notes } = req.body;
+function createInvoicePaymentRecordHandler(paymentService = invoiceService) {
+  return async (req, res) => {
+    try {
+      const role = String(req.user?.role || '').toLowerCase();
+      if (!['owner', 'admin', 'super_admin'].includes(role)) {
+        return res.status(403).json({ error: 'Only owners or administrators can record invoice payments.' });
+      }
+      const companyId = req.user.companyId || req.user.company_id;
+      const userId = req.user.id || req.user.userId;
+      const { id } = req.params;
+      const { paymentMethod, transactionReference, amount, notes } = req.body;
 
-    if (!paymentMethod || !amount) {
-      return res.status(400).json({ error: 'Payment method and amount are required' });
+      if (!paymentMethod || !amount) {
+        return res.status(400).json({ error: 'Payment method and amount are required' });
+      }
+
+      const result = await paymentService.recordPayment({
+        invoiceId: id,
+        companyId,
+        paymentMethod,
+        transactionReference,
+        amount,
+        notes,
+        idempotencyKey: req.get('Idempotency-Key'),
+        recordedBy: userId,
+      });
+
+      return res.json(result);
+    } catch (err) {
+      console.error('POST /api/invoices/:id/record-payment failed:', err?.code || 'PAYMENT_RECORDING_ERROR');
+      return res.status(err.statusCode || 500).json({ error: err.statusCode ? err.message : 'Could not record payment.' });
     }
+  };
+}
 
-    const result = await invoiceService.recordPayment({
-      invoiceId: id,
-      companyId,
-      paymentMethod,
-      transactionReference,
-      amount,
-      notes,
-      recordedBy: userId,
-    });
-
-    return res.json(result);
-  } catch (err) {
-    console.error('POST /api/invoices/:id/record-payment error:', err.message);
-    return res.status(500).json({ error: err.message });
-  }
-});
+router.post('/:id/record-payment', authenticate, createInvoicePaymentRecordHandler());
 
 /**
  * POST /api/invoices/finalize
@@ -718,16 +723,16 @@ router.post('/:id/dispute', setInvoiceTenantContext, async (req, res) => {
  * GET /api/invoices/disputes/all
  * Lists all customer invoice disputes for the owner portal.
  */
-router.get('/disputes/all', authenticate, async (req, res) => {
+router.get('/disputes/all', authenticate, requireFinanceReadAccess, async (req, res) => {
   try {
     const companyId = req.user.companyId || req.user.company_id;
 
     const result = await pool.query(
       `SELECT d.*, i.invoice_number, i.total_amount, i.job_id, j.title AS job_title, c.name AS customer_name, c.email AS customer_email
        FROM invoice_disputes d
-       LEFT JOIN invoices i ON d.invoice_id = i.id
-       LEFT JOIN jobs j ON i.job_id = j.id
-       LEFT JOIN customers c ON d.customer_id = c.id
+       LEFT JOIN invoices i ON d.invoice_id = i.id AND i.company_id = d.company_id
+       LEFT JOIN jobs j ON i.job_id = j.id AND j.company_id = d.company_id
+       LEFT JOIN customers c ON d.customer_id = c.id AND c.company_id = d.company_id
        WHERE d.company_id = $1
        ORDER BY d.created_at DESC`,
       [companyId]
@@ -794,8 +799,10 @@ router.patch('/disputes/:disputeId/resolve', authenticate, async (req, res) => {
 router.get('/:id/pdf', setInvoiceTenantContext, async (req, res) => {
   try {
     const { id } = req.params;
+    const companyId = req.invoiceAccessCompanyId;
+    if (!companyId) return res.status(401).json({ error: 'Company context is required to access this invoice.' });
 
-    const invRes = await pool.query(`SELECT * FROM invoices WHERE id = $1`, [id]);
+    const invRes = await pool.query(`SELECT * FROM invoices WHERE id = $1 AND company_id::text = $2::text`, [id, String(companyId)]);
     if (invRes.rows.length === 0) {
       return res.status(404).json({ error: 'Invoice not found' });
     }
@@ -829,7 +836,7 @@ router.get('/:id/pdf', setInvoiceTenantContext, async (req, res) => {
       return res.status(401).json({ error: 'Unauthorized: Valid authentication session or signed token required' });
     }
 
-    const itemsRes = await pool.query(`SELECT * FROM invoice_items WHERE invoice_id = $1`, [id]);
+    const itemsRes = await pool.query(`SELECT * FROM invoice_items WHERE invoice_id = $1 AND company_id::text = $2::text`, [id, String(companyId)]);
 
     // Fetch company profile dynamically
     const compRes = await pool.query(`SELECT id, company_name, address, phone, contact_email, settings FROM companies WHERE id = $1`, [invoice.company_id]);
@@ -1009,3 +1016,4 @@ router.post('/:id/send-email', authenticate, async (req, res) => {
 });
 
 module.exports = router;
+module.exports.createInvoicePaymentRecordHandler = createInvoicePaymentRecordHandler;

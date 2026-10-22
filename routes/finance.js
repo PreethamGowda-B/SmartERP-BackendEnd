@@ -11,6 +11,7 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../db');
 const authMiddleware = require('../middleware/authMiddleware');
+const requireFinanceReadAccess = require('../middleware/requireFinanceReadAccess');
 const invoiceService = require('../services/invoiceService');
 
 const authenticate = authMiddleware.authenticateToken || authMiddleware;
@@ -19,7 +20,7 @@ const authenticate = authMiddleware.authenticateToken || authMiddleware;
  * GET /api/finance/summary
  * Finance Dashboard KPIs: Revenue, Outstanding AR, Tax Liabilities, Invoice Counts.
  */
-router.get('/summary', authenticate, async (req, res) => {
+router.get('/summary', authenticate, requireFinanceReadAccess, async (req, res) => {
   try {
     const companyId = req.user.companyId || req.user.company_id;
 
@@ -74,7 +75,7 @@ router.get('/summary', authenticate, async (req, res) => {
  * GET /api/finance/ar-aging
  * Accounts Receivable Aging Matrix (Current, 1-30 days, 31-60 days, 60+ days).
  */
-router.get('/ar-aging', authenticate, async (req, res) => {
+router.get('/ar-aging', authenticate, requireFinanceReadAccess, async (req, res) => {
   try {
     const companyId = req.user.companyId || req.user.company_id;
 
@@ -177,55 +178,73 @@ router.get('/gst-summary', authenticate, async (req, res) => {
  * GET /api/finance/payments
  * Payments Log List (Razorpay, Cash, Bank Transfer, Cheque, UPI).
  */
-router.get('/payments', authenticate, async (req, res) => {
-  try {
-    const companyId = req.user.companyId || req.user.company_id;
+function createFinancePaymentsReadHandler(query = (...args) => pool.query(...args)) {
+  return async (req, res) => {
+    try {
+      const role = String(req.user?.role || '').toLowerCase();
+      if (!['owner', 'admin', 'super_admin'].includes(role)) {
+        return res.status(403).json({ error: 'Only owners or administrators can view financial payments.' });
+      }
+      const companyId = req.user.companyId || req.user.company_id;
 
-    const payRes = await pool.query(
-      `SELECT p.*, i.invoice_number, i.customer_name
-       FROM invoice_payments p
-       LEFT JOIN invoices i ON p.invoice_id = i.id
-       WHERE p.company_id = $1
-       ORDER BY p.payment_date DESC`,
-      [companyId]
-    );
+      const payRes = await query(
+        `SELECT p.*, i.invoice_number, i.customer_name
+         FROM invoice_payments p
+         LEFT JOIN invoices i ON p.invoice_id = i.id AND p.company_id = i.company_id
+         WHERE p.company_id = $1
+         ORDER BY p.payment_date DESC`,
+        [companyId]
+      );
 
-    return res.json({ success: true, payments: payRes.rows });
-  } catch (err) {
-    console.error('GET /api/finance/payments error:', err.message);
-    return res.status(500).json({ error: err.message });
-  }
-});
+      return res.json({ success: true, payments: payRes.rows });
+    } catch (err) {
+      console.error('GET /api/finance/payments error:', err.message);
+      return res.status(500).json({ error: err.message });
+    }
+  };
+}
 
 /**
  * POST /api/finance/payments/record
  * Manually records a payment for an invoice (Cash / Bank Transfer / UPI / Cheque).
  */
-router.post('/payments/record', authenticate, async (req, res) => {
-  try {
-    const companyId = req.user.companyId || req.user.company_id;
-    const userId = req.user.id || req.user.userId;
-    const { invoiceId, paymentMethod, transactionReference, amount, notes } = req.body;
+function createFinancePaymentRecordHandler(paymentService = invoiceService) {
+  return async (req, res) => {
+    try {
+      const role = String(req.user?.role || '').toLowerCase();
+      if (!['owner', 'admin', 'super_admin'].includes(role)) {
+        return res.status(403).json({ error: 'Only owners or administrators can record financial payments.' });
+      }
+      const companyId = req.user.companyId || req.user.company_id;
+      const userId = req.user.id || req.user.userId;
+      const { invoiceId, paymentMethod, transactionReference, amount, notes } = req.body;
 
-    if (!invoiceId || !paymentMethod || !amount) {
-      return res.status(400).json({ error: 'Invoice ID, payment method, and amount are required' });
+      if (!invoiceId || !paymentMethod || !amount) {
+        return res.status(400).json({ error: 'Invoice ID, payment method, and amount are required' });
+      }
+
+      const result = await paymentService.recordPayment({
+        invoiceId,
+        companyId,
+        paymentMethod,
+        transactionReference,
+        amount,
+        notes,
+        idempotencyKey: req.get('Idempotency-Key'),
+        recordedBy: userId,
+      });
+
+      return res.json(result);
+    } catch (err) {
+      console.error('POST /api/finance/payments/record failed:', err?.code || 'PAYMENT_RECORDING_ERROR');
+      return res.status(err.statusCode || 500).json({ error: err.statusCode ? err.message : 'Could not record payment.' });
     }
+  };
+}
 
-    const result = await invoiceService.recordPayment({
-      invoiceId,
-      companyId,
-      paymentMethod,
-      transactionReference,
-      amount,
-      notes,
-      recordedBy: userId,
-    });
-
-    return res.json(result);
-  } catch (err) {
-    console.error('POST /api/finance/payments/record error:', err.message);
-    return res.status(500).json({ error: err.message });
-  }
-});
+router.get('/payments', authenticate, createFinancePaymentsReadHandler());
+router.post('/payments/record', authenticate, createFinancePaymentRecordHandler());
 
 module.exports = router;
+module.exports.createFinancePaymentsReadHandler = createFinancePaymentsReadHandler;
+module.exports.createFinancePaymentRecordHandler = createFinancePaymentRecordHandler;

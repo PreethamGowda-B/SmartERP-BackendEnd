@@ -34,13 +34,89 @@ router.use(authenticateToken);
 router.use(authenticateSuperAdmin);
 
 /**
+ * GET /api/v1/superadmin/security/health
+ * Diagnostic health endpoint for 24/7 Security Background Worker and SOC operations.
+ */
+router.get('/health', async (req, res) => {
+  try {
+    const { redisClient } = require('../utils/redis');
+    const { securityWorker } = require('../jobs/securityWorker');
+
+    // 1. Database connectivity
+    let dbStatus = 'healthy';
+    let dbLatencyMs = null;
+    const dbStart = Date.now();
+    try {
+      await pool.query('SELECT 1');
+      dbLatencyMs = Date.now() - dbStart;
+    } catch (e) {
+      dbStatus = 'degraded';
+    }
+
+    // 2. Redis connectivity
+    const redisStatus = redisClient?.status === 'ready' ? 'connected' : (redisClient ? redisClient.status : 'disconnected');
+
+    // 3. BullMQ Worker state
+    const workerRunning = Boolean(securityWorker && !securityWorker.closing && !securityWorker.closed);
+
+    // 4. Latest Security Event & Incident telemetry
+    const lastEventRes = await pool.query('SELECT created_at FROM security_events ORDER BY created_at DESC LIMIT 1').catch(() => ({ rows: [] }));
+    const lastIncidentRes = await pool.query('SELECT id, threat_category, severity, created_at FROM security_incidents ORDER BY created_at DESC LIMIT 1').catch(() => ({ rows: [] }));
+
+    // 5. Threat summary
+    const summaryRes = await pool.query(`
+      SELECT
+        COUNT(*) FILTER (WHERE status IN ('open', 'investigating')) as active_incidents,
+        COUNT(*) FILTER (WHERE severity = 'critical' AND status IN ('open', 'investigating')) as critical_active
+      FROM security_incidents
+    `).catch(() => ({ rows: [{ active_incidents: 0, critical_active: 0 }] }));
+
+    const activeCount = parseInt(summaryRes.rows[0]?.active_incidents || '0', 10);
+    const criticalCount = parseInt(summaryRes.rows[0]?.critical_active || '0', 10);
+
+    let systemThreatPosture = 'NORMAL';
+    if (criticalCount > 0) systemThreatPosture = 'CRITICAL';
+    else if (activeCount > 0) systemThreatPosture = 'ELEVATED';
+
+    res.json({
+      status: 'healthy',
+      timestamp: new Date().toISOString(),
+      uptimeSeconds: Math.round(process.uptime()),
+      worker: {
+        securityWorkerActive: workerRunning,
+        queueName: 'security-detection',
+        concurrency: 5,
+        redisStatus,
+      },
+      database: {
+        status: dbStatus,
+        latencyMs: dbLatencyMs,
+      },
+      telemetry: {
+        lastEventAt: lastEventRes.rows[0]?.created_at || null,
+        lastIncidentAt: lastIncidentRes.rows[0]?.created_at || null,
+        lastIncident: lastIncidentRes.rows[0] || null,
+      },
+      posture: {
+        threatLevel: systemThreatPosture,
+        activeIncidents: activeCount,
+        criticalIncidents: criticalCount,
+      },
+    });
+  } catch (err) {
+    logger.error(`[SecurityHealth] Diagnostic error: ${err.message}`);
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+/**
  * GET /api/v1/superadmin/security/dashboard
  * Retrieves high-level security posture, active incidents, and threat summaries.
  */
 router.get('/dashboard', async (req, res) => {
   try {
     const statsRes = await pool.query(`
-      SELECT 
+      SELECT
         COUNT(*) as total_incidents,
         COUNT(*) FILTER (WHERE status = 'open') as open_incidents,
         COUNT(*) FILTER (WHERE status = 'investigating') as investigating_incidents,
@@ -51,7 +127,7 @@ router.get('/dashboard', async (req, res) => {
     `);
 
     const actionsRes = await pool.query(`
-      SELECT 
+      SELECT
         COUNT(*) as total_actions,
         COUNT(*) FILTER (WHERE approval_status = 'pending') as pending_approvals,
         COUNT(*) FILTER (WHERE approval_status = 'executed') as executed_actions
@@ -59,9 +135,9 @@ router.get('/dashboard', async (req, res) => {
     `);
 
     const recentIncidents = await pool.query(`
-      SELECT id, company_id, title, threat_category, status, severity, risk_score, source_ip, target_user_id, event_count, created_at 
-      FROM security_incidents 
-      ORDER BY created_at DESC 
+      SELECT id, company_id, title, threat_category, status, severity, risk_score, source_ip, target_user_id, event_count, created_at
+      FROM security_incidents
+      ORDER BY created_at DESC
       LIMIT 6
     `);
 
@@ -358,8 +434,8 @@ router.post('/actions/:id/reject', async (req, res) => {
     }
 
     const updatedRes = await pool.query(
-      `UPDATE security_actions 
-       SET approval_status = 'rejected', 
+      `UPDATE security_actions
+       SET approval_status = 'rejected',
            executed_by = $1,
            details = jsonb_set(COALESCE(details, '{}'::jsonb), '{rejectedBy}', $2::jsonb)
        WHERE id = $3

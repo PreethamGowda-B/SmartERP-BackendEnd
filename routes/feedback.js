@@ -1,7 +1,9 @@
 const express = require('express');
+const crypto = require('crypto');
 const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
+const { authenticateSuperAdmin } = require('../middleware/adminMiddleware');
 
 /**
  * @route   POST /api/feedback
@@ -120,11 +122,7 @@ router.get('/', authenticateToken, async (req, res) => {
  * @desc    Get feedback aggregate stats (Super Admin only)
  * @access  Private/SuperAdmin
  */
-router.get('/stats', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'super_admin') {
-    return res.status(403).json({ error: 'Only superadmins can view feedback stats' });
-  }
-
+router.get('/stats', authenticateToken, authenticateSuperAdmin, async (req, res) => {
   try {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
@@ -174,6 +172,9 @@ router.patch('/:id/status', authenticateToken, async (req, res) => {
   const validStatuses = ['new', 'open', 'in_progress', 'resolved', 'closed', 'replied'];
   if (!status || !validStatuses.includes(status)) {
     return res.status(400).json({ error: `Status must be one of: ${validStatuses.join(', ')}` });
+  }
+  if (status === 'replied') {
+    return res.status(400).json({ error: 'Use the reply action to record a reply after provider acceptance.' });
   }
 
   try {
@@ -234,85 +235,138 @@ router.patch('/:id/status', authenticateToken, async (req, res) => {
  * @desc    Reply to a user's feedback (Superadmin only)
  * @access  Private/SuperAdmin
  */
-router.patch('/:id/reply', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'super_admin') {
-    return res.status(403).json({ error: 'Only superadmins can reply to feedback' });
-  }
+function createFeedbackReplyHandler({
+  db = pool,
+  sendEmail = (...args) => require('../services/emailNotificationService').sendFeedbackReplyEmail(...args),
+  enqueueNotification = (...args) => require('../utils/queue').enqueueNotification(...args),
+} = {}) {
+  return async (req, res) => {
+    const { id } = req.params;
+    const replyMessage = typeof req.body?.replyMessage === 'string' ? req.body.replyMessage.trim() : '';
+    if (!replyMessage) return res.status(400).json({ error: 'Reply message is required' });
 
-  const { id } = req.params;
-  const { replyMessage } = req.body;
+    try {
+      const feedbackRes = await db.query(
+        `SELECT f.*, u.name AS user_name, u.email AS user_email, u.company_id
+         FROM feedback f
+         LEFT JOIN users u ON f.user_id = u.id
+         WHERE f.id = $1`,
+        [id]
+      );
+      if (feedbackRes.rows.length === 0) return res.status(404).json({ error: 'Feedback not found' });
+      const feedback = feedbackRes.rows[0];
+      if (feedback.status === 'replied' || feedback.replied_at) {
+        return res.status(409).json({ code: 'FEEDBACK_ALREADY_REPLIED', error: 'Feedback has already been replied to' });
+      }
 
-  if (!replyMessage || !replyMessage.trim()) {
-    return res.status(400).json({ error: 'Reply message is required' });
-  }
+      const isWhatsAppRecord = feedback.support_channel === 'whatsapp';
+      if (!isWhatsAppRecord && !feedback.user_email) {
+        return res.status(422).json({ code: 'FEEDBACK_REPLY_EMAIL_MISSING', error: 'No recipient email is available; the reply was not recorded.' });
+      }
 
-  try {
-    const feedbackRes = await pool.query(
-      `SELECT f.*, u.name as user_name, u.email as user_email, u.company_id
-       FROM feedback f
-       LEFT JOIN users u ON f.user_id = u.id
-       WHERE f.id = $1`,
-      [id]
-    );
+      if (feedback.status === 'in_progress' && feedback.admin_reply) {
+        return res.status(409).json({
+          code: 'FEEDBACK_REPLY_PENDING_VERIFICATION',
+          error: feedback.admin_reply === replyMessage
+            ? 'This reply is pending provider verification. Do not resend it; reconcile the provider result first.'
+            : 'A different reply is already pending provider verification for this ticket.',
+        });
+      }
+      if (feedback.admin_reply && feedback.admin_reply !== replyMessage) {
+        return res.status(409).json({ code: 'FEEDBACK_REPLY_PENDING_VERIFICATION', error: 'An earlier reply is pending provider verification.' });
+      }
 
-    if (feedbackRes.rows.length === 0) {
-      return res.status(404).json({ error: 'Feedback not found' });
-    }
+      const previousStatus = feedback.status || 'open';
+      const claim = await db.query(
+        `UPDATE feedback
+         SET status = 'in_progress', admin_reply = $1
+         WHERE id = $2 AND COALESCE(status, 'new') <> 'replied' AND replied_at IS NULL
+           AND (COALESCE(status, 'new') <> 'in_progress' OR admin_reply IS NULL)
+         RETURNING id`,
+        [replyMessage, id]
+      );
+      if (claim.rows.length === 0) {
+        return res.status(409).json({ code: 'FEEDBACK_REPLY_PENDING_VERIFICATION', error: 'Another reply action is already in progress for this ticket.' });
+      }
 
-    const feedback = feedbackRes.rows[0];
+      let providerResult = null;
+      if (!isWhatsAppRecord) {
+        const replyHash = crypto.createHash('sha256').update(replyMessage).digest('hex');
+        const idempotencyKey = `feedback-reply:${id}:${replyHash}`;
+        try {
+          providerResult = await sendEmail({
+            email: feedback.user_email,
+            name: feedback.user_name,
+            subject: feedback.subject,
+            originalMessage: feedback.message,
+            replyMessage,
+            idempotencyKey,
+          });
+          if (!providerResult?.accepted) throw new Error('Email provider did not confirm acceptance.');
+        } catch (emailError) {
+          if (emailError.providerRejected) {
+            await db.query(
+              `UPDATE feedback SET status = $1, admin_reply = NULL
+               WHERE id = $2 AND status = 'in_progress' AND admin_reply = $3 AND replied_at IS NULL`,
+              [previousStatus, id, replyMessage]
+            ).catch((resetError) => console.error('[feedback-reply] Could not release rejected reply claim:', resetError.message));
+            return res.status(502).json({ code: 'FEEDBACK_EMAIL_REJECTED', error: 'Email provider rejected the reply; no reply was recorded.' });
+          }
+          console.error('[feedback-reply] Provider outcome is uncertain; reply remains pending verification.');
+          return res.status(503).json({
+            code: 'FEEDBACK_REPLY_PENDING_VERIFICATION',
+            error: 'Email outcome is uncertain. The reply remains pending; verify provider status before retrying.',
+          });
+        }
+      }
 
-    if (feedback.status === 'replied') {
-      return res.status(400).json({ error: 'Feedback has already been replied to' });
-    }
+      const updateRes = await db.query(
+        `UPDATE feedback
+         SET status = 'replied', replied_at = NOW(),
+             support_first_responded_at = CASE
+               WHEN type = 'support' THEN COALESCE(support_first_responded_at, NOW())
+               ELSE support_first_responded_at
+             END
+         WHERE id = $1 AND status = 'in_progress' AND admin_reply = $2 AND replied_at IS NULL
+         RETURNING *`,
+        [id, replyMessage]
+      );
+      if (updateRes.rows.length === 0) {
+        return res.status(503).json({
+          code: 'FEEDBACK_REPLY_PENDING_VERIFICATION',
+          error: 'The provider accepted the reply, but the ticket state could not be finalized. Reconcile before retrying.',
+        });
+      }
 
-    const updateRes = await pool.query(
-      `UPDATE feedback 
-       SET status = 'replied', admin_reply = $1, replied_at = NOW(),
-           support_first_responded_at = CASE
-             WHEN type = 'support' THEN COALESCE(support_first_responded_at, NOW())
-             ELSE support_first_responded_at
-           END
-       WHERE id = $2 
-       RETURNING *`,
-      [replyMessage, id]
-    );
-
-    if (feedback.user_email && feedback.support_channel !== 'whatsapp') {
-      const { sendFeedbackReplyEmail } = require('../services/emailNotificationService');
-      await sendFeedbackReplyEmail({
-        email: feedback.user_email,
-        name: feedback.user_name,
-        subject: feedback.subject,
-        originalMessage: feedback.message,
-        replyMessage: replyMessage
-      });
-    }
-
-    if (feedback.user_id) {
-       const { enqueueNotification } = require('../utils/queue');
-       await enqueueNotification({
+      if (feedback.user_id) {
+        await enqueueNotification({
           user_id: feedback.user_id,
           company_id: feedback.company_id,
           type: 'feedback_reply',
           title: 'Support Reply Received',
           message: `We've responded to your feedback regarding: ${feedback.subject || 'Support Request'}`,
           priority: 'high',
-          data: { url: '/notifications' }
-       }).catch(e => console.error('Queue Notification Error for feedback reply:', e.message));
+          data: { url: '/notifications' },
+        }).catch((error) => console.error('[feedback-reply] Queue notification failed:', error.message));
+      }
+
+      return res.json({
+        success: true,
+        provider_accepted: !isWhatsAppRecord,
+        recipient_delivery_confirmed: false,
+        message: isWhatsAppRecord
+          ? 'WhatsApp response recorded; SmartERP did not send a WhatsApp message.'
+          : 'Email provider accepted the reply; recipient delivery is not confirmed.',
+        data: updateRes.rows[0],
+      });
+    } catch (err) {
+      console.error('❌ Error replying to feedback:', err.message);
+      return res.status(500).json({ error: 'Internal server error while sending reply' });
     }
+  };
+}
 
-    res.json({
-      success: true,
-      message: feedback.support_channel === 'whatsapp'
-        ? 'WhatsApp response recorded successfully.'
-        : 'Reply sent successfully',
-      data: updateRes.rows[0]
-    });
-
-  } catch (err) {
-    console.error('❌ Error replying to feedback:', err.message);
-    res.status(500).json({ error: 'Internal server error while sending reply' });
-  }
-});
+router.patch('/:id/reply', authenticateToken, authenticateSuperAdmin, createFeedbackReplyHandler());
 
 module.exports = router;
+module.exports.createFeedbackReplyHandler = createFeedbackReplyHandler;

@@ -2,19 +2,22 @@ const express = require("express");
 const router = express.Router();
 
 const { authenticateToken } = require("../middleware/authMiddleware");
+const { createAiPromptGuard } = require('../middleware/aiPromptGuard');
 const { loadPlan } = require("../middleware/planMiddleware");
 const { requireFeature } = require("../middleware/featureGuard");
 const { resolvePlanTier } = require("../services/subscriptionCatalog");
 const { consumeAIRequest } = require("../services/aiQuota");
 
 const ContextEngine = require("../ai/context/context.engine");
-const SecurityShield = require("../ai/gateway/security.shield");
 const ReActEngine = require("../ai/planner/ReAct.engine");
 const pluginRegistry = require("../ai/plugins");
 const MetricsService = require("../ai/telemetry/metrics.service");
 const { pool } = require("../db");
 
 const AIDataService = require("../services/aiDataService");
+const { loadAttendanceSummary } = require("../services/aiAttendanceSummary");
+const { canUseAiFastPath } = require("../services/aiMetricAccess");
+const validateAiPrompt = createAiPromptGuard();
 
 let redisClient = null;
 try {
@@ -87,6 +90,7 @@ router.post(
   authenticateToken,
   loadPlan,
   requireFeature('ai_assistant', 'AI assistant'),
+  validateAiPrompt,
   enforceAIRequestQuota,
   async (req, res) => {
     const startTime = Date.now();
@@ -110,7 +114,7 @@ router.post(
       const planTier = getPlanTier(req);
 
       // 2. Sanitize & Defend Input
-      const cleanMessage = SecurityShield.sanitizeInput(message);
+      const cleanMessage = req.sanitizedAiMessage;
 
       // Fast-Path 1: Instant Conversational Greetings (< 10ms response, 0 LLM calls, 0 fake data)
       const GREETING_REGEX = /^(hi+|hello+|hey+|hallo|greetings|good\s*(morning|afternoon|evening|day)|who\s*are\s*you|what\s*can\s*you\s*do|help|howdy|sup)[\s!.?]*$/i;
@@ -134,6 +138,7 @@ router.post(
       // Fast-Path 2: Direct Live ERP Data Resolvers (Ultra-Fast Response < 25ms, Zero LLM Errors)
       const promptLower = cleanMessage.toLowerCase();
       const companyId = req.user?.companyId || req.user?.company_id;
+      const role = req.user?.role;
 
       // ── Attendance Summary Resolver ──────────────────────────────────────────
       if (
@@ -146,15 +151,28 @@ router.post(
         promptLower.includes("late arrival") ||
         promptLower.includes("who is late")
       ) {
-        if (!companyId) {
-          return res.status(401).json({ message: 'Unauthorized: Missing company context.' });
+        let attendanceAccess;
+        try {
+          attendanceAccess = await loadAttendanceSummary({
+            role: req.user?.role,
+            companyId,
+            dataService: AIDataService,
+          });
+        } catch (error) {
+          console.error("AI attendance summary unavailable:", error.message);
+          return res.status(503).json({ error: "Attendance summary is temporarily unavailable. Please try again." });
         }
-        const ownerSummary = await AIDataService.getOwnerDashboardSummary({ companyId });
-        const presentCount = ownerSummary.attendance?.present ?? 0;
-        const absentCount = ownerSummary.attendance?.absent ?? 0;
-        const onLeaveCount = ownerSummary.attendance?.on_leave ?? 0;
-        const lateCount = ownerSummary.attendance?.late ?? 0;
-        const totalEmployees = ownerSummary.attendance?.total ?? ownerSummary.employees?.active_count ?? 0;
+
+        if (!attendanceAccess) {
+          return res.status(403).json({ message: 'Attendance summary is not available for this account.' });
+        }
+
+        const companyAttendance = attendanceAccess.summary;
+        const presentCount = companyAttendance.present;
+        const absentCount = companyAttendance.absent;
+        const onLeaveCount = companyAttendance.on_leave;
+        const lateCount = companyAttendance.late;
+        const totalEmployees = companyAttendance.total;
 
         const lateDetail = lateCount > 0 ? ` (${lateCount} late)` : '';
 
@@ -170,7 +188,12 @@ router.post(
               { label: "Total Staff", value: totalEmployees }
             ]
           },
-          navigation: { path: "/owner/attendance", label: "View Attendance Records" },
+          navigation: {
+            path: req.user?.role === "hr"
+              ? "/hr/attendance"
+              : req.user?.role === "employee" ? "/employee/time" : "/owner/attendance",
+            label: "View Attendance Records",
+          },
           confidenceScore: 1.0,
           sources: ["Attendance System (Live PostgreSQL)"],
           autoSelectedModel: "Attendance AI",
@@ -180,9 +203,9 @@ router.post(
       }
 
       // ── Completed Jobs Resolver ──────────────────────────────────────────────
-      if (promptLower.includes("completed job") || promptLower.includes("jobs completed") || promptLower.includes("how many jobs are completed") || promptLower.includes("how much jobs are completed")) {
+      if (canUseAiFastPath("jobs", role) && (promptLower.includes("completed job") || promptLower.includes("jobs completed") || promptLower.includes("how many jobs are completed") || promptLower.includes("how much jobs are completed"))) {
         if (!companyId) {
-          return res.status(401).json({ message: 'Unauthorized: Missing company context.' });
+          return res.status(403).json({ message: 'Company access context is unavailable for this account.' });
         }
         const ownerSummary = await AIDataService.getOwnerDashboardSummary({ companyId });
         const completedCount = ownerSummary.jobs?.completed || 0;
@@ -209,16 +232,25 @@ router.post(
 
       // ── Payroll / Salary Resolver ───────────────────────────────────────────
       if (
+        canUseAiFastPath("payroll", role) && (
         promptLower.includes("payroll") ||
         promptLower.includes("salary") ||
         promptLower.includes("payout")
+        )
       ) {
         if (!companyId) {
-          return res.status(401).json({ message: 'Unauthorized: Missing company context.' });
+          return res.status(403).json({ message: 'Company access context is unavailable for this account.' });
         }
-        const ownerSummary = await AIDataService.getOwnerDashboardSummary({ companyId });
-        const activeStaff = ownerSummary.employees?.active_count || 0;
-        const pendingLeaves = ownerSummary.leaves?.pending || 0;
+        const isOwnerOrAdmin = role === "owner" || role === "admin";
+        const payrollSummary = isOwnerOrAdmin
+          ? await AIDataService.getOwnerDashboardSummary({ companyId })
+          : await AIDataService.getHrDashboardSummary({ companyId });
+        const activeStaff = isOwnerOrAdmin
+          ? payrollSummary.employees?.active_count || 0
+          : (payrollSummary.department_headcount || []).reduce((sum, item) => sum + Number(item.count || 0), 0);
+        const pendingLeaves = isOwnerOrAdmin
+          ? payrollSummary.leaves?.pending_requests || 0
+          : (payrollSummary.pending_leave_requests || []).length;
 
         return res.json({
           text: `Payroll Status Overview: Managing **${activeStaff}** active staff members. Currently **${pendingLeaves}** pending leave requests require authorization before final cycle disbursement.`,
@@ -241,13 +273,15 @@ router.post(
 
       // ── Inventory / Stock Resolver ──────────────────────────────────────────
       if (
+        canUseAiFastPath("inventory", role) && (
         promptLower.includes("inventory") ||
         promptLower.includes("stock") ||
         promptLower.includes("low stock") ||
         promptLower.includes("materials")
+        )
       ) {
         if (!companyId) {
-          return res.status(401).json({ message: 'Unauthorized: Missing company context.' });
+          return res.status(403).json({ message: 'Company access context is unavailable for this account.' });
         }
         const ownerSummary = await AIDataService.getOwnerDashboardSummary({ companyId });
         const lowStockCount = ownerSummary.inventory?.low_stock_count || 0;
@@ -274,18 +308,20 @@ router.post(
 
       // ── GST & Financials Resolver ───────────────────────────────────────────
       if (
+        canUseAiFastPath("financial", role) && (
         promptLower.includes("gst") ||
         promptLower.includes("financial") ||
         promptLower.includes("revenue") ||
         promptLower.includes("invoice")
+        )
       ) {
         if (!companyId) {
-          return res.status(401).json({ message: 'Unauthorized: Missing company context.' });
+          return res.status(403).json({ message: 'Company access context is unavailable for this account.' });
         }
         const ownerSummary = await AIDataService.getOwnerDashboardSummary({ companyId });
         const todayRev = ownerSummary.revenue?.today || 0;
         const monthRev = ownerSummary.revenue?.this_month || 0;
-        const pendingInvoices = ownerSummary.invoices?.total || 0;
+        const pendingInvoices = ownerSummary.invoices?.pending_count || 0;
 
         return res.json({
           text: `Financial & GST Snapshot: Today's realized revenue is **₹${todayRev.toLocaleString('en-IN')}** (Month-to-Date: **₹${monthRev.toLocaleString('en-IN')}**). There are **${pendingInvoices}** open/pending invoice records.`,
@@ -511,6 +547,38 @@ router.post(
         return res.status(400).json({ error: "Tool name is required for action execution." });
       }
 
+      if (params && typeof params === 'object') {
+        const SecurityShield = require('../ai/gateway/security.shield');
+        for (const [key, val] of Object.entries(params)) {
+          if (typeof val === 'string') {
+            const check = SecurityShield.inspectPrompt(val);
+            if (check.blocked && check.isAttack) {
+              const { emitSecurityEvent, SECURITY_EVENT_TYPES } = require("../utils/securityEmitter");
+              emitSecurityEvent({
+                companyId: req.user?.companyId || req.user?.company_id,
+                userId: req.user?.userId || req.user?.id,
+                eventType: SECURITY_EVENT_TYPES.PROMPT_INJECTION,
+                severity: check.riskLevel || 'high',
+                ipAddress: req.ip || req.headers?.['x-forwarded-for'],
+                userAgent: req.headers?.['user-agent'],
+                endpoint: '/api/ai/confirm-action',
+                httpMethod: 'POST',
+                statusCode: 400,
+                metadata: {
+                  reason: check.reason,
+                  paramKey: key,
+                },
+              });
+              return res.status(400).json({
+                error: "SECURITY_VIOLATION",
+                message: `Security violation in parameter '${key}': ${check.reason}`,
+                code: "INJECTION_IN_ACTION_PARAM"
+              });
+            }
+          }
+        }
+      }
+
       const planTier = getPlanTier(req);
       const context = ContextEngine.buildContext(req, {}, planTier);
       const confirmedParams = { ...params, confirmed: true };
@@ -585,10 +653,11 @@ router.post(
   authenticateToken,
   loadPlan,
   requireFeature('ai_assistant', 'AI assistant'),
+  validateAiPrompt,
   enforceAIRequestQuota,
   async (req, res) => {
     try {
-      const { message } = req.body;
+      const message = req.sanitizedAiMessage;
       const planTier = getPlanTier(req);
       const context = ContextEngine.buildContext(req, {}, planTier);
       const result = await ReActEngine.run({ userPrompt: message, context });

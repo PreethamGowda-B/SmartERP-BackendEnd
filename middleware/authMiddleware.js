@@ -1,72 +1,28 @@
 const jwt = require("jsonwebtoken");
 const { redisClient } = require("../utils/redis");
 const { setTenantContext } = require("./tenantContext");
-
-const SUSPENSION_CACHE_TTL = 60; // seconds
+const { getRequestPath, isSuperAdminRoute, selectRequestAuthToken } = require("./requestAuthToken");
+const { storage } = require('./als');
+const { verifyAccessAccountState } = require('./authAccountState');
 
 async function isCompanySuspended(companyId) {
   if (!companyId) return false;
-  const cacheKey = `company_suspended:${companyId}`;
-
-  // 1. Try Redis cache first (reduces DB load significantly)
-  if (redisClient && redisClient.status === 'ready') {
-    try {
-      const cached = await redisClient.get(cacheKey);
-      if (cached !== null) {
-        return cached === "1";
-      }
-    } catch (e) {
-      // Redis error — fall through to DB
-    }
-  }
-
-  // 2. DB fallback
+  // Read the authoritative status on each authenticated request so a newly
+  // suspended company cannot retain access through a stale cache entry.
   const { pool } = require("../db");
-  const companyRes = await pool.query("SELECT status FROM companies WHERE id = $1", [companyId]);
-  const suspended = companyRes.rows.length > 0 && companyRes.rows[0].status === "suspended";
-
-  // 3. Store result in Redis for subsequent requests
-  if (redisClient && redisClient.status === 'ready') {
-    try {
-      await redisClient.set(cacheKey, suspended ? "1" : "0", { EX: SUSPENSION_CACHE_TTL });
-    } catch (e) {
-      // Ignore Redis write errors
-    }
-  }
-
-  return suspended;
+  const companyRes = await pool.query(
+    "SELECT status, COALESCE(NULLIF(to_jsonb(c)->>'is_suspended', ''), 'false') as is_susp FROM companies c WHERE id = $1",
+    [companyId]
+  );
+  return companyRes.rows.length > 0 && (
+    companyRes.rows[0].status === "suspended" || companyRes.rows[0].is_susp === "true"
+  );
 }
 
 async function authenticateToken(req, res, next) {
-  let token = null;
-
-  const isAdminRoute = req.originalUrl?.startsWith('/api/admin') || 
-                       req.originalUrl?.startsWith('/api/superadmin') || 
-                       req.originalUrl?.startsWith('/api/v1/superadmin') ||
-                       req.originalUrl?.startsWith('/api/ai');
-
-  // If visiting an admin route, prioritize superadmin cookie if present
-  if (isAdminRoute && req.cookies?.superadmin_access_token) {
-    token = req.cookies.superadmin_access_token;
-  }
-
-  // Try Authorization header
-  if (!token) {
-    const authHeader = req.headers["authorization"];
-    if (authHeader && authHeader.startsWith("Bearer ")) {
-      token = authHeader.split(" ")[1];
-    }
-  }
-
-  // Try query parameter (for SSE connections)
-  if (!token && req.query && req.query.token) {
-    token = req.query.token;
-  }
-
-  // Fallback to cookies
-  if (!token && req.cookies) {
-    token = req.cookies.superadmin_access_token || req.cookies.user_access_token || req.cookies.access_token;
-  }
+  const token = selectRequestAuthToken(req);
+  const requestPath = getRequestPath(req);
+  const isAdminRoute = isSuperAdminRoute(requestPath);
 
   if (!token) {
     // Only log in debug mode — these are normal during token refresh cycles
@@ -137,7 +93,9 @@ async function authenticateToken(req, res, next) {
     if (!companyId && payload.role !== 'super_admin' && (payload.id || payload.userId)) {
       try {
         const { pool } = require("../db");
-        const userDb = await pool.query("SELECT company_id FROM users WHERE id = $1", [payload.id || payload.userId]);
+        const userDb = await storage.run({ isWebRequest: true, bypassRls: true }, () =>
+          pool.query("SELECT company_id FROM users WHERE id = $1", [payload.id || payload.userId])
+        );
         if (userDb.rows.length > 0 && userDb.rows[0].company_id) {
           companyId = userDb.rows[0].company_id;
           payload.companyId = companyId;
@@ -146,10 +104,39 @@ async function authenticateToken(req, res, next) {
       } catch (_) {}
     }
 
+    // Every valid staff JWT is checked against the current account state. This
+    // makes Super Admin deactivation and approved staff suspension effective
+    // before an access token expires. The trusted lookup explicitly opts into
+    // the repository's auth-route RLS bypass for this single user-id query.
+    const userId = payload.id || payload.userId;
+    try {
+      const { pool } = require('../db');
+      const accountState = await storage.run(
+        { isWebRequest: true, bypassRls: true },
+        () => verifyAccessAccountState({ pool, redisClient, userId, tokenIssuedAt: payload.iat })
+      );
+      if (!accountState.allowed) {
+        const isInactive = accountState.reason === 'user_inactive';
+        return res.status(isInactive ? 403 : 401).json({
+          message: isInactive ? 'Account Suspended/Disabled' : 'Session is no longer valid',
+          error: isInactive ? 'account_suspended' : (accountState.reason === 'session_revoked' ? 'token_revoked' : accountState.reason),
+          ...(isInactive ? {
+            details: 'Your account is suspended/disabled because of some unusual activities found in your account. Please contact our customer care to reactivate account. Customer care email: prozyncinnovations@gmail.com'
+          } : {})
+        });
+      }
+    } catch (error) {
+      console.error('Authentication account-state check failed:', error?.code || 'ACCOUNT_STATE_UNAVAILABLE');
+      return res.status(503).json({ message: 'Unable to verify account status. Please retry.' });
+    }
+
     // Check if company is suspended (Only if not super_admin) — Redis-cached with 60s TTL
     if (payload.role !== 'super_admin' && companyId) {
       try {
-        const suspended = await isCompanySuspended(companyId);
+        const suspended = await storage.run(
+          { isWebRequest: true, bypassRls: true },
+          () => isCompanySuspended(companyId)
+        );
         if (suspended) {
           console.warn(`🛑 Blocked access for suspended company: ${companyId} (User: ${payload.email})`);
           emitSecurityEvent({
@@ -173,7 +160,8 @@ async function authenticateToken(req, res, next) {
           });
         }
       } catch (e) {
-        console.error("Error checking suspension status:", e.message);
+        console.error("Error checking suspension status:", e?.code || 'COMPANY_STATUS_UNAVAILABLE');
+        return res.status(503).json({ message: 'Unable to verify company status. Please retry.' });
       }
     }
 
@@ -191,4 +179,4 @@ async function authenticateToken(req, res, next) {
     setTenantContext(req, res, next);
 }
 
-module.exports = { authenticateToken };
+module.exports = { authenticateToken, isCompanySuspended };

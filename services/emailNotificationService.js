@@ -7,7 +7,8 @@ const APP_URL = process.env.FRONTEND_ORIGIN || 'https://www.prozync.in';
 /**
  * 📧 Email Notification Service
  * Wraps Resend to send branded transactional emails for key ERP events.
- * All functions are fire-and-forget safe — they never throw to the caller.
+ * Most functions are fire-and-forget safe. Feedback replies surface provider outcomes
+ * so the ticket workflow can record only a confirmed provider acceptance.
  */
 
 // ─── Shared HTML wrapper ────────────────────────────────────────────────────
@@ -206,8 +207,10 @@ async function sendJobCompletedEmail({ ownerEmail, ownerName, employeeName, jobT
 }
 
 // ─── 5. Feedback Reply Email (from Superadmin) ─────────────────────────────
-async function sendFeedbackReplyEmail({ email, name, subject, originalMessage, replyMessage }) {
-  try {
+async function sendFeedbackReplyEmail({ email, name, subject, originalMessage, replyMessage, idempotencyKey }) {
+    if (!idempotencyKey || typeof idempotencyKey !== 'string') {
+      throw new Error('Feedback reply email requires a stable idempotency key.');
+    }
     const safeSubject = subject || 'No Subject';
     const body = `
       <h2 style="margin:0 0 8px;font-size:24px;font-weight:700;color:#1e293b;">Support Reply: ${safeSubject}</h2>
@@ -226,16 +229,21 @@ async function sendFeedbackReplyEmail({ email, name, subject, originalMessage, r
       <p style="margin:0;color:#64748b;font-size:14px;">If you have any further questions, please submit a new feedback ticket via the dashboard. We're here to help!</p>
     `;
 
-    await resend.emails.send({
+    const result = await resend.emails.send({
       from: FROM_EMAIL,
       to: email,
       subject: `Reply to your feedback: ${safeSubject}`,
       html: htmlWrapper(`Support Reply: ${safeSubject}`, body)
-    });
-    console.log(`✅ [EmailService] Feedback reply email sent to ${email}`);
-  } catch (err) {
-    console.error(`❌ [EmailService] Failed to send feedback reply email:`, err.message);
-  }
+    }, { idempotencyKey });
+    if (result?.error) {
+      const error = new Error('The email provider rejected the feedback reply.');
+      error.providerRejected = true;
+      throw error;
+    }
+    if (!result?.data?.id) {
+      throw new Error('The email provider did not confirm acceptance of the feedback reply.');
+    }
+    return { accepted: true, providerMessageId: result.data.id };
 }
 
 async function sendSupportTicketNotification({ ticketId, companyId, userName, userEmail, planName, channel, responseDueAt }) {

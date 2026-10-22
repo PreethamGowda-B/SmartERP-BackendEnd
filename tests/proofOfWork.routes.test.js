@@ -1,3 +1,8 @@
+'use strict';
+
+process.env.NODE_ENV = 'test';
+process.env.REDIS_URL = '';
+
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const Module = require('node:module');
@@ -64,7 +69,16 @@ function basePool({ company = companyId, insertRows = null, failProofRead = fals
   const pool = {
     calls,
     async connect() {
-      return { query: async (sql) => { calls.push(sql); return { rows: [] }; }, release() {} };
+      return {
+        query: async (sql) => {
+          calls.push(sql);
+          if (sql.includes('INSERT INTO job_proof_of_work')) {
+            return { rows: insertRows === null ? [proof] : insertRows };
+          }
+          return { rows: [] };
+        },
+        release() {},
+      };
     },
     async query(sql, params = []) {
       calls.push(sql);

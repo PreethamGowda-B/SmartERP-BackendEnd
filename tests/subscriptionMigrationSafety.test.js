@@ -45,9 +45,9 @@ test('migration 037 remains explicitly registered but is excluded from startup a
   assert.match(autoMigrate, /filename === '037_subscription_catalog_and_storage\.sql'/);
 });
 
-test('migration 038 support policy is registered for repeatable startup application', () => {
+test('migration 038 support policy remains controlled behind its 037 prerequisite', () => {
   assert.ok(FORWARD_MIGRATIONS.some(item => item.id === '038_tiered_support_entitlements'));
-  assert.ok(STARTUP_MIGRATIONS.some(item => item.id === '038_tiered_support_entitlements'));
+  assert.ok(!STARTUP_MIGRATIONS.some(item => item.id === '038_tiered_support_entitlements'));
   const migration = fs.readFileSync(path.join(__dirname, '../migrations/038_tiered_support_entitlements.sql'), 'utf8');
   assert.match(migration, /ADD COLUMN IF NOT EXISTS support_policy/);
   assert.match(migration, /CREATE INDEX IF NOT EXISTS/);

@@ -9,9 +9,10 @@
 'use strict';
 
 const { pool } = require('../db');
+const crypto = require('crypto');
 const auditService = require('./auditService');
 const pdfInvoiceService = require('./pdfInvoiceService');
-const { calculateInvoice } = require('./invoiceMath');
+const { calculateInvoice, roundMoney } = require('./invoiceMath');
 
 async function allocateInvoiceNumber(client, companyId) {
   // Lock one tenant row so every invoice path serializes number allocation company-wide.
@@ -28,6 +29,70 @@ async function allocateInvoiceNumber(client, companyId) {
     return match ? Math.max(max, Number(match[1])) : max;
   }, 0);
   return `${prefix}${String(maxSequence + 1).padStart(4, '0')}`;
+}
+
+function canonicalDirectInvoicePayload(companyId, invoiceData = {}) {
+  const canonicalNumber = (value, fallback) => {
+    const parsed = Number(value ?? fallback);
+    return Number.isFinite(parsed) ? parsed.toFixed(2) : String(value ?? fallback);
+  };
+  const allowedTypes = new Set(['service', 'labour', 'labor', 'material', 'equipment', 'transport', 'extra']);
+  const items = (Array.isArray(invoiceData.lineItems) ? invoiceData.lineItems : []).map((item) => {
+    const rawType = String(item.item_type || 'service').trim().toLowerCase();
+    const itemType = allowedTypes.has(rawType) ? rawType : 'service';
+    return {
+      item_type: itemType,
+      description: String(item.description || 'Item Description').trim(),
+      hsn_code: String(item.hsn_code || (itemType === 'material' ? '847990' : '998311')).trim(),
+      quantity: canonicalNumber(item.quantity, 1),
+      unit_price: canonicalNumber(item.unit_price, 0),
+      inventory_item_id: item.inventory_item_id == null ? null : String(item.inventory_item_id),
+    };
+  });
+
+  // Preserve item order because it is visible on the invoice. Include every
+  // input that changes persisted invoice data, tax/total calculations, payment,
+  // customer resolution, due dates, inventory effects, or generated PDF text.
+  return {
+    company_id: String(companyId),
+    customer_id: String(invoiceData.customer_id || ''),
+    customer_name: String(invoiceData.customer_name || 'Walk-in Customer').trim(),
+    customer_email: String(invoiceData.customer_email || '').trim(),
+    customer_phone: String(invoiceData.customer_phone || '').trim(),
+    customer_address: String(invoiceData.customer_address || '').trim(),
+    customer_gstin: String(invoiceData.customer_gstin || '').trim(),
+    auto_create_customer: Boolean(invoiceData.auto_create_customer),
+    invoice_type: String(invoiceData.invoice_type || 'walk_in').trim(),
+    items,
+    labour_hours: canonicalNumber(invoiceData.labour_hours, 0),
+    labour_rate: canonicalNumber(invoiceData.labour_rate, 0),
+    equipment_charges: canonicalNumber(invoiceData.equipment_charges, 0),
+    transport_charges: canonicalNumber(invoiceData.transport_charges, 0),
+    additional_charges: canonicalNumber(invoiceData.additional_charges, 0),
+    discount_amount: canonicalNumber(invoiceData.discount_amount, 0),
+    is_inter_state: Boolean(invoiceData.is_inter_state),
+    gst_rate: canonicalNumber(invoiceData.gst_rate, 18),
+    payment_status: invoiceData.payment_status === 'paid' ? 'paid' : 'issued',
+    payment_method: String(invoiceData.payment_method || (invoiceData.payment_status === 'paid' ? 'cash' : '')).trim().toLowerCase(),
+    transaction_reference: String(invoiceData.transaction_reference || 'COUNTER_SALE').trim(),
+    payment_notes: String(invoiceData.payment_notes || 'Immediate counter payment').trim(),
+    due_days: Number.parseInt(invoiceData.due_days || 0, 10) || 0,
+    payment_terms: String(invoiceData.payment_terms || (invoiceData.payment_status === 'paid' ? 'Immediate Payment' : 'Due on receipt')),
+    customer_notes: String(invoiceData.customer_notes || 'Thank you for your business!'),
+    internal_notes: String(invoiceData.internal_notes || ''),
+  };
+}
+
+function directInvoiceFingerprint(companyId, invoiceData) {
+  return crypto.createHash('sha256')
+    .update(JSON.stringify(canonicalDirectInvoicePayload(companyId, invoiceData)))
+    .digest('hex');
+}
+
+function directInvoiceConflict(message = 'This idempotency key was already used for a direct invoice with different details.') {
+  const error = new Error(message);
+  error.statusCode = 409;
+  return error;
 }
 
 async function fetchProductionInvoiceSource(client, productionOrderId, companyId, lock = false) {
@@ -1135,10 +1200,99 @@ class InvoiceService {
   /**
    * Records a payment against an invoice and updates AR/Job status.
    */
-  static async recordPayment({ invoiceId, companyId, paymentMethod, transactionReference, amount, notes, recordedBy }) {
+  static async recordPayment({ invoiceId, companyId, paymentMethod, transactionReference, amount, notes, recordedBy, idempotencyKey }) {
+    const methods = new Set(['cash', 'upi', 'card', 'bank_transfer', 'cheque']);
+    const paymentAmount = Number(amount);
+    if (!Number.isFinite(paymentAmount) || paymentAmount <= 0) {
+      const error = new Error('Payment amount must be a finite amount greater than zero.');
+      error.statusCode = 400;
+      throw error;
+    }
+    if (!methods.has(String(paymentMethod || '').toLowerCase())) {
+      const error = new Error('Select a supported payment method.');
+      error.statusCode = 400;
+      throw error;
+    }
+    let roundedPayment;
+    try {
+      roundedPayment = roundMoney(paymentAmount);
+    } catch {
+      const error = new Error('Payment amount must be a valid decimal amount.');
+      error.statusCode = 400;
+      throw error;
+    }
+    if (roundedPayment <= 0) {
+      const error = new Error('Payment amount must be at least ₹0.01.');
+      error.statusCode = 400;
+      throw error;
+    }
+
+    const normalizedMethod = String(paymentMethod).trim().toLowerCase();
+    const normalizedReference = String(transactionReference || '').trim();
+    const normalizedNotes = String(notes || '').trim();
+    let requestFingerprint = null;
+    if (idempotencyKey !== undefined && idempotencyKey !== null) {
+      if (typeof idempotencyKey !== 'string' || idempotencyKey.trim() !== idempotencyKey ||
+          idempotencyKey.length < 8 || idempotencyKey.length > 128 || /[\u0000-\u001f\u007f]/.test(idempotencyKey)) {
+        const error = new Error('A valid payment idempotency key is required.');
+        error.statusCode = 400;
+        throw error;
+      }
+      requestFingerprint = crypto.createHash('sha256').update(JSON.stringify({
+        companyId: String(companyId),
+        invoiceId: String(invoiceId),
+        amount: roundedPayment.toFixed(2),
+        paymentMethod: normalizedMethod,
+        transactionReference: normalizedReference,
+        notes: normalizedNotes,
+      })).digest('hex');
+    }
+
+    const schemaRequiredError = () => {
+      const error = new Error('Payment retry protection is not available yet. Please contact support before retrying this payment.');
+      error.statusCode = 503;
+      error.code = 'PAYMENT_IDEMPOTENCY_SCHEMA_REQUIRED';
+      return error;
+    };
+    const idempotencySchemaError = (err) => Boolean(idempotencyKey) && ['42703', '42P01'].includes(err?.code);
+    const replayResult = (row) => ({
+      success: true,
+      status: row.result_status,
+      amountPaid: Number(row.result_amount_paid),
+      amountDue: Number(row.result_amount_due),
+    });
+    const conflictError = () => {
+      const error = new Error('This payment retry key was already used for different payment details.');
+      error.statusCode = 409;
+      return error;
+    };
+
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+
+      if (idempotencyKey) {
+        let prior;
+        try {
+          prior = await client.query(
+            `SELECT invoice_id, request_fingerprint, result_status, result_amount_paid, result_amount_due
+             FROM invoice_payments WHERE company_id = $1 AND idempotency_key = $2 LIMIT 1`,
+            [companyId, idempotencyKey]
+          );
+        } catch (err) {
+          if (idempotencySchemaError(err)) throw schemaRequiredError();
+          throw err;
+        }
+        if (prior.rows.length) {
+          if (prior.rows[0].request_fingerprint !== requestFingerprint) throw conflictError();
+          const original = replayResult(prior.rows[0]);
+          if (!original.status || !Number.isFinite(original.amountPaid) || !Number.isFinite(original.amountDue)) {
+            throw schemaRequiredError();
+          }
+          await client.query('COMMIT');
+          return original;
+        }
+      }
 
       const invRes = await client.query(
         `SELECT * FROM invoices WHERE id = $1 AND company_id = $2 FOR UPDATE`,
@@ -1146,31 +1300,108 @@ class InvoiceService {
       );
 
       if (invRes.rows.length === 0) {
-        throw new Error(`Invoice ${invoiceId} not found`);
+        const error = new Error('Invoice not found for this company.');
+        error.statusCode = 404;
+        throw error;
+      }
+
+      if (idempotencyKey) {
+        let afterLock;
+        try {
+          // A same-invoice duplicate may have waited on FOR UPDATE while the
+          // first request committed. Recheck before balance validation so a
+          // full-payment winner is replayed instead of appearing overpaid.
+          afterLock = await client.query(
+            'SELECT invoice_id, request_fingerprint, result_status, result_amount_paid, result_amount_due ' +
+              'FROM invoice_payments WHERE company_id = $1 AND idempotency_key = $2 LIMIT 1',
+            [companyId, idempotencyKey]
+          );
+        } catch (err) {
+          if (idempotencySchemaError(err)) throw schemaRequiredError();
+          throw err;
+        }
+        if (afterLock.rows.length) {
+          if (afterLock.rows[0].request_fingerprint !== requestFingerprint) throw conflictError();
+          const original = replayResult(afterLock.rows[0]);
+          if (!original.status || !Number.isFinite(original.amountPaid) || !Number.isFinite(original.amountDue)) {
+            throw schemaRequiredError();
+          }
+          await client.query('COMMIT');
+          return original;
+        }
       }
 
       const invoice = invRes.rows[0];
-      const newAmountPaid = parseFloat((parseFloat(invoice.amount_paid || 0) + parseFloat(amount)).toFixed(2));
-      const newAmountDue = Math.max(0, parseFloat((parseFloat(invoice.total_amount) - newAmountPaid).toFixed(2)));
+      const currentAmountPaid = roundMoney(invoice.amount_paid || 0);
+      const totalAmount = roundMoney(invoice.total_amount);
+      const currentAmountDue = roundMoney(Math.max(0, totalAmount - currentAmountPaid));
+      if (currentAmountDue <= 0) {
+        const error = new Error('This invoice has no outstanding balance.');
+        error.statusCode = 409;
+        throw error;
+      }
+      if (roundedPayment > currentAmountDue) {
+        const error = new Error('Payment amount cannot exceed the outstanding balance.');
+        error.statusCode = 409;
+        throw error;
+      }
+      const newAmountPaid = roundMoney(currentAmountPaid + roundedPayment);
+      const newAmountDue = roundMoney(Math.max(0, totalAmount - newAmountPaid));
       const newStatus = newAmountDue === 0 ? 'paid' : 'partially_paid';
 
       // Insert payment record
-      await client.query(
-        `INSERT INTO invoice_payments
-         (invoice_id, company_id, payment_method, transaction_reference, amount, notes, recorded_by, payment_date)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())`,
-        [invoiceId, companyId, paymentMethod, transactionReference || '', amount, notes || '', recordedBy || null]
-      );
+      if (idempotencyKey) await client.query('SAVEPOINT payment_idempotency_insert');
+      try {
+        if (idempotencyKey) {
+          await client.query(
+            `INSERT INTO invoice_payments
+             (invoice_id, company_id, payment_method, transaction_reference, amount, notes, recorded_by, payment_date,
+              idempotency_key, request_fingerprint, result_status, result_amount_paid, result_amount_due)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), $8, $9, $10, $11, $12)`,
+            [invoiceId, companyId, normalizedMethod, normalizedReference, roundedPayment, normalizedNotes,
+              recordedBy || null, idempotencyKey, requestFingerprint, newStatus, newAmountPaid, newAmountDue]
+          );
+        } else {
+          // Preserve keyless compatibility for old clients during the rollout.
+          await client.query(
+            `INSERT INTO invoice_payments
+             (invoice_id, company_id, payment_method, transaction_reference, amount, notes, recorded_by, payment_date)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())`,
+            [invoiceId, companyId, normalizedMethod, normalizedReference, roundedPayment, normalizedNotes, recordedBy || null]
+          );
+        }
+      } catch (insertError) {
+        if (idempotencySchemaError(insertError)) throw schemaRequiredError();
+        if (!idempotencyKey || insertError?.code !== '23505') throw insertError;
+
+        // The partial unique index is the concurrency arbiter. A duplicate
+        // insert waits for the winning transaction, then replays its result.
+        await client.query('ROLLBACK TO SAVEPOINT payment_idempotency_insert');
+        const concurrent = await client.query(
+          `SELECT invoice_id, request_fingerprint, result_status, result_amount_paid, result_amount_due
+           FROM invoice_payments WHERE company_id = $1 AND idempotency_key = $2 LIMIT 1`,
+          [companyId, idempotencyKey]
+        );
+        if (!concurrent.rows.length) throw insertError;
+        if (concurrent.rows[0].request_fingerprint !== requestFingerprint) throw conflictError();
+        const original = replayResult(concurrent.rows[0]);
+        if (!original.status || !Number.isFinite(original.amountPaid) || !Number.isFinite(original.amountDue)) {
+          throw schemaRequiredError();
+        }
+        await client.query('COMMIT');
+        return original;
+      }
 
       // Update invoice status
-      await client.query(
+      const updatedInvoice = await client.query(
         `UPDATE invoices
          SET amount_paid = $1, amount_due = $2, status = $3, updated_at = NOW()
-         WHERE id = $4 AND company_id = $5`,
+         WHERE id = $4 AND company_id = $5 RETURNING id`,
         [newAmountPaid, newAmountDue, newStatus, invoiceId, companyId]
       );
+      if (!updatedInvoice.rows.length) throw new Error('Invoice payment totals were not updated.');
 
-      // Settle AR schedule if fully paid
+      // Settle or update AR collection schedule in the same transaction
       if (newStatus === 'paid') {
         await client.query(
           `UPDATE ar_collection_schedules
@@ -1186,6 +1417,13 @@ class InvoiceService {
             [invoice.job_id, companyId]
           );
         }
+      } else {
+        await client.query(
+          `UPDATE ar_collection_schedules
+           SET amount_outstanding = $1, updated_at = NOW()
+           WHERE invoice_id = $2 AND company_id = $3`,
+          [newAmountDue, invoiceId, companyId]
+        );
       }
 
       await client.query('COMMIT');
@@ -1194,8 +1432,12 @@ class InvoiceService {
 
     } catch (err) {
       await client.query('ROLLBACK').catch(() => {});
-      console.error(`invoiceService.recordPayment error:`, err.message);
-      throw err;
+      console.error('invoiceService.recordPayment failed:', err?.code || 'PAYMENT_RECORDING_ERROR');
+      if (err.statusCode) throw err;
+      if (idempotencySchemaError(err)) throw schemaRequiredError();
+      const safeError = new Error('Could not record payment.');
+      safeError.statusCode = 500;
+      throw safeError;
     } finally {
       client.release();
     }
@@ -1269,15 +1511,29 @@ class InvoiceService {
         err.statusCode = 400;
         throw err;
       }
+      idempotencyKey = String(idempotencyKey);
+      if (idempotencyKey.length < 8 || idempotencyKey.length > 128) {
+        const err = new Error('Idempotency key must contain between 8 and 128 characters');
+        err.statusCode = 400;
+        throw err;
+      }
+      const requestFingerprint = directInvoiceFingerprint(companyId, invoiceData);
+
       if (idempotencyKey) {
         const previous = await client.query(
           `SELECT * FROM invoices WHERE company_id::text = $1::text AND idempotency_key = $2 FOR UPDATE`,
           [String(companyId), String(idempotencyKey)]
         );
         if (previous.rows.length) {
-          const items = await client.query('SELECT * FROM invoice_items WHERE invoice_id = $1 ORDER BY id', [previous.rows[0].id]);
+          const prev = previous.rows[0];
+          if (!prev.request_fingerprint) {
+            throw directInvoiceConflict('This legacy idempotency key has no stored request fingerprint and requires manual reconciliation before it can be replayed.');
+          }
+          if (prev.request_fingerprint !== requestFingerprint) throw directInvoiceConflict();
+          const items = await client.query('SELECT * FROM invoice_items WHERE invoice_id = $1 AND company_id = $2 ORDER BY id', [prev.id, companyId]);
+
           await client.query('COMMIT');
-          return { success: true, invoice: previous.rows[0], lineItems: items.rows, payment: null, pdfUrl: previous.rows[0].pdf_url, idempotentReplay: true };
+          return { success: true, invoice: prev, lineItems: items.rows, payment: null, pdfUrl: prev.pdf_url, idempotentReplay: true };
         }
       }
 
@@ -1387,9 +1643,9 @@ class InvoiceService {
           customer_address, customer_gstin, invoice_type, invoice_number, version_number,
           is_latest, status, payment_method, labour_hours, labour_rate, labour_cost,
           materials_cost, equipment_charges, transport_charges, additional_charges,
-          discount_amount, subtotal, is_inter_state, gst_rate, cgst, sgst, igst,
+         discount_amount, subtotal, is_inter_state, gst_rate, cgst, sgst, igst,
           total_tax, total_amount, amount_paid, amount_due, due_date, payment_terms,
-          customer_notes, internal_notes, idempotency_key, created_at, updated_at)
+          customer_notes, internal_notes, idempotency_key, request_fingerprint, created_at, updated_at)
          VALUES
          ($1, NULL, $2, $3, $4, $5,
           $6, $7, $8, $9, 1,
@@ -1397,7 +1653,7 @@ class InvoiceService {
           $13, $14, $15, $16,
           $17, $18, $19, $20, $21, $22, $23,
           $24, $25, $26, $27, $28, $29,
-          $30, $31, $32, NOW(), NOW())
+          $30, $31, $32, $33, NOW(), NOW())
          RETURNING *`,
         [
           companyId, customerId, customerName, customerEmail, customerPhone,
@@ -1406,7 +1662,7 @@ class InvoiceService {
           materialsCost, equipmentCharges, transportCharges, additionalCharges,
           discountAmount, subtotal, isInterState, gstRateVal, cgst, sgst, igst,
           totalTax, totalAmount, amountPaid, amountDue, dueDate, invoiceData.payment_terms || (isPaidNow ? 'Immediate Payment' : 'Due on receipt'),
-          invoiceData.customer_notes || 'Thank you for your business!', invoiceData.internal_notes || '', idempotencyKey
+          invoiceData.customer_notes || 'Thank you for your business!', invoiceData.internal_notes || '', idempotencyKey, requestFingerprint
         ]
       );
 
@@ -1491,14 +1747,23 @@ class InvoiceService {
       };
     } catch (err) {
       await client.query('ROLLBACK').catch(() => {});
+      if (err.code === '42703' && /request_fingerprint/i.test(err.message || '')) {
+        err.statusCode = 503;
+        err.message = 'Direct invoice idempotency schema is not active. Apply the reviewed invoice fingerprint migration before retrying.';
+      }
       if (err.code === '23505' && idempotencyKey) {
         const previous = await client.query(
           `SELECT * FROM invoices WHERE company_id::text = $1::text AND idempotency_key = $2`,
           [String(companyId), String(idempotencyKey)]
         ).catch(() => ({ rows: [] }));
         if (previous.rows.length) {
-          const items = await client.query('SELECT * FROM invoice_items WHERE invoice_id = $1 ORDER BY id', [previous.rows[0].id]).catch(() => ({ rows: [] }));
-          return { success: true, invoice: previous.rows[0], lineItems: items.rows, payment: null, pdfUrl: previous.rows[0].pdf_url, idempotentReplay: true };
+          const prior = previous.rows[0];
+          if (!prior.request_fingerprint) {
+            throw directInvoiceConflict('This legacy idempotency key has no stored request fingerprint and requires manual reconciliation before it can be replayed.');
+          }
+          if (prior.request_fingerprint !== directInvoiceFingerprint(companyId, invoiceData)) throw directInvoiceConflict();
+          const items = await client.query('SELECT * FROM invoice_items WHERE invoice_id = $1 AND company_id = $2 ORDER BY id', [prior.id, companyId]).catch(() => ({ rows: [] }));
+          return { success: true, invoice: prior, lineItems: items.rows, payment: null, pdfUrl: prior.pdf_url, idempotentReplay: true };
         }
       }
       console.error('invoiceService.createDirectInvoice error:', err.message);
@@ -1510,5 +1775,7 @@ class InvoiceService {
 }
 
 InvoiceService.allocateInvoiceNumber = allocateInvoiceNumber;
+InvoiceService.canonicalDirectInvoicePayload = canonicalDirectInvoicePayload;
+InvoiceService.directInvoiceFingerprint = directInvoiceFingerprint;
 
 module.exports = InvoiceService;

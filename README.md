@@ -42,19 +42,9 @@ npm start
 - POST /api/jobs
 - GET /api/jobs
 
-### Development helpers: employees API
+### Employees API
 
-The backend exposes an `/api/employees` endpoint which will list and create employee records. By default these routes require authentication. For local development you can enable an unauthenticated dev mode by setting the following environment variable in your `.env`:
-
-```
-DEV_ALLOW_UNAUTH_USERS=true
-```
-
-When enabled:
-- GET /api/employees returns a JSON list of employees (joins `users` and `employee_profiles`).
-- POST /api/employees creates a new user and corresponding employee_profile (default password used when not provided).
-
-Keep this flag off in production to avoid exposing user creation without auth.
+The `/api/employees` endpoints require a valid authenticated token and company context. Employee creation is limited to owner, admin, or HR roles and is subject to the current subscription employee limit. The application does not implement the previously documented `DEV_ALLOW_UNAUTH_USERS` bypass; do not add an unauthenticated employee mode for local testing.
 
 ## Testing with curl (PowerShell)
 

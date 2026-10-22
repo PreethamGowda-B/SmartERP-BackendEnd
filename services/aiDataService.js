@@ -3,6 +3,51 @@ const AttendancePolicy = require('./attendancePolicyService');
 
 class AIDataService {
   /**
+   * Company-wide attendance counts for roles allowed to view workforce data.
+   * Keep this query narrow: the AI attendance resolver must not read unrelated
+   * financial or inventory data just to answer an attendance question.
+   */
+  static async getCompanyAttendanceSummary({ companyId }) {
+    const cid = String(companyId);
+    const policy = await AttendancePolicy.getCompanyPolicy(companyId, pool);
+    const workDate = AttendancePolicy.localDate(new Date(), policy.timezone);
+    const result = await pool.query(
+      `SELECT a.check_in_time, a.status, a.is_late,
+              EXISTS (
+                SELECT 1
+                  FROM leave_requests l
+                 WHERE l.user_id::text = u.id::text
+                   AND l.company_id::text = u.company_id::text
+                   AND l.status = 'approved'
+                   AND $2::date BETWEEN l.start_date AND l.end_date
+              ) AS is_on_leave
+         FROM users u
+         LEFT JOIN attendance a
+           ON a.user_id::text = u.id::text
+          AND a.company_id::text = u.company_id::text
+          AND a.date = $2
+        WHERE u.company_id::text = $1
+          AND u.is_active = TRUE
+          AND COALESCE(u.status, 'active') <> 'suspended'
+          AND u.role = 'employee'`,
+      [cid, workDate]
+    );
+
+    const rows = result.rows || [];
+    const attended = (row) => Boolean(row.check_in_time) || ["present", "late", "half_day"].includes(row.status);
+    const onLeave = (row) => !attended(row) && row.is_on_leave === true;
+    const present = rows.filter(attended).length;
+    const onLeaveCount = rows.filter(onLeave).length;
+    return {
+      total: rows.length,
+      present,
+      absent: rows.length - present - onLeaveCount,
+      late: rows.filter((row) => row.is_late === true || row.status === "late").length,
+      on_leave: onLeaveCount,
+    };
+  }
+
+  /**
    * Owner AI Summary: Live enterprise operational metrics strictly scoped by companyId
    */
   static async getOwnerDashboardSummary({ companyId }) {
@@ -42,6 +87,7 @@ class AIDataService {
       pool.query(
         `SELECT 
            COUNT(*) as total_invoices,
+           COUNT(*) FILTER (WHERE status = 'issued') as pending_count,
            COALESCE(SUM(CASE WHEN status = 'issued' THEN total_amount ELSE 0 END), 0) as pending_amount,
            COUNT(CASE WHEN status = 'issued' AND due_date < CURRENT_DATE THEN 1 END) as overdue_count
          FROM invoices 
@@ -65,13 +111,12 @@ class AIDataService {
          FROM users u
          LEFT JOIN attendance a ON u.id::text = a.user_id::text AND a.company_id::text = u.company_id::text AND a.date = $2
          WHERE (u.role = 'employee' OR (u.role != 'owner' AND u.role != 'admin' AND u.role != 'customer'))
+           AND u.is_active = TRUE
+           AND COALESCE(u.status, 'active') <> 'suspended'
            AND (u.company_id = $1 OR u.company_id::text = $1::text)
          ORDER BY u.name ASC`,
         [cid, workDate]
-      ).catch((err) => {
-        console.error("❌ AIDataService attendance overview query error:", err.message);
-        return { rows: [] };
-      }),
+      ),
 
       // Low stock inventory items
       pool.query(
@@ -129,6 +174,8 @@ class AIDataService {
         this_month: Number(revenueRes.rows[0]?.month_revenue || 0),
       },
       invoices: {
+        total: parseInt(invoiceRes.rows[0]?.total_invoices || 0, 10),
+        pending_count: parseInt(invoiceRes.rows[0]?.pending_count || 0, 10),
         pending_amount: Number(invoiceRes.rows[0]?.pending_amount || 0),
         overdue_count: parseInt(invoiceRes.rows[0]?.overdue_count || 0, 10),
       },
@@ -174,9 +221,10 @@ class AIDataService {
       pool.query(
         `SELECT id, title, status, priority, stage, created_at 
          FROM jobs 
-         WHERE (assigned_employee_id::text = $1 OR employee_id::text = $1)
+         WHERE company_id::text = $2
+           AND (assigned_employee_id::text = $1 OR employee_id::text = $1)
          ORDER BY created_at DESC LIMIT 10`,
-        [uid]
+        [uid, cid]
       ).catch(() => ({ rows: [] })),
 
       // Attendance history for this month
@@ -193,18 +241,18 @@ class AIDataService {
       pool.query(
         `SELECT leave_type, start_date, end_date, status, reason 
          FROM leave_requests 
-         WHERE user_id::text = $1 
+         WHERE user_id::text = $1 AND company_id::text = $2
          ORDER BY created_at DESC LIMIT 5`,
-        [uid]
+        [uid, cid]
       ).catch(() => ({ rows: [] })),
 
       // Employee's material requests
       pool.query(
         `SELECT item_name, quantity, status, urgency 
          FROM material_requests 
-         WHERE requested_by::text = $1 
+         WHERE requested_by::text = $1 AND company_id::text = $2
          ORDER BY created_at DESC LIMIT 5`,
-        [uid]
+        [uid, cid]
       ).catch(() => ({ rows: [] })),
     ]);
 
@@ -236,7 +284,7 @@ class AIDataService {
       pool.query(
         `SELECT l.id, u.name as employee_name, l.leave_type, l.start_date, l.end_date, l.reason, l.status
          FROM leave_requests l
-         LEFT JOIN users u ON l.user_id::text = u.id::text
+         LEFT JOIN users u ON l.user_id::text = u.id::text AND l.company_id::text = u.company_id::text
          WHERE l.company_id::text = $1 AND l.status = 'pending'`,
         [cid]
       ).catch(() => ({ rows: [] })),
@@ -262,6 +310,8 @@ class AIDataService {
         `SELECT department, COUNT(*) as count 
          FROM users 
          WHERE company_id::text = $1 AND role = 'employee'
+           AND is_active = TRUE
+           AND COALESCE(status, 'active') <> 'suspended'
          GROUP BY department`,
         [cid]
       ).catch(() => ({ rows: [] })),

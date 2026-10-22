@@ -5,6 +5,7 @@ const jwt = require("jsonwebtoken");
 const { pool } = require("../db");
 const logActivity = require("../helpers/logActivity");
 const { authenticateToken } = require("../middleware/authMiddleware");
+const { isUserAccountActive } = require('../middleware/authAccountState');
 const passport = require("passport");
 const GoogleStrategy = require("passport-google-oauth20").Strategy;
 const { Resend } = require("resend");
@@ -16,6 +17,13 @@ const { redisClient } = require("../utils/redis");
 const { storage } = require("../middleware/als");
 const { hashToken } = require("../utils/tokenHash");
 const { getPlan } = require("../services/subscriptionCatalog");
+const {
+  issueStaffPasswordResetOtp,
+  verifyStaffPasswordResetOtp,
+  resetStaffPassword,
+} = require("../services/staffPasswordResetService");
+const { checkPasswordResetRateLimit } = require("../services/passwordResetRateLimiter");
+const { sendRefreshUnavailable } = require("../utils/refreshFailureResponse");
 
 // ✅ RLS bypass — auth routes query users/companies by email BEFORE any company
 // context is known (login lookup, OTP, Google OAuth). They explicitly opt-in to
@@ -342,14 +350,23 @@ router.get('/google/callback', (req, res, next) => {
       }
 
       // ── Staff callback ─────────────────────────────────────────────────────
+      if (!isUserAccountActive(user)) {
+        return res.redirect(`${FRONTEND}/suspended?reason=account_suspended`);
+      }
       if (user.role !== 'super_admin' && user.company_id) {
-        const companyRes = await pool.query('SELECT status FROM companies WHERE id = $1', [user.company_id]);
-        if (companyRes.rows.length > 0 && companyRes.rows[0].status === 'suspended') {
+        const companyRes = await pool.query(
+          "SELECT status, COALESCE(NULLIF(to_jsonb(c)->>'is_suspended', ''), 'false') as is_susp FROM companies c WHERE id = $1",
+          [user.company_id]
+        );
+        if (companyRes.rows.length > 0 && (companyRes.rows[0].status === 'suspended' || companyRes.rows[0].is_susp === 'true')) {
           console.warn(`🛑 Google login blocked for suspended company user: ${user.email}`);
-          return res.redirect(`${FRONTEND}/suspended`);
+          return res.redirect(`${FRONTEND}/suspended?reason=company_suspended`);
         }
       }
 
+      if (redisClient && redisClient.status === 'ready') {
+        await redisClient.del(`token_revoked:${user.id}`);
+      }
       await logActivity(user.id, 'login_google', req);
 
       const staffAccess = jwt.sign(
@@ -469,6 +486,23 @@ function computeHmacToken(data, secretSalt = process.env.JWT_SECRET || 'smarterp
   return crypto.createHmac("sha256", secretSalt).update(String(data)).digest("hex");
 }
 
+async function sendStaffPasswordResetEmail(email, otp) {
+  if (!process.env.RESEND_API_KEY) throw new Error("Password recovery email is unavailable.");
+  const resend = new Resend(process.env.RESEND_API_KEY);
+  const response = await resend.emails.send({
+    from: process.env.RESEND_FROM_EMAIL || "SmartERP <noreply@prozync.in>",
+    to: email,
+    subject: "SmartERP Password Reset Code",
+    html: `<div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;padding:28px;color:#0f172a">
+      <h2>Password reset request</h2>
+      <p>Use this code to verify your SmartERP account. It expires in 10 minutes and can only be used once.</p>
+      <p style="font:700 36px monospace;letter-spacing:8px">${otp}</p>
+      <p>If you did not request this code, you can ignore this email.</p>
+    </div>`,
+  });
+  if (response?.error) throw new Error("Password recovery email could not be sent.");
+}
+
 // ---------------------------------------------
 // ✅ Send OTP for general email verification
 // ---------------------------------------------
@@ -519,7 +553,7 @@ router.post("/send-otp", async (req, res) => {
 
     const otpHash = computeHmacToken(otp + normalizedEmail);
     await pool.query(
-      "INSERT INTO email_otps (email, otp_code, account_type, expires_at) VALUES ($1, $2, 'staff', $3)",
+      "INSERT INTO email_otps (email, otp_code, account_type, purpose, expires_at) VALUES ($1, $2, 'staff', 'email_verification', $3)",
       [normalizedEmail, otpHash, expiresAt]
     );
 
@@ -569,27 +603,20 @@ router.post("/forgot-password", async (req, res) => {
 
   // Rate Limiting per email/IP (5 requests per 15 minutes)
   const rateLimitKey = `forgot_pw_limit:${normalizedEmail}`;
-  if (redisClient && redisClient.status === "ready") {
-    try {
-      const count = await redisClient.incr(rateLimitKey);
-      if (count === 1) await redisClient.expire(rateLimitKey, 900);
-      if (count > 5) {
-        const { emitSecurityEvent, SECURITY_EVENT_TYPES } = require("../utils/securityEmitter");
-        emitSecurityEvent({
-          eventType: SECURITY_EVENT_TYPES.AUTH_RATE_LIMITED || 'AUTH_RATE_LIMITED',
-          severity: 'medium',
-          ipAddress: req.ip || req.headers['x-forwarded-for'],
-          userAgent: req.headers['user-agent'],
-          endpoint: '/api/auth/forgot-password',
-          httpMethod: 'POST',
-          statusCode: 429,
-          metadata: { email: normalizedEmail, reason: 'excessive_forgot_password_requests' }
-        });
-        return res.status(429).json({ message: "Too many password reset requests. Please try again later." });
-      }
-    } catch (rErr) {
-      console.warn("⚠️ Forgot password rate limit error:", rErr.message);
-    }
+  const rateLimit = await checkPasswordResetRateLimit(redisClient, rateLimitKey);
+  if (!rateLimit.allowed) {
+    const { emitSecurityEvent, SECURITY_EVENT_TYPES } = require("../utils/securityEmitter");
+    emitSecurityEvent({
+      eventType: SECURITY_EVENT_TYPES.AUTH_RATE_LIMITED || 'AUTH_RATE_LIMITED',
+      severity: 'medium',
+      ipAddress: req.ip || req.headers['x-forwarded-for'],
+      userAgent: req.headers['user-agent'],
+      endpoint: '/api/auth/forgot-password',
+      httpMethod: 'POST',
+      statusCode: 429,
+      metadata: { email: normalizedEmail, reason: 'excessive_forgot_password_requests' }
+    });
+    return res.status(429).json({ message: "Too many password reset requests. Please try again later." });
   }
 
   try {
@@ -601,42 +628,10 @@ router.post("/forgot-password", async (req, res) => {
 
     if (userRes.rows.length > 0 && userRes.rows[0].is_active !== false) {
       const user = userRes.rows[0];
-      const otp = crypto.randomInt(100000, 999999).toString();
-      const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 min
+      const otp = await issueStaffPasswordResetOtp({ pool, email: normalizedEmail, computeHmacToken });
 
-      await pool.query("DELETE FROM email_otps WHERE LOWER(email) = $1 AND account_type = 'staff'", [normalizedEmail]);
-
-      const otpHash = computeHmacToken(otp + normalizedEmail);
-      await pool.query(
-        "INSERT INTO email_otps (email, otp_code, account_type, expires_at) VALUES ($1, $2, 'staff', $3)",
-        [normalizedEmail, otpHash, expiresAt]
-      );
-
-      if (process.env.RESEND_API_KEY) {
-        const resend = new Resend(process.env.RESEND_API_KEY);
-        await resend.emails.send({
-          from: process.env.RESEND_FROM_EMAIL || "SmartERP <noreply@prozync.in>",
-          to: normalizedEmail,
-          subject: `SmartERP Password Reset Code: ${otp}`,
-          html: `
-            <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 32px; background: #f8fafc; border-radius: 12px; border: 1px solid #e2e8f0;">
-              <div style="text-align: center; margin-bottom: 24px;">
-                <div style="background: #4F46E5; display: inline-block; padding: 10px 22px; border-radius: 8px;">
-                  <span style="color: white; font-size: 20px; font-weight: 800; letter-spacing: 0.5px;">SmartERP</span>
-                </div>
-              </div>
-              <h2 style="color: #0f172a; text-align: center; margin-bottom: 8px; font-size: 22px; font-weight: 700;">Password Reset Request</h2>
-              <p style="color: #475569; text-align: center; margin-bottom: 28px; font-size: 14px; line-height: 1.5;">We received a request to reset your password. Use the verification code below to set a new password for your SmartERP workspace account.</p>
-              <div style="background: #ffffff; border: 2px solid #cbd5e1; border-radius: 12px; padding: 20px; text-align: center; margin-bottom: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.05);">
-                <div style="font-size: 38px; font-weight: 800; letter-spacing: 8px; color: #4F46E5; font-family: 'Courier New', Courier, monospace;">${otp}</div>
-              </div>
-              <p style="color: #64748b; text-align: center; font-size: 13px; margin-bottom: 8px;">This code expires in <strong>10 minutes</strong>. Single-use only.</p>
-              <p style="color: #ef4444; text-align: center; font-size: 12px; margin-top: 12px; font-weight: 600;">Security Warning: Never share this code with anyone. SmartERP staff will never ask for your code.</p>
-              <p style="color: #94a3b8; text-align: center; font-size: 12px; margin-top: 20px; border-top: 1px solid #e2e8f0; padding-top: 16px;">If you didn't request a password reset, you can safely ignore this email — your account remains secure.</p>
-            </div>
-          `,
-        }).catch(err => console.error("Resend reset email failed:", err.message));
-      }
+      await sendStaffPasswordResetEmail(normalizedEmail, otp)
+        .catch(err => console.error("Password recovery email failed:", err.message));
 
       const { emitSecurityEvent, SECURITY_EVENT_TYPES } = require("../utils/securityEmitter");
       emitSecurityEvent({
@@ -655,6 +650,46 @@ router.post("/forgot-password", async (req, res) => {
   } catch (err) {
     console.error("Forgot password error:", err.message);
     return res.status(200).json({ ok: true, message: GENERIC_RESPONSE });
+  }
+});
+
+// Authenticated Employee Settings flow. The destination email is loaded from
+// the authenticated staff record rather than accepted from the browser.
+router.post("/request-password-reset-otp", authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user?.userId || req.user?.id;
+    const userResult = await pool.query(
+      `SELECT id, email
+         FROM users
+        WHERE id::text = $1::text
+          AND role IN ('owner', 'employee', 'hr', 'super_admin')
+          AND is_active IS DISTINCT FROM FALSE
+        LIMIT 1`,
+      [String(userId || "")]
+    );
+    if (!userResult.rows.length) {
+      return res.status(403).json({ message: "Password recovery is unavailable for this account." });
+    }
+
+    const user = userResult.rows[0];
+    const normalizedEmail = String(user.email || "").trim().toLowerCase();
+    const rateLimit = await checkPasswordResetRateLimit(redisClient, `forgot_pw_limit:${normalizedEmail}`);
+    if (!rateLimit.allowed) {
+      return res.status(429).json({ message: "Too many password reset requests. Please try again later." });
+    }
+
+    const otp = await issueStaffPasswordResetOtp({ pool, email: normalizedEmail, computeHmacToken });
+    try {
+      await sendStaffPasswordResetEmail(normalizedEmail, otp);
+    } catch (emailError) {
+      console.error("Authenticated password recovery email failed:", emailError.message);
+      return res.status(503).json({ message: "Password recovery email is temporarily unavailable. Please retry later." });
+    }
+
+    return res.json({ ok: true, message: "A new verification code was sent to your account email." });
+  } catch (err) {
+    console.error("Authenticated password reset request failed:", err.message);
+    return res.status(500).json({ message: "Unable to send a password reset code. Please retry later." });
   }
 });
 
@@ -683,79 +718,16 @@ router.post("/verify-reset-otp", async (req, res) => {
   }
 
   try {
-    const submittedHmac = computeHmacToken(plainOtp + normalizedEmail);
-    const fallbackSha = crypto.createHash("sha256").update(plainOtp + normalizedEmail).digest("hex");
-
-    const otpRes = await pool.query(
-      `SELECT id, otp_code, attempts, expires_at 
-       FROM email_otps 
-       WHERE LOWER(email) = $1 
-         AND account_type = 'staff' 
-         AND used = FALSE 
-         AND expires_at > NOW() 
-       ORDER BY created_at DESC LIMIT 1`,
-      [normalizedEmail]
-    );
-
-    if (otpRes.rows.length === 0) {
-      return res.status(400).json({ message: "Invalid or expired verification code. Please request a new code." });
-    }
-
-    const record = otpRes.rows[0];
-    const currentAttempts = (record.attempts || 0) + 1;
-
-    // Check if code matches either keyed HMAC or legacy hash using constant-time comparison
-    let isMatch = false;
-    try {
-      const expectedBuffer = Buffer.from(record.otp_code);
-      const hmacBuffer = Buffer.from(submittedHmac);
-      const shaBuffer = Buffer.from(fallbackSha);
-      if (expectedBuffer.length === hmacBuffer.length && crypto.timingSafeEqual(expectedBuffer, hmacBuffer)) {
-        isMatch = true;
-      } else if (expectedBuffer.length === shaBuffer.length && crypto.timingSafeEqual(expectedBuffer, shaBuffer)) {
-        isMatch = true;
-      }
-    } catch (e) {
-      isMatch = false;
-    }
-
-    if (!isMatch) {
-      await pool.query("UPDATE email_otps SET attempts = $1 WHERE id = $2", [currentAttempts, record.id]);
-      if (currentAttempts >= 5) {
-        await pool.query("UPDATE email_otps SET used = TRUE WHERE id = $1", [record.id]);
-      }
-      return res.status(400).json({ message: "Invalid verification code. Please check and try again." });
-    }
-
-    // Invalidate OTP (single-use)
-    await pool.query("UPDATE email_otps SET used = TRUE WHERE id = $1", [record.id]);
-
-    // Lookup user to associate single-use token
-    const userRes = await pool.query(
-      "SELECT id, email FROM users WHERE LOWER(email) = $1 AND role IN ('owner', 'employee', 'hr', 'super_admin')",
-      [normalizedEmail]
-    );
-
-    if (userRes.rows.length === 0) {
-      return res.status(400).json({ message: "Invalid reset session. Please try again." });
-    }
-
-    const user = userRes.rows[0];
-
-    // Generate high-entropy 32-byte cryptographic single-use reset authorization token
-    const rawResetToken = crypto.randomBytes(32).toString("hex");
-    const tokenHash = computeHmacToken(rawResetToken);
-    const tokenExpiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
-
-    await pool.query(
-      `INSERT INTO password_reset_tokens 
-         (account_type, user_id, email, token_hash, expires_at, ip_address, user_agent)
-       VALUES ('staff', $1, $2, $3, $4, $5, $6)`,
-      [user.id, normalizedEmail, tokenHash, tokenExpiresAt, req.ip || null, req.headers['user-agent'] || null]
-    );
+    const verified = await verifyStaffPasswordResetOtp({
+      pool,
+      email: normalizedEmail,
+      otp: plainOtp,
+      computeHmacToken,
+      request: { ip: req.ip, userAgent: req.headers['user-agent'] },
+    });
 
     // Set HttpOnly, Secure, SameSite=None session cookie as primary secure transport
-    res.cookie("reset_session_token", rawResetToken, {
+    res.cookie("reset_session_token", verified.resetToken, {
       httpOnly: true,
       secure: true,
       sameSite: "none",
@@ -770,10 +742,11 @@ router.post("/verify-reset-otp", async (req, res) => {
     return res.json({
       ok: true,
       verified: true,
-      reset_token: rawResetToken, // Held in memory only by caller for next POST
+      reset_token: verified.resetToken, // Held in memory only by caller for next POST
       message: "Verification successful. You can now set your new password."
     });
   } catch (err) {
+    if (err.status === 400) return res.status(400).json({ message: err.message });
     console.error("Verify reset OTP error:", err.message);
     return res.status(500).json({ message: "Verification failed. Please try again." });
   }
@@ -785,75 +758,23 @@ router.post("/verify-reset-otp", async (req, res) => {
 router.post("/reset-password", async (req, res) => {
   const { email, reset_token, new_password } = req.body;
   const rawToken = reset_token || req.cookies?.reset_session_token;
-  const normalizedEmail = String(email || "").toLowerCase().trim();
-  const rawPassword = String(new_password || "");
 
   if (!rawToken) {
     return res.status(400).json({ message: "Reset authorization token is missing or expired. Please verify your email again." });
   }
 
-  // Password Policy: Min 8 chars, 1 uppercase, 1 lowercase, 1 number, 1 special char
-  if (rawPassword.length < 8) {
-    return res.status(400).json({ message: "Password must be at least 8 characters long." });
-  }
-  if (!/[A-Z]/.test(rawPassword)) {
-    return res.status(400).json({ message: "Password must contain at least one uppercase letter." });
-  }
-  if (!/[a-z]/.test(rawPassword)) {
-    return res.status(400).json({ message: "Password must contain at least one lowercase letter." });
-  }
-  if (!/[0-9]/.test(rawPassword)) {
-    return res.status(400).json({ message: "Password must contain at least one number." });
-  }
-  if (!/[^A-Za-z0-9]/.test(rawPassword)) {
-    return res.status(400).json({ message: "Password must contain at least one special character." });
-  }
-
   try {
-    const tokenHash = computeHmacToken(rawToken);
+    const updated = await resetStaffPassword({
+      pool,
+      email,
+      resetToken: rawToken,
+      newPassword: new_password,
+      computeHmacToken,
+      bcryptImpl: bcrypt,
+    });
+    const targetUserId = updated.userId;
 
-    // Verify token exists, is valid, unconsumed, and for staff account
-    let tokenQuery = `
-      SELECT id, user_id, email, expires_at, used 
-      FROM password_reset_tokens 
-      WHERE token_hash = $1 
-        AND account_type = 'staff' 
-        AND used = FALSE 
-        AND expires_at > NOW()
-    `;
-    const params = [tokenHash];
-
-    if (normalizedEmail) {
-      tokenQuery += " AND LOWER(email) = $2";
-      params.push(normalizedEmail);
-    }
-    tokenQuery += " ORDER BY created_at DESC LIMIT 1";
-
-    const tokenRes = await pool.query(tokenQuery, params);
-
-    if (tokenRes.rows.length === 0) {
-      return res.status(400).json({ message: "Invalid or already-used reset authorization token. Please request a new verification code." });
-    }
-
-    const tokenRecord = tokenRes.rows[0];
-    const targetUserId = tokenRecord.user_id;
-
-    // 1. Invalidate the single-use reset authorization token immediately
-    await pool.query("UPDATE password_reset_tokens SET used = TRUE WHERE id = $1", [tokenRecord.id]);
-
-    // 2. Hash New Password with bcrypt (cost 10)
-    const newHash = await bcrypt.hash(rawPassword, 10);
-
-    // 3. Update Password in users table
-    await pool.query(
-      "UPDATE users SET password_hash = $1, password_set = TRUE WHERE id = $2",
-      [newHash, targetUserId]
-    );
-
-    // 4. Invalidate all existing refresh tokens / active session families for security
-    await pool.query("DELETE FROM refresh_tokens WHERE user_id = $1", [targetUserId]).catch(() => {});
-
-    // 5. Clear reset cookie
+    // Clear the reset cookie only after the authoritative password transaction commits.
     res.clearCookie("reset_session_token", { path: "/" });
 
     // 6. Security Event & Activity Log
@@ -871,7 +792,7 @@ router.post("/reset-password", async (req, res) => {
       endpoint: '/api/auth/reset-password',
       httpMethod: 'POST',
       statusCode: 200,
-      metadata: { email: tokenRecord.email }
+      metadata: { email: updated.email }
     });
 
     console.log(`✅ Password successfully reset & active sessions revoked for staff user ID: ${targetUserId}`);
@@ -882,6 +803,7 @@ router.post("/reset-password", async (req, res) => {
       message: "Password reset successful! Your SmartERP password has been updated."
     });
   } catch (err) {
+    if (err.status === 400) return res.status(400).json({ message: err.message });
     console.error("Reset password execution error:", err.message);
     return res.status(500).json({ message: "Failed to reset password. Please try again." });
   }
@@ -911,13 +833,12 @@ router.post("/signup", [
 
   const { name, email, password, role = "owner", phone, position, department, company_code } = req.body;
   const client = await pool.connect();
-
   try {
     await client.query("BEGIN");
 
     // 1. Transactional OTP Verification
     const otpCheck = await client.query(
-      "SELECT id FROM email_otps WHERE email = $1 AND used = TRUE AND created_at > NOW() - INTERVAL '15 minutes' ORDER BY created_at DESC LIMIT 1",
+      "SELECT id FROM email_otps WHERE email = $1 AND account_type = 'staff' AND purpose = 'email_verification' AND used = TRUE AND created_at > NOW() - INTERVAL '15 minutes' ORDER BY created_at DESC LIMIT 1",
       [email]
     );
 
@@ -1153,10 +1074,33 @@ router.post("/login", async (req, res) => {
 
     const user = result.rows[0];
 
+    if (!isUserAccountActive(user)) {
+      emitSecurityEvent({
+        companyId: user.company_id ? String(user.company_id) : undefined,
+        userId: String(user.id),
+        eventType: SECURITY_EVENT_TYPES.AUTH_FAILED,
+        severity: 'medium',
+        ipAddress: clientIp,
+        userAgent: req.headers?.['user-agent'],
+        endpoint: '/api/auth/login',
+        httpMethod: 'POST',
+        statusCode: 403,
+        metadata: { reason: 'inactive_account' },
+      });
+      return res.status(403).json({
+        message: 'Account Suspended/Disabled',
+        error: 'account_suspended',
+        details: 'Your account is suspended/disabled because of some unusual activities found in your account. Please contact our customer care to reactivate account. Customer care email: prozyncinnovations@gmail.com'
+      });
+    }
+
     // Check if company is suspended (Only if not super_admin)
     if (user.role !== 'super_admin' && user.company_id) {
-      const companyRes = await pool.query("SELECT status FROM companies WHERE id = $1", [user.company_id]);
-      if (companyRes.rows.length > 0 && companyRes.rows[0].status === 'suspended') {
+      const companyRes = await pool.query(
+        "SELECT status, COALESCE(NULLIF(to_jsonb(c)->>'is_suspended', ''), 'false') as is_susp FROM companies c WHERE id = $1",
+        [user.company_id]
+      );
+      if (companyRes.rows.length > 0 && (companyRes.rows[0].status === 'suspended' || companyRes.rows[0].is_susp === 'true')) {
         console.warn(`🛑 Login blocked for suspended company user: ${identifier}`);
         emitSecurityEvent({
           companyId: String(user.company_id),
@@ -1204,6 +1148,15 @@ router.post("/login", async (req, res) => {
         }
       });
       return res.status(401).json({ message: "Invalid email or password" });
+    }
+
+    if (redisClient && redisClient.status === 'ready') {
+      try {
+        await redisClient.del(`token_revoked:${user.id}`);
+      } catch (error) {
+        console.error('Login session-state check failed:', error?.code || 'SESSION_STATE_UNAVAILABLE');
+        return res.status(503).json({ message: 'Unable to verify session state. Please retry.' });
+      }
     }
 
     // Reset failed counter on successful login
@@ -1289,9 +1242,9 @@ router.post("/refresh", async (req, res) => {
     return res.status(401).json({ message: "No refresh token provided" });
   }
 
-  const client = await pool.connect();
-
+  let client = null;
   try {
+    client = await pool.connect();
     await client.query("BEGIN");
 
     const tokenHash = hashToken(token);
@@ -1364,18 +1317,44 @@ router.post("/refresh", async (req, res) => {
       return res.status(401).json({ message: "Invalid or expired refresh token" });
     }
 
+    if (redisClient && redisClient.status === 'ready') {
+      const revokedAtValue = await redisClient.get(`token_revoked:${userId}`);
+      if (revokedAtValue !== null) {
+        const revokedAt = Number(revokedAtValue);
+        const issuedAt = Number(payload.iat);
+        if (!Number.isFinite(revokedAt) || !Number.isFinite(issuedAt) || issuedAt * 1000 <= revokedAt) {
+          await client.query('UPDATE refresh_tokens SET revoked = TRUE WHERE user_id = $1::uuid AND revoked = FALSE', [userId]);
+          await client.query('COMMIT');
+          return res.status(401).json({ message: 'Session was revoked. Please sign in again.' });
+        }
+      }
+    }
+
     // 4. Fetch User Data
-    const userRes = await client.query("SELECT id, role, email, company_id FROM users WHERE id = $1", [userId]);
+    const userRes = await client.query("SELECT id, role, email, company_id, is_active FROM users WHERE id = $1", [userId]);
     if (userRes.rows.length === 0) {
       await client.query("ROLLBACK");
       return res.status(401).json({ message: "User not found" });
     }
     const user = userRes.rows[0];
 
+    if (!isUserAccountActive(user)) {
+      await client.query("UPDATE refresh_tokens SET revoked = TRUE WHERE user_id = $1::uuid AND revoked = FALSE", [userId]);
+      await client.query("COMMIT");
+      return res.status(403).json({
+        message: 'Account Suspended/Disabled',
+        error: 'account_suspended',
+        details: 'Your account is suspended/disabled. Please contact prozyncinnovations@gmail.com'
+      });
+    }
+
     // 5. Check Suspension
     if (user.role !== 'super_admin' && user.company_id) {
-      const compRes = await client.query("SELECT status FROM companies WHERE id = $1", [user.company_id]);
-      if (compRes.rows.length > 0 && compRes.rows[0].status === 'suspended') {
+      const compRes = await client.query(
+        "SELECT status, COALESCE(NULLIF(to_jsonb(c)->>'is_suspended', ''), 'false') as is_susp FROM companies c WHERE id = $1",
+        [user.company_id]
+      );
+      if (compRes.rows.length > 0 && (compRes.rows[0].status === 'suspended' || compRes.rows[0].is_susp === 'true')) {
         await client.query("ROLLBACK");
         return res.status(403).json({
           message: "Account Suspended/Disabled",
@@ -1441,10 +1420,10 @@ router.post("/refresh", async (req, res) => {
   } catch (err) {
     if (client) await client.query("ROLLBACK").catch(() => {});
     console.error("❌ Refresh route error:", err.message || err);
-    return res.status(401).json({
-      message: "Server error during refresh",
-      error: "Unauthorized"
-    });
+    // An operational failure does not prove the refresh token is invalid.
+    // Keep it distinct from the explicit 401/403 credential and account-state
+    // responses above so clients retain the session and can safely retry.
+    return sendRefreshUnavailable(res);
   } finally {
     if (client) client.release();
   }
@@ -1500,6 +1479,10 @@ router.post("/logout", async (req, res) => {
         const family = row.token_family;
 
         await logActivity(userId, "logout", req).catch(() => {});
+
+        if (redisClient && redisClient.status === 'ready') {
+          await redisClient.set(`token_revoked:${userId}`, Date.now().toString(), 'EX', 86400).catch(() => {});
+        }
 
         // Revoke active token family strictly scoped to this user
         try {

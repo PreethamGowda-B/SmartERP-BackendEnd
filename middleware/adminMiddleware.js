@@ -18,7 +18,12 @@ function authenticateSuperAdmin(req, res, next) {
   const matchesEnvEmail = Boolean(envSuperAdminEmail && userEmail === envSuperAdminEmail);
 
   if (isSuperAdminRole || matchesEnvEmail) {
-    return next();
+    // The database RLS layer also checks app.current_role. Keep that context
+    // consistent with this authorization decision, including the configured
+    // email fallback, without enabling BYPASSRLS or changing the tenant ID.
+    const { storage } = require('./als');
+    const context = storage.getStore() || {};
+    return storage.run({ ...context, role: 'super_admin' }, next);
   }
 
   console.warn(`🚫 Unauthorized Superadmin access attempt by: ${user.email || 'undefined'} (Role: ${user.role || 'none'}) for ${req.method} ${req.path}`);

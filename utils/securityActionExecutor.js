@@ -59,10 +59,12 @@ async function executeSecurityAction(actionId, executedBy = 'security-policy-eng
       case SECURITY_ACTION_TYPES.SESSION_REVOKE_TARGET: {
         const userId = details.userId;
         if (userId) {
-          if (redisClient && redisClient.status === 'ready') {
-            await redisClient.set(`token_revoked:${userId}`, Date.now().toString(), 'EX', 86400);
+          if (!redisClient || redisClient.status !== 'ready') {
+            throw new Error('Session revocation storage is unavailable; action was not marked executed.');
           }
-          executionDetails = { revokedUserId: userId, revocationTimestamp: Date.now() };
+          const revocationTimestamp = Date.now();
+          await redisClient.set(`token_revoked:${userId}`, revocationTimestamp.toString(), 'EX', 86400);
+          executionDetails = { revokedUserId: userId, revocationTimestamp };
         }
         break;
       }
@@ -79,11 +81,27 @@ async function executeSecurityAction(actionId, executedBy = 'security-policy-eng
       case SECURITY_ACTION_TYPES.USER_SUSPEND: {
         const userId = details.userId;
         if (userId) {
+          if (!redisClient || redisClient.status !== 'ready') {
+            throw new Error('Session revocation storage is unavailable; suspension was not applied.');
+          }
+          const previous = await pool.query('SELECT is_active, role, company_id FROM users WHERE id = $1 FOR UPDATE', [userId]);
+          if (!previous.rows.length) throw new Error('Target user was not found; suspension was not applied.');
+          if (previous.rows[0].role === 'super_admin') {
+            throw new Error('CANNOT_SUSPEND_SUPERADMIN: Super Admin accounts cannot be suspended.');
+          }
+          if (action.company_id && previous.rows[0].company_id && String(previous.rows[0].company_id) !== String(action.company_id)) {
+            throw new Error(`Target user ${userId} does not belong to company ${action.company_id}`);
+          }
           await pool.query(
             `UPDATE users SET is_active = FALSE WHERE id = $1`,
             [userId]
           );
-          executionDetails = { suspendedUserId: userId };
+          await pool.query('UPDATE refresh_tokens SET revoked = TRUE WHERE user_id = $1::uuid AND revoked = FALSE', [userId]);
+          const nowTs = Date.now().toString();
+          await redisClient.set(`token_revoked:${userId}`, nowTs, 'EX', 86400);
+          await redisClient.set(`user_suspended:${userId}`, '1', 'EX', 86400 * 7);
+          await redisClient.del(`user_active:${userId}`);
+          executionDetails = { suspendedUserId: userId, previousIsActive: previous.rows[0].is_active !== false, revocationTimestamp: nowTs };
         }
         break;
       }
@@ -91,11 +109,11 @@ async function executeSecurityAction(actionId, executedBy = 'security-policy-eng
       case SECURITY_ACTION_TYPES.COMPANY_SUSPEND: {
         const companyId = details.companyId;
         if (companyId) {
-          await pool.query(
-            `UPDATE companies SET is_suspended = TRUE WHERE id = $1`,
-            [companyId]
-          );
-          executionDetails = { suspendedCompanyId: companyId };
+          const company = await pool.query('SELECT status FROM companies WHERE id = $1 FOR UPDATE', [companyId]);
+          if (!company.rows.length) throw new Error('Target company was not found; suspension was not applied.');
+          await pool.query("UPDATE companies SET status = 'suspended' WHERE id = $1", [companyId]);
+          if (redisClient?.status === 'ready') await redisClient.del(`company_suspended:${companyId}`);
+          executionDetails = { suspendedCompanyId: companyId, previousStatus: company.rows[0].status };
         }
         break;
       }
@@ -176,6 +194,9 @@ async function revertSecurityAction(actionId, revertedBy = 'super_admin') {
 
       case SECURITY_ACTION_TYPES.SESSION_REVOKE_TARGET: {
         const userId = details.userId;
+        if (userId && (!redisClient || redisClient.status !== 'ready')) {
+          throw new Error('Session revocation storage is unavailable; session was not restored.');
+        }
         if (redisClient && redisClient.status === 'ready' && userId) {
           await redisClient.del(`token_revoked:${userId}`);
         }
@@ -193,10 +214,21 @@ async function revertSecurityAction(actionId, revertedBy = 'super_admin') {
       case SECURITY_ACTION_TYPES.USER_SUSPEND: {
         const userId = details.userId;
         if (userId) {
+          if (!redisClient || redisClient.status !== 'ready') {
+            throw new Error('Session revocation storage is unavailable; user was not restored.');
+          }
+          const priorActive = details.executionDetails?.previousIsActive;
+          if (typeof priorActive !== 'boolean') throw new Error('Saved user account state is missing; refusing to restore an unknown prior state.');
+          await redisClient.set(`token_revoked:${userId}`, Date.now().toString(), 'EX', 86400);
           await pool.query(
-            `UPDATE users SET is_active = TRUE WHERE id = $1`,
-            [userId]
+            `UPDATE users SET is_active = $1 WHERE id = $2`,
+            [priorActive, userId]
           );
+          await pool.query('UPDATE refresh_tokens SET revoked = TRUE WHERE user_id = $1::uuid AND revoked = FALSE', [userId]);
+          if (priorActive) {
+            await redisClient.del(`user_suspended:${userId}`);
+            await redisClient.set(`user_active:${userId}`, '1', 'EX', 60);
+          }
         }
         break;
       }
@@ -204,10 +236,16 @@ async function revertSecurityAction(actionId, revertedBy = 'super_admin') {
       case SECURITY_ACTION_TYPES.COMPANY_SUSPEND: {
         const companyId = details.companyId;
         if (companyId) {
-          await pool.query(
-            `UPDATE companies SET is_suspended = FALSE WHERE id = $1`,
-            [companyId]
+          const previousStatus = details.executionDetails?.previousStatus;
+          if (typeof previousStatus !== 'string' || previousStatus === 'suspended') {
+            throw new Error('Saved company status is missing or was already suspended; refusing to overwrite its current state.');
+          }
+          const restored = await pool.query(
+            "UPDATE companies SET status = $1 WHERE id = $2 AND status = 'suspended' RETURNING id",
+            [previousStatus, companyId]
           );
+          if (!restored.rows.length) throw new Error('Company status changed after suspension; refusing to overwrite the newer status.');
+          if (redisClient?.status === 'ready') await redisClient.del(`company_suspended:${companyId}`);
         }
         break;
       }

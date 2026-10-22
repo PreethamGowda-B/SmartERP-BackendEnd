@@ -2,6 +2,20 @@ const cron = require('node-cron');
 const { pool } = require('../db');
 const { storage } = require('../middleware/als');
 const AttendancePolicy = require('../services/attendancePolicyService');
+const {
+  logAttendanceProcessorCompletion,
+  logAttendanceProcessorFailure,
+} = require('../services/attendanceProcessorLogger');
+
+function attachProcessorErrorContext(error, context) {
+  if (error && (typeof error === 'object' || typeof error === 'function')) {
+    try {
+      error.attendanceProcessorContext = context;
+    } catch {
+      // Preserve the original failure if its error object cannot be annotated.
+    }
+  }
+}
 
 async function processCompany(companyId, workDate, now = new Date()) {
   const client = await pool.connect();
@@ -20,26 +34,37 @@ async function processCompany(companyId, workDate, now = new Date()) {
 }
 
 async function runDailyAttendanceProcessing(now = new Date()) {
+  const startedAt = Date.now();
   return storage.run({ isWebRequest: false, bypassRls: true, role: 'system' }, async () => {
     const companies = await pool.query('SELECT id FROM companies ORDER BY id');
     const results = [];
     for (const { id: companyId } of companies.rows) {
       // Company policies currently default to IST. The policy service resolves
       // the work date and due cutoff for that company's timezone.
-      const policy = await AttendancePolicy.getCompanyPolicy(companyId, pool);
-      const today = AttendancePolicy.localDate(now, policy.timezone);
-      const candidates = [today];
-      // Recover the previous work date after a restart, but never rewrite a
-      // processed historical row. The task intentionally has no data migration.
-      const yesterdayDate = new Date(AttendancePolicy.zonedDateTimeToUtc(today, '12:00', policy.timezone).getTime() - 86400000);
-      const yesterday = AttendancePolicy.localDate(yesterdayDate, policy.timezone);
-      candidates.unshift(yesterday);
-      for (const workDate of candidates) {
-        const outcome = await processCompany(companyId, workDate, now);
-        results.push({ company_id: companyId, ...outcome });
+      try {
+        const policy = await AttendancePolicy.getCompanyPolicy(companyId, pool);
+        const today = AttendancePolicy.localDate(now, policy.timezone);
+        const candidates = [today];
+        // Recover the previous work date after a restart, but never rewrite a
+        // processed historical row. The task intentionally has no data migration.
+        const yesterdayDate = new Date(AttendancePolicy.zonedDateTimeToUtc(today, '12:00', policy.timezone).getTime() - 86400000);
+        const yesterday = AttendancePolicy.localDate(yesterdayDate, policy.timezone);
+        candidates.unshift(yesterday);
+        for (const workDate of candidates) {
+          try {
+            const outcome = await processCompany(companyId, workDate, now);
+            results.push({ company_id: companyId, ...outcome });
+          } catch (error) {
+            attachProcessorErrorContext(error, { companyId, workDate });
+            throw error;
+          }
+        }
+      } catch (error) {
+        if (!error?.attendanceProcessorContext) attachProcessorErrorContext(error, { companyId });
+        throw error;
       }
     }
-    console.info('[attendance-processor] completed', JSON.stringify(results));
+    logAttendanceProcessorCompletion(results, Date.now() - startedAt);
     return results;
   });
 }
@@ -49,14 +74,14 @@ function startDailyAttendanceProcessor() {
   // the next tick, with startup recovery and transactional idempotency intact.
   cron.schedule('* * * * *', () => {
     runDailyAttendanceProcessing().catch((error) => {
-      console.error('[attendance-processor] failed', error.message, error.stack);
+      logAttendanceProcessorFailure(error);
     });
   }, { timezone: 'Asia/Kolkata' });
 
   // Catch up a missed cutoff after process restart. Service-level due checks
   // ensure this never closes today's session before its configured cutoff.
   runDailyAttendanceProcessing().catch((error) => {
-    console.error('[attendance-processor] startup recovery failed', error.message, error.stack);
+    logAttendanceProcessorFailure(error, console, 'startup recovery failed');
   });
   console.log('✅ Daily attendance processor scheduled (policy cutoff, Asia/Kolkata; 1-minute retry and startup recovery)');
 }

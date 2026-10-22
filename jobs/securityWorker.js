@@ -24,6 +24,7 @@ const THREAT_CATEGORIES = {
   ROUTE_SCAN: 'ROUTE_SCAN',
   MULTI_VECTOR_SURGE: 'MULTI_VECTOR_SURGE',
   COMPANY_SUSPENSION_BREACH: 'COMPANY_SUSPENSION_BREACH',
+  PROMPT_INJECTION: 'PROMPT_INJECTION',
 };
 
 /**
@@ -67,6 +68,12 @@ function calculateDeterministicRisk(category, counts, totalDistinctTypes) {
     case THREAT_CATEGORIES.COMPANY_SUSPENSION_BREACH:
       score = 65;
       break;
+
+    case THREAT_CATEGORIES.PROMPT_INJECTION: {
+      const injectionAttempts = counts[SECURITY_EVENT_TYPES.PROMPT_INJECTION] || 1;
+      score = Math.min(98, 65 + (injectionAttempts * 10));
+      break;
+    }
 
     case THREAT_CATEGORIES.MULTI_VECTOR_SURGE:
       score = 92;
@@ -140,7 +147,11 @@ async function processSecurityIncident(data) {
   let threatCategory = null;
   let title = '';
 
-  if (counts[SECURITY_EVENT_TYPES.ADMIN_UNAUTHORIZED]) {
+  if (counts[SECURITY_EVENT_TYPES.PROMPT_INJECTION]) {
+    threatCategory = THREAT_CATEGORIES.PROMPT_INJECTION;
+    const count = counts[SECURITY_EVENT_TYPES.PROMPT_INJECTION];
+    title = `Adversarial AI Prompt Injection Attempt${count > 1 ? 's' : ''} from ${ipAddress || userId} (${count} attempts)`;
+  } else if (counts[SECURITY_EVENT_TYPES.ADMIN_UNAUTHORIZED]) {
     threatCategory = THREAT_CATEGORIES.SUPERADMIN_PROBE;
     title = `Unauthorized Super Admin Access Probing from ${ipAddress || userId}`;
   } else if (distinctTypes.length >= 2 && (counts[SECURITY_EVENT_TYPES.AUTH_FAILED] || counts[SECURITY_EVENT_TYPES.ROUTE_SCAN])) {
@@ -293,6 +304,8 @@ function getRemediationGuideline(category) {
       return 'Monitor origin IP. Apply temporary firewall throttle if scanning continues.';
     case THREAT_CATEGORIES.MULTI_VECTOR_SURGE:
       return 'High-priority suspicious activity. Flag for Super Admin review and consider temporary IP quarantine.';
+    case THREAT_CATEGORIES.PROMPT_INJECTION:
+      return 'Inspect AI prompt logs for adversarial payload patterns. Temporary IP throttle applied; review account for suspension if repeated.';
     default:
       return 'Monitor security telemetry for further anomalous behavior.';
   }

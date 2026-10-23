@@ -395,12 +395,12 @@ class AIDataService {
 
       // Employee headcount by department
       pool.query(
-        `SELECT department, COUNT(*) as count 
-         FROM users 
-         WHERE company_id::text = $1 AND role = 'employee'
-           AND is_active = TRUE
-           AND COALESCE(status, 'active') <> 'suspended'
-         GROUP BY department`,
+        `SELECT u.department, COUNT(*) as count
+         FROM users u
+         WHERE u.company_id::text = $1 AND u.role = 'employee'
+           AND u.is_active = TRUE
+           AND COALESCE(NULLIF(to_jsonb(u)->>'status', ''), 'active') <> 'suspended'
+         GROUP BY u.department`,
         [cid]
       ).catch(() => ({ rows: [] })),
     ]);

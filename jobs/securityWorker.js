@@ -27,6 +27,29 @@ const THREAT_CATEGORIES = {
   PROMPT_INJECTION: 'PROMPT_INJECTION',
 };
 
+function readEventMetadata(event) {
+  if (event?.metadata && typeof event.metadata === 'object') return event.metadata;
+  if (typeof event?.metadata === 'string') {
+    try { return JSON.parse(event.metadata); } catch (_) {}
+  }
+  return {};
+}
+
+function getVerifiedPromptEvidence(events, userId, companyId) {
+  if (!userId) return { count: 0, categories: [] };
+  const categories = new Set();
+  let count = 0;
+  for (const event of events) {
+    if (event.event_type !== SECURITY_EVENT_TYPES.PROMPT_INJECTION || String(event.user_id || '') !== String(userId)) continue;
+    if (String(event.company_id || '') !== String(companyId || '')) continue;
+    const metadata = readEventMetadata(event);
+    if (metadata.isSecurityThreat !== true || typeof metadata.category !== 'string' || !metadata.category) continue;
+    count += 1;
+    categories.add(metadata.category);
+  }
+  return { count, categories: [...categories].sort() };
+}
+
 /**
  * Calculates a deterministic risk score (0 - 100) and severity.
  *
@@ -141,6 +164,13 @@ async function processSecurityIncident(data) {
     eventIds.push(ev.id);
   }
 
+  // Prompt containment is based only on confirmed shield detections attributed
+  // to this same authenticated user and company. A single flagged request is
+  // recorded for review but does not revoke the session or throttle an IP.
+  const promptEvidence = getVerifiedPromptEvidence(events, userId, companyId);
+  if (promptEvidence.count > 0) counts[SECURITY_EVENT_TYPES.PROMPT_INJECTION] = promptEvidence.count;
+  else delete counts[SECURITY_EVENT_TYPES.PROMPT_INJECTION];
+
   const distinctTypes = Object.keys(counts);
 
   // 3. Determine Primary Threat Category
@@ -187,6 +217,8 @@ async function processSecurityIncident(data) {
     deterministicEvaluation: true,
     slidingWindowMinutes: 15,
     eventBreakdown: counts,
+    verifiedPromptAttemptCount: promptEvidence.count,
+    verifiedPromptCategories: promptEvidence.categories,
     correlatedEventIds: eventIds.slice(0, 20),
     totalEventsInWindow: events.length,
     latestEndpoints: [...new Set(events.map((e) => e.endpoint).filter(Boolean))].slice(0, 5),
@@ -341,6 +373,7 @@ if (redisConnection) {
 module.exports = {
   processSecurityIncident,
   calculateDeterministicRisk,
+  getVerifiedPromptEvidence,
   THREAT_CATEGORIES,
   securityWorker,
 };

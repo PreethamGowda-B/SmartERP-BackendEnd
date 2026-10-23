@@ -80,9 +80,11 @@ function emitSecurityEvent(eventData) {
         ? sanitizeMetadata(eventData.metadata)
         : {};
 
-      // 1. Direct Asynchronous Insert to security_events table
+      // 1. Persist the security event before queuing it for correlation.
+      let eventPersisted = false;
       if (pool && pool.query) {
-        await pool.query(
+        try {
+          await pool.query(
           `INSERT INTO security_events 
            (company_id, user_id, event_type, severity, ip_address, user_agent, endpoint, http_method, status_code, metadata, created_at)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())`,
@@ -98,9 +100,33 @@ function emitSecurityEvent(eventData) {
             statusCode,
             JSON.stringify(cleanMetadata),
           ]
-        ).catch((dbErr) => {
+          );
+          eventPersisted = true;
+        } catch (dbErr) {
           logger.warn(`SecurityEmitter DB Insert Warning: ${dbErr.message}`);
-        });
+        }
+      }
+
+      // A prompt-injection event must reach the security-detection worker after
+      // durable persistence; a database row alone does not wake the BullMQ worker.
+      if (eventPersisted && eventType === SECURITY_EVENT_TYPES.PROMPT_INJECTION) {
+        if (redisClient?.status === 'ready') {
+          try {
+            const { enqueueSecurityEvent } = require('./queue');
+            await enqueueSecurityEvent({
+              trigger: 'prompt_injection_event',
+              eventType,
+              ipAddress,
+              userId,
+              companyId,
+              severity,
+            });
+          } catch (queueErr) {
+            logger.error(`[SecurityEmitter] Prompt-injection event persisted but worker enqueue failed: ${queueErr.message}`);
+          }
+        } else {
+          logger.error('[SecurityEmitter] Prompt-injection event persisted but Redis is unavailable; standalone database polling must be active.');
+        }
       }
 
       // 2. Sliding window counter in Redis for high-frequency correlation

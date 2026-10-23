@@ -17,7 +17,32 @@ const { pool } = require("../db");
 const AIDataService = require("../services/aiDataService");
 const { loadAttendanceSummary } = require("../services/aiAttendanceSummary");
 const { canUseAiFastPath } = require("../services/aiMetricAccess");
-const validateAiPrompt = createAiPromptGuard();
+const SecurityShield = require('../ai/gateway/security.shield');
+const validateAiPrompt = createAiPromptGuard({
+  historyField: 'history',
+  contextField: 'clientContext',
+  rootContextFields: ['currentPortal', 'currentModule', 'currentPagePath'],
+});
+
+function findBlockedActionInput(value, path = 'params', depth = 0) {
+  if (depth > 12) return { invalid: true, path };
+  if (typeof value === 'string') {
+    const result = SecurityShield.inspectPrompt(value);
+    return result.blocked && result.isAttack ? { path, result, length: value.length } : null;
+  }
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i += 1) {
+      const found = findBlockedActionInput(value[i], `${path}[${i}]`, depth + 1);
+      if (found) return found;
+    }
+  } else if (value && typeof value === 'object') {
+    for (const [key, child] of Object.entries(value)) {
+      const found = findBlockedActionInput(child, `${path}.${key}`, depth + 1);
+      if (found) return found;
+    }
+  }
+  return null;
+}
 
 let redisClient = null;
 try {
@@ -595,7 +620,18 @@ router.post(
             : 'SmartERP AI provider is temporarily unavailable. Please retry shortly.',
         });
       }
-      console.error("❌ SmartERP AI Agent Error:", error?.code || error?.name || 'unknown_error');
+      const diagnostic = {
+        code: typeof error?.code === 'string' ? error.code.slice(0, 40) : null,
+        name: typeof error?.name === 'string' ? error.name.slice(0, 80) : 'Error',
+      };
+      // PostgreSQL SQLSTATE diagnostics (including undefined columns) are safe
+      // to log without request prompts, credentials, or parameter values.
+      if (typeof error?.code === 'string' && /^[0-9A-Z]{5}$/.test(error.code)) {
+        diagnostic.databaseMessage = String(error.message || '').slice(0, 240);
+        if (error.column) diagnostic.column = String(error.column).slice(0, 100);
+        if (error.table) diagnostic.table = String(error.table).slice(0, 100);
+      }
+      console.error("❌ SmartERP AI Agent Error:", diagnostic);
       res.status(500).json({
         code: 'AI_AGENT_FAILED',
         error: "SmartERP AI could not complete this request. Please retry shortly.",
@@ -620,35 +656,38 @@ router.post(
         return res.status(400).json({ error: "Tool name is required for action execution." });
       }
 
-      if (params && typeof params === 'object') {
-        const SecurityShield = require('../ai/gateway/security.shield');
-        for (const [key, val] of Object.entries(params)) {
-          if (typeof val === 'string') {
-            const check = SecurityShield.inspectPrompt(val);
-            if (check.blocked && check.isAttack) {
-              const { emitSecurityEvent, SECURITY_EVENT_TYPES } = require("../utils/securityEmitter");
-              emitSecurityEvent({
-                companyId: req.user?.companyId || req.user?.company_id,
-                userId: req.user?.userId || req.user?.id,
-                eventType: SECURITY_EVENT_TYPES.PROMPT_INJECTION,
-                severity: check.riskLevel || 'high',
-                ipAddress: req.ip || req.headers?.['x-forwarded-for'],
-                userAgent: req.headers?.['user-agent'],
-                endpoint: '/api/ai/confirm-action',
-                httpMethod: 'POST',
-                statusCode: 400,
-                metadata: {
-                  reason: check.reason,
-                  paramKey: key,
-                },
-              });
-              return res.status(400).json({
-                error: "SECURITY_VIOLATION",
-                message: `Security violation in parameter '${key}': ${check.reason}`,
-                code: "INJECTION_IN_ACTION_PARAM"
-              });
-            }
+      {
+        const blocked = findBlockedActionInput(params);
+        if (blocked) {
+          if (blocked.invalid) {
+            return res.status(400).json({ error: 'Action parameters are too deeply nested.', code: 'INVALID_ACTION_PARAMS' });
           }
+          const { emitSecurityEvent, SECURITY_EVENT_TYPES } = require("../utils/securityEmitter");
+          emitSecurityEvent({
+            companyId: req.user?.companyId || req.user?.company_id,
+            userId: req.user?.userId || req.user?.id,
+            eventType: SECURITY_EVENT_TYPES.PROMPT_INJECTION,
+            severity: blocked.result.riskLevel || 'high',
+            ipAddress: req.ip || req.headers?.['x-forwarded-for'],
+            userAgent: req.headers?.['user-agent'],
+            endpoint: '/api/ai/confirm-action',
+            httpMethod: 'POST',
+            statusCode: 400,
+            metadata: {
+              isSecurityThreat: true,
+              category: blocked.result.category,
+              reason: blocked.result.category,
+              riskLevel: blocked.result.riskLevel,
+              requestId: req.id || require('node:crypto').randomUUID(),
+              paramPath: blocked.path,
+              messageLength: blocked.length,
+            },
+          });
+          return res.status(400).json({
+            error: "SECURITY_VIOLATION",
+            message: `Security violation in action parameters: ${blocked.result.reason}`,
+            code: "INJECTION_IN_ACTION_PARAM"
+          });
         }
       }
 

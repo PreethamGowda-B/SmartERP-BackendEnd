@@ -156,8 +156,18 @@ function evaluatePolicyForIncident(incident) {
       break;
 
     case 'PROMPT_INJECTION':
-      // Safe: 30-min IP rate throttle
-      if (sourceIp) {
+      {
+      const evidence = typeof incident.ai_analysis === 'string'
+        ? (() => { try { return JSON.parse(incident.ai_analysis); } catch (_) { return {}; } })()
+        : (incident.ai_analysis || {});
+      const verifiedAttempts = Number(evidence.verifiedPromptAttemptCount) || 0;
+      const verifiedCategories = Array.isArray(evidence.verifiedPromptCategories)
+        ? evidence.verifiedPromptCategories.filter((category) => typeof category === 'string')
+        : [];
+
+      // A single blocked prompt is logged for review. Repeated, detector-confirmed
+      // attempts by the same account trigger temporary, reversible containment.
+      if (verifiedAttempts >= 3 && sourceIp) {
         actions.push({
           actionType: SECURITY_ACTION_TYPES.IP_THROTTLE_TEMPORARY,
           isAutomated: true,
@@ -168,8 +178,7 @@ function evaluatePolicyForIncident(incident) {
           payload: { ipAddress: sourceIp, durationMinutes: 30 },
         });
       }
-      // Safe: Invalidate caller session tokens
-      if (targetUserId) {
+      if (verifiedAttempts >= 3 && targetUserId) {
         actions.push({
           actionType: SECURITY_ACTION_TYPES.SESSION_REVOKE_TARGET,
           isAutomated: true,
@@ -180,8 +189,9 @@ function evaluatePolicyForIncident(incident) {
           payload: { userId: targetUserId },
         });
       }
-      // Sensitive: Propose account suspension for Super Admin review if critical risk
-      if (targetUserId && riskScore >= 85) {
+      // Suspension remains a human-approved action. Require corroboration across
+      // multiple detector categories and repeated events before proposing it.
+      if (targetUserId && riskScore >= 90 && verifiedAttempts >= 5 && new Set(verifiedCategories).size >= 2) {
         actions.push({
           actionType: SECURITY_ACTION_TYPES.USER_SUSPEND,
           isAutomated: false,
@@ -193,6 +203,7 @@ function evaluatePolicyForIncident(incident) {
         });
       }
       break;
+      }
 
     default:
       break;

@@ -8,6 +8,9 @@ const { consumeAIRequest } = require('../services/aiQuota');
 const { resolvePlanTier } = require('../services/subscriptionCatalog');
 const { redisClient } = require('../utils/redis');
 const { checkPlanLimit } = require('../middleware/planMiddleware');
+const { createAiPromptGuard } = require('../middleware/aiPromptGuard');
+
+const validateCopilotPrompt = createAiPromptGuard({ field: 'prompt' });
 
 async function requireAIQuota(req, res, next) {
   const quota = await consumeAIRequest(redisClient, req.user?.userId || req.user?.id, resolvePlanTier(req.plan));
@@ -22,13 +25,13 @@ async function requireAIQuota(req, res, next) {
 }
 
 function requireJobQuotaForCopilot(req, res, next) {
-  const prompt = String(req.body?.prompt || '').toLowerCase();
+  const prompt = String(req.sanitizedAiPrompt || '').toLowerCase();
   const createsJob = prompt.includes('create job') || prompt.includes('breakdown job') || prompt.includes('schedule pm');
   return createsJob ? checkPlanLimit('job')(req, res, next) : next();
 }
 
 // ─── POST /api/ai/copilot (Enterprise AI Operations Copilot & Multi-Step Workflows) ───
-router.post('/', authenticateToken, loadPlan, requireFeature('ai_assistant', 'AI assistant'), requireAIQuota, requireJobQuotaForCopilot, async (req, res) => {
+router.post('/', authenticateToken, loadPlan, requireFeature('ai_assistant', 'AI assistant'), validateCopilotPrompt, requireAIQuota, requireJobQuotaForCopilot, async (req, res) => {
   try {
     const companyId = req.user.companyId || req.user.company_id;
     if (!companyId && req.user.role !== 'super_admin') {
@@ -37,11 +40,8 @@ router.post('/', authenticateToken, loadPlan, requireFeature('ai_assistant', 'AI
     const userId = req.user.userId || req.user.id;
     const userName = req.user.name || 'User';
     const role = req.user.role || 'owner';
-    const { prompt, mode = 'query', confirm_action = false } = req.body;
-
-    if (!prompt) {
-      return res.status(400).json({ message: 'Prompt is required' });
-    }
+    const prompt = req.sanitizedAiPrompt;
+    const { mode = 'query', confirm_action = false } = req.body;
 
     // RBAC Permission Guard for AI Copilot
     if (role === 'customer' && prompt.toLowerCase().includes('delete')) {

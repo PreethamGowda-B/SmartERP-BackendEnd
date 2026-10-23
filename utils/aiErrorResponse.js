@@ -22,6 +22,9 @@ function getAiErrorResponse(error) {
   if (error?.code === 'AI_TOOL_ARGUMENTS_INVALID') {
     return { status: 502, body: { code: error.code, error: 'The AI returned an invalid action request. No tool was executed; please rephrase your request.' } };
   }
+  if (error?.code === 'AI_TOOL_SCOPE_DENIED') {
+    return { status: 502, body: { code: error.code, error: 'The selected SmartERP assistant requested an unsupported action. No tool was executed; please try a more specific request.' } };
+  }
   if (error?.code === 'AI_WORKFLOW_NOT_IMPLEMENTED') {
     return { status: 501, body: { code: error.code, error: 'This AI workflow is not connected to an approved execution path. No business records were changed.' } };
   }

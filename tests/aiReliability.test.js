@@ -63,4 +63,7 @@ test('CNC AI data lookups do not hide query failures or broaden a machine search
   assert.doesNotMatch(cnc, /\.catch\(\(\) => \(\{ rows: \[\] \}\)\)/);
   assert.doesNotMatch(cnc, /SELECT id, title, description, status, priority, created_at FROM jobs\s+WHERE company_id::text = \$1::text ORDER BY created_at DESC LIMIT \$2/);
   assert.match(cnc, /WHERE m\.company_id::text = \$1::text/);
+  assert.match(cnc, /c\.company_id::text = m\.company_id::text/);
+  assert.match(cnc, /p\.company_id::text = m\.company_id::text/);
+  assert.match(cnc, /m\.company_id::text = w\.company_id::text/);
 });

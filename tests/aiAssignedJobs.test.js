@@ -25,6 +25,7 @@ test('employee assigned-jobs query uses only tracked assignment columns and both
     assert.match(captured.sql, /j\.company_id::text = \$2/);
     assert.match(captured.sql, /j\.assigned_employee_id::text = \$1 OR j\.assigned_to::text = \$1/);
     assert.doesNotMatch(captured.sql, /\bemployee_id\b/);
+    assert.doesNotMatch(captured.sql, /\bj\.stage\b/);
   } finally {
     pool.query = originalQuery;
   }
@@ -100,17 +101,43 @@ test('job tool limits are bounded and passed as SQL parameters', async () => {
   }
 });
 
+test('AI job creation persists the authenticated actor UUID rather than a text label', async () => {
+  const originalQuery = pool.query;
+  let captured;
+  pool.query = async (sql, params) => {
+    captured = { sql: String(sql), params };
+    return { rows: [{ id: 'job-new', title: 'New job' }] };
+  };
+  try {
+    const JobService = require('../services/jobService');
+    await assert.rejects(JobService.createJob({ companyId: 'company-a', title: 'Missing actor' }), /actor ID/);
+    await JobService.createJob({ companyId: 'company-a', createdBy: 'owner-a', title: 'Created job' });
+    assert.match(captured.sql, /created_by/);
+    assert.match(captured.sql, /\$6/);
+    assert.equal(captured.params[5], 'owner-a');
+    assert.doesNotMatch(captured.sql, /'AI Copilot'/);
+  } finally {
+    pool.query = originalQuery;
+  }
+});
+
 test('assigned-jobs prompt matcher is employee-only and response contains the real employee jobs destination', () => {
   const { isEmployeeAssignedJobsPrompt, createEmployeeAssignedJobsResponse } = require('../services/employeeAssignedJobsResponse');
   assert.equal(isEmployeeAssignedJobsPrompt('employee', 'Show my assigned jobs'), true);
+  assert.equal(isEmployeeAssignedJobsPrompt('employee', 'Show jobs assigned to me'), true);
   assert.equal(isEmployeeAssignedJobsPrompt('owner', 'Show my assigned jobs'), false);
   assert.equal(isEmployeeAssignedJobsPrompt('employee', 'Show active jobs'), false);
+  assert.equal(isEmployeeAssignedJobsPrompt('employee', 'Show assigned jobs'), false);
 
   const result = createEmployeeAssignedJobsResponse({ totalCount: 1, jobs: [{ title: 'Assigned job' }] }, 12);
   assert.match(result.text, /Assigned job/);
   assert.deepEqual(result.navigation, { path: '/employee/jobs', label: 'Open Assigned Jobs' });
   assert.equal(result.widget.metrics[0].value, 1);
   assert.equal(result.telemetry.latencyMs, 12);
+
+  const empty = createEmployeeAssignedJobsResponse({ totalCount: 0, jobs: [] });
+  assert.match(empty.text, /no directly assigned jobs/i);
+  assert.equal(empty.widget.metrics[0].value, 0);
 
   const route = fs.readFileSync(path.join(__dirname, '..', 'routes', 'ai.routes.js'), 'utf8');
   assert.match(route, /isEmployeeAssignedJobsPrompt\(role, promptLower\)/);
@@ -122,7 +149,50 @@ test('model prose cannot invent navigation actions and navigation tool destinati
   const navigation = fs.readFileSync(path.join(__dirname, '..', 'ai', 'plugins', 'navigation.plugin.js'), 'utf8');
   assert.match(planner, /navigation: navigationCommand/);
   assert.doesNotMatch(planner, /parsedPayload\?\.navigation\s*\|\|/);
+  assert.match(planner, /proposedWidget\?\.type === "ACTION_CONFIRMATION"[\s\S]*?actionConfirmation/);
+  assert.match(planner, /confidenceScore: undefined/);
   assert.match(navigation, /const targetRoute = routeMap\[page\]/);
   assert.match(navigation, /NAVIGATION_TARGET_UNAVAILABLE/);
   assert.doesNotMatch(navigation, /routeMap\[page\]\s*\|\|\s*`\$\{prefix\}\/\$\{page\}`/);
+  const routes = fs.readFileSync(path.join(__dirname, '..', 'routes', 'ai.routes.js'), 'utf8');
+  assert.match(routes, /confidenceScore: undefined/);
+  assert.match(routes, /diagnostic\.cause = \{ code: error\.cause\.code \}/);
+});
+
+test('registered navigation action resolves only supported destinations', async () => {
+  const NavigationPlugin = require('../ai/plugins/navigation.plugin');
+  const navigation = new NavigationPlugin();
+  const valid = await navigation.tools.navigate_to_route.execute({ targetPage: 'jobs' }, { user: { role: 'employee' } });
+  assert.deepEqual(valid, { action: 'NAVIGATE', path: '/employee/jobs', label: 'Opening jobs module...' });
+  const invalid = await navigation.tools.navigate_to_route.execute({ targetPage: '/employee/jobs?company=other' }, { user: { role: 'employee' } });
+  assert.equal(invalid.action, undefined);
+  assert.equal(invalid.error, 'NAVIGATION_TARGET_UNAVAILABLE');
+});
+
+test('specialist scopes restrict tool access at advertisement and execution while general remains role/plan filtered', () => {
+  const { isPluginAllowedForAiScope } = require('../services/aiPluginScope');
+  assert.equal(isPluginAllowedForAiScope('inventory', 'InventoryPlugin'), true);
+  assert.equal(isPluginAllowedForAiScope('inventory', 'FinancialPlugin'), false);
+  assert.equal(isPluginAllowedForAiScope('finance', 'FinancialPlugin'), true);
+  assert.equal(isPluginAllowedForAiScope('security', 'SecurityPlugin'), true);
+  assert.equal(isPluginAllowedForAiScope('security', 'JobsPlugin'), false);
+  assert.equal(isPluginAllowedForAiScope('general', 'SecurityPlugin'), false);
+  assert.equal(isPluginAllowedForAiScope('unknown-specialist', 'JobsPlugin'), false);
+
+  const registry = fs.readFileSync(path.join(__dirname, '..', 'ai', 'plugins', 'index.js'), 'utf8');
+  const planner = fs.readFileSync(path.join(__dirname, '..', 'ai', 'planner', 'ReAct.engine.js'), 'utf8');
+  const route = fs.readFileSync(path.join(__dirname, '..', 'routes', 'ai.routes.js'), 'utf8');
+  assert.match(registry, /isPluginAllowedForAiScope\(context\?\.aiModelScope, pluginName\)/);
+  assert.match(registry, /isPluginAllowedForAiScope\(context\?\.aiModelScope, targetPlugin\.constructor\.name\)/);
+  assert.match(planner, /aiModelScope: modelScope/);
+  assert.match(route, /modelScope: scope/);
+});
+
+test('employee role cannot use AI directory tools that return other employees or customer contact records', () => {
+  const EmployeePlugin = require('../ai/plugins/employee.plugin');
+  const CustomerPlugin = require('../ai/plugins/customer.plugin');
+  const employeeDirectory = new EmployeePlugin().tools.get_employees;
+  const customerDirectory = new CustomerPlugin().tools.get_customers;
+  assert.deepEqual(employeeDirectory.allowedRoles, ['owner', 'hr', 'admin']);
+  assert.deepEqual(customerDirectory.allowedRoles, ['owner', 'hr', 'admin']);
 });

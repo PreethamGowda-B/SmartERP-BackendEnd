@@ -45,11 +45,12 @@ class ReActEngine {
    * @param {string} [params.systemPromptOverride] - Optional pre-built system prompt
    * @returns {Promise<Object>} Structured AI response payload
    */
-  static async run({ userPrompt, history = [], context, systemPromptOverride = null }) {
+  static async run({ userPrompt, history = [], context, systemPromptOverride = null, modelScope = 'general' }) {
     const startTime = Date.now();
     const provider = ProviderFactory.getProvider();
     const systemPrompt = systemPromptOverride || ContextEngine.generateSystemPrompt(context);
-    const availableTools = pluginRegistry.getAvailableTools(context);
+    const executionContext = { ...context, aiModelScope: modelScope };
+    const availableTools = pluginRegistry.getAvailableTools(executionContext);
 
     // Build message trajectory
     const messages = [
@@ -98,7 +99,13 @@ class ReActEngine {
           }
         }
 
-        const widget = parsedPayload?.widget || null;
+        const proposedWidget = parsedPayload?.widget || null;
+        // Confirmation cards must carry a server-produced tool reference. A
+        // model-written widget is not an executable action and must not be
+        // rendered as one.
+        const widget = proposedWidget?.type === "ACTION_CONFIRMATION"
+          ? actionConfirmation
+          : proposedWidget;
 
         let finalWidget = widget;
         if (!finalWidget && modulesUsed.has("AttendancePlugin")) {
@@ -153,7 +160,7 @@ class ReActEngine {
 
         let toolResult;
         try {
-          toolResult = await pluginRegistry.execute(functionName, args, context);
+          toolResult = await pluginRegistry.execute(functionName, args, executionContext);
         } catch (toolErr) {
           await MetricsService.logAIAuditEvent({
             userContext: context,

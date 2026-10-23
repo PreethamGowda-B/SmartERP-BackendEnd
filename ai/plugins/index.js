@@ -11,6 +11,7 @@ const GSTReconciliationPlugin = require("./gstReconciliation.plugin");
 const LiveSummaryPlugin = require("./liveSummary.plugin");
 const CncPlugin = require("./cnc.plugin");
 const SecurityPlugin = require("./security.plugin");
+const { isPluginAllowedForAiScope } = require("../../services/aiPluginScope");
 
 // Enterprise-only plugin list (kept aligned with getAvailableTools and execute).
 const PRO_ONLY_PLUGINS = [
@@ -60,6 +61,7 @@ class PluginRegistry {
 
     for (const plugin of this.plugins) {
       const pluginName = plugin.constructor.name;
+      if (!isPluginAllowedForAiScope(context?.aiModelScope, pluginName)) continue;
 
       // 3. ROLE-BASED GATING
       for (const [toolName, tool] of Object.entries(plugin.tools || {})) {
@@ -95,6 +97,11 @@ class PluginRegistry {
     const targetPlugin = this.plugins.find((plugin) => plugin.tools[functionName] || plugin.skills[functionName]);
     if (!targetPlugin) {
       throw new Error(`Tool or Skill '${functionName}' is not registered in SmartERP AI Plugin Registry.`);
+    }
+    if (!isPluginAllowedForAiScope(context?.aiModelScope, targetPlugin.constructor.name)) {
+      const error = new Error('The selected AI specialist is not authorized for this tool.');
+      error.code = 'AI_TOOL_SCOPE_DENIED';
+      throw error;
     }
     if (!subscriptionAllowsTool(planTier, targetPlugin.constructor.name, functionName)) {
       return {

@@ -290,7 +290,9 @@ class CncPlugin extends BasePlugin {
                  COALESCE(p.plant_name, 'Main Plant') as plant_name
           FROM customer_machines m
           LEFT JOIN customers c ON m.customer_id::text = c.id::text
+                               AND c.company_id::text = m.company_id::text
           LEFT JOIN customer_plants p ON m.plant_id::text = p.id::text
+                                     AND p.company_id::text = m.company_id::text
           WHERE m.company_id::text = $1::text
         `;
         const queryParams = [String(companyId)];
@@ -351,7 +353,9 @@ class CncPlugin extends BasePlugin {
                  COALESCE(p.address, 'Plant Site') as plant_address
           FROM customer_machines m
           LEFT JOIN customers c ON m.customer_id::text = c.id::text
+                               AND c.company_id::text = m.company_id::text
           LEFT JOIN customer_plants p ON m.plant_id::text = p.id::text
+                                     AND p.company_id::text = m.company_id::text
           WHERE m.company_id::text = $1::text
         `;
         const queryParams = [String(companyId)];
@@ -656,6 +660,7 @@ class CncPlugin extends BasePlugin {
           `SELECT w.*, m.machine_name, m.serial_number
            FROM warranty_claims w
            LEFT JOIN customer_machines m ON w.machine_id::text = m.id::text
+                                         AND m.company_id::text = w.company_id::text
            WHERE w.company_id::text = $1::text
              AND (w.machine_id::text = $2::text OR m.serial_number ILIKE $2)
            ORDER BY w.created_at DESC LIMIT 5`,

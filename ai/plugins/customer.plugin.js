@@ -9,7 +9,7 @@ class CustomerPlugin extends BasePlugin {
     this.tools["get_customers"] = {
       name: "get_customers",
       description: "Retrieves customer directory and profiles for the company.",
-      allowedRoles: ["owner", "hr", "admin", "employee"],
+      allowedRoles: ["owner", "hr", "admin"],
       isDestructive: false,
       parameters: {
         type: "object",

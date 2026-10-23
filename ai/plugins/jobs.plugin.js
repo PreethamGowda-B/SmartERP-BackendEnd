@@ -77,6 +77,7 @@ class JobsPlugin extends BasePlugin {
       execute: async (params, context) => {
         return await JobService.createJob({
           companyId: context.user.companyId,
+          createdBy: context.user.id,
           title: params.title,
           description: params.description,
           priority: params.priority,

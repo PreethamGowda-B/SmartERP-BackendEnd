@@ -42,7 +42,7 @@ class AIDataService {
     values.push(safeLimit);
 
     const result = await pool.query(
-      `SELECT j.id, j.title, j.status, j.priority, j.stage, j.created_at,
+      `SELECT j.id, j.title, j.status, j.priority, j.created_at,
               COUNT(*) OVER()::int AS total_count
          FROM jobs j
         WHERE j.company_id::text = $2
@@ -355,7 +355,7 @@ class AIDataService {
     const [jobsRes, attendanceRes, leavesRes, materialsRes] = await Promise.all([
       // Employee's assigned jobs
       pool.query(
-        `SELECT id, title, status, priority, stage, created_at 
+        `SELECT id, title, status, priority, created_at
          FROM jobs 
          WHERE company_id::text = $2
            AND (assigned_employee_id::text = $1 OR assigned_to::text = $1)

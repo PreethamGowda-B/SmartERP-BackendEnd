@@ -9,7 +9,7 @@ class EmployeePlugin extends BasePlugin {
     this.tools["get_employees"] = {
       name: "get_employees",
       description: "Retrieves list of employees for the company, with optional department/status filtering.",
-      allowedRoles: ["owner", "hr", "admin", "employee"],
+      allowedRoles: ["owner", "hr", "admin"],
       isDestructive: false,
       parameters: {
         type: "object",

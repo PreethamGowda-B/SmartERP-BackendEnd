@@ -451,6 +451,7 @@ router.post(
           history,
           context,
           systemPromptOverride: systemPrompt,
+          modelScope: scope,
         });
 
         finalResult.autoSelectedModel = autoSelectedModel;
@@ -466,6 +467,7 @@ router.post(
               history,
               context,
               systemPromptOverride: systemPrompt,
+              modelScope: scope,
             });
             return { scope, result };
           } catch (scopeErr) {
@@ -563,6 +565,14 @@ router.post(
         diagnostic.databaseMessage = String(error.message || '').slice(0, 240);
         if (error.column) diagnostic.column = String(error.column).slice(0, 100);
         if (error.table) diagnostic.table = String(error.table).slice(0, 100);
+      }
+      // Tool failures are wrapped to keep the public error stable. Preserve
+      // only safe PostgreSQL metadata from the cause so schema errors remain
+      // diagnosable without logging prompts, SQL parameters, or credentials.
+      if (typeof error?.cause?.code === 'string' && /^[0-9A-Z]{5}$/.test(error.cause.code)) {
+        diagnostic.cause = { code: error.cause.code };
+        if (error.cause.column) diagnostic.cause.column = String(error.cause.column).slice(0, 100);
+        if (error.cause.table) diagnostic.cause.table = String(error.cause.table).slice(0, 100);
       }
       console.error("❌ SmartERP AI Agent Error:", diagnostic);
       const response = getAiErrorResponse(error);

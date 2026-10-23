@@ -207,9 +207,9 @@ router.post(
         if (!companyId) {
           return res.status(403).json({ message: 'Company access context is unavailable for this account.' });
         }
-        const ownerSummary = await AIDataService.getOwnerDashboardSummary({ companyId });
-        const completedCount = ownerSummary.jobs?.completed || 0;
-        const totalJobs = ownerSummary.jobs?.total || 0;
+        const jobCounts = await AIDataService.getCompanyJobStatusCounts({ companyId });
+        const completedCount = jobCounts.completed || 0;
+        const totalJobs = Object.values(jobCounts).reduce((sum, count) => sum + count, 0);
 
         return res.json({
           text: `In your company, **${completedCount}** out of **${totalJobs}** total jobs are currently completed.`,
@@ -227,6 +227,35 @@ router.post(
           autoSelectedModel: "General Assistant",
           suggestedFollowUps: ["View in-progress jobs", "Check today's attendance", "Audit low stock inventory"],
           telemetry: { latencyMs: Date.now() - startTime }
+        });
+      }
+
+      // ── Active Jobs Resolver ────────────────────────────────────────────────
+      if (
+        canUseAiFastPath("jobs", role) &&
+        (promptLower.includes("active job") || promptLower.includes("in-progress job") || promptLower.includes("in progress job"))
+      ) {
+        if (!companyId) {
+          return res.status(403).json({ message: 'Company access context is unavailable for this account.' });
+        }
+        const activeCount = role === "employee"
+          ? await AIDataService.getEmployeeActiveJobCount({ userId: req.user?.userId || req.user?.id, companyId })
+          : await (async () => {
+              const counts = await AIDataService.getCompanyJobStatusCounts({ companyId });
+              return Object.entries(counts).reduce(
+                (sum, [status, count]) => sum + (["completed", "closed", "cancelled"].includes(status) ? 0 : count),
+                0
+              );
+            })();
+
+        return res.json({
+          text: `There ${activeCount === 1 ? 'is' : 'are'} **${activeCount}** active job(s)${role === "employee" ? ' assigned to you' : ' in your company'}.`,
+          widget: { type: "KPI_SUMMARY", title: "Active Jobs", metrics: [{ label: "Active Jobs", value: activeCount }] },
+          navigation: { path: role === "employee" ? "/employee/tasks" : "/owner/jobs", label: "View Active Jobs" },
+          confidenceScore: 1.0,
+          sources: ["Jobs Module (Live PostgreSQL)"],
+          autoSelectedModel: "Jobs AI",
+          telemetry: { latencyMs: Date.now() - startTime },
         });
       }
 
@@ -283,8 +312,7 @@ router.post(
         if (!companyId) {
           return res.status(403).json({ message: 'Company access context is unavailable for this account.' });
         }
-        const ownerSummary = await AIDataService.getOwnerDashboardSummary({ companyId });
-        const lowStockCount = ownerSummary.inventory?.low_stock_count || 0;
+        const lowStockCount = await AIDataService.getCompanyLowStockCount({ companyId });
 
         return res.json({
           text: lowStockCount > 0
@@ -318,10 +346,10 @@ router.post(
         if (!companyId) {
           return res.status(403).json({ message: 'Company access context is unavailable for this account.' });
         }
-        const ownerSummary = await AIDataService.getOwnerDashboardSummary({ companyId });
-        const todayRev = ownerSummary.revenue?.today || 0;
-        const monthRev = ownerSummary.revenue?.this_month || 0;
-        const pendingInvoices = ownerSummary.invoices?.pending_count || 0;
+        const financialSummary = await AIDataService.getCompanyInvoiceSummary({ companyId });
+        const todayRev = financialSummary.todayRevenue;
+        const monthRev = financialSummary.monthRevenue;
+        const pendingInvoices = financialSummary.pending;
 
         return res.json({
           text: `Financial & GST Snapshot: Today's realized revenue is **₹${todayRev.toLocaleString('en-IN')}** (Month-to-Date: **₹${monthRev.toLocaleString('en-IN')}**). There are **${pendingInvoices}** open/pending invoice records.`,
@@ -341,6 +369,37 @@ router.post(
           suggestedFollowUps: ["Today's attendance", "Payroll summary", "Inventory status"],
           telemetry: { latencyMs: Date.now() - startTime }
         });
+      }
+
+      // ── Pending Leave Resolver ──────────────────────────────────────────────
+      if (
+        promptLower.includes("pending leave") ||
+        promptLower.includes("leave requests pending") ||
+        promptLower.includes("leave request waiting")
+      ) {
+        const normalizedRole = String(role || "").toLowerCase();
+        if (["owner", "admin", "hr", "employee"].includes(normalizedRole)) {
+          if (!companyId) {
+            return res.status(403).json({ message: 'Company access context is unavailable for this account.' });
+          }
+          const personal = normalizedRole === "employee";
+          const pendingCount = await AIDataService.getPendingLeaveCount({
+            companyId,
+            userId: req.user?.userId || req.user?.id,
+            personal,
+          });
+          return res.json({
+            text: personal
+              ? `You have **${pendingCount}** leave request(s) awaiting review.`
+              : `There ${pendingCount === 1 ? 'is' : 'are'} **${pendingCount}** leave request(s) awaiting review in your company.`,
+            widget: { type: "KPI_SUMMARY", title: "Pending Leave Requests", metrics: [{ label: "Awaiting Review", value: pendingCount }] },
+            navigation: { path: normalizedRole === "hr" ? "/hr/requests" : normalizedRole === "employee" ? "/employee/time" : "/owner/attendance", label: "View Leave Requests" },
+            confidenceScore: 1.0,
+            sources: ["Leave Management (Live PostgreSQL)"],
+            autoSelectedModel: "HR Assistant",
+            telemetry: { latencyMs: Date.now() - startTime },
+          });
+        }
       }
 
       // ── Contact Support / Help Resolver ──────────────────────────────────────
@@ -418,7 +477,9 @@ router.post(
         resolvedScopes = ["general"];
       }
 
-      // 7. Execute ReAct Engine per scope (sequential multi-agent)
+      // 7. Execute independent selected scopes concurrently. The provider limiter
+      // still caps global Groq concurrency, while parallel scope execution avoids
+      // adding each agent's latency one after another.
       let finalResult;
 
       if (resolvedScopes.length <= 1) {
@@ -437,26 +498,25 @@ router.post(
         finalResult.activeModelScope = scope;
         finalResult.suggestedFollowUps = ContextEngine.getSuggestedFollowUps(scope);
       } else {
-        // Multi-agent: run sequentially per scope, combine responses
-        const scopeResults = [];
-        for (const scope of resolvedScopes) {
+        // Multi-agent: run the selected scopes concurrently, then combine responses.
+        const scopeResults = await Promise.all(resolvedScopes.map(async (scope) => {
           try {
             const systemPrompt = ContextEngine.generateSystemPrompt(context, scope);
-            const scopeResult = await ReActEngine.run({
+            const result = await ReActEngine.run({
               userPrompt: cleanMessage,
               history,
               context,
               systemPromptOverride: systemPrompt,
             });
-            scopeResults.push({ scope, result: scopeResult });
+            return { scope, result };
           } catch (scopeErr) {
-            console.warn(`⚠️ Multi-agent scope '${scope}' failed:`, scopeErr.message);
-            scopeResults.push({
+            console.warn(`⚠️ Multi-agent scope '${scope}' failed:`, scopeErr?.code || scopeErr?.name || 'provider_error');
+            return {
               scope,
               result: { text: `${scope} AI encountered an issue.`, sources: [], confidenceScore: 0 },
-            });
+            };
           }
-        }
+        }));
 
         // Combine multi-scope responses
         const combinedText = scopeResults

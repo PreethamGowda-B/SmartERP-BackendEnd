@@ -65,6 +65,11 @@ class GroqProvider extends BaseAIProvider {
     }
     this.client = new Groq({
       apiKey: process.env.GROQ_API_KEY,
+      // Keep provider latency bounded. The SDK defaults to 60 seconds and two
+      // retries, which can outlive the browser request and multiply load when
+      // the user retries an unanswered prompt.
+      timeout: 10000,
+      maxRetries: 0,
     });
     this.defaultModel = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
   }
@@ -80,7 +85,11 @@ class GroqProvider extends BaseAIProvider {
         return m;
       });
 
-      const candidateModels = model ? [model] : [this.defaultModel, ...FALLBACK_MODELS.filter(m => m !== this.defaultModel)];
+      // One fallback is enough for a model-specific issue. Trying every model
+      // in sequence made a single prompt wait through several provider calls.
+      const candidateModels = model
+        ? [model]
+        : [...new Set([this.defaultModel, ...FALLBACK_MODELS.filter(m => m !== this.defaultModel)])].slice(0, 2);
       let lastError = null;
 
       for (const modelToTry of candidateModels) {
@@ -138,6 +147,8 @@ class GroqProvider extends BaseAIProvider {
         lastError = err;
         const errStr = JSON.stringify(err || {});
         const errMsg = err?.message || String(err || "");
+        const status = Number(err?.status || err?.statusCode || err?.error?.status || 0);
+        const isTimeout = err?.name === "AbortError" || err?.name === "TimeoutError" || err?.code === "ETIMEDOUT";
 
         // Intercept failed_generation 400 errors containing tool call pseudo-XML or JSON output
         if (err?.error?.error?.failed_generation || errStr.includes("failed_generation") || errStr.includes("tool_<function") || errMsg.includes("<function=") || errStr.includes("tool call validation failed")) {
@@ -167,6 +178,9 @@ class GroqProvider extends BaseAIProvider {
             };
           }
         }
+        // Credentials, account quota, and timeouts affect the provider/account,
+        // not just the selected model. Trying another model cannot resolve them.
+        if (status === 401 || status === 403 || status === 429 || isTimeout) break;
         console.warn(`⚠️ Groq model '${modelToTry}' failed (${errMsg}) — trying next candidate...`);
       }
     }

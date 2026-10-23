@@ -2,6 +2,94 @@ const { pool } = require("../db");
 const AttendancePolicy = require('./attendancePolicyService');
 
 class AIDataService {
+  /** Narrow company-scoped job counts for common AI questions. */
+  static async getCompanyJobStatusCounts({ companyId }) {
+    if (!companyId) throw new Error("Company ID is required.");
+    const result = await pool.query(
+      `SELECT LOWER(COALESCE(status, 'open')) AS status, COUNT(*)::int AS count
+         FROM jobs
+        WHERE company_id::text = $1
+        GROUP BY LOWER(COALESCE(status, 'open'))`,
+      [String(companyId)]
+    );
+    return Object.fromEntries((result.rows || []).map((row) => [row.status, Number(row.count) || 0]));
+  }
+
+  /** Employee-only active job count, restricted to their existing assignments. */
+  static async getEmployeeActiveJobCount({ userId, companyId }) {
+    if (!userId || !companyId) throw new Error("User and company IDs are required.");
+    const result = await pool.query(
+      `SELECT COUNT(*)::int AS active_count
+         FROM jobs
+        WHERE company_id::text = $2
+          AND (assigned_employee_id::text = $1 OR employee_id::text = $1)
+          AND LOWER(COALESCE(status, 'open')) NOT IN ('completed', 'closed', 'cancelled')`,
+      [String(userId), String(companyId)]
+    );
+    return Number(result.rows?.[0]?.active_count) || 0;
+  }
+
+  /** Narrow company-scoped low-stock count without loading unrelated modules. */
+  static async getCompanyLowStockCount({ companyId }) {
+    if (!companyId) throw new Error("Company ID is required.");
+    const result = await pool.query(
+      `SELECT COUNT(*)::int AS low_stock_count
+         FROM inventory
+        WHERE company_id::text = $1 AND quantity <= min_stock_level`,
+      [String(companyId)]
+    );
+    return Number(result.rows?.[0]?.low_stock_count) || 0;
+  }
+
+  /** Invoice-only summary, avoiding failures in unrelated attendance/HR queries. */
+  static async getCompanyInvoiceSummary({ companyId }) {
+    if (!companyId) throw new Error("Company ID is required.");
+    const [result, payments] = await Promise.all([pool.query(
+      `SELECT COUNT(*)::int AS total_invoices,
+              COUNT(*) FILTER (WHERE status = 'issued')::int AS pending_count,
+              COALESCE(SUM(CASE WHEN status = 'issued' THEN total_amount ELSE 0 END), 0) AS pending_amount,
+              COUNT(*) FILTER (WHERE status = 'issued' AND due_date < CURRENT_DATE)::int AS overdue_count
+         FROM invoices
+        WHERE company_id::text = $1`,
+      [String(companyId)]
+    ), pool.query(
+      `SELECT COALESCE(SUM(CASE WHEN DATE(created_at) = CURRENT_DATE THEN amount ELSE 0 END), 0) AS today_revenue,
+              COALESCE(SUM(CASE WHEN DATE_TRUNC('month', created_at) = DATE_TRUNC('month', CURRENT_DATE) THEN amount ELSE 0 END), 0) AS month_revenue
+         FROM payments
+        WHERE company_id::text = $1`,
+      [String(companyId)]
+    )]);
+    const row = result.rows?.[0] || {};
+    const paymentRow = payments.rows?.[0] || {};
+    return {
+      total: Number(row.total_invoices) || 0,
+      pending: Number(row.pending_count) || 0,
+      pendingAmount: Number(row.pending_amount) || 0,
+      overdue: Number(row.overdue_count) || 0,
+      todayRevenue: Number(paymentRow.today_revenue) || 0,
+      monthRevenue: Number(paymentRow.month_revenue) || 0,
+    };
+  }
+
+  /** Pending leave count for authorized HR roles or an employee's own requests. */
+  static async getPendingLeaveCount({ companyId, userId = null, personal = false }) {
+    if (!companyId || (personal && !userId)) throw new Error("User and company IDs are required.");
+    const result = personal
+      ? await pool.query(
+          `SELECT COUNT(*)::int AS pending_count
+             FROM leave_requests
+            WHERE company_id::text = $1 AND user_id::text = $2 AND status = 'pending'`,
+          [String(companyId), String(userId)]
+        )
+      : await pool.query(
+          `SELECT COUNT(*)::int AS pending_count
+             FROM leave_requests
+            WHERE company_id::text = $1 AND status = 'pending'`,
+          [String(companyId)]
+        );
+    return Number(result.rows?.[0]?.pending_count) || 0;
+  }
+
   /**
    * Company-wide attendance counts for roles allowed to view workforce data.
    * Keep this query narrow: the AI attendance resolver must not read unrelated

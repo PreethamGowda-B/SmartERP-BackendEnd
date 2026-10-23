@@ -9,6 +9,7 @@ const { assertConversationOwner, getAuthenticatedIdentity } = require('../servic
 const { assertDocumentAction } = require('../services/aiDocumentAccessPolicy');
 const { prepareTextDocument, extractPlainText, chunkText } = require('../services/aiDocumentPipeline');
 const { createAiPersistenceRepository, canonicalHash } = require('../services/aiPersistence');
+const { aiPersistencePoliciesAreReady } = require('../services/aiPersistencePolicyReadiness');
 const { pool } = require('../db');
 const SecurityShield = require('../ai/gateway/security.shield');
 
@@ -26,11 +27,11 @@ function config() {
   return { configured, conversationDays, documentDays };
 }
 
-async function schemaIsReady(user) {
+async function schemaIsReady(user, db = pool) {
   const companyId = String(user.companyId || user.company_id || '');
   const userId = String(user.id || user.userId || '');
   if (!companyId || !UUID_RE.test(userId)) return false;
-  const result = await pool.query(`
+  const result = await db.query(`
     SELECT current_user='smarterp_app' AS app_role,
       current_setting('app.current_user_id',true)=$1 AS user_context,
       current_setting('app.current_company_id',true)=$2 AS company_context,
@@ -46,10 +47,13 @@ async function schemaIsReady(user) {
         ('ai_documents_owner_scope','ai_document_chunks_owner_scope','ai_conversations_owner_scope','ai_conversation_messages_owner_scope'))=4
         FROM pg_policies WHERE schemaname='public' AND tablename IN
         ('ai_documents','ai_document_chunks','ai_conversations','ai_conversation_messages')) AS policies,
-      (SELECT count(*)=1 FROM pg_policies WHERE schemaname='public' AND tablename='ai_documents' AND policyname='ai_documents_owner_scope' AND cmd='ALL' AND roles=ARRAY['public']::name[] AND coalesce(qual,'') ILIKE '%app.current_company_id%' AND coalesce(qual,'') ILIKE '%app.current_role%' AND coalesce(qual,'') ILIKE '%owner%' AND coalesce(qual,'') ILIKE '%admin%' AND coalesce(with_check,'') ILIKE '%app.current_company_id%' AND coalesce(with_check,'') ILIKE '%app.current_role%' AND coalesce(with_check,'') ILIKE '%owner%' AND coalesce(with_check,'') ILIKE '%admin%' AND lower(coalesce(qual,'') || coalesce(with_check,'')) NOT LIKE '% or %') AS document_policy,
-      (SELECT count(*)=1 FROM pg_policies WHERE schemaname='public' AND tablename='ai_document_chunks' AND policyname='ai_document_chunks_owner_scope' AND cmd='ALL' AND roles=ARRAY['public']::name[] AND coalesce(qual,'') ILIKE '%app.current_company_id%' AND coalesce(qual,'') ILIKE '%app.current_role%' AND coalesce(qual,'') ILIKE '%owner%' AND coalesce(qual,'') ILIKE '%admin%' AND coalesce(with_check,'') ILIKE '%app.current_company_id%' AND coalesce(with_check,'') ILIKE '%app.current_role%' AND coalesce(with_check,'') ILIKE '%owner%' AND coalesce(with_check,'') ILIKE '%admin%' AND lower(coalesce(qual,'') || coalesce(with_check,'')) NOT LIKE '% or %') AS chunk_policy,
-      (SELECT count(*)=1 FROM pg_policies WHERE schemaname='public' AND tablename='ai_conversations' AND policyname='ai_conversations_owner_scope' AND cmd='ALL' AND roles=ARRAY['public']::name[] AND coalesce(qual,'') ILIKE '%app.current_company_id%' AND coalesce(qual,'') ILIKE '%app.current_user_id%' AND coalesce(with_check,'') ILIKE '%app.current_company_id%' AND coalesce(with_check,'') ILIKE '%app.current_user_id%' AND lower(coalesce(qual,'') || coalesce(with_check,'')) NOT LIKE '% or %') AS conversation_policy,
-      (SELECT count(*)=1 FROM pg_policies WHERE schemaname='public' AND tablename='ai_conversation_messages' AND policyname='ai_conversation_messages_owner_scope' AND cmd='ALL' AND roles=ARRAY['public']::name[] AND coalesce(qual,'') ILIKE '%app.current_company_id%' AND coalesce(qual,'') ILIKE '%app.current_user_id%' AND coalesce(with_check,'') ILIKE '%app.current_company_id%' AND coalesce(with_check,'') ILIKE '%app.current_user_id%' AND lower(coalesce(qual,'') || coalesce(with_check,'')) NOT LIKE '% or %') AS message_policy,
+      COALESCE((SELECT json_agg(json_build_object(
+        'tableName', tablename, 'policyName', policyname, 'permissive', permissive,
+        'roles', roles, 'command', cmd, 'using', qual, 'withCheck', with_check
+      ) ORDER BY tablename)
+        FROM pg_policies
+        WHERE schemaname='public' AND tablename IN
+          ('ai_documents','ai_document_chunks','ai_conversations','ai_conversation_messages')), '[]'::json) AS ai_policies,
       (SELECT count(*)=2 FROM pg_indexes WHERE schemaname='public' AND indexname IN ('idx_ai_conversations_create_request_key','idx_ai_conversation_messages_user_request_key') AND lower(indexdef) LIKE '%create unique index%' AND lower(indexdef) LIKE '% where %') AS idempotency_indexes,
       (NOT EXISTS (SELECT 1 FROM (VALUES
         ('ai_documents','id','uuid'),('ai_documents','company_id','text'),('ai_documents','uploaded_by','uuid'),
@@ -83,7 +87,8 @@ async function schemaIsReady(user) {
     [userId, companyId]
   );
   const row = result.rows[0] || {};
-  return ['app_role','user_context','company_context','documents','chunks','conversations','messages','documents_rls','chunks_rls','conversations_rls','messages_rls','policies','document_policy','chunk_policy','conversation_policy','message_policy','idempotency_indexes','critical_columns','documents_grants','chunks_grants','conversations_grants','messages_grants','least_privilege'].every((key) => row[key] === true);
+  return ['app_role','user_context','company_context','documents','chunks','conversations','messages','documents_rls','chunks_rls','conversations_rls','messages_rls','policies','idempotency_indexes','critical_columns','documents_grants','chunks_grants','conversations_grants','messages_grants','least_privilege'].every((key) => row[key] === true)
+    && aiPersistencePoliciesAreReady(row.ai_policies);
 }
 
 function sendError(res, error) {
@@ -293,7 +298,7 @@ router.get('/documents/:id', ...protectedRoute, requireUuidParam, enabled, handl
 
 router.post('/documents/:id/reindex', ...protectedRoute, requireUuidParam, enabled, handle(async (req, res) => {
   const who = identity(req);
-  const result = await pool.query(`SELECT id, company_id AS "companyId", document_family_id, version, deleted_at AS "deletedAt", superseded_by AS "supersededBy", extracted_text, title FROM public.ai_documents WHERE id=$1::uuid AND company_id=$2 AND deleted_at IS NULL AND superseded_by IS NULL LIMIT 1`, [req.params.id, who.companyId]);
+  const result = await pool.query(`SELECT id, company_id AS "companyId", document_family_id, version, deleted_at AS "deletedAt", superseded_by AS "supersededBy", extracted_text, title FROM public.ai_documents WHERE id=$1::uuid AND company_id=$2 AND deleted_at IS NULL AND superseded_by IS NULL AND (retention_until IS NULL OR retention_until > now()) LIMIT 1`, [req.params.id, who.companyId]);
   const document = result.rows[0];
   assertDocumentAction({ user: req.user, companyId: who.companyId, action: 'reindex', document });
   const chunks = chunkText(document.extracted_text || '');
@@ -306,8 +311,10 @@ router.post('/documents/:id/reindex', ...protectedRoute, requireUuidParam, enabl
     for (const chunk of chunks) await client.query(`INSERT INTO public.ai_document_chunks(company_id,document_id,chunk_index,content,source_metadata) VALUES($1,$2::uuid,$3,$4,$5::jsonb)`, [who.companyId, document.id, chunk.ordinal, chunk.content, JSON.stringify({ startOffset: chunk.startOffset, endOffset: chunk.endOffset })]);
     const active = await client.query(`SELECT id,version FROM public.ai_documents WHERE company_id=$1 AND document_family_id=$2::uuid AND id<>$3::uuid AND deleted_at IS NULL AND superseded_by IS NULL AND processing_status='ready' ORDER BY version DESC LIMIT 1 FOR UPDATE`, [who.companyId, document.document_family_id, document.id]);
     if (active.rows[0] && Number(active.rows[0].version) > Number(document.version)) {
+      await client.query('DELETE FROM public.ai_document_chunks WHERE document_id=$1::uuid AND company_id=$2', [document.id, who.companyId]);
       await client.query(`UPDATE public.ai_documents SET superseded_by=$3::uuid,updated_at=now() WHERE id=$1::uuid AND company_id=$2`, [document.id, who.companyId, active.rows[0].id]);
     } else if (active.rows[0]) {
+      await client.query('DELETE FROM public.ai_document_chunks WHERE document_id=$1::uuid AND company_id=$2', [active.rows[0].id, who.companyId]);
       await client.query(`UPDATE public.ai_documents SET superseded_by=$3::uuid,updated_at=now() WHERE id=$1::uuid AND company_id=$2`, [active.rows[0].id, who.companyId, document.id]);
     }
     await client.query(`UPDATE public.ai_documents SET processing_status='ready', processed_at=now(), safe_error_code=NULL, updated_at=now() WHERE id=$1::uuid AND company_id=$2`, [document.id, who.companyId]);
@@ -319,7 +326,7 @@ router.post('/documents/:id/reindex', ...protectedRoute, requireUuidParam, enabl
 
 router.delete('/documents/:id', ...protectedRoute, requireUuidParam, enabled, handle(async (req, res) => {
   const who = identity(req);
-  const result = await pool.query(`SELECT id, company_id AS "companyId", deleted_at AS "deletedAt", superseded_by AS "supersededBy" FROM public.ai_documents WHERE id=$1::uuid AND company_id=$2 AND deleted_at IS NULL AND superseded_by IS NULL LIMIT 1`, [req.params.id, who.companyId]);
+  const result = await pool.query(`SELECT id, company_id AS "companyId", deleted_at AS "deletedAt", superseded_by AS "supersededBy" FROM public.ai_documents WHERE id=$1::uuid AND company_id=$2 AND deleted_at IS NULL AND superseded_by IS NULL AND (retention_until IS NULL OR retention_until > now()) LIMIT 1`, [req.params.id, who.companyId]);
   assertDocumentAction({ user: req.user, companyId: who.companyId, action: 'delete', document: result.rows[0] });
   if (!await repository.deleteDocument({ id: req.params.id, companyId: who.companyId })) return res.status(404).json({ code: 'AI_DOCUMENT_NOT_FOUND', error: 'Document not found.' });
   res.status(204).end();

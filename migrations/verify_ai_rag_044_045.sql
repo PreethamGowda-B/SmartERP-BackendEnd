@@ -1,4 +1,4 @@
--- Read-only verification queries for manual Supabase SQL Editor use.
+-- Read-only verification queries for manual isolated-database use.
 -- Confirm the project reference in the Supabase Dashboard before running.
 -- This file performs SELECTs only; it does not apply migrations or write data.
 
@@ -154,5 +154,106 @@ FROM (
            AND with_check NOT ILIKE '%d.superseded_by%')
 ) AS checks
 ORDER BY check_name;
+
+-- 8) Optional migration 046 maintenance foundation. These checks are expected
+-- to be false/not present before 046. After 046, only the executor role should
+-- execute the function; no scheduler membership is provisioned by the migration.
+SELECT check_name, result
+FROM (
+  SELECT 'maintenance function exists' AS check_name,
+         to_regprocedure('smarterp_ai_maintenance.purge_expired_documents(integer)') IS NOT NULL AS result
+  UNION ALL
+  SELECT 'maintenance selection indexes present',
+         EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname='public'
+           AND indexname='idx_ai_documents_retention_until'
+           AND indexdef ILIKE '%(retention_until, id)%'
+           AND indexdef ILIKE '%WHERE (retention_until IS NOT NULL)%')
+         AND EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname='public'
+           AND indexname='idx_ai_documents_company_superseded_by'
+           AND indexdef ILIKE '%(company_id, superseded_by)%'
+           AND indexdef ILIKE '%WHERE (superseded_by IS NOT NULL)%')
+  UNION ALL
+  SELECT 'maintenance owner is non-login, non-superuser BYPASSRLS',
+         EXISTS (SELECT 1 FROM pg_roles WHERE rolname='smarterp_ai_retention_owner'
+           AND NOT rolcanlogin AND NOT rolsuper AND rolbypassrls)
+  UNION ALL
+  SELECT 'maintenance executor is non-login and NOBYPASSRLS',
+         EXISTS (SELECT 1 FROM pg_roles WHERE rolname='smarterp_ai_retention_executor'
+           AND NOT rolcanlogin AND NOT rolsuper AND NOT rolbypassrls)
+  UNION ALL
+  SELECT 'maintenance function owned by dedicated role and SECURITY DEFINER',
+         EXISTS (SELECT 1 FROM pg_proc p
+           WHERE p.oid=to_regprocedure('smarterp_ai_maintenance.purge_expired_documents(integer)')
+             AND pg_get_userbyid(p.proowner)='smarterp_ai_retention_owner'
+             AND p.prosecdef AND p.proconfig @> ARRAY['search_path=pg_catalog'])
+  UNION ALL
+  SELECT 'application cannot execute maintenance function',
+         CASE WHEN to_regprocedure('smarterp_ai_maintenance.purge_expired_documents(integer)') IS NULL
+                    OR NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='smarterp_app')
+              THEN false
+              ELSE NOT has_function_privilege('smarterp_app',
+                'smarterp_ai_maintenance.purge_expired_documents(integer)','EXECUTE') END
+  UNION ALL
+  SELECT 'executor can execute maintenance function',
+         CASE WHEN to_regprocedure('smarterp_ai_maintenance.purge_expired_documents(integer)') IS NULL
+                    OR NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='smarterp_ai_retention_executor')
+              THEN false
+              ELSE has_function_privilege('smarterp_ai_retention_executor',
+                'smarterp_ai_maintenance.purge_expired_documents(integer)','EXECUTE') END
+  UNION ALL
+  SELECT 'application cannot assume maintenance roles',
+         CASE WHEN NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='smarterp_app')
+                    OR NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='smarterp_ai_retention_owner')
+                    OR NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='smarterp_ai_retention_executor')
+              THEN false
+              ELSE NOT pg_has_role('smarterp_app','smarterp_ai_retention_owner','MEMBER')
+                   AND NOT pg_has_role('smarterp_app','smarterp_ai_retention_executor','MEMBER') END
+  UNION ALL
+  SELECT 'application still has no document DELETE or table TRUNCATE',
+         CASE WHEN NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='smarterp_app') THEN false
+              ELSE NOT has_table_privilege('smarterp_app','public.ai_documents','DELETE')
+                   AND NOT has_table_privilege('smarterp_app','public.ai_documents','TRUNCATE')
+                   AND NOT has_table_privilege('smarterp_app','public.ai_document_chunks','TRUNCATE') END
+  UNION ALL
+  SELECT 'function owner has scoped column reads and DELETE only',
+         CASE WHEN NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='smarterp_ai_retention_owner') THEN false
+              ELSE has_table_privilege('smarterp_ai_retention_owner','public.ai_documents','DELETE')
+                   AND has_table_privilege('smarterp_ai_retention_owner','public.ai_document_chunks','DELETE')
+                   AND has_column_privilege('smarterp_ai_retention_owner','public.ai_documents','id','SELECT')
+                   AND has_column_privilege('smarterp_ai_retention_owner','public.ai_documents','company_id','SELECT')
+                   AND has_column_privilege('smarterp_ai_retention_owner','public.ai_documents','retention_until','SELECT')
+                   AND has_column_privilege('smarterp_ai_retention_owner','public.ai_documents','superseded_by','SELECT')
+                   AND has_column_privilege('smarterp_ai_retention_owner','public.ai_document_chunks','id','SELECT')
+                   AND has_column_privilege('smarterp_ai_retention_owner','public.ai_document_chunks','document_id','SELECT')
+                   AND has_column_privilege('smarterp_ai_retention_owner','public.ai_document_chunks','company_id','SELECT')
+                   AND NOT has_table_privilege('smarterp_ai_retention_owner','public.ai_documents','SELECT')
+                   AND NOT has_table_privilege('smarterp_ai_retention_owner','public.ai_document_chunks','SELECT')
+                   AND NOT has_table_privilege('smarterp_ai_retention_owner','public.ai_documents','INSERT')
+                   AND NOT has_table_privilege('smarterp_ai_retention_owner','public.ai_documents','UPDATE')
+                   AND NOT has_table_privilege('smarterp_ai_retention_owner','public.ai_document_chunks','INSERT')
+                   AND NOT has_table_privilege('smarterp_ai_retention_owner','public.ai_document_chunks','UPDATE')
+                   AND NOT has_table_privilege('smarterp_ai_retention_owner','public.ai_documents','TRUNCATE')
+                   AND NOT has_table_privilege('smarterp_ai_retention_owner','public.ai_document_chunks','TRUNCATE')
+                   AND NOT has_column_privilege('smarterp_ai_retention_owner','public.ai_documents','extracted_text','SELECT')
+                   AND NOT has_column_privilege('smarterp_ai_retention_owner','public.ai_document_chunks','content','SELECT') END
+) AS maintenance_checks
+ORDER BY check_name;
+
+-- 9) Memberships and security-definer function configuration for review.
+SELECT granted.rolname AS granted_role, member.rolname AS member_role,
+       m.admin_option
+FROM pg_auth_members m
+JOIN pg_roles granted ON granted.oid=m.roleid
+JOIN pg_roles member ON member.oid=m.member
+WHERE granted.rolname IN ('smarterp_ai_retention_owner','smarterp_ai_retention_executor')
+ORDER BY granted_role, member_role;
+
+SELECT p.oid::regprocedure AS function_name,
+       pg_get_userbyid(p.proowner) AS function_owner,
+       p.prosecdef AS security_definer,
+       p.proconfig AS function_settings,
+       pg_get_functiondef(p.oid) AS function_definition
+FROM pg_proc p
+WHERE p.oid=to_regprocedure('smarterp_ai_maintenance.purge_expired_documents(integer)');
 
 COMMIT;

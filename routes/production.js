@@ -647,7 +647,7 @@ router.post('/orders/:orderId/packing-records', route(async (req) => {
     const quantity = Number(req.body?.quantity);
     const packageCount = Number(req.body?.packageCount || 1);
     if (!Number.isInteger(packageCount) || packageCount <= 0 || packageCount > 10000) { const e = new Error('Package count must be a positive whole number.'); e.status=400; throw e; }
-    const inspection = await client.query(`SELECT id,accepted_quantity FROM production_inspections WHERE id::text=$1::text AND company_id::text=$2::text AND order_id=$3 FOR UPDATE`, [inspectionId,user.companyId,order.id]);
+    const inspection = await client.query(`SELECT id,accepted_quantity FROM production_inspections WHERE id::text=$1::text AND company_id::text=$2::text AND order_id=$3`, [inspectionId,user.companyId,order.id]);
     if (!inspection.rows.length || Number(inspection.rows[0].accepted_quantity) <= 0) { const e = new Error('Select a quality-approved inspection with accepted quantity.'); e.status=400; throw e; }
     const packed = await client.query(`SELECT
       COALESCE((SELECT SUM(quantity) FROM production_packing_records WHERE company_id::text=$1::text AND inspection_id=$2),0) AS inspection_packed,
@@ -730,7 +730,7 @@ router.post('/dispatches/:dispatchId/corrections', route(async (req) => {
     const reason = requireText(req.body?.reason, 'Correction reason', 2000);
     const delta = Number(req.body?.quantityDelta);
     if (!Number.isFinite(delta) || delta === 0 || Math.round(delta * 1000) !== delta * 1000) { const e = new Error('Correction quantity must be non-zero with at most three decimal places.'); e.status=400; throw e; }
-    const dispatch = await client.query(`SELECT d.*,o.status FROM production_dispatches d JOIN production_orders o ON o.id=d.order_id AND o.company_id::text=d.company_id::text WHERE d.id::text=$1::text AND d.company_id::text=$2::text FOR UPDATE OF d,o`, [req.params.dispatchId,user.companyId]);
+    const dispatch = await client.query(`SELECT d.*,o.status FROM production_dispatches d JOIN production_orders o ON o.id=d.order_id AND o.company_id::text=d.company_id::text WHERE d.id::text=$1::text AND d.company_id::text=$2::text FOR UPDATE OF o`, [req.params.dispatchId,user.companyId]);
     if (!dispatch.rows.length) { const e = new Error('Dispatch was not found.'); e.status=404; throw e; }
     const record = dispatch.rows[0];
     const totals = await client.query(`SELECT COALESCE((SELECT SUM(accepted_quantity) FROM production_inspections WHERE company_id::text=$1::text AND order_id=$2),0) accepted, COALESCE((SELECT SUM(quantity) FROM production_dispatches WHERE company_id::text=$1::text AND order_id=$2),0) dispatched, COALESCE((SELECT SUM(quantity_delta) FROM production_dispatch_adjustments WHERE company_id::text=$1::text AND order_id=$2),0) adjustments`, [user.companyId,record.order_id]);

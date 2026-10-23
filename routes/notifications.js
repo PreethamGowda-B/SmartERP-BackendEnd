@@ -98,11 +98,17 @@ router.get('/sse', authenticateToken, requireInternalNotificationPrincipal, asyn
   console.log(`📡 SSE connection established for user ${userId}`);
 
   res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no');
+  if (typeof res.flushHeaders === 'function') {
+    res.flushHeaders();
+  }
 
   res.write(`data: ${JSON.stringify({ type: 'connected', message: 'SSE connection established' })}\n\n`);
+  if (typeof res.flush === 'function') {
+    res.flush();
+  }
 
   // Mark user as online in Redis — reuse shared singleton, no new connection needed
   const companyId = authorizedCompanyId || '';
@@ -139,6 +145,9 @@ router.get('/sse', authenticateToken, requireInternalNotificationPrincipal, asyn
   const heartbeatInterval = setInterval(() => {
     try {
       res.write(`data: ${JSON.stringify({ type: 'ping', timestamp: Date.now() })}\n\n`);
+      if (typeof res.flush === 'function') {
+        res.flush();
+      }
     } catch {
       clearInterval(heartbeatInterval);
     }

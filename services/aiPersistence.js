@@ -3,6 +3,9 @@
 const crypto = require('crypto');
 const { normalizeConversationPage, getRetentionCutoff } = require('./aiConversationPolicy');
 
+const MAX_DOCUMENT_VERSION = 2147483647;
+const MAX_DOCUMENT_VERSION_ALLOCATION_ATTEMPTS = 100;
+
 function safeTitle(value, fallback = 'New conversation') {
   const title = String(value || '').replace(/[\u0000-\u001f\u007f]/g, ' ').trim();
   return (title || fallback).slice(0, 255);
@@ -313,18 +316,35 @@ function createAiPersistenceRepository({ pool, now = () => new Date() }) {
           ORDER BY version DESC LIMIT 1 FOR UPDATE`,
         [String(companyId), selectedFamily]
       );
-      const version = Number(latest.rows[0]?.version || 0) + 1;
-      const inserted = await client.query(
-        `INSERT INTO public.ai_documents
+      let version = Number(latest.rows[0]?.version || 0) + 1;
+      let insertedDocumentResult;
+      for (let attempt = 0; attempt < MAX_DOCUMENT_VERSION_ALLOCATION_ATTEMPTS && version <= MAX_DOCUMENT_VERSION; attempt += 1) {
+        insertedDocumentResult = await client.query(
+          `INSERT INTO public.ai_documents
           (company_id, uploaded_by, document_family_id, title, original_filename, media_type,
            processing_status, content_sha256, ingest_fingerprint, version, ingest_request_key, processing_attempts,
            processing_started_at, extracted_text, processed_at, retention_until)
          VALUES ($1,$2::uuid,$3::uuid,$4,$5,$6,'processing',$7,$8,$9,$10,1,now(),$11,NULL,$12)
+         ON CONFLICT ON CONSTRAINT ai_documents_family_version_key DO NOTHING
          RETURNING id, company_id, document_family_id, title, original_filename, processing_status, content_sha256, version, created_at`,
-        [String(companyId), String(userId), selectedFamily, safeTitle(title, fileName), String(fileName).slice(0, 255), String(mimeType).slice(0, 127), contentHash, ingestFingerprint, version, requestKey || null, text, retentionUntil]
-      );
-      documentId = inserted.rows[0].id;
-      insertedDocument = inserted.rows[0];
+          [String(companyId), String(userId), selectedFamily, safeTitle(title, fileName), String(fileName).slice(0, 255), String(mimeType).slice(0, 127), contentHash, ingestFingerprint, version, requestKey || null, text, retentionUntil]
+        );
+        if (insertedDocumentResult.rows[0]) break;
+        version += 1;
+      }
+      if (!insertedDocumentResult?.rows[0]) {
+        const exhaustedVersionSpace = version > MAX_DOCUMENT_VERSION;
+        const error = new Error(exhaustedVersionSpace
+          ? 'This document family has exhausted its supported version numbers.'
+          : 'A new version could not be allocated for this document family.');
+        error.statusCode = 409;
+        error.code = exhaustedVersionSpace
+          ? 'AI_DOCUMENT_VERSION_EXHAUSTED'
+          : 'AI_DOCUMENT_VERSION_ALLOCATION_EXHAUSTED';
+        throw error;
+      }
+      documentId = insertedDocumentResult.rows[0].id;
+      insertedDocument = insertedDocumentResult.rows[0];
       await client.query('COMMIT');
 
       // Keep the processing row durable so a failed chunk write can be retried
@@ -341,8 +361,16 @@ function createAiPersistenceRepository({ pool, now = () => new Date() }) {
       const activeVersion = await client.query(`SELECT id, version FROM public.ai_documents WHERE company_id=$1 AND document_family_id=$2::uuid AND id<>$3::uuid AND deleted_at IS NULL AND superseded_by IS NULL AND processing_status='ready' ORDER BY version DESC LIMIT 1 FOR UPDATE`, [String(companyId), String(insertedDocument.document_family_id), String(documentId)]);
       const competing = activeVersion.rows[0];
       if (competing && Number(competing.version) > Number(insertedDocument.version)) {
+        await client.query(
+          'DELETE FROM public.ai_document_chunks WHERE document_id=$1::uuid AND company_id=$2',
+          [String(documentId), String(companyId)]
+        );
         await client.query(`UPDATE public.ai_documents SET superseded_by=$3::uuid, updated_at=now() WHERE id=$1::uuid AND company_id=$2`, [String(documentId), String(companyId), String(competing.id)]);
       } else if (competing) {
+        await client.query(
+          'DELETE FROM public.ai_document_chunks WHERE document_id=$1::uuid AND company_id=$2',
+          [String(competing.id), String(companyId)]
+        );
         await client.query(`UPDATE public.ai_documents SET superseded_by=$3::uuid, updated_at=now() WHERE id=$1::uuid AND company_id=$2`, [String(competing.id), String(companyId), String(documentId)]);
       }
       await client.query(`UPDATE public.ai_documents SET processing_status='ready', processed_at=now(), updated_at=now() WHERE id=$1::uuid AND company_id=$2`, [String(documentId), String(companyId)]);
@@ -377,7 +405,8 @@ function createAiPersistenceRepository({ pool, now = () => new Date() }) {
       await client.query('BEGIN');
       const result = await client.query(
         `SELECT id FROM public.ai_documents WHERE id=$1::uuid AND company_id=$2
-          AND deleted_at IS NULL AND superseded_by IS NULL FOR UPDATE`, [String(id), String(companyId)]
+          AND deleted_at IS NULL AND superseded_by IS NULL
+          AND (retention_until IS NULL OR retention_until > now()) FOR UPDATE`, [String(id), String(companyId)]
       );
       if (result.rows[0]) {
         // Delete chunks while the parent remains visible to the chunks' RLS policy.

@@ -98,6 +98,114 @@ test('document ingestion commits a version with retention and chunks atomically 
   assert.ok(queries.some((call) => call.sql.includes("processing_status='ready'")));
 });
 
+test('document ingestion skips hidden historical versions without weakening company scope or uniqueness', async () => {
+  const versions = [];
+  const insertStatements = [];
+  const insertCompanies = [];
+  const familyId = 'e3ac2ce1-c98e-4d28-9f4e-42313138fc8e';
+  const client = {
+    async query(sql, params) {
+      if (sql.includes('SELECT id, version, deleted_at')) return { rows: [] }; // RLS hides expired/deleted/superseded history.
+      if (sql.includes('INSERT INTO public.ai_documents')) {
+        insertStatements.push(sql);
+        insertCompanies.push(params[0]);
+        versions.push(params[8]);
+        return params[8] < 3 ? { rows: [] } : { rows: [{
+          id: CONVERSATION, document_family_id: familyId, version: params[8], processing_status: 'processing',
+        }] };
+      }
+      if (sql.includes('SELECT id,version FROM public.ai_documents')) return { rows: [] };
+      return { rows: [] };
+    },
+    release() {},
+  };
+  const repo = createAiPersistenceRepository({ pool: { async query() { return { rows: [] }; }, async connect() { return client; } } });
+  const document = await repo.ingestDocument({
+    userId: USER, companyId: COMPANY_A, familyId, title: 'Updated manual', fileName: 'manual.md',
+    mimeType: 'text/markdown', contentHash: 'a'.repeat(64), ingestFingerprint: 'b'.repeat(64),
+    text: 'text', chunks: [], requestKey: 'upload-version-retry', retentionDays: 90,
+  });
+
+  assert.deepEqual(versions, [1, 2, 3]);
+  assert.equal(document.version, 3);
+  assert.ok(versions.every(Number.isInteger));
+  assert.ok(versions.length <= 100);
+  assert.ok(insertStatements.every((sql) => /ON CONFLICT ON CONSTRAINT ai_documents_family_version_key DO NOTHING/.test(sql)));
+  assert.deepEqual(insertCompanies, [COMPANY_A, COMPANY_A, COMPANY_A]);
+});
+
+test('document ingestion deletes old-version chunks before marking that version superseded', async () => {
+  const calls = [];
+  const familyId = 'e3ac2ce1-c98e-4d28-9f4e-42313138fc8e';
+  const client = {
+    async query(sql, params) {
+      calls.push({ sql, params });
+      if (sql.includes('SELECT id, version, deleted_at')) return { rows: [{ id: 'old-document', version: 1 }] };
+      if (sql.includes('INSERT INTO public.ai_documents')) return { rows: [{
+        id: CONVERSATION, document_family_id: familyId, version: params[8], processing_status: 'processing',
+      }] };
+      if (/SELECT id,\s*version FROM public\.ai_documents/.test(sql)) return { rows: [{ id: 'old-document', version: 1 }] };
+      return { rows: [] };
+    },
+    release() {},
+  };
+  const repo = createAiPersistenceRepository({ pool: { async query() { return { rows: [] }; }, async connect() { return client; } } });
+  await repo.ingestDocument({
+    userId: USER, companyId: COMPANY_A, familyId, title: 'Updated manual', fileName: 'manual.md',
+    mimeType: 'text/markdown', contentHash: 'a'.repeat(64), ingestFingerprint: 'b'.repeat(64),
+    text: 'text', chunks: [{ ordinal: 0, content: 'text', startOffset: 0, endOffset: 4 }],
+    requestKey: 'upload-version-2', retentionDays: 90,
+  });
+
+  const purgeIndex = calls.findIndex(({ sql, params }) => sql.includes('DELETE FROM public.ai_document_chunks') && params?.[0] === 'old-document');
+  const supersedeIndex = calls.findIndex(({ sql, params }) => sql.includes('UPDATE public.ai_documents SET superseded_by') && params?.[0] === 'old-document');
+  assert.ok(purgeIndex >= 0 && supersedeIndex > purgeIndex);
+});
+
+test('document version allocation returns a predictable conflict after 100 hidden-key collisions', async () => {
+  let attempts = 0;
+  const client = {
+    async query(sql, params) {
+      if (sql.includes('SELECT id, version, deleted_at')) return { rows: [] };
+      if (sql.includes('INSERT INTO public.ai_documents')) {
+        attempts += 1;
+        return { rows: [] };
+      }
+      return { rows: [] };
+    },
+    release() {},
+  };
+  const repo = createAiPersistenceRepository({ pool: { async query() { return { rows: [] }; }, async connect() { return client; } } });
+  await assert.rejects(repo.ingestDocument({
+    userId: USER, companyId: COMPANY_A, title: 'Manual', fileName: 'manual.md',
+    mimeType: 'text/markdown', contentHash: 'a'.repeat(64), ingestFingerprint: 'b'.repeat(64),
+    text: 'text', chunks: [], familyId: 'e3ac2ce1-c98e-4d28-9f4e-42313138fc8e', retentionDays: 90,
+  }), { statusCode: 409, code: 'AI_DOCUMENT_VERSION_ALLOCATION_EXHAUSTED' });
+  assert.equal(attempts, 100);
+});
+
+test('document version allocation returns a safe conflict when the integer version space is exhausted', async () => {
+  let rolledBack = false;
+  const client = {
+    async query(sql) {
+      if (sql.includes('SELECT id, version, deleted_at')) return { rows: [{ id: 'latest', version: 2147483647 }] };
+      if (sql === 'ROLLBACK') rolledBack = true;
+      return { rows: [] };
+    },
+    release() {},
+  };
+  const repo = createAiPersistenceRepository({ pool: { async query() { return { rows: [] }; }, async connect() { return client; } } });
+  await assert.rejects(
+    repo.ingestDocument({
+      userId: USER, companyId: COMPANY_A, title: 'Manual', fileName: 'manual.md',
+      mimeType: 'text/markdown', contentHash: 'a'.repeat(64), ingestFingerprint: 'b'.repeat(64),
+      text: 'text', chunks: [], familyId: 'e3ac2ce1-c98e-4d28-9f4e-42313138fc8e', retentionDays: 90,
+    }),
+    { statusCode: 409, code: 'AI_DOCUMENT_VERSION_EXHAUSTED' }
+  );
+  assert.equal(rolledBack, true);
+});
+
 test('document deletion removes chunks while parent remains RLS-visible, then soft-deletes the document', async () => {
   const sql = [];
   const client = { async query(statement) { sql.push(statement); return statement.includes('SELECT id FROM public.ai_documents') ? { rows: [{ id: CONVERSATION }] } : { rows: [] }; }, release() {} };
@@ -106,6 +214,57 @@ test('document deletion removes chunks while parent remains RLS-visible, then so
   const deleteChunks = sql.findIndex((statement) => statement.includes('DELETE FROM public.ai_document_chunks'));
   const softDeleteDoc = sql.findIndex((statement) => statement.includes('UPDATE public.ai_documents SET deleted_at'));
   assert.ok(deleteChunks >= 0 && softDeleteDoc > deleteChunks);
+});
+
+test('document deletion fails closed and does not touch chunks when document is expired, superseded, or absent', async () => {
+  const statements = [];
+  const client = {
+    async query(statement, params) {
+      statements.push({ statement, params });
+      // When document has expired or is superseded, the lookup returns 0 rows
+      if (statement.includes('SELECT id FROM public.ai_documents')) return { rows: [] };
+      return { rows: [] };
+    },
+    release() {},
+  };
+  const repo = createAiPersistenceRepository({ pool: { async query() { return { rows: [] }; }, async connect() { return client; } } });
+  const result = await repo.deleteDocument({ id: CONVERSATION, companyId: COMPANY_A });
+  assert.equal(result, false);
+
+  const lookup = statements.find((s) => s.statement.includes('SELECT id FROM public.ai_documents'));
+  assert.ok(lookup);
+  assert.ok(lookup.statement.includes('retention_until IS NULL OR retention_until > now()'));
+  assert.ok(lookup.statement.includes('deleted_at IS NULL AND superseded_by IS NULL'));
+  // Ensure chunks were never touched
+  assert.equal(statements.some((s) => s.statement.includes('DELETE FROM public.ai_document_chunks')), false);
+  assert.equal(statements.some((s) => s.statement.includes('UPDATE public.ai_documents SET deleted_at')), false);
+});
+
+test('search and list document queries scope company, processing status, and enforce unexpired retention', async () => {
+  const capturedQueries = [];
+  const pool = {
+    async query(sql, params) {
+      capturedQueries.push({ sql, params });
+      return { rows: [] };
+    },
+    async connect() { return { async query() { return { rows: [] }; }, release() {} }; },
+  };
+  const repo = createAiPersistenceRepository({ pool });
+
+  await repo.listDocuments({ companyId: COMPANY_A, page: 1, limit: 10 });
+  const listQuery = capturedQueries.find((q) => q.sql.includes('FROM public.ai_documents'));
+  assert.ok(listQuery);
+  assert.equal(listQuery.params[0], COMPANY_A);
+  assert.ok(listQuery.sql.includes('deleted_at IS NULL AND superseded_by IS NULL'));
+  assert.ok(listQuery.sql.includes('retention_until IS NULL OR retention_until > now()'));
+
+  await repo.searchDocuments({ companyId: COMPANY_A, query: 'spindle test', limit: 5 });
+  const searchQuery = capturedQueries.find((q) => q.sql.includes('FROM public.ai_document_chunks'));
+  assert.ok(searchQuery);
+  assert.equal(searchQuery.params[0], COMPANY_A);
+  assert.ok(searchQuery.sql.includes("d.processing_status='ready'"));
+  assert.ok(searchQuery.sql.includes('d.deleted_at IS NULL AND d.superseded_by IS NULL'));
+  assert.ok(searchQuery.sql.includes('d.retention_until IS NULL OR d.retention_until > now()'));
 });
 
 test('idempotent conversation turn replays the completed response for the same fingerprint', async () => {

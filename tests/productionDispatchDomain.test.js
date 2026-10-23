@@ -152,3 +152,24 @@ test('accepted work awaiting dispatch can continue production against the remain
     assignedEmployeeId: 'u-1',
   }).toStatus, S.IN_PRODUCTION);
 });
+
+
+test('production route handlers do not lock append-only tables FOR UPDATE without UPDATE privileges', () => {
+  const fs = require('fs');
+  const path = require('path');
+  const code = fs.readFileSync(path.join(__dirname, '../routes/production.js'), 'utf8');
+
+  // Verify production_inspections is not queried with FOR UPDATE (append-only table)
+  assert.doesNotMatch(
+    code,
+    /production_inspections\s+WHERE[^;]+FOR\s+UPDATE/i,
+    'production_inspections is an append-only ledger; querying FOR UPDATE fails with 42501 for smarterp_app'
+  );
+
+  // Verify production_dispatches join does not attempt FOR UPDATE OF d (append-only table)
+  assert.doesNotMatch(
+    code,
+    /production_dispatches\s+d[^;]+FOR\s+UPDATE\s+OF\s+d/i,
+    'production_dispatches is an append-only ledger; locking table d fails with 42501 for smarterp_app'
+  );
+});

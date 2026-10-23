@@ -523,9 +523,22 @@ router.post(
 
       res.json(finalResult);
     } catch (error) {
-      console.error("❌ SmartERP AI Agent Error:", error);
+      if (error?.statusCode === 503 && typeof error?.code === 'string' && error.code.startsWith('AI_PROVIDER_')) {
+        console.error("❌ SmartERP AI provider unavailable:", {
+          code: error.code,
+          providerErrorCode: error.providerErrorCode || null,
+        });
+        return res.status(503).json({
+          code: error.code,
+          error: error.code === 'AI_PROVIDER_NOT_CONFIGURED'
+            ? 'SmartERP AI is not configured on the server. Please contact your administrator.'
+            : 'SmartERP AI provider is temporarily unavailable. Please retry shortly.',
+        });
+      }
+      console.error("❌ SmartERP AI Agent Error:", error?.code || error?.name || 'unknown_error');
       res.status(500).json({
-        error: error.message || "AI Agent is temporarily unavailable. Please try again.",
+        code: 'AI_AGENT_FAILED',
+        error: "SmartERP AI could not complete this request. Please retry shortly.",
       });
     }
   }

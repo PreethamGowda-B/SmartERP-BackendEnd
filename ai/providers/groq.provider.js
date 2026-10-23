@@ -57,6 +57,12 @@ const FALLBACK_MODELS = [
 class GroqProvider extends BaseAIProvider {
   constructor() {
     super("Groq");
+    if (!process.env.GROQ_API_KEY || !process.env.GROQ_API_KEY.trim()) {
+      const error = new Error("The AI provider is not configured.");
+      error.code = "AI_PROVIDER_NOT_CONFIGURED";
+      error.statusCode = 503;
+      throw error;
+    }
     this.client = new Groq({
       apiKey: process.env.GROQ_API_KEY,
     });
@@ -164,7 +170,13 @@ class GroqProvider extends BaseAIProvider {
         console.warn(`⚠️ Groq model '${modelToTry}' failed (${errMsg}) — trying next candidate...`);
       }
     }
-    throw lastError || new Error("All AI models failed to respond.");
+    const error = new Error("The AI provider is temporarily unavailable.");
+    error.code = "AI_PROVIDER_UNAVAILABLE";
+    error.statusCode = 503;
+    // Keep only a provider error code for diagnostics; do not attach or return
+    // request/configuration data that could contain sensitive information.
+    if (lastError?.code) error.providerErrorCode = String(lastError.code).slice(0, 80);
+    throw error;
   });
 }
 }

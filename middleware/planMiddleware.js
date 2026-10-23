@@ -5,8 +5,7 @@
 
 const { pool } = require('../db');
 const { redisClient } = require('../utils/redis');
-const { getPlan, getPlanLimit, isUnlimitedPlan, getEmployeeLimit, resolvePlanTier, applyCanonicalPlanFeatures } = require('../services/subscriptionCatalog');
-const { consumeAIRequest } = require('../services/aiQuota');
+const { getPlan, getPlanLimit, isUnlimitedPlan, getEmployeeLimit, applyCanonicalPlanFeatures } = require('../services/subscriptionCatalog');
 const NodeCache = require('node-cache');
 
 const PLAN_CACHE_TTL = 300; // 5 minutes in seconds
@@ -235,8 +234,12 @@ function checkPlanLimit(limitType, options = {}) {
         return res.status(403).json({ code: 'COMPANY_REQUIRED', message: 'A company subscription is required to verify this limit.' });
       }
 
+      // AI message count is intentionally not a plan quota. Plans gate which
+      // specialist model scopes are available, while role/tenant guards remain.
+      if (limitType === 'ai_messages') return next();
+
       if (isUnlimitedPlan(plan)) {
-        if (limitType !== 'ai_messages') return next();
+        return next();
       }
 
       const requestedUsage = typeof options.getRequestedUsage === 'function'
@@ -246,14 +249,6 @@ function checkPlanLimit(limitType, options = {}) {
         return res.status(400).json({ code: 'INVALID_QUOTA_USAGE', message: 'The requested quota usage is invalid.' });
       }
       if (limitType === 'storage' && requestedUsage === 0) return next();
-
-      if (limitType === 'ai_messages') {
-        const quota = await consumeAIRequest(redisClient, req.user?.userId || req.user?.id, resolvePlanTier(plan));
-        if (!quota.allowed) {
-          return res.status(quota.status).json({ code: quota.status === 429 ? 'PLAN_LIMIT_REACHED' : 'PLAN_LIMIT_CHECK_UNAVAILABLE', message: quota.error, retryAfter: quota.retryAfter });
-        }
-        return next();
-      }
 
       // Serialize count-then-create requests for bounded employee seats and
       // active jobs across workers. The lock stays held until the route has

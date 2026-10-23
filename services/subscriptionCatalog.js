@@ -2,7 +2,7 @@ const PLAN_FEATURES = Object.freeze({
   starter: Object.freeze({
     payroll: false,
     messages: true,
-    ai_assistant: false,
+    ai_assistant: true,
     basic_reports: true,
     export_reports: true,
     advanced_reports: false,

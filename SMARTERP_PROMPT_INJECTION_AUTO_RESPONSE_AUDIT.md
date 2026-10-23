@@ -14,7 +14,7 @@ Source distinguishes the likely outcomes:
 - An uncaught SQL error in the agent handler returns HTTP 500 with `code: AI_AGENT_FAILED`. The earlier logged `42703` is consistent with this path, not a deliberate guard rejection and not a provider error. It is not proven to be the 06:22 request.
 - Provider-unavailable errors are handled separately as HTTP 503. No supplied log ties a provider failure to the reported test.
 
-The current source had a separate, reproducible schema-compatibility defect in `services/aiDataService.js::getHrDashboardSummary()`: its headcount query referenced `users.status` directly, although other current queries explicitly tolerate that optional column being absent. I changed that query to read the optional status through `to_jsonb(u)` and preserve the same active/suspended filtering. This is a plausible cause of an HR payroll-summary `42703`, but does not identify the unlogged 06:22 request.
+The source had a schema-compatibility defect in `services/aiDataService.js::getHrDashboardSummary()`: its headcount query referenced `users.status` directly, although other current queries explicitly tolerate that optional column being absent. The fix reads the optional status through `to_jsonb(u)` and preserves the same active/suspended filtering. A mocked regression test simulates a legacy `users` relation without `status`, rejects direct `u.status` references with SQLSTATE `42703`, and verifies headcount remains available. This is a plausible cause of an HR payroll-summary `42703`, but does not identify the unlogged 06:22 request; PostgreSQL-backed verification was not run.
 
 Before this audit's local patch, the copilot route did not use the shared guard, the agent screened only the latest `message` (not client-provided history or system-prompt UI context), and nested action parameters were not inspected. Prompt security events were asynchronously persisted but were not queued for the normal BullMQ worker. A standalone polling worker exists in source, but its deployment is unverified.
 
@@ -49,9 +49,9 @@ Routes are mounted under both `/api` and `/api/v1` in `server.js`.
 
 The detector in `ai/gateway/security.shield.js` is a deterministic raw-text pattern set for overrides, secret extraction, destructive SQL, cross-company access phrases, and framing delimiters. It has an educational-question exception. It does **not** prove resistance to encoded, multilingual, semantic, or arbitrary multi-step attacks. The new guard checks all supplied history text and the UI values inserted into the generated system prompt; it is still a pattern filter, not a complete injection-proof model boundary.
 
-## 3. Changes made locally
+## 3. Changes in the reviewed source
 
-The two worktrees were clean on `main` before edits. Current changes are uncommitted and not deployed.
+The two worktrees were clean on `main` before the initial edits. The backend and frontend source changes were later committed and pushed to `main`; push verification is recorded below. Deployment remains unverified.
 
 - `middleware/aiPromptGuard.js`: supports configurable prompt field; validates current message, prior history, and relevant client UI context; records only detector-confirmed attacks with redacted metadata and a correlation identifier. Oversize/shape failures no longer count as malicious events.
 - `routes/ai.routes.js`: applies history/context screening to agent/chat; recursively checks nested confirmed-action parameters; adds safe PostgreSQL SQLSTATE diagnostics without logging prompt text or parameter values.
@@ -98,14 +98,14 @@ The health endpoint reports a BullMQ worker object state, not proof that jobs we
 
 All executed tests were local source/unit checks with no database writes. No staging or production request was sent.
 
-- `node --check middleware/aiPromptGuard.js; node --check routes/ai.routes.js; node --check routes/businessCopilot.js; node --check jobs/securityWorker.js; node --check utils/securityPolicyEngine.js; node --check utils/securityEmitter.js; node --check services/aiDataService.js; node --check tests/promptInjectionResponse.test.js` — **PASS**, exit 0.
-- `node --test tests/aiPromptGuard.test.js tests/promptInjectionResponse.test.js` — **PASS**, 11 passed, 0 failed, 0 skipped. Redis URL variables were cleared for the successful run.
+- `node --check tests/aiDataServiceTenantScope.test.js` — **PASS**, exit 0.
+- `$env:REDIS_URL=''; node --test tests/aiPromptGuard.test.js tests/promptInjectionResponse.test.js tests/aiDataServiceTenantScope.test.js tests/aiAttendanceSummaryAccess.test.js` — **PASS**, 21 passed, 0 failed, 0 skipped. Redis was disabled for this run; database calls in these tests were mocked.
 - `git diff --check` in backend and frontend — **PASS**, no whitespace errors.
 - Frontend local `tsc --noEmit` — **PASS**, exit 0.
 
 The first focused test invocation inherited a Redis URL and opened Redis client connections on module import; the test runner was stopped and rerun with Redis disabled. The tests did not enqueue jobs or mutate database/business data. Because the endpoint identity was not inspected, the destination of that initial connection is **unknown**; it is not represented as an isolated integration test.
 
-Not run: database-backed tests, security worker queue consumption, account-suspension executor integration, browser tests, Render/staging verification, production migration checks, adversarial document integration tests, or real payment/provider tests.
+Not run: PostgreSQL-backed validation of the missing-column query, security worker queue consumption, account-suspension executor integration, browser tests, Render/staging verification, production migration checks, adversarial document integration tests, or real payment/provider tests.
 
 ## 6. Prioritized issues and next steps
 
@@ -132,4 +132,20 @@ Not run: database-backed tests, security worker queue consumption, account-suspe
 
 For the deployed service at the time of the reported 06:22 test, the supplied evidence is insufficient to say exactly what happened. Source says a recognized malicious prompt is rejected with HTTP 400 before AI tools run; authentication and plan checks may already have read their own state. A nonmatching/educational request can proceed to live data queries and/or the provider. The available earlier 06:01:52 log shows a different agent failure with SQLSTATE 42703, which returns HTTP 500 in source; it is not evidence of the later request.
 
-No supplied evidence verifies that the 06:22 event was persisted or processed, and no production automatic suspension is verified. In current checked-out source, even a sufficiently corroborated suspension candidate remains pending Super Admin approval. The changes in this report are local and uncommitted; they have not changed deployed behavior.
+No supplied evidence verifies that the 06:22 event was persisted or processed, and no production automatic suspension is verified. In current source, even a sufficiently corroborated suspension candidate remains pending Super Admin approval.
+
+## Follow-up repository and deployment status
+
+At the follow-up check on 2026-10-23, the backend repository was clean on `main` at `b12eaf972859227ff5b3128248e86f65029b95c9` (`origin/main`), and the frontend repository was clean on `main` at `cd21836bc6d1e07379ee82551d15a5927963d867` (`origin/main`). These commits prove GitHub delivery only, not deployment. No Render CLI or Render log connector was available, and the supplied log excerpt ends at `00:31:52.503Z`. Therefore the deployed revision, 06:22 request status, event persistence, and worker processing remain unverified. No production customer data was accessed.
+
+The missing-status regression test and follow-up report updates were included in the current follow-up commits and pushed to the existing main branches. The regression result is mocked application-test evidence, not PostgreSQL integration evidence.
+
+## AI availability and plan follow-up
+
+The reported AI `/agent` responses use HTTP 400, which is consistent with input validation or the prompt guard, not the former plan message quota. The quota returned 429 when exceeded or 503 when Redis could not verify the quota. The frontend sends the prior ten conversation turns; before the follow-up fix, one unsafe or over-3,000-character history entry caused every later safe prompt in that conversation to be rejected. The guard now omits unsafe/oversized prior turns, caps considered history to the latest 20, normalizes sender roles, and still blocks a malicious current prompt. The exact failing request body was not available, so this is a source-confirmed failure mechanism, not a verified attribution to either owner account.
+
+The per-hour AI message quota was removed. Starter now has the basic `general` assistant; Professional has `general`, CNC, inventory, attendance, and HR scopes; Enterprise has all user-facing specialist scopes. Backend direct API scope checks mirror those entitlements. The old keyword-only Enterprise topic block was removed. Existing role authorization, tenant scoping, job creation limits, and confirmed-action checks remain separate. These specialist scopes are different prompts/personas using the configured provider integration; this source change does not configure a different provider model ID per plan.
+
+The reported CORS failure on `/api/jobs` is separate from AI plan quotas and prompt screening. Tracked backend CORS configuration explicitly permits `https://www.prozync.in` and `*.prozync.in`; the missing `Access-Control-Allow-Origin` header therefore needs request-time service/proxy logs to determine whether the request reached the expected backend revision. No CORS allowlist was broadened in response to the browser error.
+
+Follow-up verification after these changes: 27 focused backend tests passed with Redis disabled and database calls mocked; frontend TypeScript passed. No Render request logs, staging request, PostgreSQL integration, or production deployment verification was available. The availability/model changes were committed and pushed to the existing main branches on 2026-10-23; deployment remains unverified.

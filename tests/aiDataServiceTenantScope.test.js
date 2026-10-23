@@ -86,3 +86,43 @@ test('employee AI dashboard queries explicitly scope every linked record to the 
     pool.query = originalQuery;
   }
 });
+
+test('HR AI headcount remains available when the users table has no optional status column', async () => {
+  const originalQuery = pool.query;
+  const calls = [];
+  // Model a legacy users relation without `status`: a direct u.status reference
+  // receives PostgreSQL's undefined-column error. The current JSON-row lookup is
+  // valid and returns active employees whose rows have no status property.
+  pool.query = async (sql, params = []) => {
+    const query = String(sql);
+    calls.push({ query, params });
+    if (query.includes('company_settings')) return { rows: [] };
+    if (/\bu\.status\b/.test(query)) {
+      const error = new Error('column u.status does not exist');
+      error.code = '42703';
+      throw error;
+    }
+    if (query.includes('FROM users u')) {
+      assert.match(query, /to_jsonb\(u\)->>'status'/);
+      assert.match(query, /u\.is_active = TRUE/);
+      assert.deepEqual(params, ['company-a']);
+      const legacyRowsWithoutStatus = [
+        { department: 'Production', is_active: true, role: 'employee' },
+        { department: 'Production', is_active: true, role: 'employee' },
+      ];
+      assert.equal(legacyRowsWithoutStatus.some((row) => Object.hasOwn(row, 'status')), false);
+      return { rows: [{ department: 'Production', count: String(legacyRowsWithoutStatus.length) }] };
+    }
+    if (query.includes('FROM leave_requests')) return { rows: [] };
+    if (query.includes('LEFT JOIN attendance a')) return { rows: [] };
+    throw new Error(`Unexpected SQL in test: ${query}`);
+  };
+
+  try {
+    const summary = await AIDataService.getHrDashboardSummary({ companyId: 'company-a' });
+    assert.deepEqual(summary.department_headcount, [{ department: 'Production', count: '2' }]);
+    assert.equal(calls.some(({ query }) => /\bu\.status\b/.test(query)), false);
+  } finally {
+    pool.query = originalQuery;
+  }
+});

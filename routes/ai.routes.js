@@ -6,7 +6,7 @@ const { createAiPromptGuard } = require('../middleware/aiPromptGuard');
 const { loadPlan } = require("../middleware/planMiddleware");
 const { requireFeature } = require("../middleware/featureGuard");
 const { resolvePlanTier } = require("../services/subscriptionCatalog");
-const { consumeAIRequest } = require("../services/aiQuota");
+const { resolveAiModelScopes } = require('../services/aiModelEntitlements');
 
 const ContextEngine = require("../ai/context/context.engine");
 const ReActEngine = require("../ai/planner/ReAct.engine");
@@ -44,26 +44,6 @@ function findBlockedActionInput(value, path = 'params', depth = 0) {
   return null;
 }
 
-let redisClient = null;
-try {
-  ({ redisClient } = require("../utils/redis"));
-} catch {
-  // Redis optional
-}
-
-async function enforceAIRequestQuota(req, res, next) {
-  const quota = await consumeAIRequest(redisClient, req.user?.userId || req.user?.id, getPlanTier(req));
-  if (!quota.allowed) return res.status(quota.status).json({
-    code: quota.status === 429 ? 'PLAN_LIMIT_REACHED' : 'PLAN_LIMIT_CHECK_UNAVAILABLE',
-    error: quota.error,
-    message: quota.error,
-    retryAfter: quota.retryAfter,
-    planTier: getPlanTier(req),
-    ...(quota.status === 429 ? { details: { limitType: 'ai_messages', currentCount: quota.count, maxLimit: quota.limit, currentPlan: req.plan?.name || 'Starter' } } : {})
-  });
-  next();
-}
-
 /**
  * Resolves the backend-authoritative plan row to its stable subscription tier.
  * @param {Object} req - Express Request
@@ -71,41 +51,6 @@ async function enforceAIRequestQuota(req, res, next) {
  */
 function getPlanTier(req) {
   return resolvePlanTier(req.plan);
-}
-
-// Enterprise-only AI topics remain a secondary guard; requireFeature below is
-// the authoritative direct-API entitlement check.
-const ENTERPRISE_CAPABILITY_KEYWORDS = [
-  "forecast",
-  "forecasting",
-  "executive report",
-  "analyze company",
-  "cross-module",
-  "financial analytics",
-  "revenue forecast",
-  "cash flow",
-  "gst reconciliation",
-  "ar collection",
-  "payroll validation",
-  "company insights",
-  "business analysis",
-  "predictive",
-];
-
-/**
- * Rule-based classifier checking if a prompt requests a Pro-only capability.
- * @param {string} prompt - User message prompt
- * @returns {string|null} Matched keyword or null
- */
-function checkEnterpriseCapabilityKeyword(prompt) {
-  if (!prompt || typeof prompt !== "string") return null;
-  const lower = prompt.toLowerCase();
-  for (const keyword of ENTERPRISE_CAPABILITY_KEYWORDS) {
-    if (lower.includes(keyword)) {
-      return keyword;
-    }
-  }
-  return null;
 }
 
 // ── POST /api/ai/agent ────────────────────────────────────────────────────────
@@ -116,7 +61,6 @@ router.post(
   loadPlan,
   requireFeature('ai_assistant', 'AI assistant'),
   validateAiPrompt,
-  enforceAIRequestQuota,
   async (req, res) => {
     const startTime = Date.now();
     try {
@@ -446,36 +390,6 @@ router.post(
         });
       }
 
-      // 4. Secondary topic filter for Enterprise-only capabilities.
-      if (planTier !== "enterprise") {
-        const matchedKeyword = checkEnterpriseCapabilityKeyword(cleanMessage);
-        if (matchedKeyword) {
-          const userContext = ContextEngine.buildContext(
-            req,
-            { ...clientContext, currentPortal, currentModule, currentPagePath },
-            planTier
-          );
-
-          await MetricsService.logAIInterception({
-            userContext,
-            prompt: cleanMessage,
-            matchedKeyword,
-            planTier,
-          });
-
-          return res.json({
-            text: "This AI capability is not included in your current plan. Review available plans with your company owner.",
-            widget: null,
-            navigation: { path: "/owner/billing", label: "Review available plans" },
-            confidenceScore: 1.0,
-            sources: ["Subscription Guard"],
-            intercepted: true,
-            matchedKeyword,
-            suggestedFollowUps: ["View pricing plans", "What features are available?"],
-          });
-        }
-      }
-
       // 5. Build Authenticated Context (Tenant Scoped + Plan Tier + Advisory UI Route Context)
       const mergedClientContext = {
         ...clientContext,
@@ -486,21 +400,26 @@ router.post(
 
       const context = ContextEngine.buildContext(req, mergedClientContext, planTier);
 
-      // 6. Determine Model Scope (Auto-detection or manual)
-      let resolvedScopes = [];
-      let autoSelectedModel = null;
-
-      if (modelScopes && modelScopes.length > 0) {
-        // Manual selection — use provided scopes
-        resolvedScopes = modelScopes;
-      } else if (autoMode !== false) {
-        // Auto-detection from prompt
-        const detectedScope = ContextEngine.detectModelScope(cleanMessage);
-        resolvedScopes = [detectedScope];
-        autoSelectedModel = detectedScope;
-      } else {
-        resolvedScopes = ["general"];
+      // 6. Resolve the model scopes included in this company's plan. AI messages
+      // are not capped by count; plans control specialist model access only.
+      const modelSelection = resolveAiModelScopes({
+        planTier,
+        requestedScopes: modelScopes,
+        autoMode,
+        prompt: cleanMessage,
+        detectModelScope: (prompt) => ContextEngine.detectModelScope(prompt),
+      });
+      if (!modelSelection.ok) {
+        return res.status(modelSelection.status).json({
+          code: modelSelection.code,
+          message: modelSelection.code === 'AI_MODEL_NOT_INCLUDED'
+            ? 'One or more selected AI models are not included in your company plan.'
+            : 'The AI model selection is invalid or the subscription plan could not be verified.',
+          unavailableScopes: modelSelection.unavailableScopes,
+        });
       }
+      const resolvedScopes = modelSelection.scopes;
+      const autoSelectedModel = modelSelection.autoSelectedModel;
 
       // 7. Execute independent selected scopes concurrently. The provider limiter
       // still caps global Groq concurrency, while parallel scope execution avoids
@@ -647,7 +566,6 @@ router.post(
   authenticateToken,
   loadPlan,
   requireFeature('ai_assistant', 'AI assistant'),
-  enforceAIRequestQuota,
   async (req, res) => {
     try {
       const { toolName, params = {} } = req.body;
@@ -766,7 +684,6 @@ router.post(
   loadPlan,
   requireFeature('ai_assistant', 'AI assistant'),
   validateAiPrompt,
-  enforceAIRequestQuota,
   async (req, res) => {
     try {
       const message = req.sanitizedAiMessage;

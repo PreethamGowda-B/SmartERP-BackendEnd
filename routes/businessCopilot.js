@@ -4,25 +4,10 @@ const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 const { loadPlan } = require('../middleware/planMiddleware');
 const { requireFeature } = require('../middleware/featureGuard');
-const { consumeAIRequest } = require('../services/aiQuota');
-const { resolvePlanTier } = require('../services/subscriptionCatalog');
-const { redisClient } = require('../utils/redis');
 const { checkPlanLimit } = require('../middleware/planMiddleware');
 const { createAiPromptGuard } = require('../middleware/aiPromptGuard');
 
 const validateCopilotPrompt = createAiPromptGuard({ field: 'prompt' });
-
-async function requireAIQuota(req, res, next) {
-  const quota = await consumeAIRequest(redisClient, req.user?.userId || req.user?.id, resolvePlanTier(req.plan));
-  if (!quota.allowed) return res.status(quota.status).json({
-    code: quota.status === 429 ? 'PLAN_LIMIT_REACHED' : 'PLAN_LIMIT_CHECK_UNAVAILABLE',
-    error: quota.error,
-    message: quota.error,
-    retryAfter: quota.retryAfter,
-    ...(quota.status === 429 ? { details: { limitType: 'ai_messages', currentCount: quota.count, maxLimit: quota.limit, currentPlan: req.plan?.name || 'Starter' } } : {})
-  });
-  next();
-}
 
 function requireJobQuotaForCopilot(req, res, next) {
   const prompt = String(req.sanitizedAiPrompt || '').toLowerCase();
@@ -31,7 +16,7 @@ function requireJobQuotaForCopilot(req, res, next) {
 }
 
 // ─── POST /api/ai/copilot (Enterprise AI Operations Copilot & Multi-Step Workflows) ───
-router.post('/', authenticateToken, loadPlan, requireFeature('ai_assistant', 'AI assistant'), validateCopilotPrompt, requireAIQuota, requireJobQuotaForCopilot, async (req, res) => {
+router.post('/', authenticateToken, loadPlan, requireFeature('ai_assistant', 'AI assistant'), validateCopilotPrompt, requireJobQuotaForCopilot, async (req, res) => {
   try {
     const companyId = req.user.companyId || req.user.company_id;
     if (!companyId && req.user.role !== 'super_admin') {

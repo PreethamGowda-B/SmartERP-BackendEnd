@@ -55,16 +55,26 @@ function createAiPromptGuard({
 
       // Prior turns and UI context are also client-controlled. Validate them
       // before they are inserted into model history or the generated system prompt.
+      // Old turns are untrusted context: omit an unsafe/oversized prior turn
+      // instead of rejecting every later, otherwise-safe request in the chat.
       if (historyField && req.body?.[historyField] !== undefined) {
-        if (!Array.isArray(req.body[historyField]) || req.body[historyField].length > 20) {
+        if (!Array.isArray(req.body[historyField])) {
           return res.status(400).json({ error: 'Chat history is invalid.' });
         }
-        req.body[historyField] = req.body[historyField].map((entry) => {
+        const safeHistory = [];
+        for (const entry of req.body[historyField].slice(-20)) {
           if (!entry || typeof entry !== 'object' || Array.isArray(entry) || typeof entry.content !== 'string') {
             throw Object.assign(new Error('Chat history is invalid.'), { inputValidationFailure: true });
           }
-          return { ...entry, content: sanitizeText(entry.content) };
-        });
+          try {
+            const content = sanitizeText(entry.content);
+            safeHistory.push({ sender: entry.sender === 'user' ? 'user' : 'assistant', content });
+          } catch (err) {
+            if (err?.isSecurityThreat === true || err?.category === 'PAYLOAD_TOO_LARGE') continue;
+            throw err;
+          }
+        }
+        req.body[historyField] = safeHistory;
       }
 
       const sanitizeContextValue = (value) => typeof value === 'string' ? sanitizeText(value) : value;
@@ -82,7 +92,7 @@ function createAiPromptGuard({
     } catch (err) {
       emitAttack(err, typeof err?.inputLength === 'number' ? err.inputLength : message.length);
       return res.status(400).json({
-        code: 'AI_PROMPT_BLOCKED',
+        code: err?.inputValidationFailure ? 'AI_HISTORY_INVALID' : 'AI_PROMPT_BLOCKED',
         error: err?.inputValidationFailure ? err.message : (err?.message || 'The message was rejected by the AI safety checks.'),
       });
     }

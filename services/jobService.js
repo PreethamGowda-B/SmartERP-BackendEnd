@@ -64,17 +64,17 @@ class JobService {
   /**
    * Creates a new job.
    */
-  static async createJob({ companyId, title, description, priority, isAiCreated = true }) {
-    if (!companyId || !title) {
-      throw new Error("Company ID and job title are required.");
+  static async createJob({ companyId, createdBy, title, description, priority, isAiCreated = true }) {
+    if (!companyId || !createdBy || !title) {
+      throw new Error("Company ID, actor ID, and job title are required.");
     }
 
     const res = await pool.query(
       `INSERT INTO jobs 
        (title, description, priority, status, company_id, is_ai_created, created_by, created_through, created_at, updated_at)
-       VALUES ($1, $2, $3, 'open', $4, $5, 'AI Copilot', 'SmartERP Intelligence', NOW(), NOW())
+       VALUES ($1, $2, $3, 'open', $4, $5, $6, 'SmartERP Intelligence', NOW(), NOW())
        RETURNING id, title, priority, status, is_ai_created, created_at`,
-      [title, description || "", priority || "medium", companyId, isAiCreated]
+      [title, description || "", priority || "medium", companyId, isAiCreated, createdBy]
     );
 
     return {

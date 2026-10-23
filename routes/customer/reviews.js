@@ -21,26 +21,7 @@ function fail(res, message, statusCode = 400) {
   return res.status(statusCode).json({ success: false, data: null, error: message });
 }
 
-// ── Ensure job_reviews table exists ──────────────────────────────────────────
-async function ensureTable() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS job_reviews (
-      id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      job_id      UUID NOT NULL UNIQUE,
-      customer_id UUID NOT NULL,
-      employee_id UUID,
-      company_id  TEXT,
-      rating      SMALLINT NOT NULL CHECK (rating >= 1 AND rating <= 5),
-      review_text TEXT,
-      created_at  TIMESTAMP NOT NULL DEFAULT NOW()
-    );
-    CREATE INDEX IF NOT EXISTS idx_job_reviews_job_id      ON job_reviews(job_id);
-    CREATE INDEX IF NOT EXISTS idx_job_reviews_employee_id ON job_reviews(employee_id);
-    CREATE INDEX IF NOT EXISTS idx_job_reviews_customer_id ON job_reviews(customer_id);
-  `).catch(() => {});
-}
-
-ensureTable();
+// ── Schema for job_reviews is managed via versioned database migrations ────────
 
 // ── GET /jobs/:id/review ──────────────────────────────────────────────────────
 router.get('/', async (req, res) => {

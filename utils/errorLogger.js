@@ -17,42 +17,12 @@
 
 const { pool } = require('../db');
 
-// ─── Ensure error_logs table exists ──────────────────────────────────────────
-let _tableReady = false;
+// ─── Schema for error_logs is managed via versioned database migrations ───────
+let _tableReady = true;
 
 async function ensureTable() {
-  if (_tableReady) return;
-  let client;
-  try {
-    client = await pool.connect();
-    await client.query('SET ROLE postgres').catch(() => {});
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS error_logs (
-        id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        context     VARCHAR(200),
-        message     TEXT,
-        stack       TEXT,
-        metadata    JSONB,
-        company_id  UUID,
-        user_id     UUID,
-        ip_address  VARCHAR(100),
-        user_agent  TEXT,
-        created_at  TIMESTAMP DEFAULT NOW()
-      );
-      CREATE INDEX IF NOT EXISTS idx_error_logs_created_at  ON error_logs(created_at DESC);
-      CREATE INDEX IF NOT EXISTS idx_error_logs_company_id  ON error_logs(company_id);
-      CREATE INDEX IF NOT EXISTS idx_error_logs_context     ON error_logs(context);
-    `);
-    _tableReady = true;
-  } catch (e) {
-    // Table creation failure is non-fatal
-  } finally {
-    if (client) client.release();
-  }
+  return Promise.resolve();
 }
-
-// Run table setup once on module load (non-blocking)
-ensureTable().catch(() => {});
 
 // ─── Core log function ────────────────────────────────────────────────────────
 /**

@@ -32,29 +32,7 @@ function fail(res, message, statusCode = 500) {
   return res.status(statusCode).json({ success: false, data: null, error: message });
 }
 
-// ─── Ensure recurring_jobs table exists (idempotent) ──────────────────────────
-async function ensureTable() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS recurring_jobs (
-      id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      customer_id     UUID NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
-      company_id      TEXT NOT NULL,
-      title           VARCHAR(255) NOT NULL,
-      description     TEXT,
-      priority        VARCHAR(50) DEFAULT 'medium',
-      pattern         VARCHAR(20) NOT NULL,  -- 'daily' | 'weekly' | 'monthly'
-      next_run_at     TIMESTAMP NOT NULL,
-      end_date        TIMESTAMP,
-      is_active       BOOLEAN DEFAULT TRUE,
-      created_at      TIMESTAMP DEFAULT NOW(),
-      last_run_at     TIMESTAMP
-    );
-    CREATE INDEX IF NOT EXISTS idx_recurring_jobs_customer ON recurring_jobs(customer_id);
-    CREATE INDEX IF NOT EXISTS idx_recurring_jobs_next_run ON recurring_jobs(next_run_at) WHERE is_active = TRUE;
-  `).catch(() => {}); // Silently ignore if already exists
-}
-
-ensureTable();
+// ─── Schema for recurring_jobs is managed via versioned database migrations ───
 
 // ─── GET / — list recurring templates ────────────────────────────────────────
 router.get('/', async (req, res) => {
@@ -170,6 +148,7 @@ router.post('/:id/run', loadPlan, checkPlanLimit('job'), async (req, res) => {
     createNotificationForOwners({
       company_id: companyId,
       type: 'job',
+      idempotency_key: `recurring_job_created:${companyId}:${createdJob.id}`,
       title: 'New Recurring Customer Job',
       message: `Recurring job triggered: ${t.title}`,
       priority: t.priority,
@@ -181,6 +160,7 @@ router.post('/:id/run', loadPlan, checkPlanLimit('job'), async (req, res) => {
       createNotificationForCompany({
         company_id: companyId,
         type: 'job_available',
+        idempotency_key: `recurring_job_available:${companyId}:${createdJob.id}`,
         title: 'New Job Available',
         message: 'A recurring job is available: "' + createdJob.title + '"',
         priority: t.priority,

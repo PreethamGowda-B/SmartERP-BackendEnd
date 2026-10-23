@@ -254,56 +254,81 @@ test('10. isCompanySuspended: Detects suspension via status or is_suspended colu
 test('11. SecurityWorker: Deterministic risk scoring and PROMPT_INJECTION incident generation', () => {
   assert.ok(THREAT_CATEGORIES.PROMPT_INJECTION, 'THREAT_CATEGORIES must include PROMPT_INJECTION');
 
-  // Single injection attempt
+  // Single injection attempt (graduated baseline without disruption)
   const singleAttemptRisk = calculateDeterministicRisk(
     THREAT_CATEGORIES.PROMPT_INJECTION,
     { [SECURITY_EVENT_TYPES.PROMPT_INJECTION]: 1 },
     1
   );
-  assert.equal(singleAttemptRisk.riskScore >= 70, true);
-  assert.equal(singleAttemptRisk.severity, 'high');
+  assert.equal(singleAttemptRisk.riskScore, 52);
+  assert.equal(singleAttemptRisk.severity, 'medium');
 
-  // Repeated injection attempts (velocity surge)
-  const repeatedAttemptsRisk = calculateDeterministicRisk(
+  // Threshold injection attempts (policy threshold reached)
+  const thresholdAttemptsRisk = calculateDeterministicRisk(
     THREAT_CATEGORIES.PROMPT_INJECTION,
-    { [SECURITY_EVENT_TYPES.PROMPT_INJECTION]: 3 },
+    { [SECURITY_EVENT_TYPES.PROMPT_INJECTION]: 16 },
     1
   );
-  assert.equal(repeatedAttemptsRisk.riskScore >= 85, true);
-  assert.equal(repeatedAttemptsRisk.severity, 'critical');
+  assert.equal(thresholdAttemptsRisk.riskScore >= 85, true);
+  assert.equal(thresholdAttemptsRisk.severity, 'critical');
 });
 
 // ── 5. Policy Engine & Remediation Actions Suite ──────────────────────────────
 
 test('12. PolicyEngine: Generates graduated response and protects Super Admins from suspension', async () => {
-  const criticalIncident = {
+  // 1. Cross-tenant IDOR triggers automated session revocation and proposes user suspension
+  const idorIncident = {
     id: 'inc-001',
-    threat_category: 'PROMPT_INJECTION',
+    threat_category: 'CROSS_TENANT_IDOR',
     risk_score: 95,
     source_ip: '203.0.113.42',
     target_user_id: 'user-attacker-123',
     company_id: 'comp-victim-456',
   };
 
-  const decisions = evaluatePolicyForIncident(criticalIncident);
-  assert.equal(decisions.length >= 2, true);
-
-  // Must include automated temporary IP throttle
-  const throttleAction = decisions.find(d => d.actionType === SECURITY_ACTION_TYPES.IP_THROTTLE_TEMPORARY);
-  assert.ok(throttleAction);
-  assert.equal(throttleAction.isAutomated, true);
-  assert.equal(throttleAction.requiresApproval, false);
+  const idorDecisions = evaluatePolicyForIncident(idorIncident);
+  assert.equal(idorDecisions.length >= 2, true);
 
   // Must include automated session revocation
-  const revokeAction = decisions.find(d => d.actionType === SECURITY_ACTION_TYPES.SESSION_REVOKE_TARGET);
+  const revokeAction = idorDecisions.find(d => d.actionType === SECURITY_ACTION_TYPES.SESSION_REVOKE_TARGET);
   assert.ok(revokeAction);
   assert.equal(revokeAction.isAutomated, true);
 
   // Must propose USER_SUSPEND for Super Admin approval
-  const suspendAction = decisions.find(d => d.actionType === SECURITY_ACTION_TYPES.USER_SUSPEND);
+  const suspendAction = idorDecisions.find(d => d.actionType === SECURITY_ACTION_TYPES.USER_SUSPEND);
   assert.ok(suspendAction);
   assert.equal(suspendAction.isAutomated, false);
   assert.equal(suspendAction.requiresApproval, true);
+
+  // 2. Super Admin probe triggers automated temporary IP throttle
+  const probeIncident = {
+    id: 'inc-002',
+    threat_category: 'SUPERADMIN_PROBE',
+    risk_score: 90,
+    source_ip: '203.0.113.42',
+    target_user_id: 'user-probe-789',
+    company_id: 'comp-victim-456',
+  };
+  const probeDecisions = evaluatePolicyForIncident(probeIncident);
+  const throttleAction = probeDecisions.find(d => d.actionType === SECURITY_ACTION_TYPES.IP_THROTTLE_TEMPORARY);
+  assert.ok(throttleAction);
+  assert.equal(throttleAction.isAutomated, true);
+  assert.equal(throttleAction.requiresApproval, false);
+
+  // 3. Prompt injection at threshold proposes USER_SUSPEND
+  const promptIncident = {
+    id: 'inc-003',
+    threat_category: 'PROMPT_INJECTION',
+    risk_score: 90,
+    source_ip: '203.0.113.42',
+    target_user_id: 'user-attacker-123',
+    company_id: 'comp-victim-456',
+    ai_analysis: { verifiedPromptAttemptCount: 16 },
+  };
+  const promptDecisions = evaluatePolicyForIncident(promptIncident);
+  assert.equal(promptDecisions.length, 1);
+  assert.equal(promptDecisions[0].actionType, SECURITY_ACTION_TYPES.USER_SUSPEND);
+  assert.equal(promptDecisions[0].requiresApproval, true);
 });
 
 test('13. ActionExecutor: Rejects USER_SUSPEND if target user is super_admin', async () => {

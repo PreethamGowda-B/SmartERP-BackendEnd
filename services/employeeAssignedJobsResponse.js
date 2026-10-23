@@ -4,7 +4,7 @@ function isEmployeeAssignedJobsPrompt(role, prompt) {
   const normalizedRole = String(role || '').toLowerCase();
   const normalizedPrompt = String(prompt || '').toLowerCase();
   return normalizedRole === 'employee'
-    && /\b(my|assigned to me|assigned)\b/.test(normalizedPrompt)
+    && /\b(my|assigned to me)\b/.test(normalizedPrompt)
     && /\b(jobs?|tasks?)\b/.test(normalizedPrompt);
 }
 
@@ -14,7 +14,7 @@ function createEmployeeAssignedJobsResponse(result, latencyMs = 0) {
   const titles = jobs.map((job) => job?.title).filter(Boolean);
   const text = count === 0
     ? 'You currently have no directly assigned jobs.'
-    : `You have **${count}** directly assigned job(s)${titles.length ? `: ${titles.join(', ')}` : ''}.`;
+    : `You have **${count}** directly assigned job(s).${titles.length ? ` Recent jobs: ${titles.join(', ')}.` : ''}`;
 
   return {
     text,

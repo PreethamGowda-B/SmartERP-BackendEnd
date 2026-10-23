@@ -25,8 +25,9 @@ Module._load = function (request, parent, isMain) {
   return originalLoad.call(this, request, parent, isMain);
 };
 let createWorkRequestActionHandler;
+let ensureWorkRequestsTable;
 try {
-  ({ createWorkRequestActionHandler } = require(routePath));
+  ({ createWorkRequestActionHandler, ensureWorkRequestsTable } = require(routePath));
 } finally {
   Module._load = originalLoad;
 }
@@ -201,6 +202,9 @@ test('unsupported work-request action is rejected before opening a transaction',
   assert.equal(connected, false);
 });
 
-test('module-load schema initializer is isolated from a real pool in this test file', () => {
+test('module-load schema initializer is isolated from a real pool in this test file', async () => {
+  if (ensureWorkRequestsTable) {
+    await ensureWorkRequestsTable();
+  }
   assert.ok(schemaQueryLog.some(({ sql }) => /CREATE TABLE IF NOT EXISTS work_requests/i.test(sql)));
 });

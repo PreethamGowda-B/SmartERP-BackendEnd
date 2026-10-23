@@ -162,6 +162,7 @@ router.post('/clock-in', authenticateToken, async (req, res) => {
       await createNotificationForOwners({
         company_id: companyId,
         type: 'employee_clock_in',
+        idempotency_key: `attendance_clock_in:${companyId}:${record.id}`,
         title: 'Employee Clocked In',
         message: `${employeeName} clocked in at ${formatPolicyTime(clockInTime, policy.timezone)} (${statusLabel})`,
         priority: isHalfDay ? 'high' : isLate ? 'medium' : 'low',
@@ -257,6 +258,7 @@ router.post('/clock-out', authenticateToken, async (req, res) => {
       await createNotificationForOwners({
         company_id: companyId,
         type: 'employee_clock_out',
+        idempotency_key: `attendance_clock_out:${companyId}:${resultRecord.id}`,
         title: 'Employee Clocked Out',
         message: `${employeeName} clocked out. Hours: ${workingHours.toFixed(2)}, Status: ${status}`,
         priority: 'low',
@@ -482,6 +484,7 @@ router.post('/corrections', authenticateToken, async (req, res) => {
       await createNotificationForOwners({
         company_id: companyId,
         type: 'attendance_correction_request',
+        idempotency_key: `attendance_correction:${companyId}:${result.rows[0].id}`,
         title: 'Attendance Correction Request',
         message: `Employee has requested attendance correction`,
         priority: 'medium',

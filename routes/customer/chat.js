@@ -36,39 +36,7 @@ function fail(res, message, statusCode = 400) {
   return res.status(statusCode).json({ success: false, data: null, error: message });
 }
 
-// ── Ensure job_messages table exists (idempotent) ─────────────────────────────
-async function ensureTable() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS job_messages (
-      id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      job_id          UUID NOT NULL,
-      sender_type     VARCHAR(20) NOT NULL,  -- 'customer' | 'employee'
-      sender_id       UUID NOT NULL,
-      sender_name     VARCHAR(255),
-      message         TEXT NOT NULL,
-      company_id      TEXT,
-      read_by_customer  BOOLEAN NOT NULL DEFAULT FALSE,
-      read_by_employee  BOOLEAN NOT NULL DEFAULT FALSE,
-      media_url       TEXT,
-      media_type      VARCHAR(30),
-      file_name       VARCHAR(255),
-      file_size       BIGINT,
-      created_at      TIMESTAMP NOT NULL DEFAULT NOW()
-    );
-    CREATE INDEX IF NOT EXISTS idx_job_messages_job_id ON job_messages(job_id);
-    CREATE INDEX IF NOT EXISTS idx_job_messages_created_at ON job_messages(job_id, created_at);
-
-    -- Add unread columns to existing tables (safe to run multiple times)
-    ALTER TABLE job_messages ADD COLUMN IF NOT EXISTS read_by_customer BOOLEAN NOT NULL DEFAULT FALSE;
-    ALTER TABLE job_messages ADD COLUMN IF NOT EXISTS read_by_employee BOOLEAN NOT NULL DEFAULT FALSE;
-    ALTER TABLE job_messages ADD COLUMN IF NOT EXISTS media_url TEXT;
-    ALTER TABLE job_messages ADD COLUMN IF NOT EXISTS media_type VARCHAR(30);
-    ALTER TABLE job_messages ADD COLUMN IF NOT EXISTS file_name VARCHAR(255);
-    ALTER TABLE job_messages ADD COLUMN IF NOT EXISTS file_size BIGINT;
-  `).catch(() => {}); // Silently ignore if already exists
-}
-
-ensureTable();
+// ── Schema for job_messages is managed via versioned database migrations ───────
 
 // Customer uploads are scoped to a job where the employee has accepted it.
 router.post('/upload', chatUpload.single('attachment'), requireValidFileSignature({

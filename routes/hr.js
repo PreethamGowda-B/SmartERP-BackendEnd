@@ -170,6 +170,7 @@ router.post('/requests', authenticateToken, async (req, res) => {
       await createNotificationForOwners({
         company_id: companyId,
         type: request_type,
+        idempotency_key: `employee_request:${companyId}:${result.rows[0].id}`,
         title: notifTitle,
         message: notifMsg,
         priority: 'medium',

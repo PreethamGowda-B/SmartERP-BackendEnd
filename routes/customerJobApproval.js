@@ -271,6 +271,7 @@ router.post('/:id/approve', authenticateToken, requireOwnerOrHr, async (req, res
     createNotificationForCompany({
       company_id: companyId,
       type: 'job_available',
+      idempotency_key: `approved_customer_job_available:${companyId}:${updatedJob.id}`,
       title: 'New Job Available',
       message: 'A customer job is available to accept: "' + updatedJob.title + '"',
       priority: updatedJob.priority || 'medium',

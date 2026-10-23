@@ -122,6 +122,7 @@ function createWorkRequestSubmitHandler({ db = pool, ensureSchema = ensureWorkRe
       await createNotificationForOwners({
         company_id: companyId,
         type: 'work_request',
+        idempotency_key: `work_request:${companyId}:${newReq.id}`,
         title: urgency === 'emergency' ? '🚨 EMERGENCY WORK REQUEST' : `Approval Request: ${title}`,
         message: `${req.user.name || 'User'} submitted ${request_type.replace(/_/g, ' ')}: ${reason || title}`,
         priority: urgency === 'emergency' ? 'urgent' : urgency === 'high' ? 'high' : 'normal',
@@ -394,3 +395,4 @@ module.exports.createWorkRequestSubmitHandler = createWorkRequestSubmitHandler;
 module.exports.createWorkRequestListHandler = createWorkRequestListHandler;
 module.exports.createWorkRequestActionHandler = createWorkRequestActionHandler;
 module.exports.canTransitionWorkRequest = canTransitionWorkRequest;
+module.exports.ensureWorkRequestsTable = ensureWorkRequestsTable;

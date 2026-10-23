@@ -57,49 +57,9 @@ function authenticateProofCaller(req, res, next) {
   }, next);
 }
 
-// Ensure proof_of_work table exists in database lazily
-let isInitialized = false;
-let initializationPromise = null;
+// Schema is managed via versioned database migrations.
 async function ensureDbInitialized() {
-  if (isInitialized) return;
-  if (initializationPromise) return initializationPromise;
-  initializationPromise = (async () => {
-    const client = await pool.connect();
-    try {
-      await client.query('SET ROLE postgres').catch(() => {});
-      await client.query(`
-      CREATE TABLE IF NOT EXISTS job_proof_of_work (
-        id SERIAL PRIMARY KEY,
-        job_id TEXT NOT NULL,
-        company_id TEXT,
-        uploaded_by_id TEXT,
-        uploaded_by_name TEXT,
-        photo_url TEXT,
-        notes TEXT,
-        gps_latitude NUMERIC,
-        gps_longitude NUMERIC,
-        stage TEXT DEFAULT 'in_progress',
-        customer_signature_url TEXT,
-        client_submission_id TEXT,
-        signed_at TIMESTAMP,
-        created_at TIMESTAMP DEFAULT NOW()
-      );
-    `);
-      await client.query('ALTER TABLE job_proof_of_work ADD COLUMN IF NOT EXISTS client_submission_id TEXT');
-      await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS job_proof_of_work_submission_unique
-        ON job_proof_of_work (company_id, client_submission_id)
-        WHERE client_submission_id IS NOT NULL`);
-      isInitialized = true;
-    } finally {
-      client.release();
-    }
-  })();
-  try {
-    await initializationPromise;
-  } catch (error) {
-    initializationPromise = null;
-    throw error;
-  }
+  return Promise.resolve();
 }
 // ── 1. POST /api/jobs/:id/proof-of-work ─────────────────────────────────────
 // Submit site photo, progress notes, and GPS check-in (Field Technicians)
@@ -241,6 +201,9 @@ router.post("/:id/proof-of-work", authenticateToken, requireClockIn, loadPlan, c
         title: 'Site Proof Uploaded',
         message: `📸 Site Proof Uploaded: ${userName} uploaded site proof photo for job #${String(jobId).substring(0, 8)}`,
         priority: 'medium',
+        // The saved proof ID is the logical event identity. Recipient IDs are
+        // added by createNotificationForOwners so each owner gets one row.
+        idempotency_key: `proof_of_work:${effectiveCompanyId}:${savedProof.id}`,
         actor_id: userId,
         data: { job_id: jobId, proof_id: savedProof.id, url: `/owner/jobs/${jobId}` }
       });

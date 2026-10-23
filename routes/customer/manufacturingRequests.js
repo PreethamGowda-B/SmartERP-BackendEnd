@@ -228,6 +228,7 @@ router.post('/', async (req, res) => {
     require('../../utils/notificationHelpers').createNotificationForOwners({
       company_id: companyId,
       type: 'production',
+      idempotency_key: `customer_manufacturing_request:${companyId}:${id}`,
       title: 'New customer manufacturing request',
       message: `${componentName} · ${requestedQuantity} ${unit} submitted for review.`,
       priority: 'medium',

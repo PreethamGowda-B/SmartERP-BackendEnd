@@ -106,6 +106,7 @@ router.post('/', authenticateToken, loadPlan, checkPlanLimit('job'), [
         await createNotificationForCompany({
           company_id: req.user.companyId,
           type: 'job',
+          idempotency_key: `job_available:${req.user.companyId}:${createdJob.id}`,
           title: 'New Job Available',
           message: `A new job is available for everyone: ${title}`,
           priority: job.priority || 'medium',
@@ -117,6 +118,7 @@ router.post('/', authenticateToken, loadPlan, checkPlanLimit('job'), [
           user_id: assignedTo,
           company_id: req.user.companyId,
           type: 'job',
+          idempotency_key: `job_assigned:${req.user.companyId}:${createdJob.id}`,
           title: 'New Job Assigned',
           message: `You have been assigned a new job: ${title}`,
           priority: job.priority || 'medium',
@@ -542,6 +544,7 @@ const handleJobAccept = async (req, res) => {
       await createNotificationForOwners({
         company_id: req.user.companyId || acceptedJob.company_id,
         type: 'job_accepted',
+        idempotency_key: `job_accepted:${req.user.companyId || acceptedJob.company_id}:${acceptedJob.id}`,
         title: 'Job Accepted',
         message: `${employeeName} accepted the job: ${acceptedJob.title}`,
         priority: 'medium',
@@ -767,6 +770,7 @@ const handleJobAccept = async (req, res) => {
           await createNotificationForOwners({
             company_id: req.user.companyId,
             type: 'job_completed',
+            idempotency_key: `job_completed:${req.user.companyId || updatedJob.company_id}:${updatedJob.id}`,
             title: 'Job Completed',
             message: `${employeeName} completed the job: ${updatedJob.title}`,
             priority: 'medium',
@@ -1166,6 +1170,7 @@ const handleJobAccept = async (req, res) => {
       await createNotificationForOwners({
         company_id: companyId,
         type: 'job_action_request',
+        idempotency_key: `job_action_request:${companyId}:${actionReq.id}`,
         title: urgency === 'emergency' ? '🚨 EMERGENCY SOS ALERT' : `Work Request: ${action_type.replace(/_/g, ' ')}`,
         message: `${userName} submitted a work request for "${jobTitle}": ${notes || action_type}`,
         priority: urgency === 'emergency' ? 'urgent' : 'high',

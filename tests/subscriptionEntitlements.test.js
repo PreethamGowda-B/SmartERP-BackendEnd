@@ -10,7 +10,7 @@ const supportMigrationSql = fs.readFileSync(path.join(__dirname, '../migrations/
 
 const expectedFeatures = {
   1: {
-    payroll: false, messages: true, ai_assistant: false, basic_reports: true,
+    payroll: false, messages: true, ai_assistant: true, basic_reports: true,
     export_reports: true, advanced_reports: false, inventory_images: false,
     priority_support: false, location_tracking: false, ar_collections: false,
     inventory_forecasts: false,
@@ -44,7 +44,7 @@ function runFeatureGuard(features, feature) {
 test('support tiers align with the canonical catalog and migration 038 while migration 037 remains immutable', () => {
   for (const [id, expected] of Object.entries(expectedFeatures)) {
     assert.deepEqual(SUBSCRIPTION_PLANS[id].features, expected);
-    const legacy = { ...expected, priority_support: false };
+    const legacy = { ...expected, priority_support: false, ...(id === '1' ? { ai_assistant: false } : {}) };
     assert.ok(migrationSql.includes(`'${JSON.stringify(legacy)}'::jsonb`), `migration 037 legacy flags for plan ${id}`);
   }
   assert.match(supportMigrationSql, /UPDATE plans[\s\S]*support_policy/);

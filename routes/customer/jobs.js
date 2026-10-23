@@ -258,6 +258,7 @@ router.post('/', loadPlan, checkPlanLimit('job'), [
     createNotificationForOwners({
       company_id: companyId,
       type: 'job',
+      idempotency_key: `customer_job_created:${companyId}:${createdJob.id}`,
       title: autoApprove ? 'New Customer Job (Auto-Approved)' : 'New Customer Job — Pending Approval',
       message: `A customer submitted a new job: ${title}`,
       priority: finalPriority,
@@ -270,6 +271,7 @@ router.post('/', loadPlan, checkPlanLimit('job'), [
       createNotificationForCompany({
         company_id: companyId,
         type: 'job_available',
+        idempotency_key: `customer_job_available:${companyId}:${createdJob.id}`,
         title: 'New Job Available',
         message: 'A customer job is available to accept: "' + createdJob.title + '"',
         priority: finalPriority,

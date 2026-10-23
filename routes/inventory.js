@@ -185,6 +185,7 @@ router.post(
             await createNotificationForCompany({
                 company_id: companyId,
                 type: 'inventory_added',
+                idempotency_key: `inventory_added_employee:${companyId}:${newItem.id}`,
                 title: 'New Inventory Added',
                 message: `${name} (${quantity} ${itemUnit}) has been added to inventory by ${employeeName}`,
                 priority: 'low',
@@ -196,6 +197,7 @@ router.post(
             await createNotificationForOwners({
                 company_id: companyId,
                 type: 'action_inventory_added',
+                idempotency_key: `inventory_added_owner:${companyId}:${newItem.id}`,
                 title: '📦 Inventory Updated',
                 message: `${employeeName} added ${newItem.name} to the stock.`,
                 priority: 'medium',

@@ -2,6 +2,7 @@ const { pool } = require('../db');
 const { redisClient } = require('./redis');
 const { sendPushNotification } = require('../services/firebaseService');
 const { isInternalNotificationRole, isCustomerNotificationTypeAllowed } = require('./notificationAudience');
+const { deliverUserEvent, notificationRecipientIdempotencyKey } = require('./notificationDelivery');
 
 // Store active SSE connections: { userId: [response1, response2, ...] }
 const sseConnections = new Map();
@@ -226,16 +227,17 @@ async function createCustomerPortalNotification({ customerId, companyId, type, t
  */
 function broadcastToUser(userId, message) {
     const uid = String(userId);
-    // 1. Deliver immediately to local in-process SSE connections (<1ms latency)
-    _broadcastInProcess(uid, message);
-
-    // 2. Publish to Redis pub/sub for cross-worker cluster delivery
-    if (redisClient && (redisClient.status === 'ready' || redisClient.status === 'connecting')) {
-        redisClient.publish(`employee_notifications:${uid}`, JSON.stringify(message))
-            .catch(e => {
-                console.error(`❌ Redis broadcast error for user ${uid}:`, e.message);
-            });
-    }
+    // An SSE connection with Redis enabled is also registered in the local map.
+    // Sending locally and publishing the same event delivered it twice to that
+    // connection. Redis is the fan-out path when available; use local delivery
+    // only when Redis cannot carry the event.
+    deliverUserEvent({
+        userId: uid,
+        message,
+        redisClient,
+        localBroadcast: _broadcastInProcess,
+        onRedisError: (error) => console.error(`❌ Redis broadcast error for user ${uid}:`, error.message),
+    });
 }
 
 function _broadcastInProcess(userId, message) {
@@ -289,7 +291,7 @@ function unregisterSSEConnection(userId, response) {
  * Medium FIX: Uses a single bulk INSERT instead of N+1 parallel INSERTs.
  * Then broadcasts to each user via Redis pub/sub for real-time delivery.
  */
-async function createNotificationForCompany({ company_id, type, title, message, priority = 'medium', data = null, exclude_user_id = null }) {
+async function createNotificationForCompany({ company_id, type, title, message, priority = 'medium', data = null, exclude_user_id = null, idempotency_key = null }) {
     try {
         if (company_id == null || String(company_id).trim() === '') {
             return { success: true, count: 0 };
@@ -310,21 +312,21 @@ async function createNotificationForCompany({ company_id, type, title, message, 
 
         // 2. Bulk INSERT — single query instead of N individual INSERTs
         const mergedData = JSON.stringify({ url: '/employee/notifications', ...data });
-        const valuePlaceholders = employees.map((_, i) => `($${i * 5 + 1}, $${i * 5 + 2}, $${i * 5 + 3}, $${i * 5 + 4}, $${i * 5 + 5}, NOW())`).join(', ');
-        const bulkParams = employees.flatMap(emp => [emp.id, company_id, type, title, message]);
-        // We use a per-row subselect to embed priority and data since flatMap would bloat params
-        // Instead use a simpler approach: build rows individually in a VALUES list
         const rowValues = [];
         const bulkValues = [];
         employees.forEach((emp, i) => {
-            const base = i * 7;
-            rowValues.push(`($${base+1}, $${base+2}, $${base+3}, $${base+4}, $${base+5}, $${base+6}, $${base+7}, NOW())`);
+            const base = i * (idempotency_key ? 8 : 7);
+            rowValues.push(idempotency_key
+                ? `($${base+1}, $${base+2}, $${base+3}, $${base+4}, $${base+5}, $${base+6}, $${base+7}, $${base+8}, NOW())`
+                : `($${base+1}, $${base+2}, $${base+3}, $${base+4}, $${base+5}, $${base+6}, $${base+7}, NOW())`);
             bulkValues.push(emp.id, company_id, type, title, message, priority, mergedData);
+            if (idempotency_key) bulkValues.push(notificationRecipientIdempotencyKey(idempotency_key, emp.id));
         });
 
         const insertResult = await pool.query(
-            `INSERT INTO notifications (user_id, company_id, type, title, message, priority, data, created_at)
+            `INSERT INTO notifications (user_id, company_id, type, title, message, priority, data${idempotency_key ? ', idempotency_key' : ''}, created_at)
              VALUES ${rowValues.join(', ')}
+             ${idempotency_key ? 'ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING' : ''}
              RETURNING id, user_id, type, title, message, priority, data, created_at`,
             bulkValues
         );
@@ -334,7 +336,7 @@ async function createNotificationForCompany({ company_id, type, title, message, 
             broadcastToUser(notification.user_id, { type: 'notification', data: notification });
         });
 
-        return { success: true, count: employees.length };
+        return { success: true, count: insertResult.rows.length };
     } catch (err) {
         console.error('❌ Error in createNotificationForCompany:', err);
         throw err;
@@ -345,7 +347,7 @@ async function createNotificationForCompany({ company_id, type, title, message, 
  * Create notifications for all owners/admins in a company.
  * Medium FIX: Uses a single bulk INSERT instead of N+1 parallel INSERTs.
  */
-async function createNotificationForOwners({ company_id, type, title, message, priority = 'medium', data = null, exclude_user_id = null }) {
+async function createNotificationForOwners({ company_id, type, title, message, priority = 'medium', data = null, exclude_user_id = null, idempotency_key = null }) {
     try {
         if (company_id == null || String(company_id).trim() === '') {
             return { success: true, count: 0 };
@@ -369,14 +371,18 @@ async function createNotificationForOwners({ company_id, type, title, message, p
         const rowValues = [];
         const bulkValues = [];
         owners.forEach((owner, i) => {
-            const base = i * 7;
-            rowValues.push(`($${base+1}, $${base+2}, $${base+3}, $${base+4}, $${base+5}, $${base+6}, $${base+7}, NOW())`);
+            const base = i * (idempotency_key ? 8 : 7);
+            rowValues.push(idempotency_key
+                ? `($${base+1}, $${base+2}, $${base+3}, $${base+4}, $${base+5}, $${base+6}, $${base+7}, $${base+8}, NOW())`
+                : `($${base+1}, $${base+2}, $${base+3}, $${base+4}, $${base+5}, $${base+6}, $${base+7}, NOW())`);
             bulkValues.push(owner.id, company_id, type, title, message, priority, mergedData);
+            if (idempotency_key) bulkValues.push(notificationRecipientIdempotencyKey(idempotency_key, owner.id));
         });
 
         const insertResult = await pool.query(
-            `INSERT INTO notifications (user_id, company_id, type, title, message, priority, data, created_at)
+            `INSERT INTO notifications (user_id, company_id, type, title, message, priority, data${idempotency_key ? ', idempotency_key' : ''}, created_at)
              VALUES ${rowValues.join(', ')}
+             ${idempotency_key ? 'ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING' : ''}
              RETURNING id, user_id, type, title, message, priority, data, created_at`,
             bulkValues
         );
@@ -386,7 +392,7 @@ async function createNotificationForOwners({ company_id, type, title, message, p
             broadcastToUser(notification.user_id, { type: 'notification', data: notification });
         });
 
-        return { success: true, count: owners.length };
+        return { success: true, count: insertResult.rows.length };
     } catch (err) {
         console.error('❌ Error in createNotificationForOwners:', err);
         throw err;

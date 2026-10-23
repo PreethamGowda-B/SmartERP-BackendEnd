@@ -304,7 +304,7 @@ router.post('/', loadPlan, upload.single('invoice'), requireValidFileSignature({
       return res.status(202).json({ success: true, bill_id: bill.id, status: 'processing', message: 'Invoice was securely saved; analysis result could not be saved yet. Refresh the request.' });
     } finally { updateClient.release(); }
     try {
-      await createNotificationForOwners({ company_id: companyId, type: 'material_purchase_bill', title: 'Purchase bill ready for review', message: `${request.item_name} is awaiting inventory verification.`, priority: 'medium', data: { request_id: request.id, bill_id: bill.id, url: '/owner/inventory?tab=materials' } });
+      await createNotificationForOwners({ company_id: companyId, type: 'material_purchase_bill', idempotency_key: `material_purchase_bill:${companyId}:${bill.id}`, title: 'Purchase bill ready for review', message: `${request.item_name} is awaiting inventory verification.`, priority: 'medium', data: { request_id: request.id, bill_id: bill.id, url: '/owner/inventory?tab=materials' } });
     } catch (error) { console.warn('Material purchase owner notification failed:', error.code || error.name || 'notification_error'); }
     return res.status(201).json({ success: true, bill_id: bill.id, ai_status: finalAiStatus, discrepancies, draft_status: 'awaiting_owner_verification' });
   } catch (error) {

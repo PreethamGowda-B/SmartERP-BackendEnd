@@ -78,6 +78,7 @@ router.post('/', authenticateToken, async (req, res) => {
             await createNotificationForOwners({
                 company_id: companyId,
                 type: 'material_request_created',
+                idempotency_key: `material_request:${companyId}:${createdRequest.id}`,
                 title: 'New Material Request',
                 message: `${userName} requested ${quantity} ${item_name}`,
                 priority: urgency === 'High' ? 'high' : 'medium',

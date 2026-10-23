@@ -181,7 +181,7 @@ class GroqProvider extends BaseAIProvider {
         // Credentials, account quota, and timeouts affect the provider/account,
         // not just the selected model. Trying another model cannot resolve them.
         if (status === 401 || status === 403 || status === 429 || isTimeout) break;
-        console.warn(`⚠️ Groq model '${modelToTry}' failed (${errMsg}) — trying next candidate...`);
+        console.warn(`⚠️ Groq model '${modelToTry}' failed (code=${String(err?.code || status || 'provider_error').slice(0, 60)}) — trying next candidate...`);
       }
     }
     const error = new Error("The AI provider is temporarily unavailable.");

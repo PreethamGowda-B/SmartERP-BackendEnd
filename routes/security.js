@@ -397,10 +397,14 @@ router.post('/actions/:id/approve', async (req, res) => {
     }
 
     // 2. Mark approved and execute
-    await pool.query(
-      `UPDATE security_actions SET approval_status = 'approved', executed_by = $1 WHERE id = $2`,
+    const approved = await pool.query(
+      `UPDATE security_actions SET approval_status = 'approved', executed_by = $1
+       WHERE id = $2 AND approval_status = 'pending' RETURNING id`,
       [superAdminId, id]
     );
+    if (!approved.rows.length) {
+      return res.status(409).json({ message: 'This action was resolved before approval and cannot be executed.' });
+    }
 
     const execResult = await executeSecurityAction(id, superAdminId);
 

@@ -159,7 +159,7 @@ class AIDataService {
          WHERE company_id::text = $1 
          GROUP BY status`,
         [cid]
-      ).catch(() => ({ rows: [] })),
+      ),
 
       // Today's revenue & monthly revenue
       pool.query(
@@ -169,7 +169,7 @@ class AIDataService {
          FROM payments 
          WHERE company_id::text = $1`,
         [cid]
-      ).catch(() => ({ rows: [{ today_revenue: 0, month_revenue: 0 }] })),
+      ),
 
       // Pending invoices & overdue
       pool.query(
@@ -181,7 +181,7 @@ class AIDataService {
          FROM invoices 
          WHERE company_id::text = $1`,
         [cid]
-      ).catch(() => ({ rows: [{ total_invoices: 0, pending_amount: 0, overdue_count: 0 }] })),
+      ),
 
       // Today's attendance overview & active employees (mirroring canonical routes/attendance.js)
       pool.query(
@@ -213,7 +213,7 @@ class AIDataService {
          WHERE company_id::text = $1 AND quantity <= min_stock_level 
          LIMIT 5`,
         [cid]
-      ).catch(() => ({ rows: [] })),
+      ),
 
       // Pending leave requests
       pool.query(
@@ -221,7 +221,7 @@ class AIDataService {
          FROM leave_requests 
          WHERE company_id::text = $1 AND status = 'pending'`,
         [cid]
-      ).catch(() => ({ rows: [{ pending_leaves: 0 }] })),
+      ),
 
       // Approved leaves for today
       pool.query(
@@ -231,7 +231,7 @@ class AIDataService {
            AND status = 'approved'
            AND $2::date BETWEEN start_date AND end_date`,
         [cid, workDate]
-      ).catch(() => ({ rows: [{ on_leave_count: 0 }] })),
+      ),
     ]);
 
     const jobCounts = {};
@@ -313,7 +313,7 @@ class AIDataService {
            AND (assigned_employee_id::text = $1 OR employee_id::text = $1)
          ORDER BY created_at DESC LIMIT 10`,
         [uid, cid]
-      ).catch(() => ({ rows: [] })),
+      ),
 
       // Attendance history for this month
       pool.query(
@@ -323,7 +323,7 @@ class AIDataService {
            AND date >= date_trunc('month', $3::date)::date AND date <= $4::date
          ORDER BY date DESC LIMIT 10`,
         [uid, cid, workDate.slice(0, 7) + '-01', workDate]
-      ).catch(() => ({ rows: [] })),
+      ),
 
       // Employee's leave requests
       pool.query(
@@ -332,7 +332,7 @@ class AIDataService {
          WHERE user_id::text = $1 AND company_id::text = $2
          ORDER BY created_at DESC LIMIT 5`,
         [uid, cid]
-      ).catch(() => ({ rows: [] })),
+      ),
 
       // Employee's material requests
       pool.query(
@@ -341,7 +341,7 @@ class AIDataService {
          WHERE requested_by::text = $1 AND company_id::text = $2
          ORDER BY created_at DESC LIMIT 5`,
         [uid, cid]
-      ).catch(() => ({ rows: [] })),
+      ),
     ]);
 
     const completedJobs = jobsRes.rows.filter((j) => j.status === "completed").length;
@@ -375,7 +375,7 @@ class AIDataService {
          LEFT JOIN users u ON l.user_id::text = u.id::text AND l.company_id::text = u.company_id::text
          WHERE l.company_id::text = $1 AND l.status = 'pending'`,
         [cid]
-      ).catch(() => ({ rows: [] })),
+      ),
 
       // Today's attendance anomalies (late arrivals or absent staff)
       pool.query(
@@ -391,7 +391,7 @@ class AIDataService {
            AND (u.role = 'employee' OR (u.role != 'owner' AND u.role != 'admin' AND u.role != 'customer'))
            AND (a.is_late = true OR a.status = 'late' OR a.check_in_time IS NULL)`,
         [cid, workDate]
-      ).catch(() => ({ rows: [] })),
+      ),
 
       // Employee headcount by department
       pool.query(
@@ -402,7 +402,7 @@ class AIDataService {
            AND COALESCE(NULLIF(to_jsonb(u)->>'status', ''), 'active') <> 'suspended'
          GROUP BY u.department`,
         [cid]
-      ).catch(() => ({ rows: [] })),
+      ),
     ]);
 
     return {
@@ -425,7 +425,7 @@ class AIDataService {
          WHERE company_id::text = $1 AND (customer_id::text = $2 OR customer_email = $3)
          ORDER BY created_at DESC LIMIT 10`,
         [cid, String(customerId || ""), String(email || "")]
-      ).catch(() => ({ rows: [] })),
+      ),
 
       pool.query(
         `SELECT id, invoice_number, total_amount, status, due_date 
@@ -433,7 +433,7 @@ class AIDataService {
          WHERE company_id::text = $1 AND (customer_id::text = $2 OR customer_email = $3)
          ORDER BY created_at DESC LIMIT 10`,
         [cid, String(customerId || ""), String(email || "")]
-      ).catch(() => ({ rows: [] })),
+      ),
     ]);
 
     return {

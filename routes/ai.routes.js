@@ -7,6 +7,8 @@ const { loadPlan } = require("../middleware/planMiddleware");
 const { requireFeature } = require("../middleware/featureGuard");
 const { resolvePlanTier } = require("../services/subscriptionCatalog");
 const { resolveAiModelScopes } = require('../services/aiModelEntitlements');
+const { getAiErrorResponse } = require('../utils/aiErrorResponse');
+const { SAFE_PROMPT_REFUSAL } = require('../middleware/aiPromptGuard');
 
 const ContextEngine = require("../ai/context/context.engine");
 const ReActEngine = require("../ai/planner/ReAct.engine");
@@ -379,9 +381,9 @@ router.post(
         promptLower.includes("help desk")
       ) {
         return res.json({
-          text: `If you need assistance, you can reach SmartERP Support through any of the following channels:\n\n• **Email:** support@smarterp.com\n• **Phone (India):** +91-80-1234-5678 (9 AM - 6 PM IST)\n• **Support Portal:** Submit a support ticket and track its resolution in real time.`,
+          text: 'Please use the Support option in your SmartERP portal or contact your company administrator for help.',
           widget: null,
-          navigation: { path: "/support", label: "Open Support Portal" },
+          navigation: null,
           confidenceScore: 1.0,
           sources: ["SmartERP Support Gateway"],
           autoSelectedModel: "General Assistant",
@@ -457,10 +459,20 @@ router.post(
             console.warn(`⚠️ Multi-agent scope '${scope}' failed:`, scopeErr?.code || scopeErr?.name || 'provider_error');
             return {
               scope,
-              result: { text: `${scope} AI encountered an issue.`, sources: [], confidenceScore: 0 },
+              failed: true,
+              errorCode: scopeErr?.code || 'AI_SCOPE_UNAVAILABLE',
+              result: { text: `${scope} AI is temporarily unavailable. No result was returned for this specialist.`, sources: [], confidenceScore: 0 },
             };
           }
         }));
+
+        if (scopeResults.every((entry) => entry.failed)) {
+          const error = new Error('All selected AI specialists failed to complete the request.');
+          error.code = scopeResults.some((entry) => String(entry.errorCode).startsWith('AI_PROVIDER_'))
+            ? 'AI_PROVIDER_UNAVAILABLE'
+            : 'AI_TOOL_EXECUTION_FAILED';
+          throw error;
+        }
 
         // Combine multi-scope responses
         const combinedText = scopeResults
@@ -505,7 +517,9 @@ router.post(
         latencyMs,
         confidenceScore: finalResult.confidenceScore,
         blocked: false,
-        promptPreview: cleanMessage,
+        promptPreview: null,
+      }).catch((auditErr) => {
+        console.warn('[SmartERP AI] Request audit event could not be recorded:', auditErr?.code || auditErr?.name || 'audit_error');
       });
 
       // Persist to CNC Enterprise AI Action Audit Trail
@@ -515,7 +529,7 @@ router.post(
         await pool.query(
           `INSERT INTO ai_action_audit_trail (company_id, user_id, user_name, prompt, ai_interpretation, workflow_type, execution_level, approval_status, result_summary, created_at)
            VALUES ($1, $2, $3, $4, $5, $6, 1, 'executed', $7, NOW())`,
-          [String(companyId), String(auditUserId), userName, cleanMessage, finalResult.text?.substring(0, 500) || 'Query Analyzed', finalResult.activeModelScope || 'general', finalResult.text?.substring(0, 500) || 'Completed']
+          [String(companyId), String(auditUserId), userName, `AI request (${finalResult.activeModelScope || 'general'})`, 'AI response generated; business content redacted.', finalResult.activeModelScope || 'general', 'AI response generated; business content redacted.']
         ).catch(() => {});
       }
 
@@ -527,18 +541,6 @@ router.post(
 
       res.json(finalResult);
     } catch (error) {
-      if (error?.statusCode === 503 && typeof error?.code === 'string' && error.code.startsWith('AI_PROVIDER_')) {
-        console.error("❌ SmartERP AI provider unavailable:", {
-          code: error.code,
-          providerErrorCode: error.providerErrorCode || null,
-        });
-        return res.status(503).json({
-          code: error.code,
-          error: error.code === 'AI_PROVIDER_NOT_CONFIGURED'
-            ? 'SmartERP AI is not configured on the server. Please contact your administrator.'
-            : 'SmartERP AI provider is temporarily unavailable. Please retry shortly.',
-        });
-      }
       const diagnostic = {
         code: typeof error?.code === 'string' ? error.code.slice(0, 40) : null,
         name: typeof error?.name === 'string' ? error.name.slice(0, 80) : 'Error',
@@ -551,10 +553,8 @@ router.post(
         if (error.table) diagnostic.table = String(error.table).slice(0, 100);
       }
       console.error("❌ SmartERP AI Agent Error:", diagnostic);
-      res.status(500).json({
-        code: 'AI_AGENT_FAILED',
-        error: "SmartERP AI could not complete this request. Please retry shortly.",
-      });
+      const response = getAiErrorResponse(error);
+      return res.status(response.status).json(response.body);
     }
   }
 );
@@ -602,9 +602,8 @@ router.post(
             },
           });
           return res.status(400).json({
-            error: "SECURITY_VIOLATION",
-            message: `Security violation in action parameters: ${blocked.result.reason}`,
-            code: "INJECTION_IN_ACTION_PARAM"
+            code: 'AI_PROMPT_BLOCKED',
+            error: SAFE_PROMPT_REFUSAL,
           });
         }
       }
@@ -616,8 +615,12 @@ router.post(
       const result = await pluginRegistry.execute(toolName, confirmedParams, context);
       res.json(result);
     } catch (error) {
-      console.error("❌ AI Action Confirmation Error:", error);
-      res.status(500).json({ error: error.message || "Action execution failed." });
+      console.error("❌ AI Action Confirmation Error:", {
+        code: typeof error?.code === 'string' ? error.code.slice(0, 40) : null,
+        name: typeof error?.name === 'string' ? error.name.slice(0, 80) : 'Error',
+      });
+      const response = getAiErrorResponse(error);
+      return res.status(response.status).json(response.body);
     }
   }
 );
@@ -692,7 +695,8 @@ router.post(
       const result = await ReActEngine.run({ userPrompt: message, context });
       res.json({ reply: result.text });
     } catch (error) {
-      res.status(500).json({ error: "AI error" });
+      const response = getAiErrorResponse(error);
+      res.status(response.status).json(response.body);
     }
   }
 );

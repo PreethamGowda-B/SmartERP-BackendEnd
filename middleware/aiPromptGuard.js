@@ -3,6 +3,8 @@
 const SecurityShield = require('../ai/gateway/security.shield');
 const { randomUUID } = require('node:crypto');
 
+const SAFE_PROMPT_REFUSAL = "Sorry, I can't follow instructions that attempt to bypass my security rules. I can still help with your normal SmartERP tasks.";
+
 function createAiPromptGuard({
   field = 'message',
   sanitizedProperty = field === 'message' ? 'sanitizedAiMessage' : 'sanitizedAiPrompt',
@@ -93,10 +95,10 @@ function createAiPromptGuard({
       emitAttack(err, typeof err?.inputLength === 'number' ? err.inputLength : message.length);
       return res.status(400).json({
         code: err?.inputValidationFailure ? 'AI_HISTORY_INVALID' : 'AI_PROMPT_BLOCKED',
-        error: err?.inputValidationFailure ? err.message : (err?.message || 'The message was rejected by the AI safety checks.'),
+        error: err?.inputValidationFailure ? err.message : (err?.isSecurityThreat === true ? SAFE_PROMPT_REFUSAL : (err?.message || 'The message was rejected by the AI safety checks.')),
       });
     }
   };
 }
 
-module.exports = { createAiPromptGuard };
+module.exports = { createAiPromptGuard, SAFE_PROMPT_REFUSAL };

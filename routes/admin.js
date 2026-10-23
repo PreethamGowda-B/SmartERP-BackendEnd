@@ -6,6 +6,7 @@ const { authenticateToken } = require('../middleware/authMiddleware');
 const { authenticateSuperAdmin } = require('../middleware/adminMiddleware');
 const { getPlan } = require('../services/subscriptionCatalog');
 const { redisClient } = require('../utils/redis');
+const { reactivateStaffAccount } = require('../services/accountReactivation');
 
 function requireAccountType(req, res, allowedTypes) {
   const accountType = req.query?.account_type || req.body?.account_type;
@@ -207,11 +208,28 @@ router.get('/users', async (req, res) => {
 
     const [result, countResult] = await Promise.all([
       pool.query(
-        `SELECT u.id::text, u.name, u.email, 'staff' AS user_type, u.role, u.company_id, u.created_at, c.company_name 
+        `SELECT u.id::text, u.name, u.email, 'staff' AS user_type, u.role, u.company_id, u.created_at, c.company_name,
+                u.is_active,
+                COALESCE(NULLIF(to_jsonb(u)->>'status', ''), 'active') AS account_status,
+                suspension.reason AS last_suspension_reason,
+                suspension.created_at::timestamp AS last_suspension_at,
+                suspension.source AS last_suspension_source
          FROM users u
          LEFT JOIN companies c ON u.company_id = c.id
+         LEFT JOIN LATERAL (
+           SELECT sa.details->>'reason' AS reason, sa.created_at,
+                  CASE WHEN sa.is_automated THEN 'Automated security policy' ELSE 'Security action approved by Super Admin' END AS source
+           FROM security_actions sa
+           WHERE sa.action_type = 'USER_SUSPEND'
+             AND sa.approval_status = 'executed'
+             AND sa.details->>'userId' = u.id::text
+             AND sa.details->'executionDetails'->>'suspendedUserId' = u.id::text
+           ORDER BY sa.created_at DESC LIMIT 1
+         ) suspension ON TRUE
          UNION ALL
-         SELECT cust.id::text, cust.name, cust.email, 'customer' AS user_type, 'customer' AS role, cust.company_id, cust.created_at, c.company_name
+         SELECT cust.id::text, cust.name, cust.email, 'customer' AS user_type, 'customer' AS role, cust.company_id, cust.created_at, c.company_name,
+                NULL::boolean AS is_active, NULL::text AS account_status,
+                NULL::text AS last_suspension_reason, NULL::timestamp AS last_suspension_at, NULL::text AS last_suspension_source
          FROM customers cust
          LEFT JOIN companies c ON cust.company_id = c.id
          ORDER BY created_at DESC
@@ -854,6 +872,9 @@ router.patch('/users/:id', async (req, res) => {
   if (is_active !== undefined && typeof is_active !== 'boolean') {
     return res.status(400).json({ message: 'is_active must be a boolean.' });
   }
+  if (is_active === true) {
+    return res.status(409).json({ code: 'USE_ACCOUNT_RESTORE', message: 'Use the audited account restore action to reactivate a staff account.' });
+  }
 
   const updates = [];
   const values = [];
@@ -1199,21 +1220,33 @@ router.post('/users/:id/force-logout', async (req, res) => {
 router.post('/users/:id/restore', async (req, res) => {
   if (!requireAccountType(req, res, ['staff'])) return;
   const { id } = req.params;
+  const actorId = String(req.user?.userId || req.user?.id || '');
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
+    return res.status(400).json({ code: 'ACCOUNT_ID_INVALID', message: 'A valid staff account ID is required.' });
+  }
+  const { reason } = req.body || {};
+  if (typeof reason !== 'string' || reason.trim().length < 8 || reason.trim().length > 500) {
+    return res.status(400).json({ code: 'REASON_REQUIRED', message: 'Enter a reactivation reason between 8 and 500 characters.' });
+  }
+  if (actorId.toLowerCase() === id.toLowerCase()) {
+    return res.status(409).json({ code: 'SELF_REACTIVATION_FORBIDDEN', message: 'You cannot reactivate your own Super Admin account.' });
+  }
   try {
-    if (!redisClient || redisClient.status !== 'ready') {
-      return res.status(503).json({ message: 'Session revocation storage is unavailable. Please retry restoration.' });
+    const outcome = await reactivateStaffAccount({ pool, redisClient, userId: id, actorId, reason: reason.trim() });
+    if (!outcome.ok) {
+      const messages = {
+        ACCOUNT_NOT_FOUND: 'User account was not found.',
+        SELF_REACTIVATION_FORBIDDEN: 'You cannot reactivate your own Super Admin account.',
+        SESSION_STORE_UNAVAILABLE: 'Session revocation storage is unavailable. No account change was applied; retry later.',
+        ACCOUNT_REACTIVATED_CACHE_REFRESH_REQUIRED: 'The account was reactivated, but access-cache refresh failed. Retry this action before the user signs in.',
+        ACCOUNT_ID_INVALID: 'The staff account ID is invalid.',
+        REASON_REQUIRED: 'Enter a reactivation reason between 8 and 500 characters.',
+      };
+      return res.status(outcome.status).json({ code: outcome.code, message: messages[outcome.code] || 'Account could not be reactivated.' });
     }
-    await redisClient.set(`token_revoked:${id}`, Date.now().toString(), 'EX', 86400);
-    await redisClient.del(`user_suspended:${id}`);
-    await redisClient.set(`user_active:${id}`, '1', 'EX', 60);
-    const result = await pool.query(
-      'UPDATE users SET is_active = TRUE WHERE id = $1 RETURNING id, name, email, is_active',
-      [id]
-    );
-    if (result.rows.length === 0) return res.status(404).json({ message: 'User not found' });
-    await pool.query('UPDATE refresh_tokens SET revoked = TRUE WHERE user_id = $1::uuid AND revoked = FALSE', [id]);
-    res.json({ ok: true, user: result.rows[0], message: 'User account restored' });
+    res.json({ ok: true, user: outcome.account, message: 'Account reactivated. Previous sessions remain revoked; the user must sign in again.' });
   } catch (err) {
+    console.error('[Admin account reactivation] Failed:', err.message);
     res.status(500).json({ message: 'Server error' });
   }
 });

@@ -14,6 +14,8 @@
 const crypto = require('crypto');
 const { pool } = require('../db');
 const logger = require('./logger');
+const { getPromptInjectionPolicy } = require('./promptInjectionPolicy');
+const { accountStateLockKey } = require('../services/accountReactivation');
 
 /**
  * Standard Security Action Types
@@ -161,45 +163,27 @@ function evaluatePolicyForIncident(incident) {
         ? (() => { try { return JSON.parse(incident.ai_analysis); } catch (_) { return {}; } })()
         : (incident.ai_analysis || {});
       const verifiedAttempts = Number(evidence.verifiedPromptAttemptCount) || 0;
-      const verifiedCategories = Array.isArray(evidence.verifiedPromptCategories)
-        ? evidence.verifiedPromptCategories.filter((category) => typeof category === 'string')
-        : [];
+      const policy = getPromptInjectionPolicy();
 
-      // A single blocked prompt is logged for review. Repeated, detector-confirmed
-      // attempts by the same account trigger temporary, reversible containment.
-      if (verifiedAttempts >= 3 && sourceIp) {
-        actions.push({
-          actionType: SECURITY_ACTION_TYPES.IP_THROTTLE_TEMPORARY,
-          isAutomated: true,
-          requiresApproval: false,
-          reason: 'Automated 30-min rate-limit quarantine due to adversarial prompt injection attempt.',
-          policyRule: 'RULE_PROMPT_INJECTION_IP_THROTTLE',
-          target: sourceIp,
-          payload: { ipAddress: sourceIp, durationMinutes: 30 },
-        });
-      }
-      if (verifiedAttempts >= 3 && targetUserId) {
-        actions.push({
-          actionType: SECURITY_ACTION_TYPES.SESSION_REVOKE_TARGET,
-          isAutomated: true,
-          requiresApproval: false,
-          reason: 'Immediate session invalidation following detected prompt injection vector.',
-          policyRule: 'RULE_PROMPT_INJECTION_SESSION_REVOCATION',
-          target: targetUserId,
-          payload: { userId: targetUserId },
-        });
-      }
-      // Suspension remains a human-approved action. Require corroboration across
-      // multiple detector categories and repeated events before proposing it.
-      if (targetUserId && riskScore >= 90 && verifiedAttempts >= 5 && new Set(verifiedCategories).size >= 2) {
+      // Prompt-injection events alone never throttle a shared IP or revoke a
+      // session before the configured user-specific escalation threshold.
+      // Automatic suspension is opt-in; the default continues to require an
+      // explicit Super Admin approval through the existing action workflow.
+      if (targetUserId && companyId && verifiedAttempts >= policy.threshold && incident.target_user_role !== 'super_admin') {
         actions.push({
           actionType: SECURITY_ACTION_TYPES.USER_SUSPEND,
-          isAutomated: false,
-          requiresApproval: true,
-          reason: 'Repeated adversarial prompt injection and system jailbreak attempts require administrative review.',
-          policyRule: 'RULE_PROMPT_INJECTION_SUSPEND_PROPOSAL',
+          isAutomated: policy.autoSuspendEnabled,
+          requiresApproval: !policy.autoSuspendEnabled,
+          reason: `User-specific prompt-injection threshold reached (${verifiedAttempts} verified attempts within ${policy.windowMinutes} minutes).`,
+          policyRule: policy.autoSuspendEnabled ? 'RULE_PROMPT_INJECTION_AUTO_SUSPEND' : 'RULE_PROMPT_INJECTION_SUSPEND_APPROVAL',
           target: targetUserId,
-          payload: { userId: targetUserId, companyId },
+          payload: {
+            userId: targetUserId,
+            companyId,
+            verifiedPromptAttemptCount: verifiedAttempts,
+            detectionWindowMinutes: policy.windowMinutes,
+            autoSuspensionEnabled: policy.autoSuspendEnabled,
+          },
         });
       }
       break;
@@ -232,74 +216,80 @@ function generateActionIdempotencyKey(incidentId, actionType, target) {
 async function applyRemediationPolicy(incident) {
   const decisions = evaluatePolicyForIncident(incident);
   const recordedActions = [];
+  if (decisions.length === 0) return recordedActions;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    for (const decision of decisions) {
+      if (decision.actionType === SECURITY_ACTION_TYPES.USER_SUSPEND && decision.target) {
+        // Serialize proposals for an account against concurrent worker retries
+        // and Super Admin reactivation.
+        await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [accountStateLockKey(decision.target)]);
+        const targetUser = await client.query('SELECT role, company_id::text FROM users WHERE id = $1 FOR UPDATE', [decision.target]);
+        if (!targetUser.rows.length || targetUser.rows[0].role === 'super_admin') {
+          logger.warn(`[PolicyEngine] Protected or missing account ${decision.target}; no suspension proposal was created.`);
+          continue;
+        }
+        if (incident.company_id && String(targetUser.rows[0].company_id || '') !== String(incident.company_id)) {
+          logger.warn('[PolicyEngine] Prompt-injection target company did not match the incident; no action was created.');
+          continue;
+        }
+        const existingUserAction = await client.query(
+          `SELECT id, action_type, approval_status, is_automated, details
+             FROM security_actions
+            WHERE action_type = $1 AND company_id::text = $2 AND details->>'userId' = $3
+              AND approval_status IN ('pending', 'approved', 'executed')
+            ORDER BY created_at DESC LIMIT 1`,
+          [decision.actionType, String(incident.company_id), String(decision.target)]
+        );
+        if (existingUserAction.rows.length) {
+          recordedActions.push(existingUserAction.rows[0]);
+          continue;
+        }
+      }
 
-  for (const decision of decisions) {
-    // Super Admin Protection Guard: Never propose or apply USER_SUSPEND on Super Admin accounts
-    if (decision.actionType === SECURITY_ACTION_TYPES.USER_SUSPEND && decision.target) {
-      const targetUser = await pool.query('SELECT role FROM users WHERE id = $1', [decision.target]).catch(() => ({ rows: [] }));
-      if (targetUser.rows.length > 0 && targetUser.rows[0].role === 'super_admin') {
-        logger.warn(`[PolicyEngine] Protected Super Admin account ${decision.target} from suspension proposal.`);
+      const idempotencyKey = generateActionIdempotencyKey(incident.id, decision.actionType, decision.target);
+      const checkRes = await client.query(
+        `SELECT id, action_type, approval_status, is_automated, details
+           FROM security_actions
+          WHERE incident_id = $1 AND action_type = $2 AND details->>'idempotencyKey' = $3`,
+        [incident.id, decision.actionType, idempotencyKey]
+      );
+      if (checkRes.rows.length) {
+        recordedActions.push(checkRes.rows[0]);
         continue;
       }
+
+      // Keep USER_SUSPEND pending until its serialized executor applies it.
+      const initialStatus = decision.actionType === SECURITY_ACTION_TYPES.USER_SUSPEND || decision.requiresApproval
+        ? 'pending'
+        : 'executed';
+      const actionDetails = {
+        ...decision.payload,
+        idempotencyKey,
+        policyRule: decision.policyRule,
+        reason: decision.reason,
+        proposedAt: new Date().toISOString(),
+      };
+      const insertRes = await client.query(
+        `INSERT INTO security_actions
+         (incident_id, company_id, action_type, is_automated, approval_status, executed_by, details, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW()) RETURNING *`,
+        [incident.id, incident.company_id, decision.actionType, decision.isAutomated, initialStatus,
+          decision.isAutomated ? 'security-policy-engine' : null, JSON.stringify(actionDetails)]
+      );
+      const newAction = insertRes.rows[0];
+      recordedActions.push(newAction);
+      logger.info(`[PolicyEngine] Recorded action ${newAction.id} (Type: ${newAction.action_type}, Status: ${newAction.approval_status})`);
     }
-
-    const idempotencyKey = generateActionIdempotencyKey(
-      incident.id,
-      decision.actionType,
-      decision.target
-    );
-
-    // 1. Idempotency Check: Verify if action already recorded for this incident
-    const checkRes = await pool.query(
-      `SELECT id, action_type, approval_status, is_automated, details 
-       FROM security_actions 
-       WHERE incident_id = $1 
-         AND action_type = $2 
-         AND details->>'idempotencyKey' = $3`,
-      [incident.id, decision.actionType, idempotencyKey]
-    );
-
-    if (checkRes.rows.length > 0) {
-      // Already recorded; skip duplicate
-      recordedActions.push(checkRes.rows[0]);
-      continue;
-    }
-
-    // 2. Determine initial approval status
-    const initialStatus = decision.requiresApproval ? 'pending' : 'executed';
-    const executedBy = decision.isAutomated ? 'security-policy-engine' : null;
-
-    const actionDetails = {
-      ...decision.payload,
-      idempotencyKey,
-      policyRule: decision.policyRule,
-      reason: decision.reason,
-      proposedAt: new Date().toISOString(),
-    };
-
-    // 3. Insert action record into security_actions
-    const insertRes = await pool.query(
-      `INSERT INTO security_actions 
-       (incident_id, company_id, action_type, is_automated, approval_status, executed_by, details, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-       RETURNING *`,
-      [
-        incident.id,
-        incident.company_id,
-        decision.actionType,
-        decision.isAutomated,
-        initialStatus,
-        executedBy,
-        JSON.stringify(actionDetails),
-      ]
-    );
-
-    const newAction = insertRes.rows[0];
-    recordedActions.push(newAction);
-    logger.info(`[PolicyEngine] Recorded action ${newAction.id} (Type: ${newAction.action_type}, Status: ${newAction.approval_status})`);
+    await client.query('COMMIT');
+    return recordedActions;
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
   }
-
-  return recordedActions;
 }
 
 module.exports = {

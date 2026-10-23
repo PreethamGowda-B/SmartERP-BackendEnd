@@ -6,7 +6,7 @@ const MetricsService = require("../telemetry/metrics.service");
 function synthesizeToolResponse(messages, modulesUsed) {
   const toolMessages = messages.filter((m) => m.role === "tool");
   if (toolMessages.length === 0) {
-    return "SmartERP Intelligence processed your request using live system data.";
+    return null;
   }
 
   for (let i = toolMessages.length - 1; i >= 0; i--) {
@@ -27,7 +27,7 @@ function synthesizeToolResponse(messages, modulesUsed) {
     } catch (e) {}
   }
 
-  return `Live ERP query completed. Retrieved records from ${Array.from(modulesUsed).join(", ") || "database"}.`;
+  return `I retrieved authorized ERP data from ${Array.from(modulesUsed).join(", ") || "the requested module"}, but could not format its details reliably. Please try a narrower question.`;
 }
 
 class ReActEngine {
@@ -86,6 +86,11 @@ class ReActEngine {
         let responseText = parsedPayload?.text || content;
         if (!responseText || responseText.trim() === "" || responseText === "Completed operations." || responseText === "Operation processed.") {
           responseText = synthesizeToolResponse(messages, modulesUsed);
+          if (!responseText) {
+            const error = new Error('The model returned an empty response without completing a tool action.');
+            error.code = 'AI_EMPTY_RESPONSE';
+            throw error;
+          }
         }
 
         const widget = parsedPayload?.widget || null;
@@ -127,68 +132,66 @@ class ReActEngine {
             ? JSON.parse(toolCall.function.arguments)
             : toolCall.function.arguments;
         } catch (err) {
-          args = {};
+          const error = new Error('AI model returned invalid arguments for an ERP tool.');
+          error.code = 'AI_TOOL_ARGUMENTS_INVALID';
+          throw error;
+        }
+        if (!args || typeof args !== 'object' || Array.isArray(args)) {
+          const error = new Error('AI model returned invalid arguments for an ERP tool.');
+          error.code = 'AI_TOOL_ARGUMENTS_INVALID';
+          throw error;
         }
 
+        let toolResult;
         try {
-          const toolResult = await pluginRegistry.execute(functionName, args, context);
-
-          // Audit Log Entry
-          await MetricsService.logAIAuditEvent({
-            userContext: context,
-            toolName: functionName,
-            params: args,
-            status: "SUCCESS",
-          });
-
-          // Track module source
-          if (toolResult && toolResult.action === "NAVIGATE") {
-            navigationCommand = { path: toolResult.path, label: toolResult.label };
-          }
-
-          if (toolResult && toolResult.type === "ACTION_CONFIRMATION_REQUIRED") {
-            actionConfirmation = toolResult;
-          }
-
-          modulesUsed.add(functionName.split("_")[0] || "SmartERP System");
-
-          messages.push({
-            role: "tool",
-            tool_call_id: toolCall.id,
-            content: JSON.stringify(toolResult),
-          });
+          toolResult = await pluginRegistry.execute(functionName, args, context);
         } catch (toolErr) {
           await MetricsService.logAIAuditEvent({
             userContext: context,
             toolName: functionName,
             params: args,
             status: "FAILED",
-            error: toolErr.message,
-          });
-
-          messages.push({
-            role: "tool",
-            tool_call_id: toolCall.id,
-            content: JSON.stringify({ error: toolErr.message }),
-          });
+            error: toolErr?.code || toolErr?.name || 'tool_error',
+          }).catch(() => {});
+          const error = new Error('A required SmartERP data action could not be completed.');
+          error.code = 'AI_TOOL_EXECUTION_FAILED';
+          error.cause = toolErr;
+          throw error;
         }
+
+        // Audit telemetry is best-effort and must not turn a successful read
+        // or completed action into a failed request.
+        await MetricsService.logAIAuditEvent({
+          userContext: context,
+          toolName: functionName,
+          params: args,
+          status: "SUCCESS",
+        }).catch((auditErr) => {
+          console.warn('[SmartERP AI] Tool audit event could not be recorded:', auditErr?.code || auditErr?.name || 'audit_error');
+        });
+
+        // Track module source
+        if (toolResult && toolResult.action === "NAVIGATE") {
+          navigationCommand = { path: toolResult.path, label: toolResult.label };
+        }
+
+        if (toolResult && toolResult.type === "ACTION_CONFIRMATION_REQUIRED") {
+          actionConfirmation = toolResult;
+        }
+
+        modulesUsed.add(functionName.split("_")[0] || "SmartERP System");
+
+        messages.push({
+          role: "tool",
+          tool_call_id: toolCall.id,
+          content: JSON.stringify(toolResult),
+        });
       }
     }
 
-    const fallbackText = synthesizeToolResponse(messages, modulesUsed);
-
-    return {
-      text: fallbackText,
-      widget: actionConfirmation,
-      navigation: navigationCommand,
-      confidenceScore: 0.98,
-      sources: Array.from(modulesUsed),
-      telemetry: {
-        latencyMs: Date.now() - startTime,
-        provider: provider.name,
-        iterations: iteration,
-      },
-    };
+    const error = new Error('AI tool loop exceeded its safe iteration limit.');
+    error.code = 'AI_AGENT_ITERATION_LIMIT';
+    throw error;
   }
 }
 

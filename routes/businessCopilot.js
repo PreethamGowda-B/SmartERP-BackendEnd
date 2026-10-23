@@ -6,6 +6,7 @@ const { loadPlan } = require('../middleware/planMiddleware');
 const { requireFeature } = require('../middleware/featureGuard');
 const { checkPlanLimit } = require('../middleware/planMiddleware');
 const { createAiPromptGuard } = require('../middleware/aiPromptGuard');
+const { getAiErrorResponse } = require('../utils/aiErrorResponse');
 
 const validateCopilotPrompt = createAiPromptGuard({ field: 'prompt' });
 
@@ -51,15 +52,17 @@ router.post('/', authenticateToken, loadPlan, requireFeature('ai_assistant', 'AI
       const invRes = await pool.query(
         `SELECT SUM(total_amount) as total FROM service_quotations WHERE company_id::text = $1::text AND status = 'converted_to_job'`,
         [companyId]
-      ).catch(() => ({ rows: [{ total: 150000 }] }));
-      responseText = `Total revenue generated from approved CNC service jobs is ₹${Number(invRes.rows[0]?.total || 150000).toLocaleString()}.`;
+      );
+      responseText = `Total revenue recorded from approved CNC service jobs is ₹${Number(invRes.rows[0]?.total || 0).toLocaleString()}.`;
       workflowType = 'query_revenue';
     } else if (lower.includes('machine') && (lower.includes('breakdown') || lower.includes('health'))) {
       const macRes = await pool.query(
         `SELECT machine_name, serial_number, health_score, status FROM customer_machines WHERE company_id::text = $1::text ORDER BY health_score ASC`,
         [companyId]
       );
-      responseText = `Registered machinery telemetry: ${macRes.rows.map((m) => `${m.machine_name} (Health: ${m.health_score || 100}%, Status: ${m.status})`).join(' | ')}.`;
+      responseText = macRes.rows.length
+        ? `Registered machinery telemetry: ${macRes.rows.map((m) => `${m.machine_name} (Health: ${m.health_score == null ? 'not reported' : `${m.health_score}%`}, Status: ${m.status})`).join(' | ')}.`
+        : 'No machines are currently registered for this company.';
       workflowType = 'query_machines';
     }
 
@@ -89,7 +92,7 @@ router.post('/', authenticateToken, loadPlan, requireFeature('ai_assistant', 'AI
          RETURNING *`,
         [
           jobTitle,
-          `Multi-step workflow orchestrated by SmartERP AI Copilot for ${userName}. Prompt: "${prompt}"`,
+          `Multi-step workflow created by SmartERP AI Copilot for ${userName}.`,
           'self',
           companyId,
           isPm ? 'preventive' : 'breakdown',
@@ -106,7 +109,7 @@ router.post('/', authenticateToken, loadPlan, requireFeature('ai_assistant', 'AI
       ).catch(() => {});
 
       actionResult = { job_id: job.id, job_title: job.title };
-      responseText = `Successfully executed multi-step AI workflow! Created job #${job.id.toString().substring(0, 8)} tagged "Created by SmartERP AI", updated Machine Timeline, and notified Operations.`;
+      responseText = `Created job #${job.id.toString().substring(0, 8)}. Open the job record to review its current assignment and status.`;
     }
 
     // ── 3. HIGH-RISK INTENTS (Level 3 - Explicit Owner Approval) ─────────────
@@ -129,16 +132,20 @@ router.post('/', authenticateToken, loadPlan, requireFeature('ai_assistant', 'AI
         });
       }
 
-      responseText = `Owner explicitly approved high-risk AI operation: "${prompt}". Operation executed safely.`;
+      return res.status(501).json({
+        success: false,
+        code: 'AI_WORKFLOW_NOT_IMPLEMENTED',
+        message: 'This high-risk operation is not connected to an approved execution workflow. No business records were changed.',
+      });
     } else {
-      responseText = `SmartERP AI Operations Copilot analyzed prompt: "${prompt}". Active company database telemetry checked cleanly.`;
+      responseText = 'I can help with company jobs, machine status, revenue summaries, and approved job workflows. Ask about one of those areas to continue.';
     }
 
     // Log Immutable AI Audit Trail
     await pool.query(
       `INSERT INTO ai_action_audit_trail (company_id, user_id, user_name, prompt, ai_interpretation, workflow_type, execution_level, approval_status, result_summary, created_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, 'executed', $8, NOW())`,
-      [companyId, userId, userName, prompt, responseText, workflowType, executionLevel, responseText]
+      [companyId, userId, userName, `AI request (${workflowType})`, 'AI response generated; business content redacted.', workflowType, executionLevel, 'AI response generated; business content redacted.']
     ).catch(() => {});
 
     res.json({
@@ -149,8 +156,12 @@ router.post('/', authenticateToken, loadPlan, requireFeature('ai_assistant', 'AI
       action_result: actionResult,
     });
   } catch (err) {
-    console.error('❌ Error executing AI Copilot workflow:', err.message);
-    res.status(500).json({ message: err.message || 'Server error' });
+    console.error('❌ Error executing AI Copilot workflow:', {
+      code: typeof err?.code === 'string' ? err.code.slice(0, 40) : null,
+      name: typeof err?.name === 'string' ? err.name.slice(0, 80) : 'Error',
+    });
+    const response = getAiErrorResponse(err);
+    res.status(response.status).json({ ...response.body, message: response.body.error });
   }
 });
 
@@ -165,12 +176,16 @@ router.get('/activity', authenticateToken, loadPlan, requireFeature('ai_assistan
     const result = await pool.query(
       `SELECT * FROM ai_action_audit_trail WHERE company_id::text = $1::text ORDER BY created_at DESC LIMIT 30`,
       [companyId.toString()]
-    ).catch(() => ({ rows: [] }));
+    );
 
     res.json({ success: true, activities: result.rows });
   } catch (err) {
-    console.error('❌ Error fetching AI Activity Log:', err.message);
-    res.status(200).json({ success: true, activities: [] });
+    console.error('❌ Error fetching AI Activity Log:', {
+      code: typeof err?.code === 'string' ? err.code.slice(0, 40) : null,
+      name: typeof err?.name === 'string' ? err.name.slice(0, 80) : 'Error',
+    });
+    const response = getAiErrorResponse(err);
+    res.status(response.status).json({ ...response.body, success: false });
   }
 });
 

@@ -102,6 +102,7 @@ test('HR AI headcount remains available when the users table has no optional sta
       error.code = '42703';
       throw error;
     }
+    if (query.includes('LEFT JOIN attendance a')) return { rows: [] };
     if (query.includes('FROM users u')) {
       assert.match(query, /to_jsonb\(u\)->>'status'/);
       assert.match(query, /u\.is_active = TRUE/);
@@ -114,7 +115,6 @@ test('HR AI headcount remains available when the users table has no optional sta
       return { rows: [{ department: 'Production', count: String(legacyRowsWithoutStatus.length) }] };
     }
     if (query.includes('FROM leave_requests')) return { rows: [] };
-    if (query.includes('LEFT JOIN attendance a')) return { rows: [] };
     throw new Error(`Unexpected SQL in test: ${query}`);
   };
 

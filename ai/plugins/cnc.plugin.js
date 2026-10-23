@@ -306,13 +306,17 @@ class CncPlugin extends BasePlugin {
 
         query += ` ORDER BY m.created_at DESC LIMIT 25`;
 
-        const result = await pool.query(query, queryParams).catch(async () => {
-          return pool.query(
+        let result;
+        try {
+          result = await pool.query(query, queryParams);
+        } catch (error) {
+          if (!['42703', '42P01'].includes(error?.code)) throw error;
+          result = await pool.query(
             `SELECT id, machine_name, serial_number, make, model, controller_type, spindle_hours, health_score, status
              FROM customer_machines WHERE company_id::text = $1::text ORDER BY created_at DESC LIMIT 25`,
             [String(companyId)]
-          ).catch(() => ({ rows: [] }));
-        });
+          );
+        }
 
         return {
           success: true,
@@ -362,7 +366,21 @@ class CncPlugin extends BasePlugin {
           return { success: false, message: "Please provide either machineId or serialNumber." };
         }
 
-        const res = await pool.query(query, queryParams).catch(() => ({ rows: [] }));
+        let res;
+        try {
+          res = await pool.query(query, queryParams);
+        } catch (error) {
+          // Customer/plant metadata is optional in older installations. Keep
+          // the machine lookup company-scoped while degrading to its base row.
+          if (!['42703', '42P01'].includes(error?.code)) throw error;
+          res = await pool.query(
+            `SELECT m.* FROM customer_machines m
+              WHERE m.company_id::text = $1::text
+                AND (($2::text <> '' AND (m.id::text = $2::text OR m.machine_name ILIKE $2))
+                  OR ($3::text <> '' AND m.serial_number ILIKE $3)) LIMIT 1`,
+            [String(companyId), params.machineId ? String(params.machineId) : '', params.serialNumber ? `%${params.serialNumber}%` : '']
+          );
+        }
         if (res.rows.length === 0) {
           return { success: false, message: "Machine not found or not registered under your company." };
         }
@@ -418,13 +436,7 @@ class CncPlugin extends BasePlugin {
         `;
 
         const machineIdentifier = String(params.machineId || "");
-        const res = await pool.query(query, [String(companyId), machineIdentifier, limit]).catch(async () => {
-          return pool.query(
-            `SELECT id, title, description, status, priority, created_at FROM jobs
-             WHERE company_id::text = $1::text ORDER BY created_at DESC LIMIT $2`,
-            [String(companyId), limit]
-          ).catch(() => ({ rows: [] }));
-        });
+        const res = await pool.query(query, [String(companyId), machineIdentifier, limit]);
 
         return {
           success: true,
@@ -611,7 +623,7 @@ class CncPlugin extends BasePlugin {
              AND (name ILIKE $2 OR sku ILIKE $2 OR category ILIKE $2)
            ORDER BY quantity DESC LIMIT 10`,
           [String(companyId), searchTerm]
-        ).catch(() => ({ rows: [] }));
+        );
 
         return {
           success: true,
@@ -648,7 +660,7 @@ class CncPlugin extends BasePlugin {
              AND (w.machine_id::text = $2::text OR m.serial_number ILIKE $2)
            ORDER BY w.created_at DESC LIMIT 5`,
           [String(companyId), String(params.machineId)]
-        ).catch(() => ({ rows: [] }));
+        );
 
         return {
           success: true,

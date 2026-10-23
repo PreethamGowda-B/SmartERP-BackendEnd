@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const SecurityShield = require('../ai/gateway/security.shield');
-const { createAiPromptGuard } = require('../middleware/aiPromptGuard');
+const { createAiPromptGuard, SAFE_PROMPT_REFUSAL } = require('../middleware/aiPromptGuard');
 
 function mockResponse() {
   return {
@@ -44,12 +44,27 @@ test('AI prompt guard blocks injection, returns 400, and emits only redacted met
   assert.equal(nextCalled, false);
   assert.equal(res.statusCode, 400);
   assert.equal(res.body.code, 'AI_PROMPT_BLOCKED');
+  assert.equal(res.body.error, SAFE_PROMPT_REFUSAL);
   assert.equal(events.length, 1);
   assert.equal(events[0].eventType, 'prompt.injection_attempt');
   assert.equal(events[0].userId, 'user-1');
   assert.equal(events[0].companyId, 'company-1');
   assert.equal(events[0].metadata.messageLength, req.body.message.length);
   assert.equal(JSON.stringify(events[0]).includes(req.body.message), false);
+});
+
+test('AI prompt guard allows benign security education without creating an incident', () => {
+  const events = [];
+  const guard = createAiPromptGuard({ emitSecurityEvent: (event) => events.push(event) });
+  const req = {
+    body: { message: 'What is prompt injection and how do I protect my application?' },
+    user: { id: 'user-1', companyId: 'company-1' },
+  };
+  const res = mockResponse();
+  let nextCalled = false;
+  guard(req, res, () => { nextCalled = true; });
+  assert.equal(nextCalled, true);
+  assert.equal(events.length, 0);
 });
 
 test('AI prompt guard rejects missing or non-string messages before quota or model execution', () => {

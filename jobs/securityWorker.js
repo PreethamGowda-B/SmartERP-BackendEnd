@@ -12,6 +12,7 @@ const { pool } = require('../db');
 const { redisConnection } = require('../utils/queue');
 const logger = require('../utils/logger');
 const { SECURITY_EVENT_TYPES } = require('../utils/securityEmitter');
+const { getPromptInjectionPolicy } = require('../utils/promptInjectionPolicy');
 
 /**
  * Deterministic Threat Category Identifiers
@@ -94,7 +95,8 @@ function calculateDeterministicRisk(category, counts, totalDistinctTypes) {
 
     case THREAT_CATEGORIES.PROMPT_INJECTION: {
       const injectionAttempts = counts[SECURITY_EVENT_TYPES.PROMPT_INJECTION] || 1;
-      score = Math.min(98, 65 + (injectionAttempts * 10));
+      const threshold = getPromptInjectionPolicy().threshold;
+      score = injectionAttempts >= threshold ? 90 : Math.min(84, 50 + (injectionAttempts * 2));
       break;
     }
 
@@ -128,6 +130,7 @@ function calculateDeterministicRisk(category, counts, totalDistinctTypes) {
  * @returns {Promise<Object|null>} Generated or updated incident record
  */
 async function processSecurityIncident(data) {
+  const promptPolicy = getPromptInjectionPolicy();
   const ipAddress = data.ipAddress ? String(data.ipAddress).slice(0, 50) : null;
   const userId = data.userId ? String(data.userId) : null;
   const companyId = data.companyId ? String(data.companyId) : null;
@@ -144,12 +147,12 @@ async function processSecurityIncident(data) {
       ($1::varchar IS NOT NULL AND ip_address = $1)
       OR ($2::varchar IS NOT NULL AND user_id = $2)
     )
-    AND created_at > NOW() - INTERVAL '15 minutes'
+    AND created_at > NOW() - ($3::int * INTERVAL '1 minute')
     ORDER BY created_at DESC
     LIMIT 100
   `;
 
-  const eventRes = await pool.query(query, [ipAddress, userId]);
+  const eventRes = await pool.query(query, [ipAddress, userId, promptPolicy.windowMinutes]);
   const events = eventRes.rows;
 
   if (events.length === 0) {
@@ -167,7 +170,31 @@ async function processSecurityIncident(data) {
   // Prompt containment is based only on confirmed shield detections attributed
   // to this same authenticated user and company. A single flagged request is
   // recorded for review but does not revoke the session or throttle an IP.
-  const promptEvidence = getVerifiedPromptEvidence(events, userId, companyId);
+  let promptEvidence = getVerifiedPromptEvidence(events, userId, companyId);
+  if (userId && companyId) {
+    // Count the complete detector-confirmed user+tenant window independently
+    // of the broader 100-row IP correlation sample. Worker retries reread the
+    // same durable rows and therefore do not increment the attempt count.
+    const promptRows = await pool.query(
+      `SELECT COUNT(*)::int AS attempt_count,
+              COALESCE(array_agg(DISTINCT metadata->>'category') FILTER (WHERE metadata->>'category' IS NOT NULL), ARRAY[]::text[]) AS categories
+         FROM security_events
+        WHERE event_type = $1
+          AND user_id::text = $2
+          AND company_id::text = $3
+          AND metadata->>'isSecurityThreat' = 'true'
+          AND metadata->>'category' IS NOT NULL
+          AND created_at > NOW() - ($4::int * INTERVAL '1 minute')`,
+      [SECURITY_EVENT_TYPES.PROMPT_INJECTION, userId, companyId, promptPolicy.windowMinutes]
+    );
+    const row = promptRows.rows?.[0];
+    if (row) {
+      promptEvidence = {
+        count: Number(row.attempt_count) || 0,
+        categories: Array.isArray(row.categories) ? row.categories.filter((item) => typeof item === 'string').sort() : [],
+      };
+    }
+  }
   if (promptEvidence.count > 0) counts[SECURITY_EVENT_TYPES.PROMPT_INJECTION] = promptEvidence.count;
   else delete counts[SECURITY_EVENT_TYPES.PROMPT_INJECTION];
 
@@ -229,12 +256,15 @@ async function processSecurityIncident(data) {
   const existingRes = await pool.query(
     `SELECT id, event_count, risk_score FROM security_incidents
      WHERE threat_category = $1
-       AND (source_ip = $2 OR (target_user_id IS NOT NULL AND target_user_id = $3))
+       AND (
+         ($1 = 'PROMPT_INJECTION' AND company_id::text = $4 AND target_user_id::text = $3)
+         OR ($1 <> 'PROMPT_INJECTION' AND (source_ip = $2 OR (target_user_id IS NOT NULL AND target_user_id::text = $3)))
+       )
        AND status IN ('open', 'investigating')
-       AND created_at > NOW() - INTERVAL '15 minutes'
+       AND created_at > NOW() - ($5::int * INTERVAL '1 minute')
      ORDER BY created_at DESC
      LIMIT 1`,
-    [threatCategory, ipAddress, userId]
+    [threatCategory, ipAddress, userId, companyId, promptPolicy.windowMinutes]
   );
 
   let incident = null;
@@ -337,7 +367,7 @@ function getRemediationGuideline(category) {
     case THREAT_CATEGORIES.MULTI_VECTOR_SURGE:
       return 'High-priority suspicious activity. Flag for Super Admin review and consider temporary IP quarantine.';
     case THREAT_CATEGORIES.PROMPT_INJECTION:
-      return 'Inspect AI prompt logs for adversarial payload patterns. Temporary IP throttle applied; review account for suspension if repeated.';
+      return 'Review detector-confirmed attempts for this authenticated user and company. The configured threshold creates a user-specific suspension action; Super Admin approval is required unless automatic suspension is explicitly enabled.';
     default:
       return 'Monitor security telemetry for further anomalous behavior.';
   }

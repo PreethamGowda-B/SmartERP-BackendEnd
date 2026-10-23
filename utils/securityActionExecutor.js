@@ -10,6 +10,98 @@ const { pool } = require('../db');
 const { redisClient } = require('./redis');
 const logger = require('./logger');
 const { SECURITY_ACTION_TYPES } = require('./securityPolicyEngine');
+const { accountStateLockKey } = require('../services/accountReactivation');
+const { canExecuteAutomaticPromptSuspension } = require('./promptInjectionPolicy');
+
+async function executeUserSuspendAction({ action, actionId, executedBy }) {
+  const userId = action.details?.userId;
+  if (!userId) return { success: false, error: 'Target user is missing; suspension was not applied.' };
+  if (!redisClient || redisClient.status !== 'ready') {
+    return { success: false, error: 'Session revocation storage is unavailable; suspension was not applied.' };
+  }
+
+  const client = await pool.connect();
+  let transactionStarted = false;
+  try {
+    await client.query('BEGIN');
+    transactionStarted = true;
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [accountStateLockKey(userId)]);
+    const currentAction = await client.query('SELECT id, approval_status, details FROM security_actions WHERE id = $1 FOR UPDATE', [actionId]);
+    if (!currentAction.rows.length) throw new Error('Security action not found.');
+    if (currentAction.rows[0].approval_status === 'executed') {
+      await client.query('COMMIT');
+      transactionStarted = false;
+      return { success: true, alreadyExecuted: true, action: currentAction.rows[0] };
+    }
+    const currentDetails = currentAction.rows[0].details && typeof currentAction.rows[0].details === 'object'
+      ? currentAction.rows[0].details : {};
+    const automaticPromptSuspension = canExecuteAutomaticPromptSuspension({ action, details: currentDetails });
+    const executableStatus = currentAction.rows[0].approval_status === 'approved'
+      || (automaticPromptSuspension && currentAction.rows[0].approval_status === 'pending');
+    if (!executableStatus) {
+      throw new Error(`Suspension action is no longer executable (${currentAction.rows[0].approval_status}).`);
+    }
+
+    const target = await client.query(
+      `SELECT id::text, role, company_id::text, is_active,
+              COALESCE(NULLIF(to_jsonb(u)->>'status', ''), 'active') AS account_status
+       FROM users u WHERE id = $1 FOR UPDATE`,
+      [userId]
+    );
+    if (!target.rows.length) throw new Error('Target user was not found; suspension was not applied.');
+    if (target.rows[0].role === 'super_admin') throw new Error('CANNOT_SUSPEND_SUPERADMIN: Super Admin accounts cannot be suspended.');
+    if (action.company_id && String(target.rows[0].company_id || '') !== String(action.company_id)) {
+      throw new Error('Target user does not belong to the action company.');
+    }
+    if (target.rows[0].is_active !== true || ['suspended', 'inactive'].includes(String(target.rows[0].account_status).toLowerCase())) {
+      throw new Error('Target account is already inactive; refusing to replace its existing account state.');
+    }
+
+    const statusColumn = await client.query(
+      `SELECT EXISTS (SELECT 1 FROM information_schema.columns
+       WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'status') AS present`
+    );
+    if (statusColumn.rows[0]?.present) {
+      await client.query("UPDATE users SET is_active = FALSE, status = 'suspended' WHERE id = $1", [userId]);
+    } else {
+      await client.query('UPDATE users SET is_active = FALSE WHERE id = $1', [userId]);
+    }
+    await client.query('UPDATE refresh_tokens SET revoked = TRUE WHERE user_id = $1::uuid AND revoked = FALSE', [userId]);
+
+    const revokedAt = Date.now().toString();
+    await redisClient.set(`token_revoked:${userId}`, revokedAt, 'EX', 86400);
+    await redisClient.set(`user_suspended:${userId}`, '1', 'EX', 86400 * 7);
+    await redisClient.del(`user_active:${userId}`);
+
+    const details = currentAction.rows[0].details && typeof currentAction.rows[0].details === 'object'
+      ? currentAction.rows[0].details : action.details || {};
+    const expectedStatus = automaticPromptSuspension ? 'pending' : 'approved';
+    const updated = await client.query(
+      `UPDATE security_actions SET approval_status = 'executed', executed_by = $1, details = $2::jsonb
+       WHERE id = $3 AND approval_status = $4 RETURNING *`,
+      [executedBy, JSON.stringify({
+        ...details,
+        executionDetails: {
+          suspendedUserId: userId,
+          previousIsActive: target.rows[0].is_active === true,
+          previousStatus: target.rows[0].account_status,
+          revocationTimestamp: revokedAt,
+        },
+        executedAt: new Date().toISOString(),
+      }), actionId, expectedStatus]
+    );
+    if (!updated.rows.length) throw new Error('Suspension action changed while executing.');
+
+    await client.query('COMMIT');
+    transactionStarted = false;
+    return { success: true, action: updated.rows[0] };
+  } catch (error) {
+    if (transactionStarted) await client.query('ROLLBACK').catch(() => {});
+    return { success: false, error: error.message };
+  } finally {
+    client.release();
+  }
+}
 
 /**
  * Executes a security action idempotently.
@@ -39,6 +131,24 @@ async function executeSecurityAction(actionId, executedBy = 'security-policy-eng
       error: 'APPROVAL_REQUIRED',
       message: 'Sensitive security action requires explicit Super Admin approval before execution.',
     };
+  }
+
+  // Serialize account suspensions with Super Admin reactivation. The shared
+  // advisory lock and fresh action-state read prevent a stale approval from
+  // re-suspending an account after it was reactivated.
+  if (action.action_type === SECURITY_ACTION_TYPES.USER_SUSPEND) {
+    const result = await executeUserSuspendAction({ action, actionId, executedBy });
+    if (result.success && !result.alreadyExecuted) {
+      logger.info(`[ActionExecutor] Successfully executed action ${actionId} (${action.action_type}) by ${executedBy}`);
+    } else if (!result.success) {
+      logger.warn(`[ActionExecutor] USER_SUSPEND action ${actionId} was not executed: ${result.error}`);
+      await pool.query(
+        `UPDATE security_actions SET approval_status = 'failed', details = $1::jsonb
+         WHERE id = $2 AND approval_status = 'approved'`,
+        [JSON.stringify({ ...(action.details || {}), executionError: result.error, failedAt: new Date().toISOString() }), actionId]
+      ).catch(() => {});
+    }
+    return result;
   }
 
   let executionDetails = {};
@@ -78,33 +188,8 @@ async function executeSecurityAction(actionId, executedBy = 'security-policy-eng
         break;
       }
 
-      case SECURITY_ACTION_TYPES.USER_SUSPEND: {
-        const userId = details.userId;
-        if (userId) {
-          if (!redisClient || redisClient.status !== 'ready') {
-            throw new Error('Session revocation storage is unavailable; suspension was not applied.');
-          }
-          const previous = await pool.query('SELECT is_active, role, company_id FROM users WHERE id = $1 FOR UPDATE', [userId]);
-          if (!previous.rows.length) throw new Error('Target user was not found; suspension was not applied.');
-          if (previous.rows[0].role === 'super_admin') {
-            throw new Error('CANNOT_SUSPEND_SUPERADMIN: Super Admin accounts cannot be suspended.');
-          }
-          if (action.company_id && previous.rows[0].company_id && String(previous.rows[0].company_id) !== String(action.company_id)) {
-            throw new Error(`Target user ${userId} does not belong to company ${action.company_id}`);
-          }
-          await pool.query(
-            `UPDATE users SET is_active = FALSE WHERE id = $1`,
-            [userId]
-          );
-          await pool.query('UPDATE refresh_tokens SET revoked = TRUE WHERE user_id = $1::uuid AND revoked = FALSE', [userId]);
-          const nowTs = Date.now().toString();
-          await redisClient.set(`token_revoked:${userId}`, nowTs, 'EX', 86400);
-          await redisClient.set(`user_suspended:${userId}`, '1', 'EX', 86400 * 7);
-          await redisClient.del(`user_active:${userId}`);
-          executionDetails = { suspendedUserId: userId, previousIsActive: previous.rows[0].is_active !== false, revocationTimestamp: nowTs };
-        }
-        break;
-      }
+      case SECURITY_ACTION_TYPES.USER_SUSPEND:
+        throw new Error('USER_SUSPEND must use the serialized account-state executor.');
 
       case SECURITY_ACTION_TYPES.COMPANY_SUSPEND: {
         const companyId = details.companyId;

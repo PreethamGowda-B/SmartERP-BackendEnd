@@ -28,7 +28,7 @@ class AIDataService {
           AND a.date = $2
         WHERE u.company_id::text = $1
           AND u.is_active = TRUE
-          AND COALESCE(u.status, 'active') <> 'suspended'
+          AND COALESCE(NULLIF(to_jsonb(u)->>'status', ''), 'active') <> 'suspended'
           AND u.role = 'employee'`,
       [cid, workDate]
     );
@@ -112,7 +112,7 @@ class AIDataService {
          LEFT JOIN attendance a ON u.id::text = a.user_id::text AND a.company_id::text = u.company_id::text AND a.date = $2
          WHERE (u.role = 'employee' OR (u.role != 'owner' AND u.role != 'admin' AND u.role != 'customer'))
            AND u.is_active = TRUE
-           AND COALESCE(u.status, 'active') <> 'suspended'
+           AND COALESCE(NULLIF(to_jsonb(u)->>'status', ''), 'active') <> 'suspended'
            AND (u.company_id = $1 OR u.company_id::text = $1::text)
          ORDER BY u.name ASC`,
         [cid, workDate]

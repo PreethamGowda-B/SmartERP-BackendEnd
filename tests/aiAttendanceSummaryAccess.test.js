@@ -85,7 +85,39 @@ test('company attendance counts exclude inactive users and distinguish approved 
     assert.match(attendanceQuery.query, /u\.company_id::text = \$1/);
     assert.match(attendanceQuery.query, /u\.is_active = TRUE/);
     assert.match(attendanceQuery.query, /u\.role = 'employee'/);
+    assert.match(attendanceQuery.query, /COALESCE\(NULLIF\(to_jsonb\(u\)->>'status', ''\), 'active'\) <> 'suspended'/);
+    assert.doesNotMatch(attendanceQuery.query, /u\.status/);
     assert.match(attendanceQuery.query, /l\.company_id::text = u\.company_id::text/);
+  } finally {
+    pool.query = originalQuery;
+  }
+});
+
+test('owner AI dashboard summary supports databases without the optional users.status column', async () => {
+  const originalQuery = pool.query;
+  const calls = [];
+  pool.query = async (sql, params = []) => {
+    const query = String(sql);
+    calls.push({ query, params });
+    if (query.includes('FROM company_settings')) return { rows: [] };
+    if (query.includes('FROM jobs')) return { rows: [] };
+    if (query.includes('FROM payments')) return { rows: [{ today_revenue: 0, month_revenue: 0 }] };
+    if (query.includes('FROM invoices')) return { rows: [{ total_invoices: 0, pending_count: 0, pending_amount: 0, overdue_count: 0 }] };
+    if (query.includes('FROM users u')) return { rows: [] };
+    if (query.includes('FROM inventory')) return { rows: [] };
+    if (query.includes('FROM leave_requests') && query.includes("status = 'pending'")) return { rows: [{ pending_leaves: 0 }] };
+    if (query.includes('FROM leave_requests') && query.includes("status = 'approved'")) return { rows: [{ on_leave_count: 0 }] };
+    throw new Error(`Unexpected SQL in test: ${query}`);
+  };
+
+  try {
+    await AIDataService.getOwnerDashboardSummary({ companyId: 'company-a' });
+    const attendanceQuery = calls.find(({ query }) => query.includes('FROM users u'));
+    assert.ok(attendanceQuery);
+    assert.match(attendanceQuery.query, /COALESCE\(NULLIF\(to_jsonb\(u\)->>'status', ''\), 'active'\) <> 'suspended'/);
+    assert.doesNotMatch(attendanceQuery.query, /u\.status/);
+    assert.match(attendanceQuery.query, /u\.company_id::text = \$1::text/);
+    assert.equal(attendanceQuery.params[0], 'company-a');
   } finally {
     pool.query = originalQuery;
   }

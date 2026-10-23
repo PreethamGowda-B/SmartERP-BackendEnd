@@ -84,9 +84,16 @@ test('direct API route requests authorize Owner/Admin and deny employee, custome
       return { rows: [{ total_invoiced: '0', total_paid: '0', total_outstanding: '0', total_tax_collected: '0', pending_count: 0, paid_count: 0, disputed_count: 0, sent_count: 0 }] };
     }
     if (sql.includes('FROM ar_collection_schedules') && sql.includes('overdue_count')) return { rows: [{ overdue_count: 0, overdue_amount: '0' }] };
-    if (sql.includes('FROM invoices i') && sql.includes('WHERE i.id = $1')) return { rows: [{ id: 'invoice-test', company_id: 'company-1', job_title: null }] };
+    if (sql.includes('FROM invoices i') && sql.includes('WHERE i.id = $1')) {
+      // Fail like PostgreSQL when a schema variant stores company IDs using
+      // different scalar types and the detail join omits its explicit cast.
+      if (!/j\.company_id::text\s*=\s*i\.company_id::text/.test(sql)) {
+        throw Object.assign(new Error('operator does not exist for mismatched company_id types'), { code: '42883' });
+      }
+      return { rows: [{ id: 'invoice-test', company_id: 'company-1', job_title: null }] };
+    }
     if (sql.includes('FROM invoices i')) return { rows: [] };
-    if (sql.startsWith('SELECT id, company_name')) return { rows: [{ id: 'company-1', company_name: 'Test Company', settings: {} }] };
+    if (sql.startsWith('SELECT c.id, c.company_name')) return { rows: [{ id: 'company-1', company_name: 'Test Company', address: null, phone: null, contact_email: null, settings: null }] };
     if (/FROM invoice_(items|disputes|activity_logs|payments)/.test(sql)) return { rows: [] };
     return { rows: [] };
   };
@@ -121,8 +128,17 @@ test('direct API route requests authorize Owner/Admin and deny employee, custome
     assert.equal(listQuery.params[0], 'company-1');
     const detail = await request('/api/invoices/invoice-test', 'admin');
     assert.equal(detail.status, 200);
+    const detailBody = await detail.json();
+    assert.equal(detailBody.success, true);
+    assert.equal(detailBody.company.name, 'Test Company');
+    assert.equal(detailBody.company.address, '');
     const rootQuery = queries.find(({ sql }) => sql.includes('FROM invoices i') && sql.includes('WHERE i.id = $1'));
+    assert.match(rootQuery.sql, /j\.company_id::text = i\.company_id::text/);
+    assert.match(rootQuery.sql, /i\.company_id::text = \$2::text/);
     assert.equal(rootQuery.params[1], 'company-1');
+    const companyQuery = queries.find(({ sql }) => sql.startsWith('SELECT c.id, c.company_name'));
+    assert.match(companyQuery.sql, /to_jsonb\(c\)->>'address'/);
+    assert.match(companyQuery.sql, /to_jsonb\(c\)->'settings'/);
     for (const table of ['invoice_items', 'invoice_disputes', 'invoice_activity_logs', 'invoice_payments']) {
       const childQuery = queries.find(({ sql }) => sql.includes(`FROM ${table}`));
       assert.ok(childQuery?.sql.includes('company_id = $2'), `${table} lookup must be company scoped`);

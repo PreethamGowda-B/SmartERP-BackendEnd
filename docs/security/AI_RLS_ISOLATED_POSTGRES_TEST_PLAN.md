@@ -361,12 +361,17 @@ Neither migration 045 nor 046 is approved for manual application until the compl
 
 This section is the authoritative implementation note. The candidate allocates versions under the existing company/family transaction advisory lock by probing the 044 unique constraint with `ON CONFLICT ON CONSTRAINT ai_documents_family_version_key DO NOTHING`. It does not query hidden document metadata. A bounded 100-attempt ceiling is deliberately retained: without PostgreSQL evidence and a separately reviewed allocator that can safely initialize from hidden history, an unbounded probe loop could create excessive work. After 100 consecutive conflicts the request fails predictably with HTTP 409 `AI_DOCUMENT_VERSION_ALLOCATION_EXHAUSTED`; the integer boundary has its own HTTP 409 `AI_DOCUMENT_VERSION_EXHAUSTED`. An isolated PostgreSQL test is still required to prove how the unique index and RLS interact under the restricted role.
 
+Ingest request keys are independently protected by `idx_ai_documents_ingest_request`, scoped to company, uploader, and key. The service maps a unique violation from that exact index (when a historical row is invisible under RLS) to generic HTTP 409 `AI_DOCUMENT_IDEMPOTENCY_KEY_UNAVAILABLE`. It returns no prior-row data and does not release or recycle the key. This is a source-level fix with mocked regression coverage; unique-index and RLS behavior still require the PostgreSQL cases below.
+
 ### 7.1 Version allocation test cases
 
 - [ ] Seed more than 100 consecutive historical versions hidden by expiry/supersession. As `smarterp_app`, run the real repository upload path and confirm it makes at most 100 unique-index probes, returns `AI_DOCUMENT_VERSION_ALLOCATION_EXHAUSTED`, rolls back, and returns no hidden version metadata.
 - [ ] Run concurrent uploads for the same company and family using separate app-role connections. Confirm the family advisory lock serializes cooperating requests, every committed version is unique, and retries never cross the company key.
 - [ ] Seed a visible latest version `2147483647` as a privileged test fixture and confirm the application returns `AI_DOCUMENT_VERSION_EXHAUSTED` without integer overflow or data mutation. Also document the unresolved case where all historical versions are hidden and the maximum integer is occupied; the bounded 100-attempt result remains the safe response.
-- [ ] Separately test replay of an ingest request key held by an RLS-hidden historical row. Migration 044's `idx_ai_documents_ingest_request` is a different unique index; the business policy for reuse/expiry of request keys remains unresolved and must not be bypassed by the version allocator.
+- [ ] Repeat an identical upload concurrently with the same company, authenticated uploader, request key, and payload. Confirm the request-key advisory lock and unique index produce one document; a visible retry replays the same ID and does not insert a second row.
+- [ ] Reuse a visible request key with a changed fingerprint. Confirm HTTP 409 `AI_DOCUMENT_IDEMPOTENCY_CONFLICT` and no mutation.
+- [ ] Seed a deleted, superseded, or expired document whose request key is hidden by 045 but remains in `idx_ai_documents_ingest_request`. A retry with that key must return only generic HTTP 409 `AI_DOCUMENT_IDEMPOTENCY_KEY_UNAVAILABLE`; confirm no historical ID, title, processing state, or SQL error is returned. The key remains reserved; retrying the upload requires a fresh key.
+- [ ] Reuse the same request-key string from another company and from another uploader in one company. Confirm the 044 uniqueness scope allows independent requests while both lookups and inserts remain scoped to the authenticated company and uploader.
 
 ### 7.2 Lifecycle and maintenance test cases
 

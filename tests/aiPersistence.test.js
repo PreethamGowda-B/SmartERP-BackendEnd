@@ -134,6 +134,139 @@ test('document ingestion skips hidden historical versions without weakening comp
   assert.deepEqual(insertCompanies, [COMPANY_A, COMPANY_A, COMPANY_A]);
 });
 
+test('a hidden historical ingest-key collision returns a generic 409 without exposing the old row', async () => {
+  const statements = [];
+  const client = {
+    async query(sql, params) {
+      statements.push({ sql, params });
+      if (sql.includes('SELECT id, ingest_fingerprint, processing_status')) return { rows: [] }; // Historical row is hidden by RLS.
+      if (sql.includes('INSERT INTO public.ai_documents')) {
+        const error = new Error('duplicate key contains private historical row details');
+        error.code = '23505';
+        error.constraint = 'idx_ai_documents_ingest_request';
+        throw error;
+      }
+      return { rows: [] };
+    },
+    release() {},
+  };
+  const repo = createAiPersistenceRepository({ pool: { async query() { return { rows: [] }; }, async connect() { return client; } } });
+
+  await assert.rejects(repo.ingestDocument({
+    userId: USER, companyId: COMPANY_A, title: 'Manual', fileName: 'manual.md',
+    mimeType: 'text/markdown', contentHash: 'a'.repeat(64), ingestFingerprint: 'b'.repeat(64),
+    text: 'text', chunks: [], familyId: 'e3ac2ce1-c98e-4d28-9f4e-42313138fc8e',
+    requestKey: 'historical-key', retentionDays: 90,
+  }), (error) => {
+    assert.equal(error.statusCode, 409);
+    assert.equal(error.code, 'AI_DOCUMENT_IDEMPOTENCY_KEY_UNAVAILABLE');
+    assert.equal(error.message, 'This upload request key cannot be reused. Start a new upload request.');
+    assert.doesNotMatch(error.message, /historical|private|duplicate/i);
+    return true;
+  });
+
+  const lookup = statements.find(({ sql }) => sql.includes('SELECT id, ingest_fingerprint, processing_status'));
+  assert.match(lookup.sql, /company_id=\$1 AND uploaded_by=\$2::uuid AND ingest_request_key=\$3/);
+  assert.deepEqual(lookup.params, [COMPANY_A, USER, 'historical-key']);
+  assert.equal(statements.some(({ sql }) => sql === 'COMMIT'), false);
+  assert.equal(statements.some(({ sql }) => sql === 'ROLLBACK'), true);
+});
+
+test('concurrent identical document uploads serialize on company, user, and request key', async () => {
+  const docs = [];
+  const calls = [];
+  const tails = new Map();
+  let nextId = 0;
+  async function acquire(key) {
+    const previous = tails.get(key) || Promise.resolve();
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const queued = previous.then(() => gate);
+    tails.set(key, queued);
+    await previous;
+    return () => {
+      release();
+      if (tails.get(key) === queued) tails.delete(key);
+    };
+  }
+  const pool = {
+    async query() { return { rows: [] }; },
+    async connect() {
+      const held = [];
+      let pendingDoc = null;
+      return {
+        async query(sql, params = []) {
+          calls.push({ sql, params });
+          if (sql === 'BEGIN') return { rows: [] };
+          if (sql === 'ROLLBACK') { pendingDoc = null; held.splice(0).forEach((release) => release()); return { rows: [] }; }
+          if (sql === 'COMMIT') {
+            if (pendingDoc && !docs.some((doc) => doc.companyId === pendingDoc.companyId && doc.familyId === pendingDoc.familyId && doc.version === pendingDoc.version)) docs.push(pendingDoc);
+            pendingDoc = null;
+            held.splice(0).forEach((release) => release());
+            return { rows: [] };
+          }
+          if (sql.includes('pg_advisory_xact_lock')) { held.push(await acquire(`${params[0]}:${params[1]}`)); return { rows: [] }; }
+          if (sql.includes('SELECT id, ingest_fingerprint, processing_status')) {
+            const prior = docs.find((doc) => doc.companyId === params[0] && doc.userId === params[1] && doc.requestKey === params[2]);
+            return { rows: prior ? [{ id: prior.id, ingest_fingerprint: prior.fingerprint, processing_status: prior.processingStatus }] : [] };
+          }
+          if (sql.includes('SELECT id, version, deleted_at')) {
+            const family = docs.filter((doc) => doc.companyId === params[0] && doc.familyId === params[1]);
+            const latest = family.sort((a, b) => b.version - a.version)[0];
+            return { rows: latest ? [{ id: latest.id, version: latest.version }] : [] };
+          }
+          if (sql.includes('INSERT INTO public.ai_documents')) {
+            const row = { id: `doc-${++nextId}`, companyId: params[0], userId: params[1], familyId: params[2], version: params[8], requestKey: params[9], fingerprint: params[7], processingStatus: 'processing', supersededBy: null };
+            pendingDoc = row;
+            return { rows: [{ id: row.id, document_family_id: row.familyId, version: row.version, processing_status: row.processingStatus }] };
+          }
+          if (/SELECT id,\s*version FROM public\.ai_documents/.test(sql)) {
+            const competing = docs.filter((doc) => doc.companyId === params[0] && doc.familyId === params[1]
+              && doc.id !== params[2] && doc.processingStatus === 'ready' && !doc.supersededBy)
+              .sort((a, b) => b.version - a.version)[0];
+            return { rows: competing ? [{ id: competing.id, version: competing.version }] : [] };
+          }
+          if (sql.includes('UPDATE public.ai_documents SET superseded_by')) {
+            const row = docs.find((doc) => doc.id === params[0]);
+            if (row) row.supersededBy = params[2];
+          }
+          if (sql.includes("SET processing_status='ready'")) {
+            const row = docs.find((doc) => doc.id === params[0]);
+            if (row) row.processingStatus = 'ready';
+          }
+          return { rows: [] };
+        },
+        release() { held.splice(0).forEach((release) => release()); },
+      };
+    },
+  };
+  const repo = createAiPersistenceRepository({ pool });
+  const input = {
+    userId: USER, companyId: COMPANY_A, title: 'Manual', fileName: 'manual.md',
+    mimeType: 'text/markdown', contentHash: 'a'.repeat(64), ingestFingerprint: 'b'.repeat(64),
+    text: 'text', chunks: [], familyId: 'e3ac2ce1-c98e-4d28-9f4e-42313138fc8e',
+    requestKey: 'same-request-key', retentionDays: 90,
+  };
+
+  const results = await Promise.all([
+    repo.ingestDocument(input),
+    repo.ingestDocument({ ...input, requestKey: 'other-family-upload' }),
+    repo.ingestDocument(input),
+  ]);
+
+  assert.equal(docs.length, 2);
+  assert.equal(calls.filter(({ sql }) => sql.includes('INSERT INTO public.ai_documents')).length, 2);
+  assert.equal(results[0].id, results[2].id);
+  assert.equal(Number(Boolean(results[0].replayed)) + Number(Boolean(results[1].replayed)) + Number(Boolean(results[2].replayed)), 1);
+  assert.deepEqual(docs.map((doc) => doc.version).sort((a, b) => a - b), [1, 2]);
+  assert.equal(docs.filter((doc) => !doc.supersededBy && doc.processingStatus === 'ready').length, 1);
+  assert.equal(docs.find((doc) => doc.version === 1).supersededBy, docs.find((doc) => doc.version === 2).id);
+  const requestLock = calls.filter(({ sql, params }) => sql.includes('pg_advisory_xact_lock') && String(params?.[0] || '').startsWith('ai-ingest:'));
+  const familyLocks = calls.filter(({ sql, params }) => sql.includes('pg_advisory_xact_lock') && String(params?.[0] || '').startsWith('ai-doc:'));
+  assert.equal(requestLock.length, 3);
+  assert.equal(familyLocks.length, 4); // One family lock for each new upload and finalization.
+});
+
 test('document ingestion deletes old-version chunks before marking that version superseded', async () => {
   const calls = [];
   const familyId = 'e3ac2ce1-c98e-4d28-9f4e-42313138fc8e';

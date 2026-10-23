@@ -381,6 +381,16 @@ function createAiPersistenceRepository({ pool, now = () => new Date() }) {
       if (documentId) {
         await pool.query(`UPDATE public.ai_documents SET processing_status='failed', safe_error_code='INGEST_FAILED', updated_at=now() WHERE id=$1::uuid AND company_id=$2 AND uploaded_by=$3::uuid`, [String(documentId), String(companyId), String(userId)]).catch(() => {});
       }
+      // An expired, deleted, or superseded row may be hidden by RLS while its
+      // company/uploader-scoped idempotency key remains protected by the unique
+      // index. Do not retry that key indefinitely or reveal the hidden row; map
+      // only this known constraint to a generic, safe client conflict.
+      if (error?.code === '23505' && error?.constraint === 'idx_ai_documents_ingest_request') {
+        const conflict = new Error('This upload request key cannot be reused. Start a new upload request.');
+        conflict.statusCode = 409;
+        conflict.code = 'AI_DOCUMENT_IDEMPOTENCY_KEY_UNAVAILABLE';
+        throw conflict;
+      }
       throw error;
     } finally {
       client.release();

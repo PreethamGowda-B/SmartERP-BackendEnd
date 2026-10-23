@@ -13,6 +13,7 @@ const {
 
 const migrationPath = path.join(__dirname, '..', 'migrations', AI_RAG_PERSISTENT_CONVERSATIONS.file);
 const sql = fs.readFileSync(migrationPath, 'utf8');
+const verifierSql = fs.readFileSync(path.join(__dirname, '..', 'migrations', 'verify_ai_rag_044_045.sql'), 'utf8');
 
 test('AI persistence migration is registered after security baseline and never runs at startup', () => {
   const ids = FORWARD_MIGRATIONS.map(({ id }) => id);
@@ -66,4 +67,13 @@ test('post-migration verifier rejects unsafe role privileges or missing forced R
     browser_role_privilege_count: 0,
   }] }; } };
   await assert.rejects(assertAiRagPersistentConversationsSchema(client), /AI RAG\/conversation schema verification failed/);
+});
+
+test('read-only verification checks version uniqueness and scoped ingest idempotency index', () => {
+  assert.match(verifierSql, /BEGIN READ ONLY/);
+  assert.match(verifierSql, /ai_documents_family_version_key/);
+  assert.match(verifierSql, /UNIQUE \(company_id, document_family_id, version\)/);
+  assert.match(verifierSql, /idx_ai_documents_ingest_request/);
+  assert.match(verifierSql, /company_id, uploaded_by, ingest_request_key/);
+  assert.doesNotMatch(verifierSql, /^\s*(INSERT|UPDATE|DELETE|ALTER|DROP|CREATE|TRUNCATE|GRANT|REVOKE)\b/im);
 });

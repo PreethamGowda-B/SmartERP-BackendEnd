@@ -45,6 +45,21 @@ FROM (
           WHERE schemaname='public' AND tablename IN
             ('ai_documents','ai_document_chunks','ai_conversations','ai_conversation_messages'))
   UNION ALL
+  SELECT 'document family version uniqueness is validated',
+         EXISTS (SELECT 1 FROM pg_constraint c
+          WHERE c.conrelid=to_regclass('public.ai_documents')
+            AND c.conname='ai_documents_family_version_key'
+            AND c.contype='u' AND c.convalidated
+            AND pg_get_constraintdef(c.oid) ILIKE 'UNIQUE (company_id, document_family_id, version)')
+  UNION ALL
+  SELECT 'ingest request idempotency index is company and uploader scoped',
+         EXISTS (SELECT 1 FROM pg_indexes
+          WHERE schemaname='public' AND tablename='ai_documents'
+            AND indexname='idx_ai_documents_ingest_request'
+            AND lower(indexdef) LIKE 'create unique index%'
+            AND lower(indexdef) LIKE '%(company_id, uploaded_by, ingest_request_key)%'
+            AND lower(indexdef) LIKE '%where (ingest_request_key is not null)%')
+  UNION ALL
   SELECT 'public application migration history exists',
          to_regclass('public.app_migration_history') IS NOT NULL
 ) AS checks

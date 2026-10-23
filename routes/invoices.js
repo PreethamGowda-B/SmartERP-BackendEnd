@@ -272,8 +272,8 @@ router.get('/:id', authenticate, requireFinanceReadAccess, async (req, res) => {
     const invRes = await pool.query(
       `SELECT i.*, j.title AS job_title
        FROM invoices i
-       LEFT JOIN jobs j ON i.job_id = j.id AND j.company_id = i.company_id
-       WHERE i.id = $1 AND i.company_id = $2`,
+       LEFT JOIN jobs j ON i.job_id = j.id AND j.company_id::text = i.company_id::text
+       WHERE i.id = $1 AND i.company_id::text = $2::text`,
       [id, companyId]
     );
 
@@ -288,7 +288,19 @@ router.get('/:id', authenticate, requireFinanceReadAccess, async (req, res) => {
     const paymentsRes = await pool.query(`SELECT * FROM invoice_payments WHERE invoice_id = $1 AND company_id = $2 ORDER BY created_at DESC`, [invoice.id, companyId]);
 
     // Fetch company details dynamically from DB
-    const compRes = await pool.query(`SELECT id, company_name, address, phone, contact_email, settings FROM companies WHERE id = $1`, [invoice.company_id]);
+    // Company profile columns vary across supported legacy schemas. Read the
+    // optional fields through the row's JSON representation so a missing
+    // address/phone/contact_email/settings column cannot fail invoice viewing.
+    const compRes = await pool.query(
+      `SELECT c.id, c.company_name,
+              to_jsonb(c)->>'address' AS address,
+              to_jsonb(c)->>'phone' AS phone,
+              to_jsonb(c)->>'contact_email' AS contact_email,
+              to_jsonb(c)->'settings' AS settings
+       FROM companies c
+       WHERE c.id::text = $1::text`,
+      [invoice.company_id]
+    );
     const compRow = compRes.rows[0] || {};
     const s = compRow.settings || {};
 

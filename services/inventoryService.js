@@ -9,9 +9,12 @@ class InventoryService {
 
     const res = await pool.query(
       `SELECT id, name, category, quantity, min_quantity, unit
-       FROM inventory
-       WHERE company_id::text = $1 AND (quantity <= min_quantity OR quantity < 10)
-       ORDER BY quantity ASC`,
+       FROM inventory_items
+       WHERE company_id::text = $1
+         AND (is_deleted = FALSE OR is_deleted IS NULL)
+         AND min_quantity > 0
+         AND quantity < min_quantity
+       ORDER BY (quantity::float / NULLIF(min_quantity, 0)) ASC`,
       [String(companyId)]
     );
 

@@ -34,8 +34,11 @@ class AIDataService {
     if (!companyId) throw new Error("Company ID is required.");
     const result = await pool.query(
       `SELECT COUNT(*)::int AS low_stock_count
-         FROM inventory
-        WHERE company_id::text = $1 AND quantity <= min_stock_level`,
+         FROM inventory_items
+        WHERE company_id::text = $1
+          AND (is_deleted = FALSE OR is_deleted IS NULL)
+          AND min_quantity > 0
+          AND quantity < min_quantity`,
       [String(companyId)]
     );
     return Number(result.rows?.[0]?.low_stock_count) || 0;

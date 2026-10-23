@@ -287,8 +287,8 @@ router.post(
 
         return res.json({
           text: lowStockCount > 0
-            ? `⚠️ Low Stock Warning: **${lowStockCount}** inventory item(s) have reached or fallen below their minimum threshold.`
-            : `Inventory Status: All warehouse and inventory stock levels are currently within optimal thresholds.`,
+            ? `⚠️ Low Stock Warning: **${lowStockCount}** inventory item(s) are below their configured reorder threshold.`
+            : `No inventory items are currently below their configured reorder threshold.`,
           widget: {
             type: "KPI_SUMMARY",
             title: "Inventory Health",

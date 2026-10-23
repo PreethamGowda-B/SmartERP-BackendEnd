@@ -10,7 +10,7 @@ class PayrollPlugin extends BasePlugin {
     this.tools["get_payroll_summary"] = {
       name: "get_payroll_summary",
       description: "Retrieves payroll expense breakdown, total wages, and payment statuses for the company.",
-      allowedRoles: ["owner", "hr", "admin"],
+      allowedRoles: ["owner", "admin"],
       isDestructive: false,
       parameters: {
         type: "object",
@@ -32,7 +32,7 @@ class PayrollPlugin extends BasePlugin {
     this.tools["calculate_payroll"] = {
       name: "calculate_payroll",
       description: "Generates monthly payroll records for all active company employees.",
-      allowedRoles: ["owner", "hr", "admin"],
+      allowedRoles: ["owner", "admin"],
       isDestructive: true,
       parameters: {
         type: "object",
@@ -55,7 +55,7 @@ class PayrollPlugin extends BasePlugin {
     this.tools["validate_payroll_pre_run"] = {
       name: "validate_payroll_pre_run",
       description: "Executes 7-point pre-run validation audit (ghost employees, duplicate bank accounts, salary spikes, statutory errors) before payroll disbursal.",
-      allowedRoles: ["owner", "hr", "admin"],
+      allowedRoles: ["owner", "admin"],
       isDestructive: false,
       parameters: {
         type: "object",

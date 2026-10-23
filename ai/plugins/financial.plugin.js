@@ -27,7 +27,7 @@ class FinancialPlugin extends BasePlugin {
     this.tools["get_unpaid_invoices"] = {
       name: "get_unpaid_invoices",
       description: "Identifies pending or unpaid client invoices.",
-      allowedRoles: ["owner", "admin", "hr"],
+      allowedRoles: ["owner", "admin"],
       isDestructive: false,
       parameters: {
         type: "object",

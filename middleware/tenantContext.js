@@ -13,9 +13,9 @@ function setTenantContext(req, res, next) {
     return next();
   }
 
-  const companyId = req.user.companyId;
+  const companyId = req.user.companyId || req.user.company_id;
   const role = req.user.role;
-  const userId = req.user.id;
+  const userId = req.user.id || req.user.userId;
 
   if (!companyId && role !== 'super_admin') {
     console.warn(`⚠️ setTenantContext: Authenticated user ${userId || 'unknown'} has no companyId on ${req.method} ${req.path}`);
@@ -43,8 +43,11 @@ function setTenantContext(req, res, next) {
   }
 
   const existingStore = storage.getStore();
-  // Preserve existing bypassRls from outer middleware (e.g., auth routes) or if user has no companyId yet (onboarding/registration)
-  const bypassRls = existingStore?.bypassRls === true || !companyId;
+  // Missing tenant context must fail closed under the non-bypass app role.
+  // Bypass is preserved only when a trusted server-side middleware explicitly
+  // established it (for example, the auth router before identity lookup).
+  // Never infer privileged database access from absent company data.
+  const bypassRls = existingStore?.bypassRls === true;
 
   // Run the rest of the request chain inside the ALS context
   storage.run({ isWebRequest: true, companyId, role, userId, bypassRls }, () => {

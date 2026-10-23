@@ -183,6 +183,49 @@ class AIDataService {
     };
   }
 
+  /** Personal attendance summary. Identity and company must come from the authenticated request. */
+  static async getEmployeePersonalAttendanceSummary({ userId, companyId }) {
+    if (!userId || !companyId) throw new Error('User and company IDs are required.');
+    const uid = String(userId);
+    const cid = String(companyId);
+    const policy = await AttendancePolicy.getCompanyPolicy(cid, pool);
+    const workDate = AttendancePolicy.localDate(new Date(), policy.timezone);
+    const result = await pool.query(
+      `SELECT a.check_in_time, a.status, a.is_late,
+              EXISTS (
+                SELECT 1
+                  FROM leave_requests l
+                 WHERE l.user_id::text = u.id::text
+                   AND l.company_id::text = u.company_id::text
+                   AND l.status = 'approved'
+                   AND $3::date BETWEEN l.start_date AND l.end_date
+              ) AS is_on_leave
+         FROM users u
+         LEFT JOIN attendance a
+           ON a.user_id::text = u.id::text
+          AND a.company_id::text = u.company_id::text
+          AND a.date = $3
+        WHERE u.id::text = $1
+          AND u.company_id::text = $2
+          AND u.role = 'employee'
+          AND u.is_active = TRUE
+          AND COALESCE(NULLIF(to_jsonb(u)->>'status', ''), 'active') <> 'suspended'
+        LIMIT 1`,
+      [uid, cid, workDate]
+    );
+    const row = result.rows?.[0];
+    if (!row) return null;
+    const present = Boolean(row.check_in_time) || ['present', 'late', 'half_day'].includes(row.status);
+    const onLeave = !present && row.is_on_leave === true;
+    return {
+      total: 1,
+      present: present ? 1 : 0,
+      absent: present || onLeave ? 0 : 1,
+      late: row.is_late === true || row.status === 'late' ? 1 : 0,
+      on_leave: onLeave ? 1 : 0,
+    };
+  }
+
   /**
    * Owner AI Summary: Live enterprise operational metrics strictly scoped by companyId
    */

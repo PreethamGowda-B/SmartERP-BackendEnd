@@ -10,7 +10,7 @@ class InventoryPlugin extends BasePlugin {
     this.tools["get_low_stock_items"] = {
       name: "get_low_stock_items",
       description: "Retrieves inventory items running low or below minimum threshold.",
-      allowedRoles: ["owner", "hr", "admin", "employee"],
+      allowedRoles: ["owner", "hr", "admin"],
       isDestructive: false,
       parameters: {
         type: "object",
@@ -27,7 +27,7 @@ class InventoryPlugin extends BasePlugin {
     this.tools["get_material_requests"] = {
       name: "get_material_requests",
       description: "Retrieves material and inventory reorder requests for the company.",
-      allowedRoles: ["owner", "hr", "admin", "employee"],
+      allowedRoles: ["owner", "hr", "admin"],
       isDestructive: false,
       parameters: {
         type: "object",

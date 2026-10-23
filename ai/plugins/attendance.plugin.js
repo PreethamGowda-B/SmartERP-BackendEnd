@@ -9,7 +9,7 @@ class AttendancePlugin extends BasePlugin {
     this.tools["get_today_attendance"] = {
       name: "get_today_attendance",
       description: "Retrieves today's attendance metrics including present count, absent list, and clock-in logs.",
-      allowedRoles: ["owner", "hr", "admin", "employee"],
+      allowedRoles: ["owner", "hr", "admin"],
       isDestructive: false,
       parameters: {
         type: "object",

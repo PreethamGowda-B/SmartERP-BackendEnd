@@ -141,7 +141,7 @@ router.get('/', authenticate, requireFinanceReadAccess, async (req, res) => {
     let query = `
       SELECT i.*, j.title AS job_title
       FROM invoices i
-      LEFT JOIN jobs j ON i.job_id = j.id AND j.company_id = i.company_id
+      LEFT JOIN jobs j ON i.job_id = j.id AND j.company_id::text = i.company_id::text
       WHERE i.company_id = $1 AND i.is_latest = TRUE
     `;
     const params = [companyId];

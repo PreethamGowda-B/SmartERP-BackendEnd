@@ -1,8 +1,10 @@
+const { FAST_PATH_POLICIES } = require('./aiFastPathPolicy');
+
 const FAST_PATH_ROLES = Object.freeze({
-  jobs: new Set(["owner", "admin", "hr", "employee"]),
-  payroll: new Set(["owner", "admin", "hr"]),
-  inventory: new Set(["owner", "admin", "hr", "employee"]),
-  financial: new Set(["owner", "admin"]),
+  jobs: new Set(FAST_PATH_POLICIES.completed_jobs.roles),
+  payroll: new Set(FAST_PATH_POLICIES.payroll.roles),
+  inventory: new Set(FAST_PATH_POLICIES.inventory.roles),
+  financial: new Set(FAST_PATH_POLICIES.finance.roles),
 });
 
 function canUseAiFastPath(metric, role) {

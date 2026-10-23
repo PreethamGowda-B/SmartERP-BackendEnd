@@ -2907,7 +2907,7 @@ Neon PostgreSQL free tier reaches a hard limit of 100 compute hours/month, causi
    - Identified Supabase project cluster region: **`ap-northeast-1` (Tokyo)**.
    - Forced dedicated IPv4 AWS Elastic Pooler:
      ```text
-     postgresql://postgres.mstwwtprtzfthfgkxbay:PASSWORD@aws-0-ap-northeast-1.pooler.supabase.com:6543/postgres
+     postgresql://<DB_USER>:<DB_PASSWORD>@<DB_HOST>:<DB_PORT>/<DB_NAME>/postgres
      ```
    - Implemented `cleanConnectionString()` auto-normalizer in `db-base.js` that automatically redirects any direct `db.mstwwtprtzfthfgkxbay.supabase.co` string to the Tokyo IPv4 Pooler.
    - Injected custom `ipv4Lookup` (`family: 4`) directly into `pg.Pool` socket options.

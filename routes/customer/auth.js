@@ -30,10 +30,11 @@ const redisClient = require('../../utils/redis');
 const { validateCompanyCode } = require('../../utils/companyIdGenerator');
 const { storage } = require('../../middleware/als');
 const { hashToken } = require('../../utils/tokenHash');
+const { createAuthRouteRlsScope, CUSTOMER_IDENTITY_LOOKUP_ROUTES } = require('../../middleware/authRouteRlsScope');
 
-// âœ… RLS bypass â€” customer auth routes look up customers/companies by email before
-// any company context is known. Explicitly opt-in to cross-tenant access.
-router.use((req, res, next) => storage.run({ isWebRequest: true, bypassRls: true }, next));
+// Only unauthenticated identity lookup and account bootstrap endpoints receive
+// cross-company context. Unknown methods/paths fail closed.
+router.use(createAuthRouteRlsScope({ storage, crossTenantRoutes: CUSTOMER_IDENTITY_LOOKUP_ROUTES }));
 
 
 // â”€â”€â”€ Constants â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€

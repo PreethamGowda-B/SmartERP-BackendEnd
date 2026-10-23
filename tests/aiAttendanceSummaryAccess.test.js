@@ -7,18 +7,17 @@ const { canUseAiFastPath } = require('../services/aiMetricAccess');
 const { pool } = require('../db');
 const AIDataService = require('../services/aiDataService');
 
-test('company attendance aggregates follow the existing owner, admin, HR, and employee tool permissions', async () => {
+test('company attendance aggregates are limited to owner, admin, and HR roles', async () => {
   const calls = [];
   const dataService = {
     async getCompanyAttendanceSummary(input) { calls.push(['company', input]); return { total: 4 }; },
   };
 
-  for (const role of ['owner', 'admin', 'hr', 'employee']) {
+  for (const role of ['owner', 'admin', 'hr']) {
     const result = await loadAttendanceSummary({ role, companyId: 'company-a', dataService });
     assert.deepEqual(result, { scope: 'company', summary: { total: 4 } });
   }
   assert.deepEqual(calls, [
-    ['company', { companyId: 'company-a' }],
     ['company', { companyId: 'company-a' }],
     ['company', { companyId: 'company-a' }],
     ['company', { companyId: 'company-a' }],
@@ -39,20 +38,23 @@ test('customers, superadmins, and missing company/user contexts cannot load atte
   assert.equal(calls, 0);
 });
 
-test('AI fast paths preserve the role permissions of their existing tools', () => {
+test('company-summary fast paths enforce the approved role boundaries', () => {
   assert.equal(canUseAiFastPath('jobs', 'owner'), true);
-  assert.equal(canUseAiFastPath('jobs', 'employee'), true);
+  assert.equal(canUseAiFastPath('jobs', 'employee'), false);
   assert.equal(canUseAiFastPath('jobs', 'customer'), false);
-  assert.equal(canUseAiFastPath('payroll', 'hr'), true);
+  assert.equal(canUseAiFastPath('payroll', 'hr'), false);
+  assert.equal(canUseAiFastPath('payroll', 'admin'), true);
   assert.equal(canUseAiFastPath('payroll', 'employee'), false);
-  assert.equal(canUseAiFastPath('inventory', 'employee'), true);
+  assert.equal(canUseAiFastPath('inventory', 'employee'), false);
   assert.equal(canUseAiFastPath('inventory', 'customer'), false);
   assert.equal(canUseAiFastPath('financial', 'owner'), true);
   assert.equal(canUseAiFastPath('financial', 'admin'), true);
   assert.equal(canUseAiFastPath('financial', 'hr'), false);
 
   const route = fs.readFileSync(path.join(__dirname, '..', 'routes', 'ai.routes.js'), 'utf8');
-  assert.equal((route.match(/canUseAiFastPath\("(?:jobs|payroll|inventory|financial)", role\)/g) || []).length, 5);
+  assert.match(route, /classifyAiFastPathIntent\(cleanMessage, role\)/);
+  assert.match(route, /authorizeAiFastPath\(/);
+  assert.match(route, /fastPathAuthorization\.allowed/);
   assert.match(route, /getCompanyJobStatusCounts\(\{ companyId \}\)/);
   assert.match(route, /getCompanyLowStockCount\(\{ companyId \}\)/);
   assert.match(route, /getCompanyInvoiceSummary\(\{ companyId \}\)/);
@@ -60,6 +62,28 @@ test('AI fast paths preserve the role permissions of their existing tools', () =
   assert.equal((route.match(/getOwnerDashboardSummary\(\{ companyId \}\)/g) || []).length, 1);
   assert.match(route, /payrollSummary\.leaves\?\.pending_requests \|\| 0/);
   assert.match(route, /getHrDashboardSummary\(\{ companyId \}\)/);
+});
+
+test('employee personal attendance summary is scoped by trusted user and company identity', async () => {
+  const originalQuery = pool.query;
+  let captured;
+  pool.query = async (sql, params = []) => {
+    const query = String(sql);
+    if (query.includes('FROM company_settings')) return { rows: [] };
+    captured = { query, params };
+    return { rows: [{ check_in_time: '09:00', status: 'present', is_late: false, is_on_leave: false }] };
+  };
+  try {
+    const summary = await AIDataService.getEmployeePersonalAttendanceSummary({ userId: 'employee-a', companyId: 'company-a' });
+    assert.deepEqual(summary, { total: 1, present: 1, absent: 0, late: 0, on_leave: 0 });
+    assert.deepEqual(captured.params.slice(0, 2), ['employee-a', 'company-a']);
+    assert.match(captured.query, /u\.id::text = \$1/);
+    assert.match(captured.query, /u\.company_id::text = \$2/);
+    assert.match(captured.query, /u\.role = 'employee'/);
+    assert.match(captured.query, /l\.company_id::text = u\.company_id::text/);
+  } finally {
+    pool.query = originalQuery;
+  }
 });
 
 test('common AI summary queries stay narrow and tenant-scoped', async () => {

@@ -140,7 +140,8 @@ test('assigned-jobs prompt matcher is employee-only and response contains the re
   assert.equal(empty.widget.metrics[0].value, 0);
 
   const route = fs.readFileSync(path.join(__dirname, '..', 'routes', 'ai.routes.js'), 'utf8');
-  assert.match(route, /isEmployeeAssignedJobsPrompt\(role, promptLower\)/);
+  assert.match(route, /classifyAiFastPathIntent\(cleanMessage, role\)/);
+  assert.match(route, /fastPathIntent\.key === 'assigned_jobs'/);
   assert.match(route, /getEmployeeAssignedJobs\(\{ userId, companyId, limit: 10 \}\)/);
 });
 

@@ -8,7 +8,7 @@ class GSTReconciliationPlugin extends BasePlugin {
     this.tools["get_gst_reconciliation_summary"] = {
       name: "get_gst_reconciliation_summary",
       description: "Retrieves summary metrics for a GSTR-2B reconciliation period.",
-      allowedRoles: ["owner", "admin", "hr"],
+      allowedRoles: ["owner", "admin"],
       isDestructive: false,
       parameters: {
         type: "object",

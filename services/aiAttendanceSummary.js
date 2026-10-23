@@ -1,4 +1,4 @@
-const COMPANY_ATTENDANCE_ROLES = new Set(["owner", "admin", "hr", "employee"]);
+const COMPANY_ATTENDANCE_ROLES = new Set(["owner", "admin", "hr"]);
 
 function resolveAttendanceSummaryScope(role) {
   const normalizedRole = String(role || "").toLowerCase();

@@ -1,20 +1,47 @@
+# Dependencies
 node_modules/
-.env
-firebase-service-account.json
-services/firebase-service-account.json
-load-tests/users.csv
-load-tests/*.log
-load-tests/*.json
 
-# Security: always ignore secrets and local files
+# Environment and Secret Configurations
+.env
 .env.local
 .env.production
 .env.*.local
 .env.test
 .env.test.*
+firebase-service-account.json
+services/firebase-service-account.json
+
+# Local Runtime and User Uploads
 uploads/
 scratch/
 backups/
+
+# Logs and Diagnostics
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+load-tests/*.log
+load-tests/*.json
+load-tests/users.csv
+
+# Test Coverage
+coverage/
+*.lcov
+
+# Operating System Files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE and Editor Cache
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Database Dumps and Raw SQL Files (Safelist canonical schemas & migrations)
 *.dump
 *.sql
+!schema.sql
 !migrations/*.sql
+!docs/proposed-migrations/*.sql

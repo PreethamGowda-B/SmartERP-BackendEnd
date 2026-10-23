@@ -9,10 +9,11 @@ const Razorpay = require('razorpay');
 const { getPlan, getPricePaise, paymentMatchesOrder, isRazorpayConfigured } = require('../services/subscriptionCatalog');
 const { recordPendingSubscriptionPayment, recordCapturedSubscriptionPayment, recordSubscriptionPaymentAttempt } = require('../services/subscriptionPayments');
 
-// ✅ RLS bypass — Razorpay webhooks arrive with no user/tenant session.
-router.use((req, res, next) => storage.run({ isWebRequest: true, bypassRls: true }, next));
-
-router.post('/razorpay', async (req, res) => {
+// Razorpay has no user session. Keep its privileged scope on this signed
+// callback only rather than granting it to every route added to this router.
+router.post('/razorpay', (req, res, next) => {
+  storage.run({ isWebRequest: true, bypassRls: true }, next);
+}, async (req, res) => {
   let verifiedOrderPurpose = null;
   let verifiedOrderNotes = null;
   try {

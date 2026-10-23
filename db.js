@@ -16,6 +16,7 @@ const ID_REGEX = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}
  *   Layer 2 — Session variables (policy filter)
  *     • app.bypass_rls         = 'on'|'off'
  *     • app.current_company_id = validated UUID/int or ''
+ *     • app.current_user_id    = validated UUID or ''
  *     • app.current_role       = role string or ''
  *
  * FAIL-CLOSED:
@@ -26,8 +27,7 @@ const ID_REGEX = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}
  *   storage.run({ bypassRls: true }, fn) in auth routes, migrations, background jobs.
  *   → RESET ROLE (neondb_owner) + app.bypass_rls='on' → all rows visible.
  */
-function buildRlsConfig() {
-  const context = storage.getStore();
+function buildRlsConfig(context = storage.getStore()) {
 
   const bypassRls  = context?.bypassRls === true;
   const role       = (context?.role && typeof context.role === 'string') ? context.role.trim() : '';
@@ -42,7 +42,12 @@ function buildRlsConfig() {
     }
   }
 
-  return { bypassRls, role, companyId };
+  const candidateUserId = context?.userId == null ? '' : String(context.userId).trim();
+  const userId = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(candidateUserId)
+    ? candidateUserId
+    : '';
+
+  return { bypassRls, role, companyId, userId };
 }
 
 /**
@@ -51,31 +56,27 @@ function buildRlsConfig() {
  *
  * REVISED APPROACH:
  * - Always RESET ROLE first (back to connection owner who has BYPASSRLS on neondb_owner)
- * - Set session variables for app-layer RLS enforcement
- * - Only SET ROLE smarterp_app if bypassRls=false AND we have a valid companyId
- *   (this prevents blocking queries when ALS context hasn't propagated yet)
+ * - Set all session variables (including empty values) on every pool checkout.
+ * - Use the non-superuser app role for every non-bypass request, including requests
+ *   with missing tenant context. RLS then returns no rows instead of running as the
+ *   database owner, which may bypass RLS.
  */
-async function applyRlsToClient(client) {
-  const { bypassRls, role, companyId } = buildRlsConfig();
-  const safeCompany = companyId || '';
+async function applyRlsToClient(client, context = storage.getStore()) {
+  const { bypassRls, role, companyId, userId } = buildRlsConfig(context);
   const safeRole = String(role || '').replace(/[^a-zA-Z0-9_-]/g, '');
 
-  if (bypassRls) {
-    // Single round-trip: reset role + apply bypass session config
-    await client.query(
-      `RESET ROLE; SELECT set_config('app.bypass_rls', 'on', false), set_config('app.current_company_id', '${safeCompany}', false), set_config('app.current_role', '${safeRole}', false);`
-    ).catch(() => {});
-  } else {
-    // Single round-trip: reset role + apply RLS session config + assume smarterp_app role
-    await client.query(
-      `RESET ROLE; SELECT set_config('app.bypass_rls', 'off', false), set_config('app.current_company_id', '${safeCompany}', false), set_config('app.current_role', '${safeRole}', false); SET ROLE smarterp_app;`
-    ).catch(async (err) => {
-      // Fallback in environments where smarterp_app role has not been provisioned
-      console.warn('⚠️ applyRlsToClient fallback:', err.message);
-      await client.query(
-        `RESET ROLE; SELECT set_config('app.bypass_rls', 'off', false), set_config('app.current_company_id', '${safeCompany}', false), set_config('app.current_role', '${safeRole}', false);`
-      ).catch(() => {});
-    });
+  // Separate statements keep parameter binding safe and make failures explicit.
+  await client.query('RESET ROLE');
+  await client.query(
+    `SELECT set_config('app.bypass_rls', $1, false),
+            set_config('app.current_company_id', $2, false),
+            set_config('app.current_role', $3, false),
+            set_config('app.current_user_id', $4, false)`,
+    [bypassRls ? 'on' : 'off', companyId, safeRole, userId]
+  );
+  if (!bypassRls) {
+    // Failure must abort checkout. Falling back to the database owner could bypass RLS.
+    await client.query('SET ROLE smarterp_app');
   }
 }
 
@@ -109,4 +110,4 @@ pool.query = async function (text, params) {
   }
 };
 
-module.exports = { pool };
+module.exports = { pool, buildRlsConfig, applyRlsToClient };

@@ -79,17 +79,35 @@ const SECURITY_INFRASTRUCTURE_HARDENING_AND_RLS = {
   tables: ['security_events', 'security_incidents', 'security_actions'],
 };
 
+const AI_RAG_PERSISTENT_CONVERSATIONS = {
+  id: '044_ai_rag_persistent_conversations',
+  file: '044_ai_rag_persistent_conversations.sql',
+  tables: ['ai_documents', 'ai_document_chunks', 'ai_conversations', 'ai_conversation_messages'],
+  indexes: [
+    'idx_ai_documents_company_uploader_status', 'idx_ai_documents_company_hash',
+    'idx_ai_documents_ingest_request', 'idx_ai_documents_family_latest',
+    'idx_ai_document_chunks_search', 'idx_ai_document_chunks_company_document',
+    'idx_ai_conversations_owner_recent', 'idx_ai_conversations_create_request_key',
+    'idx_ai_conversation_messages_order', 'idx_ai_conversation_messages_user_request_key',
+  ],
+  policies: [
+    'ai_documents_owner_scope', 'ai_document_chunks_owner_scope',
+    'ai_conversations_owner_scope', 'ai_conversation_messages_owner_scope',
+  ],
+};
+
 const FORWARD_MIGRATIONS = [
   PRODUCTION_DISPATCH, PRODUCTION_DISPATCH_PRIVILEGES, PRODUCTION_PACKING_WORKFLOW,
   CUSTOMER_MANUFACTURING_REQUESTS, SUBSCRIPTION_CATALOG_AND_STORAGE,
   TIERED_SUPPORT_ENTITLEMENTS, INVOICE_PAYMENT_IDEMPOTENCY, SUPERADMIN_ANNOUNCEMENTS_SETTINGS,
   STAFF_PASSWORD_RESET_OTP_SCOPE, SECURITY_INFRASTRUCTURE_HARDENING_AND_RLS,
+  AI_RAG_PERSISTENT_CONVERSATIONS,
 ];
 
 // Subscription migrations 037/038/039 and the newer 041/042/043 changes require
 // an explicitly reviewed rollout. 038 depends on the controlled 037 ledger;
 // 037 upserts plans and backfills storage; 039 changes payment idempotency;
-// 041/042/043 schema, privilege, and security baselines have not been verified. Keep them
+// 041-044 schema, privilege, security, and AI persistence baselines have not been verified. Keep them
 // allow-listed for controlled execution, but never apply them on startup.
 const CONTROLLED_MIGRATION_IDS = new Set([
   SUBSCRIPTION_CATALOG_AND_STORAGE.id,
@@ -98,6 +116,7 @@ const CONTROLLED_MIGRATION_IDS = new Set([
   SUPERADMIN_ANNOUNCEMENTS_SETTINGS.id,
   STAFF_PASSWORD_RESET_OTP_SCOPE.id,
   SECURITY_INFRASTRUCTURE_HARDENING_AND_RLS.id,
+  AI_RAG_PERSISTENT_CONVERSATIONS.id,
 ]);
 const STARTUP_MIGRATIONS = FORWARD_MIGRATIONS.filter(
   migration => !CONTROLLED_MIGRATION_IDS.has(migration.id)
@@ -419,7 +438,7 @@ async function assertInvoicePaymentIdempotencySchema(client) {
 }
 
 async function verifyMigration(client, migrationId) {
-  if (![INVOICE_PAYMENT_IDEMPOTENCY.id, SUPERADMIN_ANNOUNCEMENTS_SETTINGS.id, STAFF_PASSWORD_RESET_OTP_SCOPE.id].includes(migrationId)) {
+  if (![INVOICE_PAYMENT_IDEMPOTENCY.id, SUPERADMIN_ANNOUNCEMENTS_SETTINGS.id, STAFF_PASSWORD_RESET_OTP_SCOPE.id, AI_RAG_PERSISTENT_CONVERSATIONS.id].includes(migrationId)) {
     await assertProductionDispatchSchema(client);
   }
   if (migrationId === PRODUCTION_DISPATCH_PRIVILEGES.id) {
@@ -491,6 +510,76 @@ async function verifyMigration(client, migrationId) {
       throw new Error('Staff password-reset OTP schema verification failed.');
     }
   }
+  if (migrationId === AI_RAG_PERSISTENT_CONVERSATIONS.id) {
+    await assertAiRagPersistentConversationsSchema(client);
+  }
+}
+
+async function assertAiRagPersistentConversationsSchema(client) {
+  const result = await client.query(`
+    SELECT
+      (SELECT COUNT(*)::int FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+        WHERE n.nspname='public' AND c.relkind IN ('r','p') AND c.relname=ANY($1::text[])) AS table_count,
+      (SELECT COUNT(*)::int FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+        WHERE n.nspname='public' AND c.relkind IN ('r','p') AND c.relrowsecurity AND c.relforcerowsecurity
+          AND c.relname=ANY($1::text[])) AS forced_rls_count,
+      (SELECT COUNT(*)::int FROM pg_indexes WHERE schemaname='public' AND indexname=ANY($2::text[])) AS index_count,
+      (SELECT COUNT(*)::int FROM pg_policies WHERE schemaname='public' AND policyname=ANY($3::text[])) AS policy_count,
+      EXISTS (SELECT 1 FROM pg_roles WHERE rolname='smarterp_app' AND NOT rolsuper AND NOT rolbypassrls) AS app_role_safe,
+      (SELECT COUNT(*)::int FROM (VALUES
+        ('ai_documents', TRUE, FALSE),
+        ('ai_document_chunks', FALSE, TRUE),
+        ('ai_conversations', TRUE, FALSE),
+        ('ai_conversation_messages', TRUE, FALSE)
+      ) AS expected(table_name, can_update, can_delete)
+       WHERE has_table_privilege('smarterp_app','public.' || quote_ident(expected.table_name),'SELECT')
+         AND has_table_privilege('smarterp_app','public.' || quote_ident(expected.table_name),'INSERT')
+         AND has_table_privilege('smarterp_app','public.' || quote_ident(expected.table_name),'UPDATE')=expected.can_update
+         AND has_table_privilege('smarterp_app','public.' || quote_ident(expected.table_name),'DELETE')=expected.can_delete) AS app_grant_count,
+      (SELECT COUNT(*)::int FROM (VALUES
+        ('ai_documents', TRUE, TRUE, TRUE, FALSE),
+        ('ai_document_chunks', TRUE, TRUE, FALSE, TRUE),
+        ('ai_conversations', TRUE, TRUE, TRUE, FALSE),
+        ('ai_conversation_messages', TRUE, TRUE, TRUE, FALSE)
+      ) AS expected(table_name, can_select, can_insert, can_update, can_delete)
+       WHERE has_table_privilege('smarterp_app','public.' || quote_ident(expected.table_name),'SELECT')<>expected.can_select
+          OR has_table_privilege('smarterp_app','public.' || quote_ident(expected.table_name),'INSERT')<>expected.can_insert
+          OR has_table_privilege('smarterp_app','public.' || quote_ident(expected.table_name),'UPDATE')<>expected.can_update
+          OR has_table_privilege('smarterp_app','public.' || quote_ident(expected.table_name),'DELETE')<>expected.can_delete
+          OR has_table_privilege('smarterp_app','public.' || quote_ident(expected.table_name),'TRUNCATE')
+          OR has_table_privilege('smarterp_app','public.' || quote_ident(expected.table_name),'REFERENCES')
+          OR has_table_privilege('smarterp_app','public.' || quote_ident(expected.table_name),'TRIGGER')) AS app_unexpected_privilege_count,
+      (SELECT COUNT(*)::int FROM unnest($1::text[]) AS t(table_name)
+       WHERE has_table_privilege('smarterp_app','public.' || quote_ident(t.table_name),'TRUNCATE')) AS app_truncate_count,
+      (SELECT COUNT(*)::int FROM unnest(ARRAY['anon','authenticated','service_role']::text[]) AS r(role_name)
+       CROSS JOIN unnest($1::text[]) AS t(table_name)
+       WHERE has_table_privilege(r.role_name,'public.' || quote_ident(t.table_name),'SELECT')
+          OR has_table_privilege(r.role_name,'public.' || quote_ident(t.table_name),'INSERT')
+          OR has_table_privilege(r.role_name,'public.' || quote_ident(t.table_name),'UPDATE')
+          OR has_table_privilege(r.role_name,'public.' || quote_ident(t.table_name),'DELETE')
+          OR has_table_privilege(r.role_name,'public.' || quote_ident(t.table_name),'TRUNCATE')) AS browser_role_privilege_count
+  `, [
+    AI_RAG_PERSISTENT_CONVERSATIONS.tables,
+    AI_RAG_PERSISTENT_CONVERSATIONS.indexes,
+    AI_RAG_PERSISTENT_CONVERSATIONS.policies,
+  ]);
+  const row = result.rows[0] || {};
+  const expected = {
+    table_count: 4,
+    forced_rls_count: 4,
+    index_count: 10,
+    policy_count: 4,
+    app_grant_count: 4,
+    app_unexpected_privilege_count: 0,
+    app_truncate_count: 0,
+    browser_role_privilege_count: 0,
+  };
+  const failures = Object.entries(expected)
+    .filter(([key, value]) => Number(row[key]) !== value)
+    .map(([key, value]) => `${key}: expected ${value}, got ${row[key] ?? 'missing'}`);
+  if (!row.app_role_safe) failures.push('smarterp_app must exist without SUPERUSER or BYPASSRLS');
+  if (failures.length) throw new Error(`AI RAG/conversation schema verification failed: ${failures.join('; ')}`);
+  return row;
 }
 
 async function applyForwardMigration(client, { migrationId, sql }) {
@@ -627,6 +716,7 @@ module.exports = {
   INVOICE_PAYMENT_IDEMPOTENCY,
   SUPERADMIN_ANNOUNCEMENTS_SETTINGS,
   STAFF_PASSWORD_RESET_OTP_SCOPE,
+  AI_RAG_PERSISTENT_CONVERSATIONS,
   FORWARD_MIGRATIONS,
   STARTUP_MIGRATIONS,
   stripOuterTransaction,
@@ -636,6 +726,7 @@ module.exports = {
   assertProductionPackingWorkflowSchema,
   assertCustomerManufacturingRequestSchema,
   assertSuperAdminAnnouncementsSettingsSchema,
+  assertAiRagPersistentConversationsSchema,
   inspectInvoicePaymentIdempotencySchema,
   assertInvoicePaymentIdempotencySchema,
   applyForwardMigration,

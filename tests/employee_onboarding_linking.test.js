@@ -18,7 +18,9 @@ describe('Employee Onboarding & Company Code Linking Flow', () => {
     };
 
     await new Promise((resolve, reject) => {
-      setTenantContext(mockReq, {}, async () => {
+      // The real auth router explicitly scopes its pre-company onboarding
+      // operations with bypassRls before authenticateToken establishes context.
+      storage.run({ isWebRequest: true, bypassRls: true }, () => setTenantContext(mockReq, {}, async () => {
         try {
           // Verify user can be looked up
           const userRes = await pool.query('SELECT id, name, email FROM users WHERE id::text = $1', [mockReq.user.id]);
@@ -51,7 +53,7 @@ describe('Employee Onboarding & Company Code Linking Flow', () => {
         } catch (err) {
           reject(err);
         }
-      });
+      }));
     });
   });
 });

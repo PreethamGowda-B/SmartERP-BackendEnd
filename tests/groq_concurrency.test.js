@@ -45,4 +45,17 @@ test.describe('Groq API Concurrency Limiter Load Test', () => {
     console.log(`Batch Staggering Proved: YES\n`);
   });
 
+  test('bounded queues reject overload and time out queued callers without growing indefinitely', async () => {
+    const limiter = new AsyncConcurrencyLimiter(1, { maxQueue: 1, maxQueueWaitMs: 20 });
+    let releaseActive;
+    const active = limiter.run(() => new Promise((resolve) => { releaseActive = resolve; }));
+    const queued = limiter.run(async () => 'queued');
+    await assert.rejects(limiter.run(async () => 'overflow'), { code: 'AI_PROVIDER_BUSY', statusCode: 503 });
+    await assert.rejects(queued, { code: 'AI_PROVIDER_QUEUE_TIMEOUT', statusCode: 503 });
+    assert.deepEqual(limiter.stats, { activeCount: 1, pendingCount: 0 });
+    releaseActive('done');
+    assert.equal(await active, 'done');
+    assert.deepEqual(limiter.stats, { activeCount: 0, pendingCount: 0 });
+  });
+
 });

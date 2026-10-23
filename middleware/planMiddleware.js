@@ -78,7 +78,8 @@ async function loadPlan(req, res, next) {
 
     const result = await pool.query(
       `SELECT
-         c.plan_id,
+          c.id AS company_record_id,
+          c.plan_id AS company_plan_id,
          c.is_on_trial,
          c.trial_ends_at,
          p.id         AS plan_db_id,
@@ -91,16 +92,26 @@ async function loadPlan(req, res, next) {
          p.max_storage_bytes,
          p.features,
          c.subscription_expires_at
-       FROM companies c
-       JOIN plans p ON c.plan_id = p.id
+        FROM companies c
+        LEFT JOIN plans p ON c.plan_id = p.id
        WHERE c.id = $1`,
       [companyId]
     );
 
     if (result.rows.length === 0) {
-      // Graceful fallback: company has no valid plan (null plan_id or bad JOIN).
-      // Default to Free plan so users can still access the app with limited features.
-      console.warn(`⚠️ planMiddleware: No plan found for company ${companyId}. Falling back to Free plan.`);
+      return res.status(403).json({ code: 'COMPANY_CONTEXT_UNAVAILABLE', message: 'Company subscription context could not be verified.' });
+    }
+
+    const data = result.rows[0];
+    if (data.company_record_id == null || String(data.company_record_id) !== String(companyId)) {
+      return res.status(403).json({ code: 'COMPANY_CONTEXT_UNAVAILABLE', message: 'Company subscription context could not be verified.' });
+    }
+
+    if (data.company_plan_id == null) {
+      // Starter fallback is permitted only for an existing company with no plan
+      // relationship. Database errors are handled by the outer catch; dangling
+      // non-null plan IDs are rejected below as invalid configuration.
+      console.warn(`⚠️ planMiddleware: Company ${companyId} has no plan relationship. Falling back to Starter.`);
       try {
         const freeResult = await pool.query(
           `SELECT id, name, employee_limit, max_inventory_items, max_material_requests, messages_history_days, max_active_jobs, max_storage_bytes, features FROM plans WHERE id = 1`
@@ -118,7 +129,9 @@ async function loadPlan(req, res, next) {
       });
     }
 
-    const data = result.rows[0];
+    if (data.plan_db_id == null) {
+      return res.status(503).json({ code: 'SUBSCRIPTION_PLAN_INVALID', message: 'Subscription plan data is invalid. Please contact support.' });
+    }
     if (!getPlan(data.plan_db_id)) {
       return res.status(503).json({ message: 'Subscription plan data is invalid. Please contact support.' });
     }

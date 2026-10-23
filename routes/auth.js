@@ -24,11 +24,12 @@ const {
 } = require("../services/staffPasswordResetService");
 const { checkPasswordResetRateLimit } = require("../services/passwordResetRateLimiter");
 const { sendRefreshUnavailable } = require("../utils/refreshFailureResponse");
+const { createAuthRouteRlsScope, STAFF_IDENTITY_LOOKUP_ROUTES } = require('../middleware/authRouteRlsScope');
 
-// ✅ RLS bypass — auth routes query users/companies by email BEFORE any company
-// context is known (login lookup, OTP, Google OAuth). They explicitly opt-in to
-// cross-tenant access rather than relying on an empty companyId.
-router.use((req, res, next) => storage.run({ isWebRequest: true, bypassRls: true }, next));
+// Cross-company lookup is limited to pre-auth routes that must resolve identity
+// by email, OAuth subject, token, or invitation code. Authenticated routes stay
+// fail-closed here and establish tenant context through authenticateToken.
+router.use(createAuthRouteRlsScope({ storage, crossTenantRoutes: STAFF_IDENTITY_LOOKUP_ROUTES }));
 
 
 // JWT secrets
@@ -1434,25 +1435,23 @@ router.post("/refresh", async (req, res) => {
 // ---------------------------------------------
 router.get("/me", authenticateToken, async (req, res) => {
   const userId = req.user.userId || req.user.id;
-  return storage.run({ isWebRequest: true, bypassRls: true, userId }, async () => {
-    try {
-      const result = await pool.query(
+  try {
+    const result = await pool.query(
         `SELECT id, name, email, role, company_id, company_code 
          FROM users WHERE id = $1`,
         [userId]
       );
 
-      if (result.rows.length === 0) {
-        return res.status(404).json({ message: "User not found" });
-      }
-
-      const user = result.rows[0];
-      res.json(user);
-    } catch (err) {
-      console.error("GET /me error:", err.message);
-      res.status(500).json({ message: "Server error" });
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: "User not found" });
     }
-  });
+
+    const user = result.rows[0];
+    res.json(user);
+  } catch (err) {
+    console.error("GET /me error:", err.message);
+    res.status(500).json({ message: "Server error" });
+  }
 });
 
 // ---------------------------------------------

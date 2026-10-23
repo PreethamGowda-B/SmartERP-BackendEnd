@@ -874,6 +874,7 @@ v1Router.use("/analytics", require("./routes/analytics"));
 v1Router.use("/employees", require("./routes/employees"));
 v1Router.use("/material-requests", require("./routes/materialRequests"));
 v1Router.use("/ai", require("./routes/ai.routes"));
+v1Router.use("/ai", require("./routes/aiPersistence.routes"));
 v1Router.use("/messages", require("./routes/messages"));
 v1Router.use("/dashboard", require("./routes/dashboard"));
 v1Router.use("/reports", require("./routes/reports"));

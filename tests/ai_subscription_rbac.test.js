@@ -9,58 +9,59 @@ const { pool } = require("../db");
 describe("🛡️ Subscription-Aware, Permission-Aware & Context-Aware AI Security Test Suite", () => {
 
   // ───────────────────────────────────────────────────────────────────────────
-  // TEST 1: Fail-Closed Plan Behavior & Free Plan Tool Gating
+  // TEST 1: Missing Plan Context & Canonical Starter Tool Gating
   // ───────────────────────────────────────────────────────────────────────────
-  test("1. Fail-Closed Fallback & Free Plan Tool Gating: Free plan user receives 0 DB query tools", () => {
-    // 1.1 Test ContextEngine default planTier when missing -> "free"
+  test("1. Missing plan resolves to the canonical Starter tier and remains within Starter tool entitlements", () => {
+    // Keep this aligned with the current subscription catalog. API requests
+    // still pass through loadPlan/requireFeature before reaching the agent.
     const reqDummy = { user: { id: "u1", role: "owner", companyId: "c1" } };
     const contextFailClosed = ContextEngine.buildContext(reqDummy, {}, null);
-    assert.equal(contextFailClosed.planTier, "free", "Missing plan must fail-closed to 'free'");
+    assert.equal(contextFailClosed.planTier, "starter");
 
-    // 1.2 Test PluginRegistry available tools for 'free' tier
-    const freeTools = pluginRegistry.getAvailableTools(contextFailClosed);
+    const starterTools = pluginRegistry.getAvailableTools(contextFailClosed);
     
-    // Assert all free tools belong strictly to NavigationPlugin (0 DB query tools)
-    assert.ok(freeTools.length > 0, "Navigation guidance tools should be available for Free tier");
-    for (const tool of freeTools) {
-      const toolName = tool.function.name;
-      assert.ok(
-        toolName.startsWith("navigate_") || toolName.startsWith("nav_") || toolName.includes("navigation"),
-        `Free plan tool '${toolName}' must be a guidance/navigation tool, NOT a DB query tool`
-      );
-      assert.equal(toolName.startsWith("jobs_"), false, "Jobs DB tool must NOT be in free plan");
-      assert.equal(toolName.startsWith("payroll_"), false, "Payroll DB tool must NOT be in free plan");
-      assert.equal(toolName.startsWith("financial_"), false, "Financial DB tool must NOT be in free plan");
-      assert.equal(toolName.startsWith("gst_"), false, "GST DB tool must NOT be in free plan");
-    }
+    const names = starterTools.map((tool) => tool.function.name);
+    assert.ok(names.some((name) => name.startsWith("navigate_") || name.startsWith("nav_")));
+    assert.ok(names.includes("get_jobs"), "Starter includes the explicitly approved jobs summary tool");
+    assert.ok(!names.includes("get_low_stock_items"));
+    assert.ok(!names.includes("get_today_attendance"));
+    assert.ok(!names.includes("get_payroll_summary"));
+    assert.ok(!names.includes("get_revenue_analytics"));
+    assert.ok(!names.includes("get_gst_reconciliation_summary"));
   });
 
   // ───────────────────────────────────────────────────────────────────────────
-  // TEST 2: Pro Capability Keyword Interception Check
+  // TEST 2: Current Professional/Enterprise tool gating
   // ───────────────────────────────────────────────────────────────────────────
-  test("2. Pro-Capability Keyword Matcher & Basic Plan Gating", () => {
-    const basicContext = {
-      user: { id: "u-basic", role: "owner", companyId: "comp-basic" },
-      planTier: "basic",
+  test("2. Professional excludes Enterprise finance/GST tools while Enterprise exposes the wider plan set", () => {
+    const professionalContext = {
+      user: { id: "u-professional", role: "owner", companyId: "comp-professional" },
+      planTier: "professional",
+      aiModelScope: "finance",
     };
 
-    const basicTools = pluginRegistry.getAvailableTools(basicContext);
+    const professionalTools = pluginRegistry.getAvailableTools(professionalContext);
     
-    // Basic tier must NOT contain Pro-only plugins (Financial, GST)
-    for (const tool of basicTools) {
+    for (const tool of professionalTools) {
       const toolName = tool.function.name;
-      assert.equal(toolName.startsWith("financial_"), false, "Financial tools excluded from Basic");
-      assert.equal(toolName.startsWith("gst_"), false, "GST tools excluded from Basic");
+      assert.equal(toolName.startsWith("financial_"), false, "Financial tools excluded from Professional");
+      assert.equal(toolName.startsWith("gst_"), false, "GST tools excluded from Professional");
     }
 
-    const proContext = {
-      user: { id: "u-pro", role: "owner", companyId: "comp-pro" },
-      planTier: "pro",
+    const enterpriseContext = {
+      user: { id: "u-enterprise", role: "owner", companyId: "comp-enterprise" },
+      planTier: "enterprise",
+      aiModelScope: "finance",
     };
-    const proTools = pluginRegistry.getAvailableTools(proContext);
-    assert.ok(proTools.length > basicTools.length, "Pro plan must have access to all tools");
+    const enterpriseTools = pluginRegistry.getAvailableTools(enterpriseContext);
+    assert.ok(enterpriseTools.length > professionalTools.length);
+    assert.ok(enterpriseTools.some((tool) => tool.function.name === "get_revenue_analytics"));
+    const enterpriseGstTools = pluginRegistry.getAvailableTools({ ...enterpriseContext, aiModelScope: "gst" });
+    const professionalGstTools = pluginRegistry.getAvailableTools({ ...professionalContext, aiModelScope: "gst" });
+    assert.ok(enterpriseGstTools.some((tool) => tool.function.name === "get_gst_reconciliation_summary"));
+    assert.ok(!professionalGstTools.some((tool) => tool.function.name === "get_gst_reconciliation_summary"));
     assert.equal(pluginRegistry.plugins.some((plugin) => plugin.constructor.name === "CrmPlugin"), false, "Retired CRM plugin must not be registered");
-    assert.equal(proTools.some((tool) => tool.function.name.startsWith("crm_")), false, "Retired CRM tools must not be available on any plan");
+    assert.equal(enterpriseTools.some((tool) => tool.function.name.startsWith("crm_")), false, "Retired CRM tools must not be available on any plan");
     assert.notEqual(ContextEngine.detectModelScope("show me the sales pipeline"), "crm", "Retired CRM scope must not be selected");
   });
 
@@ -70,13 +71,14 @@ describe("🛡️ Subscription-Aware, Permission-Aware & Context-Aware AI Securi
   test("3. RBAC Execution Hardening: Employee role requesting payroll data via 3 different phrasings gets permission denied", async () => {
     const employeeContext = {
       user: { id: "emp-777", role: "employee", companyId: "comp-rbac-01" },
-      planTier: "pro", // Pro tier, but Employee role!
+      planTier: "enterprise", // Enterprise entitlement does not replace role authorization.
+      aiModelScope: "payroll",
     };
 
     const forbiddenPhrasings = [
-      "payroll_summary",
-      "payroll_calculate",
-      "payroll_get_reports",
+      "get_payroll_summary",
+      "calculate_payroll",
+      "validate_payroll_pre_run",
     ];
 
     for (const toolName of forbiddenPhrasings) {
@@ -100,7 +102,7 @@ describe("🛡️ Subscription-Aware, Permission-Aware & Context-Aware AI Securi
       currentPagePath: "/hr/attendance",
     };
 
-    const context = ContextEngine.buildContext(reqDummy, clientCtx, "basic");
+    const context = ContextEngine.buildContext(reqDummy, clientCtx, "professional");
 
     assert.equal(context.ui.portal, "hr");
     assert.equal(context.ui.module, "attendance");
@@ -117,8 +119,8 @@ describe("🛡️ Subscription-Aware, Permission-Aware & Context-Aware AI Securi
   // TEST 5: Multi-Tenant Scoped Tool Execution
   // ───────────────────────────────────────────────────────────────────────────
   test("5. Multi-Tenant Scoped Execution: Tool context enforces strict company_id isolation", async () => {
-    const tenantAContext = { user: { id: "user-A", role: "owner", companyId: "company-AAA" }, planTier: "pro" };
-    const tenantBContext = { user: { id: "user-B", role: "owner", companyId: "company-BBB" }, planTier: "pro" };
+    const tenantAContext = { user: { id: "user-A", role: "owner", companyId: "company-AAA" }, planTier: "enterprise" };
+    const tenantBContext = { user: { id: "user-B", role: "owner", companyId: "company-BBB" }, planTier: "enterprise" };
 
     assert.equal(tenantAContext.user.companyId, "company-AAA");
     assert.equal(tenantBContext.user.companyId, "company-BBB");

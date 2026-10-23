@@ -11,6 +11,7 @@ const {
   INVOICE_PAYMENT_IDEMPOTENCY,
   SUPERADMIN_ANNOUNCEMENTS_SETTINGS,
   STAFF_PASSWORD_RESET_OTP_SCOPE,
+  AI_RAG_PERSISTENT_CONVERSATIONS,
   applyForwardMigration,
   migrationChecksum,
 } = require('../migrations/forwardMigrationRunner');
@@ -69,19 +70,21 @@ function createMockClient({
   };
 }
 
-test('Regression: controlled subscription, support, 041, and 042 migrations stay out of automatic startup', () => {
+test('Regression: controlled subscription, support, and migrations 041-044 stay out of automatic startup', () => {
   const allIds = FORWARD_MIGRATIONS.map(m => m.id);
   assert.ok(allIds.includes('033_production_dispatch'));
   assert.ok(allIds.includes('038_tiered_support_entitlements'));
   assert.ok(allIds.includes(INVOICE_PAYMENT_IDEMPOTENCY.id));
   assert.ok(allIds.includes('041_superadmin_announcements_and_system_settings'));
   assert.ok(allIds.includes(STAFF_PASSWORD_RESET_OTP_SCOPE.id));
+  assert.ok(allIds.includes(AI_RAG_PERSISTENT_CONVERSATIONS.id));
   assert.ok(!allIds.includes('040_direct_invoice_idempotency_fingerprint'));
 
   const startupIds = STARTUP_MIGRATIONS.map(m => m.id);
   assert.ok(!startupIds.includes('041_superadmin_announcements_and_system_settings'));
   assert.ok(!startupIds.includes(SUPERADMIN_ANNOUNCEMENTS_SETTINGS.id));
   assert.ok(!startupIds.includes(STAFF_PASSWORD_RESET_OTP_SCOPE.id));
+  assert.ok(!startupIds.includes(AI_RAG_PERSISTENT_CONVERSATIONS.id));
   assert.ok(!startupIds.includes('037_subscription_catalog_and_storage'));
   assert.ok(!startupIds.includes(INVOICE_PAYMENT_IDEMPOTENCY.id));
 });

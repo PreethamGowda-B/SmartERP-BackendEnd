@@ -2,6 +2,9 @@ const ProviderFactory = require("../providers/provider.factory");
 const ContextEngine = require("../context/context.engine");
 const pluginRegistry = require("../plugins");
 const MetricsService = require("../telemetry/metrics.service");
+const { MAX_ARGUMENT_BYTES } = require('../plugins/toolArguments');
+
+const MAX_TOOL_CALLS_PER_COMPLETION = 8;
 
 function synthesizeToolResponse(messages, modulesUsed) {
   const toolMessages = messages.filter((m) => m.role === "tool");
@@ -45,12 +48,12 @@ class ReActEngine {
    * @param {string} [params.systemPromptOverride] - Optional pre-built system prompt
    * @returns {Promise<Object>} Structured AI response payload
    */
-  static async run({ userPrompt, history = [], context, systemPromptOverride = null, modelScope = 'general' }) {
+  static async run({ userPrompt, history = [], context, systemPromptOverride = null, modelScope = 'general', toolsEnabled = true }) {
     const startTime = Date.now();
     const provider = ProviderFactory.getProvider();
     const systemPrompt = systemPromptOverride || ContextEngine.generateSystemPrompt(context);
     const executionContext = { ...context, aiModelScope: modelScope };
-    const availableTools = pluginRegistry.getAvailableTools(executionContext);
+    const availableTools = toolsEnabled ? pluginRegistry.getAvailableTools(executionContext) : [];
 
     // Build message trajectory
     const messages = [
@@ -78,6 +81,23 @@ class ReActEngine {
       });
 
       const { content, toolCalls } = completion;
+
+      if (toolCalls != null && !Array.isArray(toolCalls)) {
+        const error = new Error('AI provider returned an invalid tool-call payload.');
+        error.code = 'AI_TOOL_ARGUMENTS_INVALID';
+        throw error;
+      }
+      if (Array.isArray(toolCalls) && toolCalls.length > MAX_TOOL_CALLS_PER_COMPLETION) {
+        const error = new Error('AI provider returned too many tool calls in one response.');
+        error.code = 'AI_TOOL_CALL_LIMIT_EXCEEDED';
+        throw error;
+      }
+
+      if (!toolsEnabled && toolCalls?.length) {
+        const error = new Error('Tool calls are disabled for document-only AI requests.');
+        error.code = 'AI_DOCUMENT_ONLY_TOOL_CALL_BLOCKED';
+        throw error;
+      }
 
       // If no tool calls requested, LLM has completed its reasoning
       if (!toolCalls || toolCalls.length === 0) {
@@ -144,6 +164,12 @@ class ReActEngine {
         const functionName = toolCall.function.name;
         let args = {};
         try {
+          if (typeof toolCall.function.arguments === 'string'
+              && Buffer.byteLength(toolCall.function.arguments, 'utf8') > MAX_ARGUMENT_BYTES) {
+            const error = new Error('AI tool arguments exceed the supported size.');
+            error.code = 'AI_TOOL_ARGUMENTS_INVALID';
+            throw error;
+          }
           args = typeof toolCall.function.arguments === "string"
             ? JSON.parse(toolCall.function.arguments)
             : toolCall.function.arguments;

@@ -22,7 +22,7 @@ class NavigationPlugin extends BasePlugin {
       },
       execute: async (params, context) => {
         const role = context.user.role || "employee";
-        const page = params.targetPage.toLowerCase().trim();
+        const page = typeof params.targetPage === "string" ? params.targetPage.toLowerCase().trim() : "";
 
         let prefix = "/employee";
         if (role === "owner" || role === "admin") {
@@ -32,9 +32,10 @@ class NavigationPlugin extends BasePlugin {
         }
 
         const routeMap = {
+          assigned_jobs: `${prefix}/jobs`,
           payroll: `${prefix}/payroll`,
           employees: `${prefix}/employees`,
-          inventory: `${prefix}/materials`, // materials & inventory route
+          inventory: `${prefix}/inventory`,
           jobs: `${prefix}/jobs`,
           attendance: `${prefix}/attendance`,
           reports: `${prefix}/reports`,
@@ -43,7 +44,13 @@ class NavigationPlugin extends BasePlugin {
           dashboard: prefix,
         };
 
-        const targetRoute = routeMap[page] || `${prefix}/${page}`;
+        const targetRoute = routeMap[page];
+        if (!targetRoute) {
+          return {
+            error: "NAVIGATION_TARGET_UNAVAILABLE",
+            message: "That destination is not available through SmartERP navigation.",
+          };
+        }
 
         return {
           action: "NAVIGATE",

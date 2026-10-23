@@ -22,11 +22,56 @@ class AIDataService {
       `SELECT COUNT(*)::int AS active_count
          FROM jobs
         WHERE company_id::text = $2
-          AND (assigned_employee_id::text = $1 OR employee_id::text = $1)
+          AND (assigned_employee_id::text = $1 OR assigned_to::text = $1)
           AND LOWER(COALESCE(status, 'open')) NOT IN ('completed', 'closed', 'cancelled')`,
       [String(userId), String(companyId)]
     );
     return Number(result.rows?.[0]?.active_count) || 0;
+  }
+
+  /** Returns only jobs directly assigned to one employee within their company. */
+  static async getEmployeeAssignedJobs({ userId, companyId, status, limit = 10 }) {
+    if (!userId || !companyId) throw new Error("User and company IDs are required.");
+    const safeLimit = Math.max(1, Math.min(50, Number.parseInt(limit, 10) || 10));
+    const values = [String(userId), String(companyId)];
+    let statusClause = "";
+    if (status) {
+      values.push(String(status).trim());
+      statusClause = ` AND LOWER(COALESCE(j.status, 'open')) = LOWER($${values.length})`;
+    }
+    values.push(safeLimit);
+
+    const result = await pool.query(
+      `SELECT j.id, j.title, j.status, j.priority, j.stage, j.created_at,
+              COUNT(*) OVER()::int AS total_count
+         FROM jobs j
+        WHERE j.company_id::text = $2
+          AND (j.assigned_employee_id::text = $1 OR j.assigned_to::text = $1)${statusClause}
+        ORDER BY j.created_at DESC
+        LIMIT $${values.length}`,
+      values
+    );
+    const rows = result.rows || [];
+    return {
+      totalCount: Number(rows[0]?.total_count) || 0,
+      jobs: rows.map(({ total_count, ...job }) => job),
+    };
+  }
+
+  /** Returns only an employee's assigned overdue jobs within their company. */
+  static async getEmployeeDelayedJobs({ userId, companyId }) {
+    if (!userId || !companyId) throw new Error("User and company IDs are required.");
+    const result = await pool.query(
+      `SELECT DISTINCT j.id, j.title, j.status, j.priority, j.created_at
+         FROM jobs j
+        WHERE j.company_id::text = $2
+          AND (j.assigned_employee_id::text = $1 OR j.assigned_to::text = $1)
+          AND LOWER(COALESCE(j.status, 'open')) NOT IN ('completed', 'closed', 'cancelled')
+          AND j.created_at < NOW() - INTERVAL '7 days'
+        ORDER BY j.created_at ASC`,
+      [String(userId), String(companyId)]
+    );
+    return { delayedCount: result.rows?.length || 0, delayedJobs: result.rows || [] };
   }
 
   /** Narrow company-scoped low-stock count without loading unrelated modules. */
@@ -313,7 +358,7 @@ class AIDataService {
         `SELECT id, title, status, priority, stage, created_at 
          FROM jobs 
          WHERE company_id::text = $2
-           AND (assigned_employee_id::text = $1 OR employee_id::text = $1)
+           AND (assigned_employee_id::text = $1 OR assigned_to::text = $1)
          ORDER BY created_at DESC LIMIT 10`,
         [uid, cid]
       ),

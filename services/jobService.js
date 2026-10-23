@@ -7,6 +7,9 @@ class JobService {
   static async getJobs({ companyId, status, limit = 50 }) {
     if (!companyId) throw new Error("Company ID is required.");
 
+    const parsedLimit = Number(limit);
+    const safeLimit = Number.isFinite(parsedLimit) ? Math.max(1, Math.min(parsedLimit, 100)) : 50;
+
     let query = `
       SELECT id, title, description, status, priority, created_at, updated_at
       FROM jobs
@@ -19,7 +22,8 @@ class JobService {
       values.push(status);
     }
 
-    query += ` ORDER BY created_at DESC LIMIT ${limit}`;
+    values.push(safeLimit);
+    query += ` ORDER BY created_at DESC LIMIT $${values.length}`;
     const res = await pool.query(query, values);
 
     return {

@@ -1,5 +1,6 @@
 const BasePlugin = require("./base.plugin");
 const JobService = require("../../services/jobService");
+const AIDataService = require("../../services/aiDataService");
 
 class JobsPlugin extends BasePlugin {
   constructor() {
@@ -8,7 +9,7 @@ class JobsPlugin extends BasePlugin {
     // Tool: get_jobs
     this.tools["get_jobs"] = {
       name: "get_jobs",
-      description: "Retrieves company jobs with optional status filter ('completed', 'in_progress', 'pending', 'open').",
+      description: "Retrieves jobs with an optional status filter. Employees receive only their directly assigned jobs; authorized managers receive company jobs.",
       allowedRoles: ["owner", "hr", "admin", "employee"],
       isDestructive: false,
       parameters: {
@@ -19,6 +20,14 @@ class JobsPlugin extends BasePlugin {
         },
       },
       execute: async (params, context) => {
+        if (String(context.user.role || "").toLowerCase() === "employee") {
+          return await AIDataService.getEmployeeAssignedJobs({
+            userId: context.user.id,
+            companyId: context.user.companyId,
+            status: params.status,
+            limit: params.limit,
+          });
+        }
         return await JobService.getJobs({
           companyId: context.user.companyId,
           status: params.status,
@@ -38,6 +47,12 @@ class JobsPlugin extends BasePlugin {
         properties: {},
       },
       execute: async (params, context) => {
+        if (String(context.user.role || "").toLowerCase() === "employee") {
+          return await AIDataService.getEmployeeDelayedJobs({
+            userId: context.user.id,
+            companyId: context.user.companyId,
+          });
+        }
         return await JobService.getDelayedJobs({
           companyId: context.user.companyId,
         });

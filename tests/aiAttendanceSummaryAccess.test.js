@@ -91,7 +91,10 @@ test('common AI summary queries stay narrow and tenant-scoped', async () => {
     assert.equal(await AIDataService.getPendingLeaveCount({ companyId: 'company-a', userId: 'employee-7', personal: true }), 1);
     assert.ok(calls.every(({ params }) => params.includes('company-a')));
     assert.match(calls.find(({ query }) => query.includes('user_id::text = $2')).query, /company_id::text = \$1/);
-    assert.match(calls.find(({ query }) => query.includes('assigned_employee_id')).query, /company_id::text = \$2/);
+    const employeeJobQuery = calls.find(({ query }) => query.includes('assigned_employee_id'));
+    assert.match(employeeJobQuery.query, /company_id::text = \$2/);
+    assert.match(employeeJobQuery.query, /assigned_to::text = \$1/);
+    assert.doesNotMatch(employeeJobQuery.query, /\bemployee_id\b/);
   } finally {
     pool.query = originalQuery;
   }

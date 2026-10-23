@@ -27,7 +27,12 @@ function synthesizeToolResponse(messages, modulesUsed) {
     } catch (e) {}
   }
 
-  return `I retrieved authorized ERP data from ${Array.from(modulesUsed).join(", ") || "the requested module"}, but could not format its details reliably. Please try a narrower question.`;
+  return `The ERP tool returned a response${modulesUsed.size ? ` from ${Array.from(modulesUsed).join(", ")}` : ""}, but I could not verify or format a usable result. No summary was produced; please open the related module or try a narrower question.`;
+}
+
+function getToolModuleName(functionName) {
+  const plugin = pluginRegistry.plugins.find((entry) => entry.tools[functionName] || entry.skills[functionName]);
+  return plugin?.module || plugin?.name || "SmartERP System";
 }
 
 class ReActEngine {
@@ -106,8 +111,12 @@ class ReActEngine {
         return {
           text: responseText,
           widget: finalWidget || actionConfirmation,
-          navigation: parsedPayload?.navigation || navigationCommand,
-          confidenceScore: 0.98,
+          // Navigation is executable UI behavior; expose only destinations
+          // returned by the registered navigation tool, never model prose.
+          navigation: navigationCommand,
+          // The model's prose alone is not a verified confidence signal. The
+          // deterministic data resolvers publish confidence where appropriate.
+          confidenceScore: undefined,
           sources: Array.from(modulesUsed),
           telemetry: {
             latencyMs: Date.now() - startTime,
@@ -179,7 +188,7 @@ class ReActEngine {
           actionConfirmation = toolResult;
         }
 
-        modulesUsed.add(functionName.split("_")[0] || "SmartERP System");
+        modulesUsed.add(getToolModuleName(functionName));
 
         messages.push({
           role: "tool",

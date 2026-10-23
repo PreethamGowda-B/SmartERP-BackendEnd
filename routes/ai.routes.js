@@ -19,6 +19,7 @@ const { pool } = require("../db");
 const AIDataService = require("../services/aiDataService");
 const { loadAttendanceSummary } = require("../services/aiAttendanceSummary");
 const { canUseAiFastPath } = require("../services/aiMetricAccess");
+const { isEmployeeAssignedJobsPrompt, createEmployeeAssignedJobsResponse } = require('../services/employeeAssignedJobsResponse');
 const SecurityShield = require('../ai/gateway/security.shield');
 const validateAiPrompt = createAiPromptGuard({
   historyField: 'history',
@@ -110,6 +111,18 @@ router.post(
       const promptLower = cleanMessage.toLowerCase();
       const companyId = req.user?.companyId || req.user?.company_id;
       const role = req.user?.role;
+
+      // Deterministic employee lookup: this avoids asking the model to invent a
+      // tool name for personal assignment questions and never loads company-wide
+      // jobs for an employee.
+      if (isEmployeeAssignedJobsPrompt(role, promptLower)) {
+        const userId = req.user?.userId || req.user?.id;
+        if (!companyId || !userId) {
+          return res.status(403).json({ message: 'Employee and company access context is unavailable for this account.' });
+        }
+        const assignedJobs = await AIDataService.getEmployeeAssignedJobs({ userId, companyId, limit: 10 });
+        return res.json(createEmployeeAssignedJobsResponse(assignedJobs, Date.now() - startTime));
+      }
 
       // ── Attendance Summary Resolver ──────────────────────────────────────────
       if (
@@ -483,16 +496,15 @@ router.post(
           .join("\n\n---\n\n");
 
         const combinedSources = [...new Set(scopeResults.flatMap((r) => r.result.sources || []))];
-        const avgConfidence =
-          scopeResults.reduce((sum, r) => sum + (r.result.confidenceScore || 0), 0) /
-          scopeResults.length;
         const widgets = scopeResults.filter((r) => r.result.widget).map((r) => r.result.widget);
 
         finalResult = {
           text: combinedText,
           widget: widgets.length > 0 ? widgets[0] : null,
           navigation: scopeResults.find((r) => r.result.navigation)?.result.navigation || null,
-          confidenceScore: parseFloat(avgConfidence.toFixed(4)),
+          // Specialist model scores are not calibrated or comparable. Do not
+          // invent an aggregate confidence value for a combined answer.
+          confidenceScore: undefined,
           sources: combinedSources,
           telemetry: scopeResults[0]?.result.telemetry || { latencyMs: Date.now() - startTime },
           autoSelectedModel: null,

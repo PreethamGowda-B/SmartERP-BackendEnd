@@ -395,10 +395,13 @@ router.get('/google/callback', (req, res, next) => {
         user: { id: user.id, name: user.name, email: user.email, role: user.role,
                 company_id: user.company_id, companyId: user.company_id },
       });
+      const callbackFrontend = isSuperAdmin
+        ? (process.env.SUPERADMIN_FRONTEND_ORIGIN || 'https://superadmin.prozync.in')
+        : FRONTEND;
 
       if (redisClient && redisClient.status === 'ready') {
         await redisClient.set(`oauth_code:${oauthCode}`, oauthPayload, 'EX', 60);
-        return res.redirect(`${FRONTEND}/auth/callback?code=${oauthCode}`);
+        return res.redirect(`${callbackFrontend}/auth/callback?code=${oauthCode}`);
       }
 
       // Redis unavailable — sign a secure short-lived 60s exchange token so tokens stay encrypted and safe
@@ -407,7 +410,7 @@ router.get('/google/callback', (req, res, next) => {
         ACCESS_SECRET,
         { expiresIn: '60s' }
       );
-      return res.redirect(`${FRONTEND}/auth/callback?code=${exchangeToken}`);
+      return res.redirect(`${callbackFrontend}/auth/callback?code=${exchangeToken}`);
     } catch (err) {
       console.error('Google Auth Error:', err);
       return res.redirect(`${FRONTEND}/login?error=auth_failed`);

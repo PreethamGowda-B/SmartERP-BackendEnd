@@ -54,6 +54,36 @@ test('protected account check rejects an access token issued before forced logou
   assert.deepEqual(state, { allowed: false, reason: 'session_revoked' });
 });
 
+test('independent Redis security checks run concurrently without weakening access decisions', async () => {
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const keys = [];
+  const state = await verifyAccessAccountState({
+    pool: { async query() { throw new Error('cached active state should avoid database lookup'); } },
+    redisClient: {
+      status: 'ready',
+      async get(key) {
+        keys.push(key);
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await Promise.resolve();
+        inFlight -= 1;
+        return key === 'user_active:user-1' ? '1' : null;
+      },
+    },
+    userId: 'user-1',
+    tokenIssuedAt: 100,
+  });
+
+  assert.deepEqual(state, { allowed: true, reason: null });
+  assert.deepEqual(keys.sort(), [
+    'token_revoked:user-1',
+    'user_active:user-1',
+    'user_suspended:user-1',
+  ]);
+  assert.equal(maxInFlight, 3, 'Redis round trips should overlap instead of running serially');
+});
+
 test('protected account check accepts a new token issued after the revocation timestamp', async () => {
   const state = await verifyAccessAccountState({
     pool: accountPool(),

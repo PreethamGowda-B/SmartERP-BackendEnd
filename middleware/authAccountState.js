@@ -39,14 +39,20 @@ async function verifyAccessAccountState({ pool, redisClient, userId, tokenIssued
   // 1. Check Redis for immediate suspension or revocation signals
   if (redisClient?.status === 'ready') {
     try {
-      // Check if user has been flagged as suspended/inactive in Redis
-      const cachedSuspended = await redisClient.get(`user_suspended:${userId}`);
+      // Fetch all independent security signals concurrently. These are remote
+      // Redis reads; serial awaits add three network round trips to every
+      // authenticated request without changing which signal takes precedence.
+      const [cachedSuspended, revokedAtValue, cachedActive] = await Promise.all([
+        redisClient.get(`user_suspended:${userId}`),
+        redisClient.get(`token_revoked:${userId}`),
+        redisClient.get(`user_active:${userId}`),
+      ]);
+
       if (cachedSuspended === '1') {
         return { allowed: false, reason: 'user_inactive' };
       }
 
       // Check if user session has been explicitly revoked
-      const revokedAtValue = await redisClient.get(`token_revoked:${userId}`);
       if (revokedAtValue !== null) {
         const revokedAt = Number(revokedAtValue);
         const issuedAt = Number(tokenIssuedAt);
@@ -56,7 +62,6 @@ async function verifyAccessAccountState({ pool, redisClient, userId, tokenIssued
       }
 
       // Check cached active state
-      const cachedActive = await redisClient.get(`user_active:${userId}`);
       if (cachedActive === '1') {
         return { allowed: true, reason: null };
       }

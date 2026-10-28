@@ -148,7 +148,7 @@ router.put('/change-password', authenticateToken, async (req, res) => {
 });
 
 // ─── PUT /api/settings/notification-prefs ────────────────────────────────────
-router.put('/notification-prefs', authenticateToken, async (req, res) => {
+router.put(['/notification-prefs', '/notifications'], authenticateToken, async (req, res) => {
     try {
         const userId = req.user.userId || req.user.id;
         const prefs = req.body;

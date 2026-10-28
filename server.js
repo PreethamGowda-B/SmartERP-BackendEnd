@@ -902,6 +902,7 @@ v1Router.use("/production", require("./routes/production"));
 v1Router.use("/customer-manufacturing-requests", require("./routes/customerManufacturingRequests"));
 v1Router.use("/quotations", require("./routes/quotations"));
 v1Router.use("/remote-support", require("./routes/remoteSupport"));
+v1Router.use("/customers", require("./routes/customers"));
 v1Router.use("/command-center", require("./routes/commandCenter"));
 v1Router.use("/sla", require("./routes/sla"));
 v1Router.use("/warranty-claims", require("./routes/warrantyClaims"));

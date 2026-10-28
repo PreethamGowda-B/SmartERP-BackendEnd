@@ -592,6 +592,94 @@ router.post("/send-otp", async (req, res) => {
 });
 
 // ---------------------------------------------
+// 🔐 Verify OTP for general email verification (Signup Flow)
+// ---------------------------------------------
+router.post("/verify-otp", async (req, res) => {
+  const { email, otp } = req.body;
+  const normalizedEmail = String(email || "").toLowerCase().trim();
+  const plainOtp = String(otp || "").trim();
+
+  if (!normalizedEmail || !plainOtp || plainOtp.length !== 6) {
+    return res.status(400).json({ message: "Valid email and 6-digit verification code are required." });
+  }
+
+  // Rate Limiting per email (max 5 verification attempts)
+  const attemptKey = `email_verify_otp_attempts:${normalizedEmail}`;
+  if (redisClient && redisClient.status === "ready") {
+    try {
+      const attempts = await redisClient.get(attemptKey);
+      if (attempts && parseInt(attempts, 10) >= 5) {
+        return res.status(429).json({ message: "Too many failed attempts. Please request a new verification code." });
+      }
+    } catch (_) {}
+  }
+
+  try {
+    const otpHash = computeHmacToken(plainOtp + normalizedEmail);
+
+    const otpRes = await pool.query(
+      `SELECT id, otp_code, expires_at, used
+       FROM email_otps
+       WHERE LOWER(email) = $1
+         AND account_type = 'staff'
+         AND purpose = 'email_verification'
+         AND used = FALSE
+         AND expires_at > NOW()
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [normalizedEmail]
+    );
+
+    if (otpRes.rows.length === 0) {
+      if (redisClient && redisClient.status === "ready") {
+        try {
+          const multi = redisClient.multi();
+          multi.incr(attemptKey);
+          multi.expire(attemptKey, 600);
+          await multi.exec();
+        } catch (_) {}
+      }
+      return res.status(400).json({ message: "Invalid or expired verification code. Please request a new one." });
+    }
+
+    const row = otpRes.rows[0];
+    const hashMatches = crypto.timingSafeEqual(
+      Buffer.from(otpHash, "utf8"),
+      Buffer.from(row.otp_code, "utf8")
+    );
+
+    if (!hashMatches) {
+      if (redisClient && redisClient.status === "ready") {
+        try {
+          const multi = redisClient.multi();
+          multi.incr(attemptKey);
+          multi.expire(attemptKey, 600);
+          await multi.exec();
+        } catch (_) {}
+      }
+      return res.status(400).json({ message: "Incorrect verification code." });
+    }
+
+    // Mark as used so signup transactional check succeeds
+    await pool.query(
+      "UPDATE email_otps SET used = TRUE WHERE id = $1",
+      [row.id]
+    );
+
+    if (redisClient && redisClient.status === "ready") {
+      try {
+        await redisClient.del(attemptKey);
+      } catch (_) {}
+    }
+
+    return res.json({ ok: true, message: "Email verified successfully." });
+  } catch (err) {
+    console.error("Verify OTP error:", err.message);
+    return res.status(500).json({ message: "Verification failed. Please try again." });
+  }
+});
+
+// ---------------------------------------------
 // 🔐 Forgot Password (Anti-Enumeration + Staff Scoped)
 // ---------------------------------------------
 router.post("/forgot-password", async (req, res) => {

@@ -113,9 +113,10 @@ router.get('/jobs/:id/events', authenticateSSE, async (req, res) => {
 
   // Set SSE headers (Requirement 11.1)
   res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no'); // Disable nginx buffering
+  res.setHeader('Content-Encoding', 'none');
   res.flushHeaders();
 
   // Send initial connected event (Requirement 11.2)

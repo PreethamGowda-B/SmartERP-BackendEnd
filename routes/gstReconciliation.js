@@ -249,7 +249,7 @@ router.patch('/items/:itemId/override', async (req, res) => {
  * POST /api/v1/gst-reconciliation/notify-vendors
  * Sends pre-approved WhatsApp Business API Template messages to non-compliant vendors.
  */
-router.post('/notify-vendors', async (req, res) => {
+router.post(['/notify-vendors', '/send-whatsapp-reminder'], async (req, res) => {
   if (!requireCompanyFinanceRole(req, res)) return;
   return res.status(501).json({ error: 'Vendor reminders are unavailable: the reconciliation records do not include verified supplier contact details and no GST reminder delivery workflow is configured.' });
 });

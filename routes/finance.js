@@ -13,6 +13,7 @@ const { pool } = require('../db');
 const authMiddleware = require('../middleware/authMiddleware');
 const requireFinanceReadAccess = require('../middleware/requireFinanceReadAccess');
 const invoiceService = require('../services/invoiceService');
+const ArCollectionsService = require('../services/arCollectionsService');
 
 const authenticate = authMiddleware.authenticateToken || authMiddleware;
 
@@ -107,6 +108,32 @@ router.get('/ar-aging', authenticate, requireFinanceReadAccess, async (req, res)
   } catch (err) {
     console.error('GET /api/finance/ar-aging error:', err.message);
     return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/finance/ar-aging/:scheduleId/reminder
+ * Dispatches an automated collection reminder for the AR schedule.
+ */
+router.post('/ar-aging/:scheduleId/reminder', authenticate, requireFinanceReadAccess, async (req, res) => {
+  try {
+    const companyId = req.user.companyId || req.user.company_id;
+    const { scheduleId } = req.params;
+    const { channel = 'whatsapp' } = req.body || {};
+
+    if (!scheduleId) {
+      return res.status(400).json({ error: 'Schedule ID is required.' });
+    }
+
+    const dispatchRes = await ArCollectionsService.dispatchReminder({ companyId, scheduleId, channel });
+    return res.json({
+      success: true,
+      message: 'Meta WhatsApp Business API Template reminder dispatched.',
+      log: dispatchRes?.log,
+    });
+  } catch (err) {
+    console.error('POST /api/finance/ar-aging/:scheduleId/reminder error:', err.message);
+    return res.status(500).json({ error: err.message || 'Failed to dispatch payment reminder.' });
   }
 });
 

@@ -423,6 +423,43 @@ async function fixDatabaseConstraints() {
       CREATE INDEX IF NOT EXISTS idx_crt_last_activity ON customer_refresh_tokens(customer_id, last_activity_at);
     `).catch(() => {});
 
+    // Ensure production_packing_records table exists with RLS and permissions so production orders never 503
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS production_packing_records (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        company_id TEXT NOT NULL,
+        order_id UUID NOT NULL REFERENCES production_orders(id) ON DELETE RESTRICT,
+        inspection_id UUID NOT NULL REFERENCES production_inspections(id) ON DELETE RESTRICT,
+        quantity NUMERIC(14,3) NOT NULL CHECK (quantity > 0),
+        package_count INTEGER NOT NULL DEFAULT 1 CHECK (package_count > 0),
+        package_type VARCHAR(100),
+        status VARCHAR(32) NOT NULL DEFAULT 'packing'
+          CHECK (status IN ('packing','packed','ready_for_dispatch')),
+        notes TEXT,
+        recorded_by UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+        recorded_by_name TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      ALTER TABLE production_dispatches ADD COLUMN IF NOT EXISTS packing_record_id UUID;
+      ALTER TABLE production_packing_records ENABLE ROW LEVEL SECURITY;
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_policies WHERE tablename = 'production_packing_records' AND policyname = 'production_packing_records_tenant_policy'
+        ) THEN
+          CREATE POLICY production_packing_records_tenant_policy ON production_packing_records
+            USING (company_id::text = current_setting('app.current_company_id', true));
+        END IF;
+      END $$;
+      DO $$
+      BEGIN
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'smarterp_app') THEN
+          GRANT SELECT, INSERT, UPDATE ON TABLE production_packing_records TO smarterp_app;
+        END IF;
+      END $$;
+    `).catch(() => {});
+
     console.log('✅ Database constraints fixed');
 
     // Step 4: Setup Periodic Refresh Token Cleanup (Every 24 hours)

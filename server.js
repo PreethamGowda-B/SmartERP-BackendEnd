@@ -423,6 +423,18 @@ async function fixDatabaseConstraints() {
       CREATE INDEX IF NOT EXISTS idx_crt_last_activity ON customer_refresh_tokens(customer_id, last_activity_at);
     `).catch(() => {});
 
+    // Ensure jobs and invoices have all joined columns expected by routes/jobs.js
+    await client.query(`
+      ALTER TABLE jobs ADD COLUMN IF NOT EXISTS assigned_employee_id UUID;
+      ALTER TABLE jobs ADD COLUMN IF NOT EXISTS accepted_by UUID;
+      ALTER TABLE jobs ADD COLUMN IF NOT EXISTS source VARCHAR(50);
+      ALTER TABLE invoices ADD COLUMN IF NOT EXISTS is_latest BOOLEAN DEFAULT TRUE;
+      ALTER TABLE invoices ADD COLUMN IF NOT EXISTS version_number INTEGER DEFAULT 1;
+      ALTER TABLE invoices ADD COLUMN IF NOT EXISTS edited_count INTEGER DEFAULT 0;
+      ALTER TABLE invoices ADD COLUMN IF NOT EXISTS viewed_at TIMESTAMPTZ;
+      ALTER TABLE invoices ADD COLUMN IF NOT EXISTS downloaded_at TIMESTAMPTZ;
+    `).catch(() => {});
+
     // Ensure production_packing_records table exists with RLS and permissions so production orders never 503
     await client.query(`
       CREATE TABLE IF NOT EXISTS production_packing_records (

@@ -53,7 +53,20 @@ function authenticateCustomer(req, res, next) {
     // Downstream customer routes consistently consume id and companyId.
     const customerId = payload.id || payload.customerId || payload.userId;
     const companyId = payload.companyId || payload.company_id;
-    req.customer = { ...payload, id: customerId, companyId };
+    req.customer = { ...payload, id: customerId, companyId, sid: payload.sid || null };
+
+    // Record legitimate authenticated activity for rolling 7-day session window
+    try {
+      const { recordSessionActivity } = require('../services/sessionLifecycleService');
+      const { pool } = require('../db');
+      recordSessionActivity({
+        userId: customerId,
+        tokenFamily: payload.sid || null,
+        isCustomer: true,
+        req,
+        pool,
+      });
+    } catch (_) {}
 
     // Customer requests need the same tenant-scoped RLS context as owner and
     // employee requests. Without this, INSERTs into FORCE-RLS tables such as

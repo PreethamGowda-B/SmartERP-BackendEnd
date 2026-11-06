@@ -167,8 +167,23 @@ async function authenticateToken(req, res, next) {
       userId: payload.id || payload.userId,
       companyId: companyId,
       company_id: companyId,
-      role: (payload.role || 'employee').toLowerCase()
+      role: (payload.role || 'employee').toLowerCase(),
+      sid: payload.sid || null,
     };
+
+    // Record legitimate authenticated activity for rolling 7-day session window
+    try {
+      const { recordSessionActivity } = require('../services/sessionLifecycleService');
+      const { pool } = require('../db');
+      recordSessionActivity({
+        userId: req.user.userId,
+        tokenFamily: payload.sid,
+        isCustomer: false,
+        req,
+        pool,
+        redisClient,
+      });
+    } catch (_) {}
 
     // ✅ Activate RLS tenant context immediately after auth so all downstream
     // DB queries run inside the correct company scope.

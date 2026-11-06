@@ -411,10 +411,16 @@ async function fixDatabaseConstraints() {
       END $$;
     `).catch(() => {});
 
-    // Ensure refresh_tokens and customer_refresh_tokens have updated_at column
+    // Ensure refresh_tokens and customer_refresh_tokens have updated_at, last_activity_at, revoked_at columns
     await client.query(`
       ALTER TABLE refresh_tokens ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
+      ALTER TABLE refresh_tokens ADD COLUMN IF NOT EXISTS last_activity_at TIMESTAMP WITH TIME ZONE DEFAULT NOW();
+      ALTER TABLE refresh_tokens ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMP WITH TIME ZONE;
       ALTER TABLE customer_refresh_tokens ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
+      ALTER TABLE customer_refresh_tokens ADD COLUMN IF NOT EXISTS last_activity_at TIMESTAMP WITH TIME ZONE DEFAULT NOW();
+      ALTER TABLE customer_refresh_tokens ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMP WITH TIME ZONE;
+      CREATE INDEX IF NOT EXISTS idx_refresh_tokens_last_activity ON refresh_tokens(user_id, last_activity_at);
+      CREATE INDEX IF NOT EXISTS idx_crt_last_activity ON customer_refresh_tokens(customer_id, last_activity_at);
     `).catch(() => {});
 
     console.log('✅ Database constraints fixed');

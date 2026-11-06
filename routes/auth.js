@@ -25,6 +25,11 @@ const {
 const { checkPasswordResetRateLimit } = require("../services/passwordResetRateLimiter");
 const { sendRefreshUnavailable } = require("../utils/refreshFailureResponse");
 const { createAuthRouteRlsScope, STAFF_IDENTITY_LOOKUP_ROUTES } = require('../middleware/authRouteRlsScope');
+const {
+  isSessionInactive,
+  evaluateTokenInactivity,
+  handleConcurrentRotation,
+} = require("../services/sessionLifecycleService");
 
 // Cross-company lookup is limited to pre-auth routes that must resolve identity
 // by email, OAuth subject, token, or invitation code. Authenticated routes stay
@@ -370,16 +375,16 @@ router.get('/google/callback', (req, res, next) => {
       }
       await logActivity(user.id, 'login_google', req);
 
+      const tokenFamily = crypto.randomUUID();
       const staffAccess = jwt.sign(
-        { id: user.id, userId: user.id, role: user.role, email: user.email, companyId: user.company_id },
+        { id: user.id, userId: user.id, role: user.role, email: user.email, companyId: user.company_id, sid: tokenFamily },
         ACCESS_SECRET, { expiresIn: ACCESS_EXPIRY }
       );
       const staffRefresh = jwt.sign({ id: user.id, userId: user.id }, REFRESH_SECRET, { expiresIn: REFRESH_EXPIRY });
 
-      const tokenFamily = crypto.randomUUID();
       await pool.query(
-        `INSERT INTO refresh_tokens (user_id, token, token_family, expires_at, created_at, user_agent, ip_address)
-         VALUES ($1::uuid, $2, $3::uuid, NOW() + INTERVAL '30 days', NOW(), $4, $5)`,
+        `INSERT INTO refresh_tokens (user_id, token, token_family, expires_at, created_at, last_activity_at, user_agent, ip_address)
+         VALUES ($1::uuid, $2, $3::uuid, NOW() + INTERVAL '30 days', NOW(), NOW(), $4, $5)`,
         [user.id, hashToken(staffRefresh), tokenFamily, req.headers['user-agent'], req.ip]
       );
 
@@ -1260,9 +1265,10 @@ router.post("/login", async (req, res) => {
 
     await logActivity(user.id, "login", req);
 
-    // Generate Tokens with new lifetimes
+    // Generate Tokens with new lifetimes & session family identifier
+    const tokenFamily = crypto.randomUUID();
     const accessToken = jwt.sign(
-      { id: user.id, userId: user.id, role: user.role, email: user.email, companyId: user.company_id },
+      { id: user.id, userId: user.id, role: user.role, email: user.email, companyId: user.company_id, sid: tokenFamily },
       ACCESS_SECRET,
       { expiresIn: ACCESS_EXPIRY }
     );
@@ -1275,15 +1281,14 @@ router.post("/login", async (req, res) => {
     // Revoke all previous refresh tokens for this user on new login
     // Prevents stolen old tokens from remaining valid for 30 days
     await pool.query(
-      `UPDATE refresh_tokens SET revoked = TRUE WHERE user_id = $1::uuid AND revoked = FALSE`,
+      `UPDATE refresh_tokens SET revoked = TRUE, revoked_at = NOW() WHERE user_id = $1::uuid AND revoked = FALSE`,
       [user.id]
     );
 
-    // Save Refresh Token to DB (Hashed at rest)
-    const tokenFamily = crypto.randomUUID();
+    // Save Refresh Token to DB (Hashed at rest) with rolling last_activity_at
     await pool.query(
-      `INSERT INTO refresh_tokens (user_id, token, token_family, expires_at, created_at, user_agent, ip_address)
-       VALUES ($1::uuid, $2, $3::uuid, NOW() + INTERVAL '30 days', NOW(), $4, $5)`,
+      `INSERT INTO refresh_tokens (user_id, token, token_family, expires_at, created_at, last_activity_at, user_agent, ip_address)
+       VALUES ($1::uuid, $2, $3::uuid, NOW() + INTERVAL '30 days', NOW(), NOW(), $4, $5)`,
       [user.id, hashToken(refreshToken), tokenFamily, req.headers["user-agent"], req.ip]
     );
 
@@ -1357,13 +1362,91 @@ router.post("/refresh", async (req, res) => {
     const refreshTokenData = tokenResult.rows[0];
     const userId = refreshTokenData.user_id;
 
-    // 2. REUSE / REPLAY DETECTION
-    // If an already-revoked refresh token is presented, this indicates a potential replay/theft.
-    // Immediately revoke the entire token family strictly scoped to this user.
-    if (refreshTokenData.revoked) {
+    // 2. INACTIVITY CHECK (Rolling 7-day inactivity expiration)
+    const inactivity = evaluateTokenInactivity(refreshTokenData);
+    if (inactivity.isInactive) {
       if (refreshTokenData.token_family) {
         await client.query(
-          "UPDATE refresh_tokens SET revoked = TRUE WHERE user_id = $1::uuid AND token_family = $2::uuid",
+          "UPDATE refresh_tokens SET revoked = TRUE, revoked_at = NOW() WHERE user_id = $1::uuid AND token_family = $2::uuid",
+          [userId, refreshTokenData.token_family]
+        ).catch(() => {});
+      } else {
+        await client.query(
+          "UPDATE refresh_tokens SET revoked = TRUE, revoked_at = NOW() WHERE id = $1",
+          [refreshTokenData.id]
+        ).catch(() => {});
+      }
+      await client.query("COMMIT");
+
+      if (redisClient && redisClient.status === "ready") {
+        await redisClient.del(`session:${userId}`).catch(() => {});
+      }
+
+      // Clear all possible session cookies on inactivity expiry
+      const clearOpts = { sameSite: "none", secure: true, path: "/" };
+      res.clearCookie(COOKIE_ACCESS_USER, clearOpts);
+      res.clearCookie(COOKIE_REFRESH_USER, clearOpts);
+      res.clearCookie(COOKIE_ACCESS_ADMIN, clearOpts);
+      res.clearCookie(COOKIE_REFRESH_ADMIN, clearOpts);
+      res.clearCookie("access_token", clearOpts);
+      res.clearCookie("refresh_token", clearOpts);
+
+      console.warn(`⏳ Session expired due to inactivity (>7 days) for user ${userId}`);
+      return res.status(401).json({
+        message: "Your session expired due to inactivity. Please sign in again.",
+        code: "SESSION_EXPIRED_INACTIVITY",
+        expired: true
+      });
+    }
+
+    // 3. CONCURRENCY GRACE PERIOD & REPLAY DETECTION
+    // If an already-revoked refresh token is presented, check if it was rotated
+    // within the 30-second concurrency grace window (e.g. concurrent in-flight requests).
+    if (refreshTokenData.revoked) {
+      const concurrency = await handleConcurrentRotation({
+        tokenRow: refreshTokenData,
+        table: 'refresh_tokens',
+        client,
+      });
+
+      if (concurrency.isGracePeriod && concurrency.activeTokenRow) {
+        const userRes = await client.query("SELECT id, role, email, company_id, is_active FROM users WHERE id = $1", [userId]);
+        if (userRes.rows.length > 0 && isUserAccountActive(userRes.rows[0])) {
+          const user = userRes.rows[0];
+          const activeFamily = concurrency.activeTokenRow.token_family || refreshTokenData.token_family;
+
+          const activeAccessToken = jwt.sign(
+            { id: user.id, userId: user.id, role: user.role, email: user.email, companyId: user.company_id, sid: activeFamily },
+            ACCESS_SECRET,
+            { expiresIn: ACCESS_EXPIRY }
+          );
+
+          await client.query("COMMIT");
+
+          const isSuperAdmin = user.role === 'super_admin';
+          const accessCookieName = isSuperAdmin ? COOKIE_ACCESS_ADMIN : COOKIE_ACCESS_USER;
+          const cookieOpts = {
+            httpOnly: true,
+            sameSite: "none",
+            secure: true,
+            path: "/",
+          };
+          res.cookie(accessCookieName, activeAccessToken, { ...cookieOpts, maxAge: ACCESS_MAX_AGE });
+
+          console.log(`ℹ️ Served active session during concurrency grace window for ${user.email} (Family: ${activeFamily})`);
+          return res.json({
+            ok: true,
+            accessToken: activeAccessToken,
+            refreshToken: token,
+            isSuperAdmin
+          });
+        }
+      }
+
+      // Outside grace window: genuine replay/theft detected
+      if (refreshTokenData.token_family) {
+        await client.query(
+          "UPDATE refresh_tokens SET revoked = TRUE, revoked_at = NOW() WHERE user_id = $1::uuid AND token_family = $2::uuid",
           [userId, refreshTokenData.token_family]
         ).catch(() => {});
       }
@@ -1391,7 +1474,7 @@ router.post("/refresh", async (req, res) => {
       return res.status(401).json({ message: "Security alert: Token reuse detected. Session revoked." });
     }
 
-    // 3. Verify JWT with dual-secret support (primary secret + optional fallback _OLD secret)
+    // 4. Verify JWT with dual-secret support (primary secret + optional fallback _OLD secret)
     let payload = null;
     try {
       payload = jwt.verify(token, REFRESH_SECRET);
@@ -1456,15 +1539,17 @@ router.post("/refresh", async (req, res) => {
       }
     }
 
-    // 6. SINGLE-USE ROTATION: Invalidate the current token immediately
+    // 6. SINGLE-USE ROTATION: Invalidate the current token immediately with revoked_at
     await client.query(
-      "UPDATE refresh_tokens SET revoked = TRUE WHERE id = $1",
+      "UPDATE refresh_tokens SET revoked = TRUE, revoked_at = NOW() WHERE id = $1",
       [refreshTokenData.id]
     );
 
-    // 7. Issue NEW tokens (always signed using active primary secrets)
+    const familyToUse = refreshTokenData.token_family || crypto.randomUUID();
+
+    // 7. Issue NEW tokens (always signed using active primary secrets & session family)
     const newAccessToken = jwt.sign(
-      { id: user.id, userId: user.id, role: user.role, email: user.email, companyId: user.company_id },
+      { id: user.id, userId: user.id, role: user.role, email: user.email, companyId: user.company_id, sid: familyToUse },
       ACCESS_SECRET,
       { expiresIn: ACCESS_EXPIRY }
     );
@@ -1474,13 +1559,12 @@ router.post("/refresh", async (req, res) => {
       { expiresIn: REFRESH_EXPIRY }
     );
 
-    const familyToUse = refreshTokenData.token_family || crypto.randomUUID();
     const newHashedToken = hashToken(newRefreshToken);
 
-    // Save NEW token's SHA-256 HASH to DB (Never store raw token)
+    // Save NEW token's SHA-256 HASH to DB with rolling last_activity_at
     await client.query(
-      `INSERT INTO refresh_tokens (user_id, token, token_family, expires_at, created_at, user_agent, ip_address)
-       VALUES ($1::uuid, $2, $3::uuid, NOW() + INTERVAL '30 days', NOW(), $4, $5)`,
+      `INSERT INTO refresh_tokens (user_id, token, token_family, expires_at, created_at, last_activity_at, user_agent, ip_address)
+       VALUES ($1::uuid, $2, $3::uuid, NOW() + INTERVAL '30 days', NOW(), NOW(), $4, $5)`,
       [user.id, newHashedToken, familyToUse, req.headers["user-agent"] || null, req.ip || null]
     );
 

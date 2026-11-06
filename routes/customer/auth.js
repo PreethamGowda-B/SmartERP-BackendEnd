@@ -31,6 +31,11 @@ const { validateCompanyCode } = require('../../utils/companyIdGenerator');
 const { storage } = require('../../middleware/als');
 const { hashToken } = require('../../utils/tokenHash');
 const { createAuthRouteRlsScope, CUSTOMER_IDENTITY_LOOKUP_ROUTES } = require('../../middleware/authRouteRlsScope');
+const {
+  isSessionInactive,
+  evaluateTokenInactivity,
+  handleConcurrentRotation,
+} = require('../../services/sessionLifecycleService');
 
 // Only unauthenticated identity lookup and account bootstrap endpoints receive
 // cross-company context. Unknown methods/paths fail closed.
@@ -73,9 +78,10 @@ function auditLog(req, customerId, action, details, companyId) {
 }
 
 // â”€â”€â”€ Issue full JWT cookies helper â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-async function issueTokens(res, req, customer) {
+async function issueTokens(res, req, customer, existingFamily = null) {
+  const tokenFamily = existingFamily || crypto.randomUUID();
   const accessToken = jwt.sign(
-    { id: customer.id, role: 'customer', companyId: customer.company_id, email: customer.email },
+    { id: customer.id, role: 'customer', companyId: customer.company_id, email: customer.email, sid: tokenFamily },
     JWT_SECRET,
     { expiresIn: '1h' }
   );
@@ -89,12 +95,12 @@ async function issueTokens(res, req, customer) {
   // Store refresh token in dedicated customer_refresh_tokens table (Hashed at rest)
   await pool.query(
     `INSERT INTO customer_refresh_tokens
-       (customer_id, token, token_family, expires_at, user_agent, ip_address)
-     VALUES ($1, $2, $3, NOW() + INTERVAL '30 days', $4, $5)`,
+       (customer_id, token, token_family, expires_at, created_at, last_activity_at, user_agent, ip_address)
+     VALUES ($1, $2, $3, NOW() + INTERVAL '30 days', NOW(), NOW(), $4, $5)`,
     [
       customer.id,
       hashToken(refreshToken),
-      crypto.randomUUID(),
+      tokenFamily,
       req.get('user-agent') || null,
       req.ip || null,
     ]
@@ -120,7 +126,7 @@ async function issueTokens(res, req, customer) {
     maxAge: ACCESS_MAX_AGE,
   });
 
-  return { accessToken, refreshToken };
+  return { accessToken, refreshToken, tokenFamily };
 }
 
 // â”€â”€â”€ CSRF validation middleware â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -581,67 +587,184 @@ router.post('/refresh', async (req, res) => {
     return res.status(401).json({ message: 'No refresh token provided' });
   }
 
+  let client = null;
   try {
-    // Look up token in dedicated customer_refresh_tokens table
-    const tokenResult = await pool.query(
-      `SELECT * FROM customer_refresh_tokens WHERE token = $1`,
-      [refreshToken]
+    client = await pool.connect();
+    await client.query('BEGIN');
+
+    const hashedToken = hashToken(refreshToken);
+    // Look up token in dedicated customer_refresh_tokens table (support both hashed and legacy unhashed)
+    const tokenResult = await client.query(
+      `SELECT * FROM customer_refresh_tokens WHERE token = $1 OR token = $2 FOR UPDATE`,
+      [hashedToken, refreshToken]
     );
 
     if (tokenResult.rows.length === 0) {
+      await client.query('ROLLBACK');
       return res.status(401).json({ message: 'Invalid refresh token' });
     }
 
     const storedToken = tokenResult.rows[0];
 
-    // Replay detection
+    // 1. INACTIVITY CHECK (Rolling 7-day inactivity expiration)
+    const inactivity = evaluateTokenInactivity(storedToken);
+    if (inactivity.isInactive) {
+      if (storedToken.token_family) {
+        await client.query(
+          'UPDATE customer_refresh_tokens SET revoked = TRUE, revoked_at = NOW() WHERE customer_id = $1 AND token_family = $2::uuid',
+          [storedToken.customer_id, storedToken.token_family]
+        ).catch(() => {});
+      } else {
+        await client.query(
+          'UPDATE customer_refresh_tokens SET revoked = TRUE, revoked_at = NOW() WHERE id = $1',
+          [storedToken.id]
+        ).catch(() => {});
+      }
+      await client.query('COMMIT');
+
+      // Clear customer session cookies on inactivity expiry
+      const clearOpts = { path: '/', sameSite: 'none', secure: true };
+      res.clearCookie('customer_access_token', clearOpts);
+      res.clearCookie('customer_refresh_token', clearOpts);
+      res.clearCookie('csrf_token', clearOpts);
+
+      auditLog(req, storedToken.customer_id, 'customer_session_expired_inactivity', {}, null);
+      return res.status(401).json({
+        message: 'Your session expired due to inactivity. Please sign in again.',
+        code: 'SESSION_EXPIRED_INACTIVITY',
+        expired: true,
+      });
+    }
+
+    // 2. CONCURRENCY GRACE PERIOD & REPLAY DETECTION
     if (storedToken.revoked) {
-      // Revoke entire token family
-      pool.query(
-        'UPDATE customer_refresh_tokens SET revoked = TRUE WHERE token_family = $1',
+      const concurrency = await handleConcurrentRotation({
+        tokenRow: storedToken,
+        table: 'customer_refresh_tokens',
+        client,
+      });
+
+      if (concurrency.isGracePeriod && concurrency.activeTokenRow) {
+        const customerRes = await client.query('SELECT * FROM customers WHERE id = $1', [storedToken.customer_id]);
+        if (customerRes.rows.length > 0) {
+          const customer = customerRes.rows[0];
+          const activeFamily = concurrency.activeTokenRow.token_family || storedToken.token_family;
+
+          const activeAccessToken = jwt.sign(
+            { id: customer.id, role: 'customer', companyId: customer.company_id, email: customer.email, sid: activeFamily },
+            JWT_SECRET,
+            { expiresIn: '1h' }
+          );
+
+          await client.query('COMMIT');
+
+          res.cookie('customer_access_token', activeAccessToken, {
+            ...cookieOpts,
+            maxAge: ACCESS_MAX_AGE,
+          });
+
+          return res.json({ ok: true, token: activeAccessToken });
+        }
+      }
+
+      // Beyond grace period - genuine replay attack
+      await client.query(
+        'UPDATE customer_refresh_tokens SET revoked = TRUE, revoked_at = NOW() WHERE token_family = $1::uuid',
         [storedToken.token_family]
-      ).catch(e => console.error('Token family revoke error:', e.message));
+      ).catch(() => {});
+      await client.query('COMMIT');
+
+      const clearOpts = { path: '/', sameSite: 'none', secure: true };
+      res.clearCookie('customer_access_token', clearOpts);
+      res.clearCookie('customer_refresh_token', clearOpts);
+      res.clearCookie('csrf_token', clearOpts);
 
       auditLog(req, storedToken.customer_id, 'customer_token_replay', {}, null);
       return res.status(401).json({ message: 'Security alert: Token reuse detected.' });
     }
 
-    // Verify JWT
+    // 3. Verify JWT
     let payload;
     try {
       payload = jwt.verify(refreshToken, JWT_REFRESH_SECRET);
     } catch {
+      await client.query('ROLLBACK');
       return res.status(401).json({ message: 'Invalid refresh token' });
     }
 
-    // Fetch customer
-    const customerResult = await pool.query(
+    // 4. Fetch customer
+    const customerResult = await client.query(
       'SELECT * FROM customers WHERE id = $1',
       [payload.id]
     );
 
     if (customerResult.rows.length === 0) {
+      await client.query('ROLLBACK');
       return res.status(401).json({ message: 'Customer not found' });
     }
 
     const customer = customerResult.rows[0];
 
-    // Revoke old token
-    await pool.query(
-      'UPDATE customer_refresh_tokens SET revoked = TRUE WHERE id = $1',
+    // 5. Revoke old token with revoked_at timestamp
+    await client.query(
+      'UPDATE customer_refresh_tokens SET revoked = TRUE, revoked_at = NOW() WHERE id = $1',
       [storedToken.id]
     );
 
-    // Issue new tokens
-    const { accessToken } = await issueTokens(res, req, customer);
+    // 6. Issue new tokens
+    const newAccessToken = jwt.sign(
+      { id: customer.id, role: 'customer', companyId: customer.company_id, email: customer.email, sid: storedToken.token_family },
+      JWT_SECRET,
+      { expiresIn: '1h' }
+    );
+    const newRefreshToken = jwt.sign(
+      { id: customer.id },
+      JWT_REFRESH_SECRET,
+      { expiresIn: '30d' }
+    );
 
-    // Non-blocking audit log
+    await client.query(
+      `INSERT INTO customer_refresh_tokens
+         (customer_id, token, token_family, expires_at, created_at, last_activity_at, user_agent, ip_address)
+       VALUES ($1, $2, $3, NOW() + INTERVAL '30 days', NOW(), NOW(), $4, $5)`,
+      [
+        customer.id,
+        hashToken(newRefreshToken),
+        storedToken.token_family,
+        req.get('user-agent') || null,
+        req.ip || null,
+      ]
+    );
+
+    await client.query('COMMIT');
+
+    // Set cookies
+    res.cookie('customer_access_token', newAccessToken, {
+      ...cookieOpts,
+      maxAge: ACCESS_MAX_AGE,
+    });
+    res.cookie('customer_refresh_token', newRefreshToken, {
+      ...cookieOpts,
+      maxAge: REFRESH_MAX_AGE,
+    });
+
+    const newCsrf = crypto.randomBytes(32).toString('hex');
+    res.cookie('csrf_token', newCsrf, {
+      httpOnly: false,
+      sameSite: 'none',
+      secure: true,
+      path: '/',
+      maxAge: ACCESS_MAX_AGE,
+    });
+
     auditLog(req, customer.id, 'customer_token_refresh', {}, customer.company_id);
-
-    return res.json({ ok: true, token: accessToken });
+    return res.json({ ok: true, token: newAccessToken });
   } catch (err) {
+    if (client) await client.query('ROLLBACK').catch(() => {});
     console.error('refresh error:', err.message);
     return res.status(500).json({ message: 'Server error' });
+  } finally {
+    if (client) client.release();
   }
 });
 

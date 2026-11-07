@@ -68,8 +68,8 @@ test('concurrent inventory creates serialize so the final seat cannot be exceede
     let releaseLock;
     return {
       async query(sql, params) {
-        if (sql.includes('pg_advisory_lock')) releaseLock = await locks.acquire(String(params[0]) + String(params[1]));
-        if (sql.includes('pg_advisory_unlock')) releaseLock?.();
+        if (sql.includes('pg_advisory_xact_lock')) releaseLock = await locks.acquire(String(params[0]) + String(params[1]));
+        if (sql === 'ROLLBACK') releaseLock?.();
         return {};
       },
       release() {}
@@ -131,8 +131,8 @@ test('concurrent file uploads serialize so combined bytes cannot exceed storage 
     let releaseLock;
     return {
       async query(sql, params) {
-        if (sql.includes('pg_advisory_lock')) releaseLock = await locks.acquire(String(params[0]) + String(params[1]));
-        if (sql.includes('pg_advisory_unlock')) releaseLock?.();
+        if (sql.includes('pg_advisory_xact_lock')) releaseLock = await locks.acquire(String(params[0]) + String(params[1]));
+        if (sql === 'ROLLBACK') releaseLock?.();
         return {};
       },
       release() {}

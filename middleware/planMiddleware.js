@@ -270,12 +270,15 @@ function checkPlanLimit(limitType, options = {}) {
       const lockName = limitType === 'employee' ? 'employee_seats_' : limitType === 'job' ? 'active_jobs_' : limitType === 'inventory' ? 'inventory_items_' : limitType === 'storage' ? 'company_storage_' : null;
       if (companyId && lockName) {
         quotaLockClient = await pool.connect();
-        await quotaLockClient.query("SELECT pg_advisory_lock(hashtext($1 || $2))", [lockName, String(companyId)]);
+        await quotaLockClient.query('BEGIN');
+        await quotaLockClient.query("SELECT pg_advisory_xact_lock(hashtext($1 || $2))", [lockName, String(companyId)]);
         const releaseLock = () => {
           if (!releasePromise) {
             const client = quotaLockClient;
             quotaLockClient = null;
-            releasePromise = client.query("SELECT pg_advisory_unlock(hashtext($1 || $2))", [lockName, String(companyId)])
+            // Returning the transaction releases pg_advisory_xact_lock and
+            // keeps both the lock and RLS context pinned to one pooler backend.
+            releasePromise = client.query('ROLLBACK')
               .catch((err) => console.error(`Could not release ${limitType} quota lock:`, err.message))
               .finally(() => client.release());
           }

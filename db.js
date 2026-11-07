@@ -65,67 +65,120 @@ function buildRlsConfig(context = storage.getStore()) {
   return { bypassRls, role, companyId, userId };
 }
 
-/**
- * Applies RLS context to a raw pg Client.
- * Called immediately after every pool.connect() or pool.query() checkout.
- *
- * REVISED APPROACH:
- * - Always RESET ROLE first (back to connection owner who has BYPASSRLS on neondb_owner)
- * - Set all session variables (including empty values) on every pool checkout.
- * - Use the non-superuser app role for every non-bypass request, including requests
- *   with missing tenant context. RLS then returns no rows instead of running as the
- *   database owner, which may bypass RLS.
- */
+/** Apply tenant context inside the active transaction so transaction poolers
+ * pin one PostgreSQL backend for both RLS setup and the protected query. */
 async function applyRlsToClient(client, context = storage.getStore()) {
   const { bypassRls, role, companyId, userId } = buildRlsConfig(context);
   const safeRole = String(role || '').replace(/[^a-zA-Z0-9_-]/g, '');
   const setupStartedAt = performance.now();
 
-  // Separate statements keep parameter binding safe and make failures explicit.
   let stageStartedAt = performance.now();
-  await client.query('RESET ROLE');
-  recordDbStage('rls_reset_role', performance.now() - stageStartedAt);
-  stageStartedAt = performance.now();
   await client.query(
-    `SELECT set_config('app.bypass_rls', $1, false),
-            set_config('app.current_company_id', $2, false),
-            set_config('app.current_role', $3, false),
-            set_config('app.current_user_id', $4, false)`,
+    `SELECT set_config('app.bypass_rls', $1, true),
+            set_config('app.current_company_id', $2, true),
+            set_config('app.current_role', $3, true),
+            set_config('app.current_user_id', $4, true)`,
     [bypassRls ? 'on' : 'off', companyId, safeRole, userId]
   );
   recordDbStage('rls_tenant_context', performance.now() - stageStartedAt);
   if (!bypassRls) {
-    // Failure must abort checkout. Falling back to the database owner could bypass RLS.
+    // Failure must abort this transaction. Falling back to the database owner
+    // could bypass RLS.
     stageStartedAt = performance.now();
-    await client.query('SET ROLE smarterp_app');
+    await client.query('SET LOCAL ROLE smarterp_app');
     recordDbStage('rls_set_role', performance.now() - stageStartedAt);
   }
   recordDbStage('rls_setup_total', performance.now() - setupStartedAt);
 }
 
+const CONTROL = /^(BEGIN|START\s+TRANSACTION|COMMIT|END|ROLLBACK|ABORT)\b/i;
+
+function getSql(text) {
+  return typeof text === 'string' ? text.trim() : String(text?.text || '').trim();
+}
+
+/** Run each checked-out client query in an explicit transaction. Explicit
+ * BEGIN/COMMIT calls from existing services remain supported; standalone
+ * queries retain normal autocommit behavior. RLS state is transaction-local. */
+function attachTransactionScopedRls(client, context) {
+  const rawQuery = client.query.bind(client);
+  const rawRelease = client.release.bind(client);
+  let inTransaction = false;
+
+  async function begin(beginSql = 'BEGIN') {
+    const result = await rawQuery(beginSql);
+    inTransaction = true;
+    try {
+      await applyRlsToClient({ query: rawQuery }, context);
+      return result;
+    } catch (error) {
+      try { await rawQuery('ROLLBACK'); } catch (_) {}
+      inTransaction = false;
+      throw error;
+    }
+  }
+
+  client.query = async function (text, values) {
+    const sql = getSql(text);
+    const control = sql.match(CONTROL)?.[1]?.split(/\s+/)[0]?.toUpperCase();
+
+    if (control === 'BEGIN' || control === 'START') {
+      if (inTransaction) return rawQuery(text, values);
+      return begin(text);
+    }
+    if (control === 'COMMIT' || control === 'END') {
+      if (!inTransaction) return rawQuery(text, values);
+      try { return await rawQuery(text, values); }
+      finally { inTransaction = false; }
+    }
+    if (control === 'ROLLBACK' || control === 'ABORT') {
+      if (!inTransaction) return rawQuery(text, values);
+      try { return await rawQuery(text, values); }
+      finally { inTransaction = false; }
+    }
+
+    const ownsTransaction = !inTransaction;
+    if (ownsTransaction) await begin();
+    try {
+      const result = await rawQuery(text, values);
+      if (ownsTransaction) {
+        await rawQuery('COMMIT');
+        inTransaction = false;
+      }
+      return result;
+    } catch (error) {
+      if (ownsTransaction && inTransaction) {
+        try { await rawQuery('ROLLBACK'); } catch (_) {}
+        inTransaction = false;
+      }
+      throw error;
+    }
+  };
+
+  client.release = function (error) {
+    if (!inTransaction) return rawRelease(error);
+    inTransaction = false;
+    rawQuery('ROLLBACK').then(
+      () => rawRelease(error),
+      () => rawRelease(error || new Error('Failed to rollback database transaction before release'))
+    );
+  };
+  return client;
+}
+
 // ─── Patch pool.connect ───────────────────────────────────────────────────────
-// Any code that grabs a raw client (transactions, LISTEN/NOTIFY) also
-// inherits the correct RLS context before the caller runs any query.
 const originalConnect = pool.connect.bind(pool);
 
 pool.connect = async function () {
   const acquireStartedAt = performance.now();
   const client = await originalConnect();
   recordDbStage('pool_acquire', performance.now() - acquireStartedAt);
-  try {
-    await applyRlsToClient(client);
-  } catch (err) {
-    // Release so it doesn't leak, then re-throw.
-    client.release();
-    throw err;
-  }
-  return client;
+  return attachTransactionScopedRls(client, storage.getStore());
 };
 
 // ─── Patch pool.query ─────────────────────────────────────────────────────────
-// Convenience wrapper — acquires an RLS-configured client, runs the query,
-// then releases it. Callers that need BEGIN/COMMIT should use pool.connect()
-// directly (also patched above — transactions are covered).
+// Convenience wrapper uses the same explicit transaction and transaction-local
+// RLS setup as clients checked out directly.
 pool.query = async function (text, params) {
   const client = await pool.connect(); // uses the patched version above
   const queryStartedAt = performance.now();
@@ -139,4 +192,4 @@ pool.query = async function (text, params) {
   }
 };
 
-module.exports = { pool, buildRlsConfig, applyRlsToClient };
+module.exports = { pool, buildRlsConfig, applyRlsToClient, attachTransactionScopedRls };

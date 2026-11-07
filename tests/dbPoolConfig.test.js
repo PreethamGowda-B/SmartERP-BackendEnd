@@ -30,7 +30,13 @@ test('Supabase URLs are preserved exactly when session-compatible', () => {
   assert.equal(cleanConnectionString(sharedSession), sharedSession);
 });
 
-test('Supabase transaction pooler and disabled SSL are rejected without rewriting credentials', () => {
-  assert.throws(() => cleanConnectionString('postgresql://role:secret@aws-0-us-east-1.pooler.supabase.com:6543/postgres'), /port 6543|transaction pooling/);
+test('Supabase shared transaction URLs are upgraded to the shared session port without changing credentials', () => {
+  const transaction = 'postgresql://role.abcdefghijklmnopqrst:secret@aws-0-us-east-1.pooler.supabase.com:6543/postgres?sslmode=require';
+  assert.equal(
+    cleanConnectionString(transaction),
+    'postgresql://role.abcdefghijklmnopqrst:secret@aws-0-us-east-1.pooler.supabase.com:5432/postgres?sslmode=require'
+  );
+  const dedicatedTransaction = 'postgresql://postgres:secret@db.abcdefghijklmnopqrst.supabase.co:6543/postgres';
+  assert.equal(cleanConnectionString(dedicatedTransaction), dedicatedTransaction);
   assert.throws(() => cleanConnectionString('postgresql://postgres:secret@db.abcdefghijklmnopqrst.supabase.co:5432/postgres?sslmode=disable'), /must use SSL/);
 });

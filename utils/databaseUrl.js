@@ -1,9 +1,9 @@
 'use strict';
 
 /**
- * Validate a PostgreSQL URL without rewriting host, port, username, SSL mode,
- * or credentials. SmartERP uses session-scoped PostgreSQL state, so Supabase
- * transaction-mode endpoints cannot be used for application connections.
+ * Validate a PostgreSQL URL and adapt Supabase's shared transaction pooler
+ * endpoint to its session endpoint. The application also scopes RLS state and
+ * locks to explicit transactions, which supports dedicated transaction poolers.
  */
 function cleanConnectionString(url) {
   if (!url) return url;
@@ -12,18 +12,25 @@ function cleanConnectionString(url) {
   if (!['postgres:', 'postgresql:'].includes(parsed.protocol)) throw new Error('DATABASE_URL must use PostgreSQL.');
 
   const host = parsed.hostname.toLowerCase();
+  let rewritten = false;
   if (host.endsWith('.supabase.co') || host.endsWith('.pooler.supabase.com')) {
-    const port = Number(parsed.port || (host.endsWith('.pooler.supabase.com') ? 6543 : 5432));
+    let port = Number(parsed.port || (host.endsWith('.pooler.supabase.com') ? 6543 : 5432));
     if (parsed.searchParams.get('sslmode')?.toLowerCase() === 'disable') {
       throw new Error('Supabase DATABASE_URL must use SSL.');
     }
-    if (port === 6543) throw new Error('Supabase URLs on port 6543 or using transaction pooling are incompatible; configure the dashboard-issued session/direct URL.');
-    if (port !== 5432) throw new Error('Unsupported Supabase PostgreSQL port; configure the dashboard-issued session URL.');
+    if (port === 6543 && host.endsWith('.pooler.supabase.com')) {
+      // Supavisor's shared pooler serves transaction mode on 6543 and session
+      // mode on 5432. Keep the dashboard-provided host, user and secret intact.
+      parsed.port = '5432';
+      port = 5432;
+      rewritten = true;
+    }
+    if (port !== 5432 && port !== 6543) throw new Error('Unsupported Supabase PostgreSQL port.');
     if (host.endsWith('.pooler.supabase.com') && !/^.+\.[a-z0-9]{20,}$/i.test(decodeURIComponent(parsed.username))) {
       throw new Error('Supabase shared session pooler URLs require the dashboard-issued role and project reference.');
     }
   }
-  return url;
+  return rewritten ? parsed.href : url;
 }
 
 module.exports = { cleanConnectionString };

@@ -22,6 +22,8 @@ if (process.env.SENTRY_DSN) {
 }
 
 const express = require("express");
+const { randomUUID } = require("node:crypto");
+const { performance } = require("node:perf_hooks");
 const cors = require("cors");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
@@ -37,7 +39,37 @@ const app = express();
 // receives an undefined store (which would be treated as no-context = fail-closed).
 // Auth routes opt-in to bypassRls: true via their own router-level middleware.
 app.use((req, res, next) => {
-  storage.run({ isWebRequest: true, bypassRls: false }, next);
+  const suppliedId = req.get("x-request-id");
+  const requestId = suppliedId && /^[A-Za-z0-9._:-]{1,100}$/.test(suppliedId)
+    ? suppliedId
+    : randomUUID();
+  const startedAt = performance.now();
+  let completed = false;
+  req.requestId = requestId;
+  res.setHeader("X-Request-Id", requestId);
+
+  const logCompletion = (outcome) => {
+    if (completed) return;
+    completed = true;
+    const durationMs = performance.now() - startedAt;
+    if (durationMs < Number(process.env.REQUEST_TRACE_THRESHOLD_MS || 100)) return;
+    console.warn(JSON.stringify({
+      type: "request_performance",
+      requestId,
+      method: req.method,
+      path: String(req.originalUrl || req.url).split("?")[0].replace(/[0-9a-f]{8}-[0-9a-f-]{27,}/gi, ":id"),
+      status: res.statusCode,
+      outcome,
+      durationMs: Number(durationMs.toFixed(2)),
+      pool: { total: pool.totalCount, idle: pool.idleCount, waiting: pool.waitingCount },
+    }));
+  };
+  res.once("finish", () => logCompletion("completed"));
+  res.once("close", () => {
+    if (!res.writableFinished) logCompletion("aborted");
+  });
+
+  storage.run({ isWebRequest: true, bypassRls: false, requestId }, next);
 });
 
 // ✅ Sentry Request Handling is now automatic in SDK v8+

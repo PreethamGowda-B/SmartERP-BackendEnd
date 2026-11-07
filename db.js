@@ -1,5 +1,20 @@
 const { pool } = require("./db-base");
 const { storage } = require("./middleware/als");
+const { performance } = require("node:perf_hooks");
+
+const DB_TRACE_THRESHOLD_MS = Number(process.env.DB_TRACE_THRESHOLD_MS || 100);
+
+function recordDbStage(stage, durationMs) {
+  if (durationMs < DB_TRACE_THRESHOLD_MS) return;
+  const context = storage.getStore();
+  console.warn(JSON.stringify({
+    type: "db_performance",
+    requestId: context?.requestId || null,
+    stage,
+    durationMs: Number(durationMs.toFixed(2)),
+    pool: { total: pool.totalCount, idle: pool.idleCount, waiting: pool.waitingCount },
+  }));
+}
 
 // ID validation — supports both standard UUIDs and legacy Integer IDs (numeric strings).
 const ID_REGEX = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|\d+)$/i;
@@ -64,9 +79,13 @@ function buildRlsConfig(context = storage.getStore()) {
 async function applyRlsToClient(client, context = storage.getStore()) {
   const { bypassRls, role, companyId, userId } = buildRlsConfig(context);
   const safeRole = String(role || '').replace(/[^a-zA-Z0-9_-]/g, '');
+  const setupStartedAt = performance.now();
 
   // Separate statements keep parameter binding safe and make failures explicit.
+  let stageStartedAt = performance.now();
   await client.query('RESET ROLE');
+  recordDbStage('rls_reset_role', performance.now() - stageStartedAt);
+  stageStartedAt = performance.now();
   await client.query(
     `SELECT set_config('app.bypass_rls', $1, false),
             set_config('app.current_company_id', $2, false),
@@ -74,10 +93,14 @@ async function applyRlsToClient(client, context = storage.getStore()) {
             set_config('app.current_user_id', $4, false)`,
     [bypassRls ? 'on' : 'off', companyId, safeRole, userId]
   );
+  recordDbStage('rls_tenant_context', performance.now() - stageStartedAt);
   if (!bypassRls) {
     // Failure must abort checkout. Falling back to the database owner could bypass RLS.
+    stageStartedAt = performance.now();
     await client.query('SET ROLE smarterp_app');
+    recordDbStage('rls_set_role', performance.now() - stageStartedAt);
   }
+  recordDbStage('rls_setup_total', performance.now() - setupStartedAt);
 }
 
 // ─── Patch pool.connect ───────────────────────────────────────────────────────
@@ -86,7 +109,9 @@ async function applyRlsToClient(client, context = storage.getStore()) {
 const originalConnect = pool.connect.bind(pool);
 
 pool.connect = async function () {
+  const acquireStartedAt = performance.now();
   const client = await originalConnect();
+  recordDbStage('pool_acquire', performance.now() - acquireStartedAt);
   try {
     await applyRlsToClient(client);
   } catch (err) {
@@ -103,10 +128,14 @@ pool.connect = async function () {
 // directly (also patched above — transactions are covered).
 pool.query = async function (text, params) {
   const client = await pool.connect(); // uses the patched version above
+  const queryStartedAt = performance.now();
   try {
     return await client.query(text, params);
   } finally {
+    recordDbStage('sql_execution', performance.now() - queryStartedAt);
+    const releaseStartedAt = performance.now();
     client.release();
+    recordDbStage('pool_release', performance.now() - releaseStartedAt);
   }
 };
 

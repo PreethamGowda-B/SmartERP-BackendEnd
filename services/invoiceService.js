@@ -509,6 +509,9 @@ class InvoiceService {
     try {
       await client.query('BEGIN');
       const idempotencyKey = invoiceData.idempotency_key;
+      const requestFingerprint = crypto.createHash('sha256')
+        .update(JSON.stringify({ companyId: String(companyId), jobId: jobId || null, productionOrderId: productionOrderId || null, invoiceData }))
+        .digest('hex');
       if (!idempotencyKey) {
         const err = new Error('Invoice finalization requires an idempotency key');
         err.statusCode = 400;
@@ -678,7 +681,7 @@ class InvoiceService {
             edited_count = COALESCE(edited_count, 0) + 1, updated_at = NOW(),
             status = 'issued', due_date = CURRENT_DATE + $21::integer,
             customer_name = $22, customer_email = $23, customer_phone = $24,
-            payment_terms = $25, pdf_url = $26, idempotency_key = $27
+            payment_terms = $25, pdf_url = $26, idempotency_key = $27, request_fingerprint = $28
            WHERE id::text = $19::text AND company_id::text = $20::text
            RETURNING *`,
           [
@@ -693,7 +696,7 @@ class InvoiceService {
             invoiceData.customer_email || job.customer_email || '',
             invoiceData.customer_phone || job.customer_phone || '',
             invoiceData.payment_terms || 'Due on receipt',
-            `/api/invoices/${existingId}/pdf`, idempotencyKey
+            `/api/invoices/${existingId}/pdf`, idempotencyKey, requestFingerprint
           ]
         );
 
@@ -809,12 +812,12 @@ class InvoiceService {
           transport_charges, additional_charges, discount_amount, subtotal,
           is_inter_state, gst_rate, cgst, sgst, igst, total_tax,
           total_amount, amount_paid, amount_due, due_date, payment_terms,
-          customer_notes, internal_notes, idempotency_key, created_at, updated_at)
+          customer_notes, internal_notes, idempotency_key, request_fingerprint, created_at, updated_at)
          VALUES
          ($1, $2, $3, $4, $5, $6, $7, 1, TRUE, 'issued',
           $8, $9, $10, $11, $12, $13, $14, $15, $16,
           $17, $18, $19, $20, $21, $22,
-          $23, 0.00, $23, $24, $25, $26, $27, $28, NOW(), NOW())
+          $23, 0.00, $23, $24, $25, $26, $27, $28, $29, NOW(), NOW())
          RETURNING *`,
         [
           companyId,
@@ -845,6 +848,7 @@ class InvoiceService {
           invoiceData.customer_notes || 'Thank you for your business!',
           invoiceData.internal_notes || '',
           idempotencyKey,
+          requestFingerprint,
         ]
       );
 

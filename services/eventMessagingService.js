@@ -1,5 +1,5 @@
 const { pool } = require("../db");
-const { broadcastToUser } = require("../utils/notificationHelpers");
+const { storage } = require("../middleware/als");
 
 /**
  * Event-Driven Auto-Messaging Helper Service
@@ -9,14 +9,38 @@ class EventMessagingService {
   /**
    * Spawns/Fetches job conversation and sends introductory job card
    */
-  static async onJobCreated({ jobId, companyId, title, customerId, ownerId, assignedEmployeeId }) {
+  static async onJobCreated(
+    { jobId, companyId, title, customerId, ownerId, assignedEmployeeId },
+    { connect = () => pool.connect() } = {},
+  ) {
+    let client;
+    let transactionStarted = false;
     try {
+      const context = storage.getStore();
+      const tenantId = companyId == null ? "" : String(companyId);
+      const contextCompanyId = context?.companyId == null ? "" : String(context.companyId);
+      const contextUserId = context?.userId == null ? "" : String(context.userId);
+      if (
+        !jobId || !tenantId || !ownerId ||
+        context?.bypassRls === true ||
+        contextCompanyId !== tenantId ||
+        contextUserId !== String(ownerId) ||
+        !["owner", "admin", "super_admin"].includes(String(context?.role || "").toLowerCase())
+      ) {
+        console.warn("⚠️ EventMessagingService.onJobCreated skipped: tenant context mismatch");
+        return null;
+      }
+
+      client = await connect();
+      await client.query("BEGIN");
+      transactionStarted = true;
+
       // 1. Create or get job conversation
-      const convRes = await pool.query(
+      const convRes = await client.query(
         `INSERT INTO conversations (company_id, conversation_type, job_id)
          VALUES ($1, 'job', $2)
          RETURNING id`,
-        [companyId, String(jobId)]
+        [tenantId, String(jobId)]
       );
       const convId = convRes.rows[0].id;
 
@@ -27,25 +51,46 @@ class EventMessagingService {
 
       for (const uid of participants) {
         if (uid && uid !== "null" && uid !== "undefined") {
-          await pool.query(
-            `INSERT INTO conversation_participants (conversation_id, user_id)
-             VALUES ($1, $2) ON CONFLICT DO NOTHING`,
-            [convId, uid]
+          // Only attach users whose account is in this tenant. A supplied
+          // recipient ID is never sufficient authorization by itself.
+          const member = await client.query(
+            `SELECT id FROM users
+              WHERE id::text = $1::text AND company_id::text = $2::text
+              LIMIT 1`,
+            [uid, tenantId]
           );
+          if (member.rows.length) {
+            await client.query(
+              `INSERT INTO conversation_participants (conversation_id, user_id)
+               VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+              [convId, member.rows[0].id]
+            );
+          }
         }
       }
 
       // 3. Insert initial Job ERP Card Message
-      await pool.query(
+      await client.query(
         `INSERT INTO messages 
-         (conversation_id, sender_id, message, content, message_type, erp_record_type, erp_record_id, created_at)
-         VALUES ($1, $2::uuid, $3, $3, 'erp_card', 'job', $4, NOW())`,
-        [convId, String(ownerId), `📋 Job Created: ${title}`, String(jobId)]
+         (conversation_id, sender_id, company_id, message, content, message_type, erp_record_type, erp_record_id, created_at)
+         VALUES ($1, $2::uuid, $3, $4, $4, 'erp_card', 'job', $5, NOW())`,
+        [convId, String(ownerId), tenantId, `📋 Job Created: ${title}`, String(jobId)]
       );
 
+      await client.query("COMMIT");
+      transactionStarted = false;
       return convId;
     } catch (err) {
-      console.warn("⚠️ EventMessagingService.onJobCreated skipped:", err.message);
+      if (transactionStarted && client) {
+        await client.query("ROLLBACK").catch(() => {});
+      }
+      console.warn("⚠️ EventMessagingService.onJobCreated skipped:", {
+        code: typeof err?.code === "string" ? err.code.slice(0, 40) : null,
+        name: typeof err?.name === "string" ? err.name.slice(0, 60) : "Error",
+      });
+      return null;
+    } finally {
+      if (client) client.release();
     }
   }
 

@@ -1,12 +1,13 @@
 require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
 const { Pool } = require('pg');
+const { cleanConnectionString } = require('../utils/databaseUrl');
 const fs = require('fs');
 const path = require('path');
 
 // Use a raw pool — NOT the patched db.js — so we connect as neondb_owner
 // which is the table owner and can run ALTER TABLE / CREATE POLICY DDL.
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: cleanConnectionString(process.env.DATABASE_URL),
   ssl: { rejectUnauthorized: false }
 });
 

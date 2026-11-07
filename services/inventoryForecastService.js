@@ -113,6 +113,7 @@ class InventoryForecastService {
             },
           ],
           temperature: 0.2,
+          task: 'reasoning',
         });
         if (completion.content) aiReasoning = completion.content.trim();
       } catch (e) {

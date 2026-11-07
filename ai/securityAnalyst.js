@@ -17,6 +17,7 @@ const { pool } = require('../db');
 const ProviderFactory = require('./providers/provider.factory');
 const { buildSanitizedIncidentContext, redactSensitiveData } = require('../utils/promptShield');
 const logger = require('../utils/logger');
+const { keyedDigest, resolveAuditHmacKey } = require('./telemetry/metrics.service');
 
 const SECURITY_ANALYST_SYSTEM_PROMPT = `You are the SmartERP Defensive Security AI Analyst.
 You specialize in evaluating multi-tenant ERP security incidents, authentication anomalies, cross-tenant IDOR probes, and unauthorized access attempts.
@@ -90,7 +91,8 @@ async function analyzeIncidentWithAI({ incidentId, timeoutMs = 8000 }) {
 
     // 4. Execute LLM Provider Call with hard timeout
     let parsedAnalysis = null;
-    let modelName = 'groq-llama3-70b';
+    let modelName = null;
+    let providerName = null;
 
     try {
       const provider = ProviderFactory.getProvider();
@@ -102,6 +104,7 @@ async function analyzeIncidentWithAI({ incidentId, timeoutMs = 8000 }) {
       const llmPromise = provider.generateCompletion({
         messages: promptMessages,
         temperature: 0.1,
+        task: 'reasoning',
       });
 
       const timeoutPromise = new Promise((_, reject) =>
@@ -109,6 +112,8 @@ async function analyzeIncidentWithAI({ incidentId, timeoutMs = 8000 }) {
       );
 
       const response = await Promise.race([llmPromise, timeoutPromise]);
+      modelName = response?.model || null;
+      providerName = response?.provider || provider.name || null;
       const rawContent = response?.content || response?.choices?.[0]?.message?.content || '';
 
       // Extract JSON from response (handles ```json fences or plain text)
@@ -123,6 +128,7 @@ async function analyzeIncidentWithAI({ incidentId, timeoutMs = 8000 }) {
     // 5. Structure final enrichment payload (Deterministic fallback if LLM failed)
     const finalEnrichment = {
       aiModel: modelName,
+      aiProvider: providerName,
       analyzedAt: new Date().toISOString(),
       durationMs: Date.now() - startTime,
       summary: parsedAnalysis?.summary || `Deterministic evaluation flagged ${incident.threat_category} with risk score ${incident.risk_score}/100.`,
@@ -162,15 +168,27 @@ async function analyzeIncidentWithAI({ incidentId, timeoutMs = 8000 }) {
        VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())`,
       [
         'system-security-ai',
-        Number.isInteger(Number(incident.company_id)) ? Number(incident.company_id) : null,
-        `Security Incident Analysis: ${incident.threat_category}`,
+        incident.company_id == null ? null : String(incident.company_id),
+        'Security incident enrichment',
         'SECURITY_INCIDENT_ANALYSIS',
         incidentId,
         'SUCCESS',
-        JSON.stringify(redactSensitiveData(finalEnrichment)),
+        JSON.stringify({
+          result_hmac_sha256: keyedDigest('security-incident-enrichment', finalEnrichment),
+          hmac_key_id: resolveAuditHmacKey().keyId,
+          confidence: finalEnrichment.confidence,
+          threatCategory: finalEnrichment.threatCategory,
+          riskAssessment: finalEnrichment.riskAssessment,
+          evidenceCount: finalEnrichment.evidence.length,
+          recommendedActionCount: finalEnrichment.recommendedActions.length,
+          isAiFallback: finalEnrichment.isAiFallback,
+        }),
       ]
     ).catch((auditErr) => {
-      logger.warn(`SecurityAnalyst AI Audit Log Warning: ${auditErr.message}`);
+      logger.warn('SecurityAnalyst AI audit log write failed.', {
+        code: typeof auditErr?.code === 'string' ? auditErr.code.slice(0, 40) : null,
+        name: typeof auditErr?.name === 'string' ? auditErr.name.slice(0, 60) : 'Error',
+      });
     });
 
     return {
@@ -179,10 +197,13 @@ async function analyzeIncidentWithAI({ incidentId, timeoutMs = 8000 }) {
       enrichment: finalEnrichment,
     };
   } catch (err) {
-    logger.error(`[SecurityAnalyst] Unexpected error in analyzeIncidentWithAI: ${err.message}`);
+    logger.error('[SecurityAnalyst] Incident enrichment failed.', null, {
+      code: typeof err?.code === 'string' ? err.code.slice(0, 40) : null,
+      name: typeof err?.name === 'string' ? err.name.slice(0, 60) : 'Error',
+    });
     return {
       success: false,
-      error: err.message,
+      error: 'Incident enrichment is temporarily unavailable.',
     };
   }
 }

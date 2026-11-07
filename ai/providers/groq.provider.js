@@ -1,6 +1,7 @@
 const BaseAIProvider = require("./provider.interface");
 const Groq = require("groq-sdk");
 const { groqConcurrencyLimiter } = require("../../utils/asyncLimiter");
+const { routeTask } = require("./model-registry");
 
 function sanitizeToolArgs(rawArgs) {
   let args = {};
@@ -47,12 +48,33 @@ function parsePseudoToolCalls(str) {
   return toolCalls;
 }
 
-const FALLBACK_MODELS = [
-  "openai/gpt-oss-120b",
-  "openai/gpt-oss-20b",
-  "qwen/qwen3.8-27b",
-  "groq/compound",
-];
+function containsImageInput(messages = []) {
+  return messages.some((message) => Array.isArray(message?.content)
+    && message.content.some((part) => part?.type === 'image_url'));
+}
+
+function validateImageInput(messages = [], routedModel) {
+  const imageParts = messages.flatMap((message) => Array.isArray(message?.content)
+    ? message.content.filter((part) => part?.type === 'image_url')
+    : []);
+  if (!imageParts.length) return;
+  if (!routedModel.capabilities.includes('vision')) {
+    const error = new Error('Image input requires a configured vision-capable model.');
+    error.code = 'AI_MODEL_CAPABILITY_MISMATCH';
+    error.statusCode = 400;
+    throw error;
+  }
+  for (const part of imageParts) {
+    const url = part?.image_url?.url;
+    const match = typeof url === 'string' && url.match(/^data:image\/(jpeg|png|webp);base64,([A-Za-z0-9+/]+={0,2})$/i);
+    if (!match || Buffer.from(match[2], 'base64').length > 20 * 1024 * 1024) {
+      const error = new Error('Image input must be a supported, bounded data URL.');
+      error.code = 'AI_IMAGE_INPUT_INVALID';
+      error.statusCode = 400;
+      throw error;
+    }
+  }
+}
 
 class GroqProvider extends BaseAIProvider {
   constructor() {
@@ -71,10 +93,21 @@ class GroqProvider extends BaseAIProvider {
       timeout: 10000,
       maxRetries: 0,
     });
-    this.defaultModel = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
+    if (process.env.GROQ_MODEL) {
+      const configuredModel = routeTask({ task: 'general', modelOverride: process.env.GROQ_MODEL });
+      if (configuredModel.alias !== 'general') {
+        const error = new Error('GROQ_MODEL must identify the registered general model.');
+        error.code = 'AI_MODEL_NOT_CONFIGURED';
+        error.statusCode = 503;
+        throw error;
+      }
+      this.defaultModel = configuredModel.modelId;
+    } else {
+      this.defaultModel = routeTask({ task: 'reasoning' }).modelId;
+    }
   }
 
-  async generateCompletion({ messages, tools = [], temperature = 0.2, model = null }) {
+  async generateCompletion({ messages, tools = [], temperature = 0.2, model = null, task = 'general' }) {
     return groqConcurrencyLimiter.run(async () => {
       // Clean up previous assistant messages in trajectory to strip raw pseudo-XML tags
       const sanitizedMessages = messages.map((m) => {
@@ -87,9 +120,18 @@ class GroqProvider extends BaseAIProvider {
 
       // One fallback is enough for a model-specific issue. Trying every model
       // in sequence made a single prompt wait through several provider calls.
-      const candidateModels = model
-        ? [model]
-        : [...new Set([this.defaultModel, ...FALLBACK_MODELS.filter(m => m !== this.defaultModel)])].slice(0, 2);
+      const routedModel = routeTask({ task, modelOverride: model });
+      const hasImageInput = containsImageInput(sanitizedMessages);
+      if (hasImageInput && task !== 'vision') {
+        const error = new Error('Image input must use the vision task route.');
+        error.code = 'AI_MODEL_CAPABILITY_MISMATCH';
+        error.statusCode = 400;
+        throw error;
+      }
+      validateImageInput(sanitizedMessages, routedModel);
+      const selected = model || (task === 'general' && process.env.GROQ_MODEL ? this.defaultModel : routedModel.modelId);
+      const fallbackModel = routedModel.fallback ? routeTask({ task: routedModel.fallback }).modelId : null;
+      const candidateModels = [...new Set([selected, fallbackModel].filter(Boolean))];
       let lastError = null;
 
       for (const modelToTry of candidateModels) {
@@ -142,6 +184,7 @@ class GroqProvider extends BaseAIProvider {
           toolCalls,
           usage: response.usage || {},
           model: response.model,
+          provider: 'groq',
         };
       } catch (err) {
         lastError = err;
@@ -196,3 +239,4 @@ class GroqProvider extends BaseAIProvider {
 }
 
 module.exports = GroqProvider;
+module.exports.validateImageInput = validateImageInput;

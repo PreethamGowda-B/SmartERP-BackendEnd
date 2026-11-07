@@ -173,6 +173,10 @@ class PluginRegistry {
     }
 
     const registeredTool = targetPlugin.tools[functionName];
+    if (params && typeof params === 'object' && !Array.isArray(params)) {
+      params = { ...params };
+      delete params.confirmed;
+    }
     params = validateToolArguments(params, registeredTool?.parameters || { type: 'object' });
 
     for (const plugin of this.plugins) {

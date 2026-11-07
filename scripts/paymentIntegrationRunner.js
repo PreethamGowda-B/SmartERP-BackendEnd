@@ -13,6 +13,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const { cleanConnectionString } = require('../utils/databaseUrl');
 const crypto = require('node:crypto');
 const { Pool } = require('pg');
 const {
@@ -49,7 +50,7 @@ async function runIntegrationSuite({
   assertDedicatedTestDatabaseName(preflightReport.database);
 
   const pool = new Pool({
-    connectionString: activeEnv.TEST_DATABASE_URL,
+    connectionString: cleanConnectionString(activeEnv.TEST_DATABASE_URL),
     ssl: { rejectUnauthorized: false },
     connectionTimeoutMillis: 20000,
     statement_timeout: 20000,

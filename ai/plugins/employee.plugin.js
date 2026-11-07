@@ -33,6 +33,7 @@ class EmployeePlugin extends BasePlugin {
       description: "Creates a new employee profile in SmartERP.",
       allowedRoles: ["owner", "hr", "admin"],
       isDestructive: true,
+      requiresTransactionalAudit: true,
       parameters: {
         type: "object",
         properties: {
@@ -50,6 +51,7 @@ class EmployeePlugin extends BasePlugin {
           email: params.email,
           position: params.position,
           department: params.department,
+          queryable: context.dbClient,
         });
       },
     };

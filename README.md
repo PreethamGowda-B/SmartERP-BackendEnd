@@ -130,6 +130,8 @@ The API routes are mounted modularly in [`server.js`](file:///c:/Users/ADMIN/Des
 
 ## 5. Role-Based Access Control (RBAC) & Permissions
 
+The employee API does not implement the previously documented `DEV_ALLOW_UNAUTH_USERS` bypass. Employee routes require a valid authenticated token and company context.
+
 Roles are strictly hierarchical and enforced at the route level via [`middleware/authMiddleware.js`](file:///c:/Users/ADMIN/Desktop/SMARTERP/SmartERP-BackendEnd/middleware/authMiddleware.js):
 
 | Capability / Action | `super_admin` | `owner` | `admin` | `hr` | `employee` | `customer` |

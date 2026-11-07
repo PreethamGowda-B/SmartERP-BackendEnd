@@ -1,5 +1,6 @@
 const { pool } = require("../db");
 const AttendancePolicy = require('./attendancePolicyService');
+const { keyedDigest, resolveAuditHmacKey } = require('../ai/telemetry/metrics.service');
 
 class AIDataService {
   /** Narrow company-scoped job counts for common AI questions. */
@@ -542,10 +543,27 @@ class AIDataService {
         `INSERT INTO ai_audit_logs 
          (user_id, user_name, role, company_id, prompt, action_name, affected_record_id, status, details, created_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())`,
-        [String(userId || ""), userName || "User", role || "employee", companyId || null, prompt, actionName, String(affectedRecordId || ""), status, JSON.stringify(details)]
+        [
+          String(userId || ""),
+          null,
+          role || "employee",
+          companyId == null ? null : String(companyId),
+          'AI action execution',
+          String(actionName || 'AI_ACTION').slice(0, 100),
+          String(affectedRecordId || ""),
+          status,
+          JSON.stringify({
+            payload_hmac_sha256: keyedDigest('legacy-ai-action-details', details || {}),
+            prompt_hmac_sha256: keyedDigest('legacy-ai-action-prompt', String(prompt || '')),
+            hmac_key_id: resolveAuditHmacKey().keyId,
+          }),
+        ]
       );
     } catch (err) {
-      console.warn("⚠️ AI Audit Logging failed:", err.message);
+      console.warn("⚠️ AI Audit Logging failed:", {
+        code: typeof err?.code === 'string' ? err.code.slice(0, 40) : null,
+        name: typeof err?.name === 'string' ? err.name.slice(0, 60) : 'Error',
+      });
     }
   }
 }

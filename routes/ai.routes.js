@@ -23,6 +23,9 @@ const AIDataService = require("../services/aiDataService");
 const { loadAttendanceSummary } = require("../services/aiAttendanceSummary");
 const { classifyAiFastPathIntent, authorizeAiFastPath } = require("../services/aiFastPathPolicy");
 const { createEmployeeAssignedJobsResponse } = require('../services/employeeAssignedJobsResponse');
+const { consumeApprovalToken, stableHash } = require('../services/aiActionApproval');
+const { redisClient } = require('../utils/redis');
+const { checkPlanLimit } = require('../middleware/planMiddleware');
 const SecurityShield = require('../ai/gateway/security.shield');
 const validateAiPrompt = createAiPromptGuard({
   historyField: 'history',
@@ -529,6 +532,8 @@ router.post(
           confidenceScore: undefined,
           sources: combinedSources,
           telemetry: scopeResults[0]?.result.telemetry || { latencyMs: Date.now() - startTime },
+          providersUsed: [...new Set(scopeResults.map((entry) => entry.result?.telemetry?.provider).filter(Boolean))],
+          modelsUsed: [...new Set(scopeResults.map((entry) => entry.result?.telemetry?.model).filter(Boolean))],
           autoSelectedModel: null,
           activeModelScope: resolvedScopes.join("+"),
           suggestedFollowUps: ContextEngine.getSuggestedFollowUps(resolvedScopes[0]),
@@ -552,6 +557,8 @@ router.post(
         confidenceScore: finalResult.confidenceScore,
         blocked: false,
         promptPreview: null,
+        provider: (finalResult.providersUsed || [finalResult.telemetry?.provider]).filter(Boolean).join(',') || null,
+        model: (finalResult.modelsUsed || [finalResult.telemetry?.model]).filter(Boolean).join(',') || null,
       }).catch((auditErr) => {
         console.warn('[SmartERP AI] Request audit event could not be recorded:', auditErr?.code || auditErr?.name || 'audit_error');
       });
@@ -618,16 +625,28 @@ router.post(
   authenticateToken,
   loadPlan,
   requireFeature('ai_assistant', 'AI assistant'),
+  (req, res, next) => req.body?.toolName === 'create_job' ? checkPlanLimit('job')(req, res, next) : next(),
   async (req, res) => {
     try {
-      const { toolName, params = {} } = req.body;
+      const { toolName, approval_token: approvalToken } = req.body || {};
+      const params = req.body?.params;
 
-      if (!toolName) {
-        return res.status(400).json({ error: "Tool name is required for action execution." });
+      if (typeof toolName !== 'string' || !toolName || !params || typeof params !== 'object' || Array.isArray(params)) {
+        return res.status(400).json({ code: 'AI_APPROVAL_REQUEST_INVALID', error: 'A tool name and action payload are required.' });
       }
 
+      const targetTool = pluginRegistry.plugins
+        .map((plugin) => ({ plugin, tool: plugin.tools?.[toolName] }))
+        .find(({ tool }) => tool);
+      if (!targetTool?.tool?.isDestructive || !targetTool.tool.requiresTransactionalAudit) {
+        return res.status(403).json({ code: 'AI_ACTION_NOT_APPROVABLE', error: 'This tool is not an approved write operation.' });
+      }
+
+      const approvalPayload = { ...params };
+      delete approvalPayload.confirmed;
+
       {
-        const blocked = findBlockedActionInput(params);
+        const blocked = findBlockedActionInput(approvalPayload);
         if (blocked) {
           if (blocked.invalid) {
             return res.status(400).json({ error: 'Action parameters are too deeply nested.', code: 'INVALID_ACTION_PARAMS' });
@@ -662,10 +681,64 @@ router.post(
 
       const planTier = getPlanTier(req);
       const context = ContextEngine.buildContext(req, {}, planTier);
-      const confirmedParams = { ...params, confirmed: true };
-
-      const result = await pluginRegistry.execute(toolName, confirmedParams, context);
-      res.json(result);
+      const userId = req.user?.userId || req.user?.id;
+      const companyId = req.user?.companyId || req.user?.company_id;
+      await consumeApprovalToken(approvalToken, {
+        userId,
+        companyId,
+        action: `plugin_tool:${toolName}`,
+        payload: approvalPayload,
+        redisClient,
+      });
+      context.approvedAiAction = { toolName, payloadHash: stableHash(approvalPayload) };
+      let dbClient;
+      try {
+        dbClient = await pool.connect();
+      } catch (_) {
+        const unavailable = new Error('The action could not start after approval was consumed.');
+        unavailable.code = 'AI_ACTION_NOT_COMMITTED';
+        throw unavailable;
+      }
+      let inTransaction = false;
+      let phase = 'begin';
+      let destroyClient = null;
+      try {
+        await dbClient.query('BEGIN');
+        inTransaction = true;
+        phase = 'execute';
+        context.dbClient = dbClient;
+        const result = await pluginRegistry.execute(toolName, approvalPayload, context);
+        if (result?.success === false || result?.error) {
+          throw new Error('The approved AI action did not complete.');
+        }
+        await MetricsService.writeAIAuditEvent({
+          queryable: dbClient,
+          userContext: context,
+          toolName,
+          params: approvalPayload,
+          status: 'SUCCESS',
+        });
+        phase = 'commit';
+        await dbClient.query('COMMIT');
+        inTransaction = false;
+        return res.json(result);
+      } catch (error) {
+        let rollbackSucceeded = false;
+        if (inTransaction) {
+          try {
+            await dbClient.query('ROLLBACK');
+            rollbackSucceeded = true;
+          } catch (rollbackError) {
+            destroyClient = rollbackError;
+          }
+        }
+        error.code = phase === 'commit' && !rollbackSucceeded
+          ? 'AI_ACTION_COMMIT_OUTCOME_UNKNOWN'
+          : 'AI_ACTION_NOT_COMMITTED';
+        throw error;
+      } finally {
+        dbClient.release(destroyClient);
+      }
     } catch (error) {
       console.error("❌ AI Action Confirmation Error:", {
         code: typeof error?.code === 'string' ? error.code.slice(0, 40) : null,
@@ -745,7 +818,7 @@ router.post(
       const planTier = getPlanTier(req);
       const context = ContextEngine.buildContext(req, {}, planTier);
       const result = await ReActEngine.run({ userPrompt: message, context });
-      res.json({ reply: result.text });
+      res.json({ reply: result.text, widget: result.widget || null });
     } catch (error) {
       const response = getAiErrorResponse(error);
       res.status(response.status).json(response.body);

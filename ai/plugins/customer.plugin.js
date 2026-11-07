@@ -31,6 +31,7 @@ class CustomerPlugin extends BasePlugin {
       description: "Creates a new customer profile.",
       allowedRoles: ["owner", "hr", "admin"],
       isDestructive: true,
+      requiresTransactionalAudit: true,
       parameters: {
         type: "object",
         properties: {
@@ -48,6 +49,7 @@ class CustomerPlugin extends BasePlugin {
           email: params.email,
           phone: params.phone,
           companyName: params.companyName,
+          queryable: context.dbClient,
         });
       },
     };

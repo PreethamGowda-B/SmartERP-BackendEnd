@@ -96,12 +96,57 @@ const AI_RAG_PERSISTENT_CONVERSATIONS = {
   ],
 };
 
+const AI_AUDIT_TELEMETRY_SCHEMA = {
+  id: '048_ai_audit_telemetry_schema',
+  file: '048_ai_audit_telemetry_schema.sql',
+};
+
+const AI_AUDIT_TELEMETRY_COLUMNS = [
+  'company_id', 'user_id', 'user_role', 'tool_name', 'action_params', 'status',
+  'error_message', 'created_at', 'portal', 'module', 'plan_tier', 'model_scope',
+  'latency_ms', 'confidence_score', 'blocked', 'prompt_preview', 'provider', 'model',
+];
+const AI_AUDIT_LEGACY_COLUMNS = [
+  'id', 'company_id', 'user_id', 'user_name', 'role', 'prompt', 'action_name',
+  'affected_record_id', 'status', 'details', 'created_at',
+];
+const AI_AUDIT_REQUIRED_COLUMNS = [...new Set([...AI_AUDIT_TELEMETRY_COLUMNS, ...AI_AUDIT_LEGACY_COLUMNS])];
+const AI_AUDIT_REQUIRED_INDEXES = ['idx_ai_audit_logs_created_at', 'idx_ai_audit_logs_company_created'];
+const AI_AUDIT_COLUMN_TYPE_OPTIONS = {
+  id: ['integer', 'bigint', 'uuid'],
+  company_id: ['text'],
+  user_id: ['text'],
+  user_name: ['text'],
+  role: ['text'],
+  prompt: ['text'],
+  action_name: ['text'],
+  affected_record_id: ['text'],
+  status: ['text', 'character varying'],
+  details: ['jsonb'],
+  created_at: ['timestamp without time zone', 'timestamp with time zone'],
+  user_role: ['text', 'character varying'],
+  tool_name: ['text', 'character varying'],
+  action_params: ['jsonb'],
+  error_message: ['text'],
+  portal: ['text', 'character varying'],
+  module: ['text', 'character varying'],
+  plan_tier: ['text', 'character varying'],
+  model_scope: ['text', 'character varying'],
+  latency_ms: ['integer'],
+  confidence_score: ['numeric'],
+  blocked: ['boolean'],
+  prompt_preview: ['text'],
+  provider: ['text', 'character varying'],
+  model: ['text', 'character varying'],
+};
+
 const FORWARD_MIGRATIONS = [
   PRODUCTION_DISPATCH, PRODUCTION_DISPATCH_PRIVILEGES, PRODUCTION_PACKING_WORKFLOW,
   CUSTOMER_MANUFACTURING_REQUESTS, SUBSCRIPTION_CATALOG_AND_STORAGE,
   TIERED_SUPPORT_ENTITLEMENTS, INVOICE_PAYMENT_IDEMPOTENCY, SUPERADMIN_ANNOUNCEMENTS_SETTINGS,
   STAFF_PASSWORD_RESET_OTP_SCOPE, SECURITY_INFRASTRUCTURE_HARDENING_AND_RLS,
   AI_RAG_PERSISTENT_CONVERSATIONS,
+  AI_AUDIT_TELEMETRY_SCHEMA,
 ];
 
 // Subscription migrations 037/038/039 and the newer 041/042/043 changes require
@@ -117,6 +162,7 @@ const CONTROLLED_MIGRATION_IDS = new Set([
   STAFF_PASSWORD_RESET_OTP_SCOPE.id,
   SECURITY_INFRASTRUCTURE_HARDENING_AND_RLS.id,
   AI_RAG_PERSISTENT_CONVERSATIONS.id,
+  AI_AUDIT_TELEMETRY_SCHEMA.id,
 ]);
 const STARTUP_MIGRATIONS = FORWARD_MIGRATIONS.filter(
   migration => !CONTROLLED_MIGRATION_IDS.has(migration.id)
@@ -438,7 +484,7 @@ async function assertInvoicePaymentIdempotencySchema(client) {
 }
 
 async function verifyMigration(client, migrationId) {
-  if (![INVOICE_PAYMENT_IDEMPOTENCY.id, SUPERADMIN_ANNOUNCEMENTS_SETTINGS.id, STAFF_PASSWORD_RESET_OTP_SCOPE.id, AI_RAG_PERSISTENT_CONVERSATIONS.id].includes(migrationId)) {
+  if (![INVOICE_PAYMENT_IDEMPOTENCY.id, SUPERADMIN_ANNOUNCEMENTS_SETTINGS.id, STAFF_PASSWORD_RESET_OTP_SCOPE.id, AI_RAG_PERSISTENT_CONVERSATIONS.id, AI_AUDIT_TELEMETRY_SCHEMA.id].includes(migrationId)) {
     await assertProductionDispatchSchema(client);
   }
   if (migrationId === PRODUCTION_DISPATCH_PRIVILEGES.id) {
@@ -513,6 +559,60 @@ async function verifyMigration(client, migrationId) {
   if (migrationId === AI_RAG_PERSISTENT_CONVERSATIONS.id) {
     await assertAiRagPersistentConversationsSchema(client);
   }
+  if (migrationId === AI_AUDIT_TELEMETRY_SCHEMA.id) {
+    await assertAiAuditTelemetrySchema(client);
+  }
+}
+
+async function assertAiAuditTelemetrySchema(client) {
+  const table = await client.query("SELECT to_regclass('public.ai_audit_logs') IS NOT NULL AS table_exists");
+  if (table.rows[0]?.table_exists !== true) throw new Error('AI audit telemetry schema verification failed.');
+  const columnsResult = await client.query(`
+    SELECT column_name, data_type, is_nullable
+      FROM information_schema.columns
+     WHERE table_schema='public' AND table_name='ai_audit_logs'
+  `);
+  const columns = new Map(columnsResult.rows.map((row) => [row.column_name, row]));
+  const missingColumns = AI_AUDIT_REQUIRED_COLUMNS.filter((name) => !columns.has(name));
+  const wrongTypes = Object.entries(AI_AUDIT_COLUMN_TYPE_OPTIONS).filter(([name, types]) =>
+    columns.has(name) && !types.includes(columns.get(name).data_type)
+  ).map(([name]) => name);
+  const legacyNotNullable = ['role', 'prompt', 'action_name'].filter((name) => columns.get(name)?.is_nullable !== 'YES');
+  const indexesResult = await client.query("SELECT indexname, indexdef FROM pg_indexes WHERE schemaname='public' AND tablename='ai_audit_logs'");
+  const indexes = new Map(indexesResult.rows.map((row) => [row.indexname, row.indexdef]));
+  const invalidIndexes = AI_AUDIT_REQUIRED_INDEXES.filter((name) => !isAiAuditIndexDefinitionValid(name, indexes.get(name)));
+  if (missingColumns.length || wrongTypes.length || legacyNotNullable.length || invalidIndexes.length) {
+    throw new Error('AI audit telemetry schema verification failed.');
+  }
+  return { table_exists: true, missingColumns, wrongTypes, legacyNotNullable, invalidIndexes };
+}
+
+function isAiAuditIndexDefinitionValid(indexName, definition) {
+  if (!definition) return false;
+  const normalized = String(definition).toLowerCase().replace(/"/g, '').replace(/\s+/g, ' ');
+  if (indexName === 'idx_ai_audit_logs_created_at') {
+    return /on (?:public\.)?ai_audit_logs using btree \(created_at desc\)/.test(normalized);
+  }
+  if (indexName === 'idx_ai_audit_logs_company_created') {
+    return /on (?:public\.)?ai_audit_logs using btree \(company_id, created_at desc\)/.test(normalized);
+  }
+  return false;
+}
+
+async function assertRecognizedAiAuditBaseline(client) {
+  const result = await client.query(`
+    SELECT column_name
+      FROM information_schema.columns
+     WHERE table_schema='public' AND table_name='ai_audit_logs'
+  `);
+  const columns = new Set(result.rows.map(row => row.column_name));
+  if (!columns.size) return { tableExists: false, baseline: null };
+  const legacyColumns = ['id','company_id','user_id','user_name','role','prompt','action_name','affected_record_id','status','details','created_at'];
+  const runtimeColumns = ['id','company_id','user_id','user_role','tool_name','action_params','status','error_message','created_at','portal','module','plan_tier','model_scope','latency_ms','confidence_score','blocked','prompt_preview'];
+  const hasBaseline = (required) => required.every(column => columns.has(column));
+  if (hasBaseline(legacyColumns)) return { tableExists: true, baseline: '018_legacy' };
+  if (hasBaseline(runtimeColumns)) return { tableExists: true, baseline: 'legacy_runtime_ddl' };
+  throw new Error('Migration 048 found an unrecognized existing ai_audit_logs schema; refusing to alter it. Inspect the production schema and reconcile it explicitly.');
 }
 
 async function assertAiRagPersistentConversationsSchema(client) {
@@ -686,8 +786,12 @@ async function applyForwardMigration(client, { migrationId, sql }) {
         if (preexistingFunction.rows[0]?.exists) names.push('production_reject_history_mutation()');
         throw new Error(`Untracked Production & Dispatch objects already exist (${names.join(', ')}); inspect and reconcile the migration ledger before proceeding.`);
       }
-    } else if (![INVOICE_PAYMENT_IDEMPOTENCY.id, SUPERADMIN_ANNOUNCEMENTS_SETTINGS.id, STAFF_PASSWORD_RESET_OTP_SCOPE.id].includes(migrationId)) {
+    } else if (![INVOICE_PAYMENT_IDEMPOTENCY.id, SUPERADMIN_ANNOUNCEMENTS_SETTINGS.id, STAFF_PASSWORD_RESET_OTP_SCOPE.id, AI_AUDIT_TELEMETRY_SCHEMA.id].includes(migrationId)) {
       await assertProductionDispatchSchema(client);
+    }
+
+    if (migrationId === AI_AUDIT_TELEMETRY_SCHEMA.id) {
+      await assertRecognizedAiAuditBaseline(client);
     }
 
     await client.query(stripOuterTransaction(sql));
@@ -717,6 +821,12 @@ module.exports = {
   SUPERADMIN_ANNOUNCEMENTS_SETTINGS,
   STAFF_PASSWORD_RESET_OTP_SCOPE,
   AI_RAG_PERSISTENT_CONVERSATIONS,
+  AI_AUDIT_TELEMETRY_SCHEMA,
+  AI_AUDIT_TELEMETRY_COLUMNS,
+  AI_AUDIT_LEGACY_COLUMNS,
+  AI_AUDIT_REQUIRED_COLUMNS,
+  AI_AUDIT_REQUIRED_INDEXES,
+  AI_AUDIT_COLUMN_TYPE_OPTIONS,
   FORWARD_MIGRATIONS,
   STARTUP_MIGRATIONS,
   stripOuterTransaction,
@@ -727,6 +837,9 @@ module.exports = {
   assertCustomerManufacturingRequestSchema,
   assertSuperAdminAnnouncementsSettingsSchema,
   assertAiRagPersistentConversationsSchema,
+  assertAiAuditTelemetrySchema,
+  isAiAuditIndexDefinitionValid,
+  assertRecognizedAiAuditBaseline,
   inspectInvoicePaymentIdempotencySchema,
   assertInvoicePaymentIdempotencySchema,
   applyForwardMigration,

@@ -31,12 +31,12 @@ class CustomerService {
   /**
    * Creates a new customer.
    */
-  static async createCustomer({ companyId, name, email, phone, companyName }) {
+  static async createCustomer({ companyId, name, email, phone, companyName, queryable = pool }) {
     if (!companyId || !name) {
       throw new Error("Company ID and customer name are required.");
     }
 
-    const res = await pool.query(
+    const res = await queryable.query(
       `INSERT INTO customers (name, email, phone, company_name, company_id, status, created_at)
        VALUES ($1, $2, $3, $4, $5, 'active', NOW())
        RETURNING id, name, email, phone, company_name, created_at`,

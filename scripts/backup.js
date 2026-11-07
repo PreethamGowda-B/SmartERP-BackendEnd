@@ -14,9 +14,10 @@ const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
 require('dotenv').config();
+const { cleanConnectionString } = require('../utils/databaseUrl');
 
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: cleanConnectionString(process.env.DATABASE_URL),
   ssl: { rejectUnauthorized: false },
   max: 3,
   connectionTimeoutMillis: 15000

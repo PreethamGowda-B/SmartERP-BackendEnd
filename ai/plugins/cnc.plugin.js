@@ -679,9 +679,9 @@ class CncPlugin extends BasePlugin {
     // ── Tool 7: prepare_service_escalation ────────────────────────────────────
     this.tools["prepare_service_escalation"] = {
       name: "prepare_service_escalation",
-      description: "Prepares a high-priority service ticket escalation for a critical machine breakdown. Returns a structured confirmation widget for user approval.",
+      description: "Drafts a service escalation proposal for review. This tool does not create a ticket or send alerts.",
       allowedRoles: ["owner", "admin", "hr", "employee", "super_admin"],
-      isDestructive: true,
+      isDestructive: false,
       parameters: {
         type: "object",
         properties: {
@@ -694,15 +694,13 @@ class CncPlugin extends BasePlugin {
       },
       execute: async (params, context) => {
         return {
-          action: "ACTION_CONFIRMATION_REQUIRED",
-          actionType: "CREATE_SERVICE_ESCALATION",
-          title: "Confirm CNC Service Escalation",
+          type: "PROPOSAL_ONLY",
+          status: "not_created",
           machineId: params.machineId,
           symptom: params.symptom,
           urgency: params.urgency || "urgent",
-          proposedAction: params.proposedAction || "Dispatch Senior Field Service Engineer for on-site diagnostic verification.",
-          warning: "Creating this escalation will dispatch priority alerts to the Operations Manager and Field Service Lead.",
-          requiresUserConfirmation: true
+          proposedAction: params.proposedAction || null,
+          message: "Draft only. No service ticket, assignment, or alert was created. Use the service operations workflow to submit an escalation.",
         };
       }
     };

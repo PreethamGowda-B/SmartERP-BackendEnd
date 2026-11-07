@@ -7,6 +7,8 @@ const { requireFeature } = require('../middleware/featureGuard');
 const { checkPlanLimit } = require('../middleware/planMiddleware');
 const { createAiPromptGuard } = require('../middleware/aiPromptGuard');
 const { getAiErrorResponse } = require('../utils/aiErrorResponse');
+const { redisClient } = require('../utils/redis');
+const { createApprovalToken, consumeApprovalToken } = require('../services/aiActionApproval');
 
 const validateCopilotPrompt = createAiPromptGuard({ field: 'prompt' });
 
@@ -25,9 +27,13 @@ router.post('/', authenticateToken, loadPlan, requireFeature('ai_assistant', 'AI
     }
     const userId = req.user.userId || req.user.id;
     const userName = req.user.name || 'User';
-    const role = req.user.role || 'owner';
+    const role = req.user.role || 'employee';
     const prompt = req.sanitizedAiPrompt;
     const { mode = 'query', confirm_action = false } = req.body;
+
+    if (!companyId) {
+      return res.status(403).json({ message: 'Select a company context before using the company operations copilot.' });
+    }
 
     // RBAC Permission Guard for AI Copilot
     if (role === 'customer' && prompt.toLowerCase().includes('delete')) {
@@ -42,6 +48,9 @@ router.post('/', authenticateToken, loadPlan, requireFeature('ai_assistant', 'AI
 
     // ── 1. READ-ONLY QUERY INTENTS (Level 1 - Immediate) ─────────────────────
     if (lower.includes('pending job') || lower.includes('active job')) {
+      if (!['owner', 'admin', 'hr', 'service_manager'].includes(String(role).toLowerCase())) {
+        return res.status(403).json({ message: 'You are not authorized to view company-wide job information.' });
+      }
       const jobsRes = await pool.query(
         `SELECT id, title, status, priority, service_type FROM jobs WHERE company_id::text = $1::text AND status NOT IN ('completed', 'cancelled')`,
         [companyId]
@@ -49,6 +58,9 @@ router.post('/', authenticateToken, loadPlan, requireFeature('ai_assistant', 'AI
       responseText = `Found ${jobsRes.rows.length} pending job(s) for your company: ${jobsRes.rows.map((j) => `"${j.title}" (${j.service_type})`).join(', ')}.`;
       workflowType = 'query_jobs';
     } else if (lower.includes('revenue') || lower.includes('financial')) {
+      if (!['owner', 'admin'].includes(String(role).toLowerCase())) {
+        return res.status(403).json({ message: 'Only owners and administrators may view company financial summaries.' });
+      }
       const invRes = await pool.query(
         `SELECT SUM(total_amount) as total FROM service_quotations WHERE company_id::text = $1::text AND status = 'converted_to_job'`,
         [companyId]
@@ -56,6 +68,9 @@ router.post('/', authenticateToken, loadPlan, requireFeature('ai_assistant', 'AI
       responseText = `Total revenue recorded from approved CNC service jobs is ₹${Number(invRes.rows[0]?.total || 0).toLocaleString()}.`;
       workflowType = 'query_revenue';
     } else if (lower.includes('machine') && (lower.includes('breakdown') || lower.includes('health'))) {
+      if (!['owner', 'admin', 'service_manager'].includes(String(role).toLowerCase())) {
+        return res.status(403).json({ message: 'You are not authorized to view company-wide machine information.' });
+      }
       const macRes = await pool.query(
         `SELECT machine_name, serial_number, health_score, status FROM customer_machines WHERE company_id::text = $1::text ORDER BY health_score ASC`,
         [companyId]
@@ -71,45 +86,88 @@ router.post('/', authenticateToken, loadPlan, requireFeature('ai_assistant', 'AI
       executionLevel = 2;
       workflowType = lower.includes('schedule pm') ? 'pm_flow' : 'breakdown_flow';
 
+      if (!['owner', 'admin'].includes(String(role).toLowerCase())) {
+        return res.status(403).json({ message: 'Only an owner or administrator may approve an AI-created service job.' });
+      }
+
+      const isPm = workflowType === 'pm_flow';
+      const jobPayload = {
+        title: isPm ? '[AI Scheduled PM] Machine Maintenance Visit' : '[AI Breakdown Dispatch] CNC Breakdown Repair',
+        serviceType: isPm ? 'preventive' : 'breakdown',
+        priority: 'high',
+      };
+      const approvalPayload = { workflowType, job: jobPayload };
+
       if (!confirm_action) {
+        let approvalToken;
+        try {
+          approvalToken = createApprovalToken({
+            userId,
+            companyId,
+            action: 'create_service_job',
+            payload: approvalPayload,
+          });
+        } catch (approvalError) {
+          const response = getAiErrorResponse(approvalError);
+          return res.status(response.status).json({ ...response.body, message: response.body.error });
+        }
         return res.json({
           success: true,
           execution_level: 2,
           requires_confirmation: true,
+          approval_token: approvalToken,
+          approval_expires_in_seconds: 300,
           workflow_type: workflowType,
-          ai_interpretation: `Intended action: Create a new ${workflowType === 'pm_flow' ? 'Preventive Maintenance' : 'Breakdown'} Job with Machine metadata, update Machine Timeline, tag "Created by SmartERP AI", and send owner notification.`,
+          ai_interpretation: `Intended action: create one ${workflowType === 'pm_flow' ? 'preventive maintenance' : 'breakdown'} job and add a machine timeline event. No machine, customer, assignment, or notification is included.`,
           message: `Please confirm execution of this multi-step ${workflowType === 'pm_flow' ? 'PM' : 'Breakdown'} AI workflow.`,
         });
       }
 
-      // Execute Multi-Step Workflow using DB Transaction
-      const isPm = workflowType === 'pm_flow';
-      const jobTitle = isPm ? `[AI Scheduled PM] Machine Maintenance Visit` : `[AI Breakdown Dispatch] CNC Breakdown Repair`;
-
-      const jobRes = await pool.query(
-        `INSERT INTO jobs (title, description, customer_id, company_id, service_type, priority, status, employee_status, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, 'high', 'open', 'pending', NOW(), NOW())
-         RETURNING *`,
-        [
-          jobTitle,
-          `Multi-step workflow created by SmartERP AI Copilot for ${userName}.`,
-          'self',
+      try {
+        await consumeApprovalToken(req.body?.approval_token, {
+          userId,
           companyId,
-          isPm ? 'preventive' : 'breakdown',
-        ]
-      );
+          action: 'create_service_job',
+          payload: approvalPayload,
+          redisClient,
+        });
+      } catch (approvalError) {
+        const response = getAiErrorResponse(approvalError);
+        return res.status(response.status).json({ ...response.body, message: response.body.error });
+      }
 
-      const job = jobRes.rows[0];
-
-      // Auto-Trigger Timeline Event
-      await pool.query(
-        `INSERT INTO machine_timeline_events (company_id, event_type, title, description, created_at)
-         VALUES ($1, $2, $3, $4, NOW())`,
-        [companyId, isPm ? 'pm_scheduled' : 'breakdown_reported', jobTitle, `AI Workflow initiated by ${userName}`]
-      ).catch(() => {});
-
-      actionResult = { job_id: job.id, job_title: job.title };
-      responseText = `Created job #${job.id.toString().substring(0, 8)}. Open the job record to review its current assignment and status.`;
+      // Execute the approved workflow, timeline event, and audit record in one
+      // tenant-scoped transaction. The AI cannot vary any write fields after approval.
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        await client.query("SELECT set_config('app.current_company_id', $1::text, true)", [String(companyId)]);
+        const jobRes = await client.query(
+          `INSERT INTO jobs (title, description, customer_id, company_id, service_type, priority, status, employee_status, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, 'open', 'pending', NOW(), NOW())
+           RETURNING id, title`,
+          [jobPayload.title, `Workflow created by SmartERP AI Copilot for ${userName}.`, null, companyId, jobPayload.serviceType, jobPayload.priority]
+        );
+        const job = jobRes.rows[0];
+        await client.query(
+          `INSERT INTO machine_timeline_events (company_id, event_type, title, description, created_at)
+           VALUES ($1, $2, $3, $4, NOW())`,
+          [companyId, isPm ? 'pm_scheduled' : 'breakdown_reported', jobPayload.title, `AI Workflow initiated by ${userName}`]
+        );
+        await client.query(
+          `INSERT INTO ai_action_audit_trail (company_id, user_id, user_name, prompt, ai_interpretation, workflow_type, execution_level, approval_status, result_summary, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, 2, 'executed', $7, NOW())`,
+          [companyId, userId, userName, `AI request (${workflowType})`, 'User approved a server-verified, payload-bound AI service job.', workflowType, `Created job ${job.id}`]
+        );
+        await client.query('COMMIT');
+        actionResult = { job_id: job.id, job_title: job.title };
+        responseText = `Created job #${String(job.id).substring(0, 8)}. Open the job record to review its current assignment and status.`;
+      } catch (writeError) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw writeError;
+      } finally {
+        client.release();
+      }
     }
 
     // ── 3. HIGH-RISK INTENTS (Level 3 - Explicit Owner Approval) ─────────────
@@ -169,8 +227,11 @@ router.post('/', authenticateToken, loadPlan, requireFeature('ai_assistant', 'AI
 router.get('/activity', authenticateToken, loadPlan, requireFeature('ai_assistant', 'AI assistant'), async (req, res) => {
   try {
     const companyId = req.user.companyId || req.user.company_id;
-    if (!companyId && req.user.role !== 'super_admin') {
-      return res.json({ success: true, activities: [] });
+    if (!companyId) {
+      return res.status(403).json({ success: false, message: 'Select a company context before viewing AI activity.' });
+    }
+    if (!['owner', 'admin', 'hr', 'service_manager'].includes(String(req.user.role || '').toLowerCase())) {
+      return res.status(403).json({ success: false, message: 'You are not authorized to view company AI activity.' });
     }
 
     const result = await pool.query(

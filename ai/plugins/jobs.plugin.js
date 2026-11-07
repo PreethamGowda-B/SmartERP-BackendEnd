@@ -65,6 +65,7 @@ class JobsPlugin extends BasePlugin {
       description: "Creates a new job in SmartERP.",
       allowedRoles: ["owner", "hr", "admin"],
       isDestructive: true,
+      requiresTransactionalAudit: true,
       parameters: {
         type: "object",
         properties: {
@@ -81,6 +82,7 @@ class JobsPlugin extends BasePlugin {
           title: params.title,
           description: params.description,
           priority: params.priority,
+          queryable: context.dbClient,
         });
       },
     };

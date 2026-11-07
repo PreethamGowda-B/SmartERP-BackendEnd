@@ -1,6 +1,40 @@
 'use strict';
 
 function getAiErrorResponse(error) {
+  const approvalStatuses = {
+    AI_APPROVAL_INVALID: 403,
+    AI_APPROVAL_SCOPE_MISMATCH: 403,
+    AI_APPROVAL_ALREADY_USED: 409,
+    AI_APPROVAL_NOT_CONFIGURED: 503,
+    AI_APPROVAL_STORE_UNAVAILABLE: 503,
+  };
+  if (approvalStatuses[error?.code]) {
+    return {
+      status: approvalStatuses[error.code],
+      body: { code: error.code, error: error.message || 'The AI approval could not be verified. No changes were made.' },
+    };
+  }
+  if (error?.code === 'AI_ACTION_NOT_COMMITTED') {
+    return {
+      status: 503,
+      body: {
+        code: error.code,
+        error: 'No changes were committed. This approval was consumed; start a new approval before retrying.',
+      },
+    };
+  }
+  if (error?.code === 'AI_ACTION_COMMIT_OUTCOME_UNKNOWN') {
+    return {
+      status: 503,
+      body: {
+        code: error.code,
+        error: 'The database could not confirm the commit result. Check the record and audit log before requesting a new approval.',
+      },
+    };
+  }
+  if (['AI_AUTH_CONTEXT_UNAVAILABLE', 'AI_TOOL_ENTITLEMENT_DENIED'].includes(error?.code)) {
+    return { status: 403, body: { code: error.code, error: 'You are not authorized to perform this AI action.' } };
+  }
   if (error?.code === 'AI_PROVIDER_NOT_CONFIGURED') {
     return { status: 503, body: { code: error.code, error: 'SmartERP AI is not configured on the server. Please contact your administrator.' } };
   }

@@ -2,38 +2,50 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
+const { loadPlan } = require('../middleware/planMiddleware');
+const { requireFeature } = require('../middleware/featureGuard');
+
+const SCHEDULER_ROLES = new Set(['owner', 'admin', 'hr', 'service_manager']);
+
+function canViewAutoSchedule(role) {
+  return SCHEDULER_ROLES.has(String(role || '').toLowerCase());
+}
+
+function buildWorkloadRankings(employees) {
+  return employees.map((emp) => ({
+    user_id: emp.id,
+    name: emp.name,
+    position: emp.position || 'Service Engineer',
+    active_jobs: emp.active_job_count || 0,
+    recommendation_reason: `Current recorded workload: ${emp.active_job_count || 0} active jobs. No skill, certification, or machine compatibility data was used.`,
+  }));
+}
 
 // ─── POST /api/ai/auto-schedule (Engineer Match Ranking Engine) ───────────
-router.post('/', authenticateToken, async (req, res) => {
+router.post('/', authenticateToken, loadPlan, requireFeature('ai_assistant', 'AI assistant'), async (req, res) => {
   try {
     const companyId = req.user.companyId || req.user.company_id;
     if (!companyId) {
       return res.status(401).json({ message: 'Unauthorized: Missing company context.' });
     }
-    const { controller_type = 'Fanuc 0i-MF', service_type = 'breakdown' } = req.body;
+    const role = String(req.user.role || '').toLowerCase();
+    if (!canViewAutoSchedule(role)) {
+      return res.status(403).json({ message: 'Only company operations managers may view employee scheduling recommendations.' });
+    }
 
     const employees = await pool.query(
       `SELECT u.id, u.name, ep.position, ep.status, ep.active_job_count
        FROM users u
        LEFT JOIN employee_profiles ep ON u.id::text = ep.user_id::text
-       WHERE u.company_id::text = $1::text`,
+         AND ep.company_id::text = $1::text
+       WHERE u.company_id::text = $1::text AND COALESCE(ep.status, 'active') = 'active'
+       ORDER BY COALESCE(ep.active_job_count, 0) ASC, u.name ASC`,
       [String(companyId)]
-    ).catch(() => ({ rows: [] }));
+    );
 
-    const rankings = employees.rows.map((emp, i) => {
-      const matchScore = Math.max(70, 98 - (emp.active_job_count || 0) * 10 - i * 3);
-      return {
-        user_id: emp.id,
-        name: emp.name,
-        position: emp.position || 'Service Engineer',
-        controller_expertise: controller_type,
-        match_score: matchScore,
-        active_jobs: emp.active_job_count || 0,
-        recommendation_reason: `${emp.name} has 4.9 rating, ${controller_type} certification, and lowest active workload (${emp.active_job_count || 0} jobs).`,
-      };
-    }).sort((a, b) => b.match_score - a.match_score);
+    const rankings = buildWorkloadRankings(employees.rows);
 
-    res.json({ success: true, rankings });
+    res.json({ success: true, ranking_basis: 'recorded_active_job_count', rankings });
   } catch (err) {
     console.error('❌ Error executing auto schedule match:', err.message);
     res.status(500).json({ message: err.message || 'Server error' });
@@ -41,3 +53,5 @@ router.post('/', authenticateToken, async (req, res) => {
 });
 
 module.exports = router;
+module.exports.canViewAutoSchedule = canViewAutoSchedule;
+module.exports.buildWorkloadRankings = buildWorkloadRankings;

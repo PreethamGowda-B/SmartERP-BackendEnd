@@ -49,7 +49,7 @@ test('payment integration runner performs the isolated-database preflight before
   const poolCreation = runner.indexOf('new Pool({', preflight);
   assert.ok(preflight >= 0);
   assert.ok(poolCreation > preflight);
-  assert.match(runner, /connectionString:\s*activeEnv\.TEST_DATABASE_URL/);
+  assert.match(runner, /connectionString:\s*cleanConnectionString\(activeEnv\.TEST_DATABASE_URL\)/);
   assert.match(runner, /assertDedicatedTestDatabaseName\(preflightReport\.database\)/);
   assert.match(runner, /applyForwardMigration\(client, \{ migrationId: migration\.id, sql: migrationSql \}\)/);
   assert.doesNotMatch(runner, /pool\.query\(migrationSql\)/);

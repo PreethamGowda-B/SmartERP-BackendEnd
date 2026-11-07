@@ -63,7 +63,7 @@ class EmployeeService {
    * @param {string} [params.position]
    * @param {string} [params.department]
    */
-  static async createEmployee({ companyId, name, email, position, department }) {
+  static async createEmployee({ companyId, name, email, position, department, queryable = pool }) {
     if (!companyId || !name || !email) {
       throw new Error("Company ID, name, and email are required to create an employee.");
     }
@@ -71,7 +71,7 @@ class EmployeeService {
     const bcrypt = require("bcrypt");
     const defaultPasswordHash = await bcrypt.hash("SmartERP@123", 10);
 
-    const res = await pool.query(
+    const res = await queryable.query(
       `INSERT INTO users (name, email, password, position, department, company_id, role, is_active, created_at)
        VALUES ($1, $2, $3, $4, $5, $6, 'employee', true, NOW())
        RETURNING id, name, email, position, department, is_active, created_at`,

@@ -34,6 +34,7 @@ class PayrollPlugin extends BasePlugin {
       description: "Generates monthly payroll records for all active company employees.",
       allowedRoles: ["owner", "admin"],
       isDestructive: true,
+      requiresTransactionalAudit: true,
       parameters: {
         type: "object",
         properties: {
@@ -47,6 +48,7 @@ class PayrollPlugin extends BasePlugin {
           companyId: context.user.companyId,
           month: params.month,
           year: params.year,
+          queryable: context.dbClient,
         });
       },
     };

@@ -1,42 +1,52 @@
 const { pool } = require("../../db");
+const crypto = require('node:crypto');
+
+function resolveAuditHmacKey() {
+  const dedicated = Boolean(process.env.AI_AUDIT_HMAC_SECRET);
+  const rootSecret = process.env.AI_AUDIT_HMAC_SECRET || process.env.JWT_SECRET;
+  if (rootSecret) {
+    const key = crypto.hkdfSync(
+      'sha256',
+      Buffer.from(rootSecret, 'utf8'),
+      Buffer.from('smarterp-ai-audit-hmac-v1', 'utf8'),
+      Buffer.from('approved-audit-fingerprint', 'utf8'),
+      32,
+    );
+    return { key, keyId: dedicated ? 'dedicated-v1' : 'jwt-derived-v1' };
+  }
+  const error = new Error('AI audit fingerprint key is not configured.');
+  error.code = 'AI_AUDIT_HMAC_NOT_CONFIGURED';
+  throw error;
+}
+
+function keyedDigest(purpose, value, key = resolveAuditHmacKey().key) {
+  return crypto.createHmac('sha256', key)
+    .update(`smarterp:ai-audit:${purpose}:v1\0`)
+    .update(typeof value === 'string' ? value : JSON.stringify(value))
+    .digest('hex');
+}
+
+function approvalAuditParams(toolName, params = {}, keyConfig = resolveAuditHmacKey()) {
+  const safeFields = {
+    create_job: ['priority'],
+    create_employee: ['position', 'department'],
+    create_customer: [],
+    calculate_payroll: ['month', 'year'],
+  }[toolName] || [];
+  const fields = {};
+  for (const key of safeFields) {
+    const value = params[key];
+    if (['string', 'number', 'boolean'].includes(typeof value)) fields[key] = String(value).slice(0, 80);
+  }
+  return {
+    payload_hmac_sha256: keyedDigest('approved-action-payload', params, keyConfig.key),
+    hmac_key_id: keyConfig.keyId,
+    supplied_fields: Object.keys(params).filter((key) => key !== 'confirmed').sort(),
+    safe_fields: fields,
+  };
+}
 
 class MetricsService {
-  /**
-   * Ensures the ai_audit_logs table exists with all extended columns.
-   */
-  static async ensureTable() {
-    // Create base table if not exists
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS ai_audit_logs (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        company_id TEXT NOT NULL,
-        user_id TEXT NOT NULL,
-        user_role VARCHAR(50) NOT NULL,
-        tool_name VARCHAR(100) NOT NULL,
-        action_params JSONB NOT NULL,
-        status VARCHAR(40) NOT NULL,
-        error_message TEXT,
-        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-      )
-    `);
-
-    // Additive column extensions — safe to run multiple times
-    const extensions = [
-      "ALTER TABLE ai_audit_logs ADD COLUMN IF NOT EXISTS portal VARCHAR(50)",
-      "ALTER TABLE ai_audit_logs ADD COLUMN IF NOT EXISTS module VARCHAR(100)",
-      "ALTER TABLE ai_audit_logs ADD COLUMN IF NOT EXISTS plan_tier VARCHAR(20)",
-      "ALTER TABLE ai_audit_logs ADD COLUMN IF NOT EXISTS model_scope VARCHAR(50)",
-      "ALTER TABLE ai_audit_logs ADD COLUMN IF NOT EXISTS latency_ms INTEGER",
-      "ALTER TABLE ai_audit_logs ADD COLUMN IF NOT EXISTS confidence_score NUMERIC(5,4)",
-      "ALTER TABLE ai_audit_logs ADD COLUMN IF NOT EXISTS blocked BOOLEAN DEFAULT FALSE",
-      "ALTER TABLE ai_audit_logs ADD COLUMN IF NOT EXISTS prompt_preview TEXT",
-    ];
-
-    for (const sql of extensions) {
-      await pool.query(sql).catch(() => {}); // Ignore if column already exists
-    }
-  }
-
   /**
    * Writes AI action execution audit record to PostgreSQL table.
    * Extended with portal, module, plan_tier, model_scope, latency_ms, confidence_score, blocked fields.
@@ -55,30 +65,56 @@ class MetricsService {
     confidenceScore = null,
     blocked = false,
     promptPreview = null,
+    provider = null,
+    model = null,
   }) {
     try {
-      const companyId = userContext?.user?.companyId || "0";
+      return await MetricsService.writeAIAuditEvent({
+        userContext, toolName, params, status, error, portal, module, planTier,
+        modelScope, latencyMs, confidenceScore, blocked, promptPreview, provider, model,
+      });
+    } catch (err) {
+      console.warn("⚠️ MetricsService audit logging warning:", {
+        code: typeof err?.code === 'string' ? err.code.slice(0, 40) : null,
+        name: typeof err?.name === 'string' ? err.name.slice(0, 60) : 'Error',
+      });
+    }
+  }
+
+  // Unlike best-effort telemetry, approved writes must share their transaction
+  // with this insert so a missing audit record also rolls back the ERP change.
+  static async writeAIAuditEvent({ queryable = pool, ...event }) {
+      const {
+        userContext, toolName, params, status = 'SUCCESS', error = null, portal = null,
+        module = null, planTier = null, modelScope = null, latencyMs = null,
+        confidenceScore = null, blocked = false, promptPreview = null, provider = null, model = null,
+      } = event;
+      const companyId = userContext?.user?.companyId || userContext?.user?.company_id || "0";
       const userId = userContext?.user?.id || "0";
       const role = userContext?.user?.role || "user";
       const resolvedPortal = portal || userContext?.ui?.portal || null;
       const resolvedModule = module || userContext?.ui?.module || null;
 
-      await this.ensureTable();
-
-      await pool.query(
+      const auditHmacKey = resolveAuditHmacKey();
+      const auditParams = approvalAuditParams(toolName, params || {}, auditHmacKey);
+      const promptDigest = promptPreview
+        ? `hmac-sha256:${keyedDigest('prompt-preview', String(promptPreview), auditHmacKey.key)}`
+        : null;
+      await queryable.query(
         `INSERT INTO ai_audit_logs (
           company_id, user_id, user_role, tool_name, action_params, status, error_message,
           portal, module, plan_tier, model_scope, latency_ms, confidence_score, blocked, prompt_preview,
+          provider, model,
           created_at
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,NOW())`,
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,NOW())`,
         [
           String(companyId),
           String(userId),
           role,
           toolName,
-          JSON.stringify(params || {}),
+          JSON.stringify(auditParams),
           status,
-          error ? String(error) : null,
+          error ? `${String(error.name || 'Error').slice(0, 40)}:${String(error.code || 'unknown').slice(0, 40)}` : null,
           resolvedPortal,
           resolvedModule,
           planTier,
@@ -86,12 +122,11 @@ class MetricsService {
           latencyMs,
           confidenceScore,
           blocked,
-          promptPreview ? promptPreview.substring(0, 200) : null,
+          promptDigest,
+          provider,
+          model,
         ]
       );
-    } catch (err) {
-      console.warn("⚠️ MetricsService audit logging warning:", err.message);
-    }
   }
 
   /**
@@ -102,8 +137,7 @@ class MetricsService {
       const companyId = userContext?.user?.companyId || "0";
       const userId = userContext?.user?.id || "0";
       const role = userContext?.user?.role || "user";
-
-      await this.ensureTable();
+      const auditHmacKey = resolveAuditHmacKey();
 
       await pool.query(
         `INSERT INTO ai_audit_logs (
@@ -116,16 +150,25 @@ class MetricsService {
           String(userId),
           role,
           "PRO_PLAN_INTERCEPTION",
-          JSON.stringify({ prompt, matchedKeyword, planTier }),
+          JSON.stringify({
+            prompt_hmac_sha256: keyedDigest('interception-prompt', String(prompt || ''), auditHmacKey.key),
+            prompt_length: String(prompt || '').length,
+            matched_keyword_hmac_sha256: keyedDigest('interception-keyword', String(matchedKeyword || ''), auditHmacKey.key),
+            planTier,
+            hmac_key_id: auditHmacKey.keyId,
+          }),
           "INTERCEPTED",
-          `Rule match: '${matchedKeyword}' on '${planTier}' plan`,
+          'AI rule interception',
           planTier,
           true,
-          prompt ? prompt.substring(0, 200) : null,
+          prompt ? `hmac-sha256:${keyedDigest('prompt-preview', String(prompt), auditHmacKey.key)}` : null,
         ]
       );
     } catch (err) {
-      console.warn("⚠️ MetricsService logAIInterception warning:", err.message);
+      console.warn("⚠️ MetricsService logAIInterception warning:", {
+        code: typeof err?.code === 'string' ? err.code.slice(0, 40) : null,
+        name: typeof err?.name === 'string' ? err.name.slice(0, 60) : 'Error',
+      });
     }
   }
 
@@ -135,8 +178,6 @@ class MetricsService {
    */
   static async getAIStats() {
     try {
-      await this.ensureTable();
-
       const today = new Date();
       today.setHours(0, 0, 0, 0);
       const monthStart = new Date(today.getFullYear(), today.getMonth(), 1);
@@ -183,7 +224,10 @@ class MetricsService {
         })),
       };
     } catch (err) {
-      console.error("⚠️ MetricsService.getAIStats error:", err.message);
+      console.error("⚠️ MetricsService.getAIStats error:", {
+        code: typeof err?.code === 'string' ? err.code.slice(0, 40) : null,
+        name: typeof err?.name === 'string' ? err.name.slice(0, 60) : 'Error',
+      });
       return {
         requestsToday: 0,
         requestsThisMonth: 0,
@@ -202,7 +246,6 @@ class MetricsService {
    */
   static async getAuditLogs({ page = 1, limit = 50, companyId = null, status = null, fromDate = null } = {}) {
     try {
-      await this.ensureTable();
       const offset = (page - 1) * limit;
       const conditions = [];
       const params = [];
@@ -216,7 +259,11 @@ class MetricsService {
 
       const [rows, countRes] = await Promise.all([
         pool.query(
-          `SELECT * FROM ai_audit_logs ${where} ORDER BY created_at DESC LIMIT $${idx} OFFSET $${idx + 1}`,
+          `SELECT id, company_id, user_id, user_role, tool_name, action_params, status,
+                  error_message, portal, module, plan_tier, model_scope, latency_ms,
+                  confidence_score, blocked, prompt_preview, provider, model, created_at
+             FROM public.ai_audit_logs ${where}
+            ORDER BY created_at DESC LIMIT $${idx} OFFSET $${idx + 1}`,
           [...params, limit, offset]
         ),
         pool.query(`SELECT COUNT(*) FROM ai_audit_logs ${where}`, params),
@@ -229,10 +276,16 @@ class MetricsService {
         limit,
       };
     } catch (err) {
-      console.error("⚠️ MetricsService.getAuditLogs error:", err.message);
+      console.error("⚠️ MetricsService.getAuditLogs error:", {
+        code: typeof err?.code === 'string' ? err.code.slice(0, 40) : null,
+        name: typeof err?.name === 'string' ? err.name.slice(0, 60) : 'Error',
+      });
       return { logs: [], total: 0, page, limit };
     }
   }
 }
 
 module.exports = MetricsService;
+module.exports.approvalAuditParams = approvalAuditParams;
+module.exports.keyedDigest = keyedDigest;
+module.exports.resolveAuditHmacKey = resolveAuditHmacKey;

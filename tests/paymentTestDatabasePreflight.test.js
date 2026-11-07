@@ -13,12 +13,20 @@ const validMockEnv = {
   NODE_ENV: 'test',
   SMARTERP_ENVIRONMENT: 'isolated_test',
   DATABASE_URL: 'postgresql://prod_user:secret_prod_pw@aws-0-prod.pooler.supabase.com:5432/postgres',
-  TEST_DATABASE_URL: 'postgresql://smarterp_test_runner:secret_test_pw@aws-0-test.pooler.supabase.com:5432/postgres',
+  TEST_DATABASE_URL: 'postgresql://smarterp_test_runner:secret_test_pw@db.testprojectref123.supabase.co:5432/smarterp_isolated_test',
   TEST_DATABASE_PROJECT_REF: 'testprojectref123',
   TEST_DATABASE_ROLE: 'smarterp_test_runner',
   TEST_DATABASE_ISOLATION_TOKEN: 'token-abc1234567890-strictly-isolated',
   TEST_DATABASE_AUTHORIZATION: 'AUTHORIZED_BY_OWNER_FOR_TESTING',
 };
+
+
+test('configuration preflight rejects the default postgres database before live access', () => {
+  assert.throws(
+    () => assertTestConfiguration({ ...validMockEnv, TEST_DATABASE_URL: 'postgresql://smarterp_test_runner:pw@db.testprojectref123.supabase.co:5432/postgres' }),
+    /default postgres database/
+  );
+});
 
 test('preflight URL parser safely extracts components without exposing password', () => {
   const parsed = parseDatabaseUrl('postgresql://test_role:super_secret_pw@aws-0-ap.pooler.supabase.com:5432/my_test_db');
@@ -40,8 +48,8 @@ test('preflight rejects missing TEST_DATABASE_URL and forbids fallback to DATABA
 test('preflight rejects if TEST_DATABASE_URL targets production DATABASE_URL host/database', () => {
   const env = {
     ...validMockEnv,
-    DATABASE_URL: 'postgresql://prod_role:pw1@aws-0-shared.pooler.supabase.com:5432/postgres',
-    TEST_DATABASE_URL: 'postgresql://smarterp_test_runner:pw2@aws-0-shared.pooler.supabase.com:5432/postgres',
+    DATABASE_URL: 'postgresql://prod_role:pw1@db.prodprojectref123.supabase.co:5432/postgres',
+    TEST_DATABASE_URL: 'postgresql://smarterp_test_runner:pw2@db.prodprojectref123.supabase.co:5432/smarterp_isolated_test',
   };
   assert.throws(
     () => assertTestConfiguration(env),
@@ -75,7 +83,7 @@ test('preflight rejects default administrative superuser accounts as test role',
   assert.throws(
     () => assertTestConfiguration({
       ...validMockEnv,
-      TEST_DATABASE_URL: 'postgresql://postgres:pw@aws-0-test.pooler.supabase.com:5432/postgres',
+      TEST_DATABASE_URL: 'postgresql://postgres:pw@db.testprojectref123.supabase.co:5432/smarterp_isolated_test',
       TEST_DATABASE_ROLE: 'postgres',
     }),
     (err) => err.message.includes('Test role cannot be the default administrative superuser')
@@ -85,7 +93,7 @@ test('preflight rejects default administrative superuser accounts as test role',
 test('preflight rejects connected role with SUPERUSER or BYPASSRLS privileges', async () => {
   const mockSuperuserRunner = async (sql) => {
     if (sql.includes('current_database()')) {
-      return { rows: [{ database_name: 'postgres', database_role: 'smarterp_test_runner' }] };
+      return { rows: [{ database_name: 'smarterp_isolated_test', database_role: 'smarterp_test_runner' }] };
     }
     if (sql.includes('pg_roles')) {
       return { rows: [{ rolname: 'smarterp_test_runner', rolsuper: true, rolbypassrls: false }] };
@@ -100,7 +108,7 @@ test('preflight rejects connected role with SUPERUSER or BYPASSRLS privileges', 
 
   const mockBypassRlsRunner = async (sql) => {
     if (sql.includes('current_database()')) {
-      return { rows: [{ database_name: 'postgres', database_role: 'smarterp_test_runner' }] };
+      return { rows: [{ database_name: 'smarterp_isolated_test', database_role: 'smarterp_test_runner' }] };
     }
     if (sql.includes('pg_roles')) {
       return { rows: [{ rolname: 'smarterp_test_runner', rolsuper: false, rolbypassrls: true }] };
@@ -117,7 +125,7 @@ test('preflight rejects connected role with SUPERUSER or BYPASSRLS privileges', 
 test('preflight rejects missing or mismatched in-database identity marker', async () => {
   const mockMissingMarkerRunner = async (sql) => {
     if (sql.includes('current_database()')) {
-      return { rows: [{ database_name: 'postgres', database_role: 'smarterp_test_runner' }] };
+      return { rows: [{ database_name: 'smarterp_isolated_test', database_role: 'smarterp_test_runner' }] };
     }
     if (sql.includes('pg_roles')) {
       return { rows: [{ rolname: 'smarterp_test_runner', rolsuper: false, rolbypassrls: false }] };
@@ -137,7 +145,7 @@ test('preflight rejects missing or mismatched in-database identity marker', asyn
 test('preflight succeeds with valid isolated metadata and returns non-secret report', async () => {
   const mockValidRunner = async (sql) => {
     if (sql.includes('current_database()')) {
-      return { rows: [{ database_name: 'postgres', database_role: 'smarterp_test_runner' }] };
+      return { rows: [{ database_name: 'smarterp_isolated_test', database_role: 'smarterp_test_runner' }] };
     }
     if (sql.includes('pg_roles')) {
       return { rows: [{ rolname: 'smarterp_test_runner', rolsuper: false, rolbypassrls: false }] };
@@ -147,7 +155,7 @@ test('preflight succeeds with valid isolated metadata and returns non-secret rep
         rows: [{
           environment: 'isolated_test',
           project_ref: 'testprojectref123',
-          database_name: 'postgres',
+          database_name: 'smarterp_isolated_test',
           database_role: 'smarterp_test_runner',
           isolation_token: 'token-abc1234567890-strictly-isolated',
         }],
@@ -162,14 +170,14 @@ test('preflight succeeds with valid isolated metadata and returns non-secret rep
   assert.equal(report.environment, 'isolated_test');
   assert.equal(report.projectRef, 'testprojectref123');
   assert.equal(report.role, 'smarterp_test_runner');
-  assert.equal(report.database, 'postgres');
+  assert.equal(report.database, 'smarterp_isolated_test');
 
   // Verify that secrets are not present in the returned safe report
   const reportStr = JSON.stringify(report);
   assert.doesNotMatch(reportStr, /secret_test_pw|token-abc/);
 });
 
-test('database-mutating integration and migration runners reject the default postgres database name', () => {
+test('preflight and database-mutating runners reject the default postgres database name', () => {
   assert.throws(() => assertDedicatedTestDatabaseName('postgres'), /default postgres database/);
   assert.throws(() => assertDedicatedTestDatabaseName('  POSTGRES  '), /default postgres database/);
   assert.throws(() => assertDedicatedTestDatabaseName(''), /name could not be verified/);

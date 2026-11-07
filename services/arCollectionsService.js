@@ -95,6 +95,7 @@ Suggest 50% payment today with a 2% early settlement discount and 50% in 14 days
       const completion = await provider.generateCompletion({
         messages: [{ role: 'user', content: prompt }],
         temperature: 0.2,
+        task: 'reasoning',
       });
 
       return completion.content

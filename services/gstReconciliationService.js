@@ -134,6 +134,7 @@ Mathematical Score: ${scoreResult.score}%, Status: ${scoreResult.matchStatus}, V
       const completion = await provider.generateCompletion({
         messages: [{ role: 'user', content: prompt }],
         temperature: 0.1,
+        task: 'reasoning',
       });
 
       return completion.content ? completion.content.trim() : `Match evaluated with confidence score ${scoreResult.score}%.`;

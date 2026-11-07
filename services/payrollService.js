@@ -28,12 +28,12 @@ class PayrollService {
   /**
    * Generates company monthly payroll.
    */
-  static async calculatePayroll({ companyId, month, year }) {
+  static async calculatePayroll({ companyId, month, year, queryable = pool }) {
     if (!companyId || !month || !year) {
       throw new Error("Company ID, month, and year are required to compute payroll.");
     }
 
-    const usersRes = await pool.query(
+    const usersRes = await queryable.query(
       `SELECT id, name, email FROM users WHERE company_id::text = $1 AND is_active = true`,
       [String(companyId)]
     );
@@ -41,7 +41,7 @@ class PayrollService {
     let createdCount = 0;
     for (const user of usersRes.rows) {
       const baseSalary = 35000;
-      await pool.query(
+      await queryable.query(
         `INSERT INTO payroll (company_id, user_id, amount, status, month, year, created_at)
          VALUES ($1, $2, $3, 'processed', $4, $5, NOW())`,
         [companyId, user.id, baseSalary, month, year]

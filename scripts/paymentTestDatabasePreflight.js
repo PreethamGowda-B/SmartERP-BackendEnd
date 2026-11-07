@@ -17,6 +17,7 @@
 
 const path = require('node:path');
 const fs = require('node:fs');
+const { cleanConnectionString } = require('../utils/databaseUrl');
 
 function parseDatabaseUrl(url) {
   let parsed;
@@ -111,6 +112,7 @@ function assertTestConfiguration(env = process.env) {
   if (!testUrl || typeof testUrl !== 'string' || !testUrl.trim()) {
     throw new Error('Refusing execution: TEST_DATABASE_URL is missing. Production fallback is forbidden.');
   }
+  cleanConnectionString(testUrl);
 
   if (env.TEST_DATABASE_AUTHORIZATION !== 'AUTHORIZED_BY_OWNER_FOR_TESTING') {
     throw new Error('Refusing execution: TEST_DATABASE_AUTHORIZATION must be "AUTHORIZED_BY_OWNER_FOR_TESTING".');
@@ -156,6 +158,10 @@ function assertTestConfiguration(env = process.env) {
   if (target.role !== env.TEST_DATABASE_ROLE) {
     throw new Error('Refusing execution: TEST_DATABASE_URL username does not match TEST_DATABASE_ROLE.');
   }
+
+  // Reject the provider's shared default database before either configuration-only
+  // preflight or a live connection. Database mutation tests require a dedicated DB.
+  assertDedicatedTestDatabaseName(target.database);
 
   // Enforce project ref match if detectable
   if (target.projectRef && target.projectRef !== env.TEST_DATABASE_PROJECT_REF) {
@@ -290,8 +296,9 @@ async function runPreflight({ env = loadTestEnvironment(), configOnly = false } 
   }
 
   const { Pool } = require('pg');
+  const { cleanConnectionString } = require('../utils/databaseUrl');
   const pool = new Pool({
-    connectionString: env.TEST_DATABASE_URL,
+    connectionString: cleanConnectionString(env.TEST_DATABASE_URL),
     ssl: { rejectUnauthorized: false },
     connectionTimeoutMillis: 20000,
     statement_timeout: 20000,

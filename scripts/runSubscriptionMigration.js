@@ -6,6 +6,7 @@ require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
 const { Pool } = require('pg');
+const { cleanConnectionString } = require('../utils/databaseUrl');
 const { storage } = require('../middleware/als');
 const { applyForwardMigration, FORWARD_MIGRATIONS } = require('../migrations/forwardMigrationRunner');
 const {
@@ -23,7 +24,7 @@ async function runMigration() {
     throw new Error('Refusing to run without explicit subscription test-database confirmation.');
   }
   const target = assertTargetConfiguration(process.env);
-  const connectionString = process.env.SMARTERP_SUBSCRIPTION_TEST_DATABASE_URL;
+  const connectionString = cleanConnectionString(process.env.SMARTERP_SUBSCRIPTION_TEST_DATABASE_URL);
   const isLoopback = ['localhost', '127.0.0.1', '::1'].includes(target.host);
   const pool = new Pool({
     connectionString,

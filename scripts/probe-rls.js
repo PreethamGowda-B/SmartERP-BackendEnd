@@ -3,7 +3,8 @@
  */
 require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
 const { Pool } = require('pg');
-const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+const { cleanConnectionString } = require('../utils/databaseUrl');
+const pool = new Pool({ connectionString: cleanConnectionString(process.env.DATABASE_URL), ssl: { rejectUnauthorized: false } });
 
 async function main() {
   const client = await pool.connect();

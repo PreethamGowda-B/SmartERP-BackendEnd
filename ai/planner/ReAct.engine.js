@@ -70,6 +70,8 @@ class ReActEngine {
     const modulesUsed = new Set();
     let maxIterations = 3; // Keep iterations focused and fast
     let iteration = 0;
+    let usedProvider = null;
+    let usedModel = null;
 
     while (iteration < maxIterations) {
       iteration++;
@@ -78,7 +80,10 @@ class ReActEngine {
         messages,
         tools: availableTools,
         temperature: 0.1,
+        task: modelScope === 'general' ? 'general' : 'reasoning',
       });
+      usedProvider = completion.provider || provider.name || null;
+      usedModel = completion.model || null;
 
       const { content, toolCalls } = completion;
 
@@ -147,7 +152,8 @@ class ReActEngine {
           sources: Array.from(modulesUsed),
           telemetry: {
             latencyMs: Date.now() - startTime,
-            provider: provider.name,
+            provider: usedProvider,
+            model: usedModel,
             iterations: iteration,
           },
         };
@@ -194,6 +200,8 @@ class ReActEngine {
             params: args,
             status: "FAILED",
             error: toolErr?.code || toolErr?.name || 'tool_error',
+            provider: usedProvider,
+            model: usedModel,
           }).catch(() => {});
           const error = new Error('A required SmartERP data action could not be completed.');
           error.code = 'AI_TOOL_EXECUTION_FAILED';
@@ -207,7 +215,9 @@ class ReActEngine {
           userContext: context,
           toolName: functionName,
           params: args,
-          status: "SUCCESS",
+          status: toolResult?.type === 'ACTION_CONFIRMATION_REQUIRED' ? 'APPROVAL_REQUIRED' : 'SUCCESS',
+          provider: usedProvider,
+          model: usedModel,
         }).catch((auditErr) => {
           console.warn('[SmartERP AI] Tool audit event could not be recorded:', auditErr?.code || auditErr?.name || 'audit_error');
         });
@@ -223,10 +233,17 @@ class ReActEngine {
 
         modulesUsed.add(getToolModuleName(functionName));
 
+        const modelVisibleToolResult = toolResult?.type === 'ACTION_CONFIRMATION_REQUIRED'
+          ? {
+            type: toolResult.type,
+            toolName: functionName,
+            message: toolResult.message || 'Explicit user approval is required before this write can execute.',
+          }
+          : toolResult;
         messages.push({
           role: "tool",
           tool_call_id: toolCall.id,
-          content: JSON.stringify(toolResult),
+          content: JSON.stringify(modelVisibleToolResult),
         });
       }
     }

@@ -22,51 +22,10 @@ function handleRouteOptimization(req, res) {
     return res.status(400).json({ success: false, message: validation.message });
   }
 
-  const stops = req.body.stops.map(s => s.trim());
-  const engineerName = req.body.engineer_name || 'Assigned Technician';
-
-  // Deterministic, realistic travel estimation between stops
-  // Generates 8-18 km per inter-stop leg
-  let totalDistanceKm = 0;
-  const legs = [];
-  for (let i = 0; i < stops.length - 1; i++) {
-    const from = stops[i];
-    const to = stops[i + 1];
-    // Seeded distance based on string character codes to provide stable, consistent distances
-    const seed = (from.length * 7 + to.length * 13 + (from.charCodeAt(0) || 1) + (to.charCodeAt(0) || 1)) % 15;
-    const legDistance = Math.round((9.5 + seed * 0.8) * 10) / 10;
-    const legMinutes = Math.round(legDistance * 2.2);
-    totalDistanceKm += legDistance;
-    legs.push({
-      leg_number: i + 1,
-      from_location: from,
-      to_location: to,
-      distance_km: legDistance,
-      duration_minutes: legMinutes,
-    });
-  }
-
-  totalDistanceKm = Math.round(totalDistanceKm * 10) / 10;
-  const totalDurationMinutes = Math.round(totalDistanceKm * 2.2);
-  const fuelAllowance = Math.round(totalDistanceKm * 8.5); // INR 8.5/km standard rate
-
-  // Google Maps Universal Directions URL
-  const encodedStops = stops.map(s => encodeURIComponent(s));
-  const googleMapsUrl = `https://www.google.com/maps/dir/${encodedStops.join('/')}`;
-
-  return res.status(200).json({
-    success: true,
-    engineer_name: engineerName,
-    route: {
-      stops,
-      total_stops: stops.length,
-      total_distance_km: totalDistanceKm,
-      estimated_duration_minutes: totalDurationMinutes,
-      estimated_fuel_allowance_inr: fuelAllowance,
-      google_maps_url: googleMapsUrl,
-      legs,
-      calculated_at: new Date().toISOString(),
-    },
+  return res.status(501).json({
+    success: false,
+    code: 'ROUTE_OPTIMIZATION_UNAVAILABLE',
+    message: 'Route optimization is unavailable because no routing provider is configured.',
   });
 }
 

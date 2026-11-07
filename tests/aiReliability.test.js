@@ -54,7 +54,7 @@ test('AI routes guard agent, chat, copilot, and confirmation parameters before a
   const copilot = fs.readFileSync(path.join(__dirname, '..', 'routes', 'businessCopilot.js'), 'utf8');
   assert.match(routes, /"\/agent"[\s\S]*?validateAiPrompt/);
   assert.match(routes, /"\/chat"[\s\S]*?validateAiPrompt/);
-  assert.match(routes, /findBlockedActionInput\(params\)/);
+  assert.match(routes, /findBlockedActionInput\(approvalPayload\)/);
   assert.match(copilot, /validateCopilotPrompt/);
 });
 

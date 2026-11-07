@@ -21,7 +21,12 @@ async function processCompany(companyId, workDate, now = new Date()) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`attendance-run:${companyId}:${workDate}`]);
+    // Use try_advisory_xact_lock so we never block and tie up a pool connection if another pass is running
+    const lockRes = await client.query('SELECT pg_try_advisory_xact_lock(hashtext($1)) AS locked', [`attendance-run:${companyId}:${workDate}`]);
+    if (!lockRes.rows[0]?.locked) {
+      await client.query('ROLLBACK');
+      return { date: workDate, due: false, skipped_locked: true };
+    }
     const result = await AttendancePolicy.processCompanyDate(companyId, workDate, client, now);
     await client.query('COMMIT');
     return result;
@@ -33,9 +38,17 @@ async function processCompany(companyId, workDate, now = new Date()) {
   }
 }
 
+let _attendanceRunning = false;
+
 async function runDailyAttendanceProcessing(now = new Date()) {
+  if (_attendanceRunning) {
+    console.log('⏳ Attendance processing pass already in progress. Skipping duplicate tick.');
+    return [];
+  }
+  _attendanceRunning = true;
   const startedAt = Date.now();
-  return storage.run({ isWebRequest: false, bypassRls: true, role: 'system' }, async () => {
+  try {
+    return await storage.run({ isWebRequest: false, bypassRls: true, role: 'system' }, async () => {
     const companies = await pool.query('SELECT id FROM companies ORDER BY id');
     const results = [];
     for (const { id: companyId } of companies.rows) {
@@ -67,6 +80,9 @@ async function runDailyAttendanceProcessing(now = new Date()) {
     logAttendanceProcessorCompletion(results, Date.now() - startedAt);
     return results;
   });
+  } finally {
+    _attendanceRunning = false;
+  }
 }
 
 function startDailyAttendanceProcessor() {

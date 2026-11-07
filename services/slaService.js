@@ -252,19 +252,30 @@ async function getSlaMetrics(companyId, { startDate, endDate } = {}) {
 }
 
 // ─── Start / Stop ─────────────────────────────────────────────────────────────
+let _slaRunning = false;
+
+async function executeSlaPass() {
+  if (_slaRunning) return;
+  _slaRunning = true;
+  try {
+    await checkAcceptanceBreaches();
+    await checkCompletionBreaches();
+  } catch (err) {
+    console.error('SLA execution pass error:', err.message);
+  } finally {
+    _slaRunning = false;
+  }
+}
+
 function start() {
   if (_slaTimer) return;
 
   console.log(`📋 SLA service started (check interval: ${CHECK_INTERVAL_MS / 1000}s)`);
 
-  _slaTimer = setInterval(async () => {
-    await checkAcceptanceBreaches();
-    await checkCompletionBreaches();
-  }, CHECK_INTERVAL_MS);
+  _slaTimer = setInterval(executeSlaPass, CHECK_INTERVAL_MS);
 
   // Run immediately on start
-  checkAcceptanceBreaches();
-  checkCompletionBreaches();
+  void executeSlaPass();
 
   // Section 9: Audit log retention — run once per day
   _retentionTimer = setInterval(purgeOldAuditLogs, RETENTION_INTERVAL_MS);

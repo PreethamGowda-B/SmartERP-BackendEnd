@@ -6,7 +6,7 @@ if (dns.setDefaultResultOrder) {
 const { Pool } = require('pg');
 require('dotenv').config();
 
-const DEFAULT_DB_POOL_MAX = 10;
+const DEFAULT_DB_POOL_MAX = 2;
 
 function resolvePoolMax(value = process.env.DB_POOL_MAX) {
   const parsed = Number.parseInt(value, 10);
@@ -63,7 +63,7 @@ const pool = new Pool({
   // more room under the shared Supabase session-pool limit. Override only
   // after sizing every process and service instance using the same database.
   max: resolvePoolMax(),
-  idleTimeoutMillis: parseInt(process.env.DB_IDLE_TIMEOUT_MS || '120000', 10),
+  idleTimeoutMillis: parseInt(process.env.DB_IDLE_TIMEOUT_MS || '10000', 10),
   connectionTimeoutMillis: 10000, // 10s connection queue timeout under load
   statement_timeout: 15000,       // 15s query safety limit
 });

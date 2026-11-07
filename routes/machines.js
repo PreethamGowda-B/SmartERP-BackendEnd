@@ -91,8 +91,24 @@ router.post('/', authenticateToken, async (req, res) => {
       amc_contract_number
     } = req.body;
 
-    if (!customer_id || !machine_name || !serial_number) {
-      return res.status(400).json({ message: 'customer_id, machine_name, and serial_number are required' });
+    let effectiveCustomerId = customer_id;
+    if (!effectiveCustomerId) {
+      const custRes = await pool.query('SELECT id FROM customers WHERE company_id::text = $1::text ORDER BY created_at ASC LIMIT 1', [String(companyId)]).catch(() => ({ rows: [] }));
+      if (custRes.rows.length > 0) {
+        effectiveCustomerId = custRes.rows[0].id;
+      } else {
+        const newCust = await pool.query(
+          `INSERT INTO customers (company_id, name, email, phone) VALUES ($1, 'In-House Workshop', 'workshop@internal.local', '0000000000') RETURNING id`,
+          [companyId]
+        ).catch(() => null);
+        if (newCust && newCust.rows.length > 0) {
+          effectiveCustomerId = newCust.rows[0].id;
+        }
+      }
+    }
+
+    if (!effectiveCustomerId || !machine_name || !serial_number) {
+      return res.status(400).json({ message: 'Machine name and serial number are required' });
     }
 
     const result = await pool.query(
@@ -108,7 +124,7 @@ router.post('/', authenticateToken, async (req, res) => {
         $15, $16, $17, $18, $19, $20
       ) RETURNING *`,
       [
-        companyId, customer_id, plant_id || null, production_line || null, area_location || null,
+        companyId, effectiveCustomerId, plant_id || null, production_line || null, area_location || null,
         machine_name, make || null, model || null, serial_number, controller_type || null,
         year_of_manufacture || null, spindle_hours, installation_date || null, warranty_expiry || null,
         ip_address || null, iot_device_id || null, status, health_score, critical_level, amc_contract_number || null

@@ -313,7 +313,7 @@ router.get('/google/callback', (req, res, next) => {
       console.error('Google OAuth error:', err && err.message);
       return res.redirect(stateData.type === 'customer'
         ? `${CUSTOMER_PORTAL}/login?error=oauth_failed`
-        : `${FRONTEND}/login?error=oauth_failed`);
+        : `${FRONTEND}/auth/login?error=oauth_failed`);
     }
 
     try {
@@ -418,7 +418,7 @@ router.get('/google/callback', (req, res, next) => {
       return res.redirect(`${callbackFrontend}/auth/callback?code=${exchangeToken}`);
     } catch (err) {
       console.error('Google Auth Error:', err);
-      return res.redirect(`${FRONTEND}/login?error=auth_failed`);
+      return res.redirect(`${FRONTEND}/auth/login?error=auth_failed`);
     }
   })(req, res, next);
 });

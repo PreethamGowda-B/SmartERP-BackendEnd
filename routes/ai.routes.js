@@ -1,5 +1,6 @@
 const express = require("express");
 const router = express.Router();
+const logger = require("../utils/logger");
 
 const { authenticateToken } = require("../middleware/authMiddleware");
 const { createAiPromptGuard } = require('../middleware/aiPromptGuard');
@@ -639,6 +640,7 @@ router.post(
         .map((plugin) => ({ plugin, tool: plugin.tools?.[toolName] }))
         .find(({ tool }) => tool);
       if (!targetTool?.tool?.isDestructive || !targetTool.tool.requiresTransactionalAudit) {
+        logger.business("AI_ACTION_REJECTED", { toolName, companyId: req.user?.companyId, userId: req.user?.userId || req.user?.id, reason: "NOT_APPROVABLE" });
         return res.status(403).json({ code: 'AI_ACTION_NOT_APPROVABLE', error: 'This tool is not an approved write operation.' });
       }
 
@@ -721,6 +723,7 @@ router.post(
         phase = 'commit';
         await dbClient.query('COMMIT');
         inTransaction = false;
+        logger.business("AI_ACTION_COMPLETED", { toolName, companyId, userId });
         return res.json(result);
       } catch (error) {
         let rollbackSucceeded = false;

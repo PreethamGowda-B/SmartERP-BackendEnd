@@ -1,5 +1,6 @@
 const express = require('express');
 const router = express.Router();
+const logger = require("../utils/logger");
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 const { loadPlan } = require('../middleware/planMiddleware');
@@ -247,7 +248,7 @@ router.post('/clock-out', authenticateToken, async (req, res) => {
     const workingHours = Number(resultRecord.working_hours || 0);
     const status = resultRecord.status;
 
-    console.log(`✅ Clock-out recorded for user ${userId}. Hours: ${workingHours}, Status: ${status} (${method})`);
+    logger.business("ATTENDANCE_COMPLETED", { userId, companyId, workingHours, status, method });
 
     // Send notification to owners about employee clock-out
     try {

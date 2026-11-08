@@ -1,4 +1,5 @@
 const admin = require('firebase-admin');
+const logger = require('../utils/logger');
 
 let firebaseInitialized = false;
 
@@ -7,50 +8,42 @@ try {
     let serviceAccount;
 
     if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-        console.log('📡 Found FIREBASE_SERVICE_ACCOUNT env var. Length:', process.env.FIREBASE_SERVICE_ACCOUNT.length);
-        // Production: credentials from environment variable
         try {
             let rawData = process.env.FIREBASE_SERVICE_ACCOUNT.trim();
             // Defensive: Remove surrounding single/double quotes if present
             if ((rawData.startsWith("'") && rawData.endsWith("'")) ||
                 (rawData.startsWith('"') && rawData.endsWith('"'))) {
-                console.log('📝 Removing surrounding quotes from env var');
                 rawData = rawData.substring(1, rawData.length - 1);
             }
             serviceAccount = JSON.parse(rawData);
-            console.log('✅ FIREBASE_SERVICE_ACCOUNT parsed successfully');
         } catch (parseErr) {
-            console.error('❌ Failed to parse FIREBASE_SERVICE_ACCOUNT env var:', parseErr.message);
-            console.error('📝 First 50 chars of env var:', process.env.FIREBASE_SERVICE_ACCOUNT.substring(0, 50));
+            logger.error('Failed to parse FIREBASE_SERVICE_ACCOUNT environment variable', parseErr);
         }
     } else {
-        console.warn('⚠️ FIREBASE_SERVICE_ACCOUNT env var is NOT set.');
         // Development: fallback to local JSON file
         try {
             serviceAccount = require('./firebase-service-account.json');
-            console.log('📡 Using Firebase credentials from local JSON file');
-        } catch (fileErr) {
-            console.warn('⚠️ firebase-service-account.json not found.');
+            logger.debug('Using Firebase credentials from local JSON file', { pid: process.pid });
+        } catch (_) {
+            logger.debug('firebase-service-account.json not found', { pid: process.pid });
         }
     }
 
     if (serviceAccount) {
-        console.log('🚀 Initializing Firebase Admin SDK...');
         if (!admin.apps.length) {
             admin.initializeApp({
                 credential: admin.credential.cert(serviceAccount)
             });
-            console.log('✅ Firebase Admin SDK initialized (First App)');
+            logger.info('Firebase Admin initialized', { pid: process.pid, isFirstApp: true });
         } else {
-            console.log('✅ Firebase Admin SDK already initialized');
+            logger.debug('Firebase Admin already initialized in app registry', { pid: process.pid });
         }
         firebaseInitialized = true;
-        console.log('⭐ firebaseInitialized set to TRUE');
     } else {
-        console.error('❌ No valid Firebase service account found. Push notifications will be DISABLED.');
+        logger.warn('No valid Firebase service account found. Push notifications will be disabled.', { pid: process.pid });
     }
 } catch (error) {
-    console.error('❌ CRITICAL Error initializing Firebase Admin:', error.stack);
+    logger.error('Critical error initializing Firebase Admin', error, { pid: process.pid });
 }
 
 /**
@@ -59,15 +52,13 @@ try {
  */
 async function sendPushNotification(token, title, body, data = {}) {
     if (!token) {
-        console.warn('⚠️ Push notification skipped — No token provided.');
+        logger.debug('Push notification skipped — no token provided');
         return;
     }
     if (!firebaseInitialized) {
-        console.warn('⚠️ Push notification skipped — Firebase not initialized in this process.');
+        logger.debug('Push notification skipped — Firebase not initialized');
         return;
     }
-
-    console.log(`🚀 FCM: Sending to token ${token.substring(0, 10)}... Title: ${title}`);
 
     const message = {
         notification: { title, body },
@@ -109,10 +100,11 @@ async function sendPushNotification(token, title, body, data = {}) {
 
     try {
         const response = await admin.messaging().send(message);
-        console.log('✅ Push notification sent successfully:', response);
+        logger.debug('Push notification delivered', { messageId: response });
+        logger.business('NOTIFICATION_SENT', { channel: 'fcm_push', count: 1, title });
         return response;
     } catch (error) {
-        console.error('❌ Error sending push notification:', error);
+        logger.error('Error sending push notification', error, { title });
         throw error;
     }
 }
@@ -175,7 +167,8 @@ async function sendMulticastPush(tokens, title, body, data = {}) {
 
     try {
         const response = await admin.messaging().sendEachForMulticast(payload);
-        console.log(`✅ Multicast push sent: ${response.successCount} success, ${response.failureCount} failure`);
+        logger.debug('Multicast push delivered', { successCount: response.successCount, failureCount: response.failureCount });
+        logger.business('NOTIFICATION_SENT', { channel: 'fcm_multicast', successCount: response.successCount, failureCount: response.failureCount, title });
 
         // Return tokens that failed so we can clean them up if needed
         const failedTokens = [];
@@ -188,7 +181,7 @@ async function sendMulticastPush(tokens, title, body, data = {}) {
         }
         return { response, failedTokens };
     } catch (error) {
-        console.error('❌ Error sending multicast notification:', error);
+        logger.error('Error sending multicast notification', error, { title });
         throw error;
     }
 }

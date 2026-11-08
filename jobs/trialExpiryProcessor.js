@@ -19,6 +19,7 @@ const { pool } = require('../db');
 const { createNotification } = require('../utils/notificationHelpers');
 const { invalidatePlanCache } = require('../middleware/planMiddleware');
 const { Resend } = require('resend');
+const logger = require('../utils/logger');
 
 const resend = new Resend(process.env.RESEND_API_KEY);
 
@@ -33,7 +34,7 @@ async function logSubscriptionEvent({ company_id, event_type, old_plan_id, new_p
       [company_id, event_type, old_plan_id || null, new_plan_id || null, JSON.stringify(metadata)]
     );
   } catch (err) {
-    console.error('❌ Failed to log subscription event:', err.message);
+    logger.error('Failed to log subscription event', { companyId: company_id, eventType: event_type, error: err.message });
   }
 }
 
@@ -48,7 +49,7 @@ async function hasBeenNotified(companyId, type, stage) {
     );
     return res.rows.length > 0;
   } catch (e) {
-    console.error('Idempotency check failed:', e);
+    logger.error('Subscription idempotency check failed', { companyId, type, stage, error: e.message });
     return false; // Safest fallback is false, but could risk dupes if DB is briefly down
   }
 }
@@ -60,7 +61,7 @@ async function markNotified(companyId, type, stage) {
       [companyId, type, stage]
     );
   } catch (e) {
-    console.error('Idempotency mark failed:', e);
+    logger.warn('Subscription idempotency mark failed', { companyId, type, stage, error: e.message });
   }
 }
 
@@ -95,7 +96,7 @@ async function sendExpiryEmail(email, subject, bodyContent, planName) {
       `,
     });
   } catch (e) {
-    console.error("Failed to send Resend email:", e.message);
+    logger.warn("Failed to send subscription expiry email via Resend", { error: e.message });
   }
 }
 
@@ -126,7 +127,7 @@ async function handleWarning(company, daysLeft, type) {
       data: { days_remaining: daysLeft, upgrade_url: '/owner/billing' }
     });
   } catch (err) {
-    console.error(`❌ Failed to send ${daysLeft}-day warning app-notif:`, err.message);
+    logger.warn('Failed to send subscription warning app notification', { companyId: company.id, daysLeft, error: err.message });
   }
 
   // 2. Send Email
@@ -137,11 +138,11 @@ async function handleWarning(company, daysLeft, type) {
 
   // 3. Mark as sent
   await markNotified(company.id, type, daysLeft);
-  console.log(`✅ Sent ${daysLeft}-day ${type} warning to ${company.company_name}`);
+  logger.debug('Sent subscription warning', { companyId: company.id, daysLeft, type });
 }
 
 async function processSubscriptionLifecycle() {
-  console.log('⏰ [Subscription Processor] Starting...');
+  logger.debug('[Subscription Processor] Starting lifecycle run');
   const startTime = Date.now();
   let warningsSent = 0;
   let downgraded = 0;
@@ -216,6 +217,11 @@ async function processSubscriptionLifecycle() {
         metadata: { downgraded_at: new Date().toISOString() }
       });
       invalidatePlanCache(company.id);
+      logger.business('SUBSCRIPTION_UPDATED', {
+        companyId: company.id,
+        reason: 'trial_expired',
+        planId: 1
+      });
       downgraded++;
     }
 
@@ -253,7 +259,6 @@ async function processSubscriptionLifecycle() {
         await markNotified(company.id, 'paid', 0);
       }
 
-      console.log(`📉 Subscription expired for "${company.company_name}" - Downgraded to Free`);
       await logSubscriptionEvent({
         company_id: company.id,
         event_type: 'subscription_expired',
@@ -262,12 +267,21 @@ async function processSubscriptionLifecycle() {
         metadata: { downgraded_at: new Date().toISOString() }
       });
       invalidatePlanCache(company.id);
+      logger.business('SUBSCRIPTION_UPDATED', {
+        companyId: company.id,
+        reason: 'subscription_expired',
+        planId: 1
+      });
       downgraded++;
     }
 
-    console.log(`✅ [Subscription Processor] Done in ${Date.now() - startTime}ms | Warnings: ${warningsSent} | Downgraded: ${downgraded}`);
+    logger.debug('[Subscription Processor] Completed run', {
+      durationMs: Date.now() - startTime,
+      warningsSent,
+      downgraded
+    });
   } catch (err) {
-    console.error('❌ [Subscription Processor] Fatal error:', err.message);
+    logger.error('[Subscription Processor] Error running subscription lifecycle', { error: err.message, stack: err.stack });
   }
 }
 
@@ -280,7 +294,7 @@ function startTrialExpiryProcessor() {
     scheduled: true,
     timezone: 'Asia/Kolkata'
   });
-  console.log('✅ Subscription lifecycle processor scheduled (daily 9:00 AM IST)');
+  logger.info('Subscription lifecycle processor scheduled (daily 9:00 AM IST)');
 }
 
 module.exports = { startTrialExpiryProcessor, processSubscriptionLifecycle, logSubscriptionEvent };

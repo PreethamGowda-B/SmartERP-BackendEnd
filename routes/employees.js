@@ -1,5 +1,6 @@
 const express = require('express');
 const router = express.Router();
+const logger = require("../utils/logger");
 const bcrypt = require('bcrypt');
 const { body, validationResult } = require('express-validator');
 const { pool } = require('../db');
@@ -149,6 +150,7 @@ router.post('/', authenticateToken, loadPlan, checkPlanLimit('employee'), [
       notifyEmployeeAdded(ownerId, companyId, name).catch(e => console.error('Push Error:', e.message));
 
       const employee = await mapRowToEmployee({ id: userId, name, email, phone, position, is_active: true });
+      logger.business("EMPLOYEE_CREATED", { employeeId: userId, companyId, createdBy: req.user.id });
       res.status(201).json(employee);
     } catch (err) {
       await client.query('ROLLBACK');

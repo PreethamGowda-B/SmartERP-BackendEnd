@@ -1,19 +1,49 @@
 const { pool } = require("./db-base");
 const { storage } = require("./middleware/als");
 const { performance } = require("node:perf_hooks");
+const logger = require("./utils/logger");
 
-const DB_TRACE_THRESHOLD_MS = Number(process.env.DB_TRACE_THRESHOLD_MS || 100);
+// Configurable slow query and pool acquisition thresholds for production performance alerts
+const SLOW_QUERY_THRESHOLD_MS = Number(process.env.SLOW_QUERY_THRESHOLD_MS || process.env.DB_SLOW_QUERY_THRESHOLD_MS || 2000);
+const POOL_ACQUIRE_WARN_MS = Number(process.env.POOL_ACQUIRE_WARN_MS || 1000);
 
-function recordDbStage(stage, durationMs) {
-  if (durationMs < DB_TRACE_THRESHOLD_MS) return;
+function recordDbStage(stage, durationMs, details = {}) {
   const context = storage.getStore();
-  console.warn(JSON.stringify({
-    type: "db_performance",
-    requestId: context?.requestId || null,
-    stage,
-    durationMs: Number(durationMs.toFixed(2)),
-    pool: { total: pool.totalCount, idle: pool.idleCount, waiting: pool.waitingCount },
-  }));
+  const requestId = context?.requestId || null;
+  const duration = Number(durationMs.toFixed(2));
+
+  // Slow query warning: only emitted when actual SQL execution exceeds the configured threshold
+  if (stage === "sql_execution" && durationMs >= SLOW_QUERY_THRESHOLD_MS) {
+    const operation = details.sql ? details.sql.slice(0, 150) : "query";
+    logger.slowQuery(operation, durationMs, {
+      requestId,
+      pool: { total: pool.totalCount, idle: pool.idleCount, waiting: pool.waitingCount },
+    });
+    return;
+  }
+
+  // Connection pool contention alert: emitted when pool checkout is slow or requests are queued
+  if (stage === "pool_acquire" && (durationMs >= POOL_ACQUIRE_WARN_MS || pool.waitingCount > 0)) {
+    logger.warn("Database connection pool contention detected", {
+      type: "pool_contention",
+      acquireDurationMs: duration,
+      requestId,
+      pool: { total: pool.totalCount, idle: pool.idleCount, waiting: pool.waitingCount },
+    });
+  }
+
+  // Low-level stages (rls_tenant_context, rls_set_role, rls_setup_total, pool_acquire, pool_release,
+  // and ordinary sub-threshold query executions) are internal diagnostics only output in DEBUG mode.
+  if (logger.isDebugEnabled()) {
+    logger.debug(`[DB Stage] ${stage} (${duration}ms)`, {
+      type: "db_stage",
+      stage,
+      durationMs: duration,
+      requestId,
+      pool: { total: pool.totalCount, idle: pool.idleCount, waiting: pool.waitingCount },
+      ...(details.sql ? { sql: details.sql.slice(0, 120) } : {}),
+    });
+  }
 }
 
 // ID validation — supports both standard UUIDs and legacy Integer IDs (numeric strings).
@@ -25,7 +55,7 @@ const ID_REGEX = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}
  * TWO-LAYER DESIGN:
  *
  *   Layer 1 — PostgreSQL Role (structural enforcement)
- *     • bypassRls: true  → RESET ROLE   (reverts to neondb_owner which has BYPASSRLS)
+ *     • bypassRls: true  → RESET ROLE   (reverts to database owner/postgres which has BYPASSRLS)
  *     • Otherwise        → SET ROLE smarterp_app  (role has NO BYPASSRLS — can't sidestep policies)
  *
  *   Layer 2 — Session variables (policy filter)
@@ -40,7 +70,7 @@ const ID_REGEX = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}
  *
  * BYPASS (explicit opt-in only):
  *   storage.run({ bypassRls: true }, fn) in auth routes, migrations, background jobs.
- *   → RESET ROLE (neondb_owner) + app.bypass_rls='on' → all rows visible.
+ *   → RESET ROLE (database owner/postgres) + app.bypass_rls='on' → all rows visible.
  */
 function buildRlsConfig(context = storage.getStore()) {
 
@@ -53,7 +83,7 @@ function buildRlsConfig(context = storage.getStore()) {
     if (ID_REGEX.test(raw)) {
       companyId = raw;
     } else {
-      console.warn(`⚠️ db.js: Invalid companyId format "${raw}" — omitting from RLS context`);
+      logger.warn(`Invalid companyId format "${raw}" — omitting from RLS context`);
     }
   }
 
@@ -182,10 +212,19 @@ pool.connect = async function () {
 pool.query = async function (text, params) {
   const client = await pool.connect(); // uses the patched version above
   const queryStartedAt = performance.now();
+  const sql = getSql(text);
   try {
     return await client.query(text, params);
+  } catch (err) {
+    const context = storage.getStore();
+    logger.error(`Database query failed: ${sql.slice(0, 120)}`, err, {
+      requestId: context?.requestId || null,
+      operation: sql.slice(0, 120),
+    });
+    throw err;
   } finally {
-    recordDbStage('sql_execution', performance.now() - queryStartedAt);
+    const durationMs = performance.now() - queryStartedAt;
+    recordDbStage('sql_execution', durationMs, { sql });
     const releaseStartedAt = performance.now();
     client.release();
     recordDbStage('pool_release', performance.now() - releaseStartedAt);

@@ -1,6 +1,7 @@
 const { Worker } = require('bullmq');
 const { redisConnection } = require('../utils/queue');
 const { createNotification } = require('../utils/notificationHelpers');
+const logger = require('../utils/logger');
 
 if (redisConnection) {
   /**
@@ -8,11 +9,11 @@ if (redisConnection) {
    * Processes FCM and SSE deliveries in the background
    */
   const notificationWorker = new Worker('notifications', async (job) => {
-    console.log(`✉️ Processing notification job ${job.id} for user ${job.data.user_id}`);
+    logger.debug(`Processing notification job ${job.id} for user ${job.data?.user_id}`, { jobId: job.id, userId: job.data?.user_id });
     try {
       await createNotification(job.data);
     } catch (err) {
-      console.error(`❌ Notification Job ${job.id} failed:`, err.message);
+      logger.error(`Notification Job ${job.id} failed`, err, { jobId: job.id });
       throw err; // Allow BullMQ to retry if needed
     }
   }, { connection: redisConnection });
@@ -22,7 +23,7 @@ if (redisConnection) {
    * Processes activity logging without blocking the API
    */
   const auditWorker = new Worker('audit', async (job) => {
-    console.log(`📋 Processing audit job ${job.id} for user ${job.data.userId}`);
+    logger.debug(`Processing audit job ${job.id} for user ${job.data?.userId}`, { jobId: job.id, userId: job.data?.userId });
   }, { connection: redisConnection });
 
   /**
@@ -40,11 +41,11 @@ if (redisConnection) {
     // Retry worker only handles plan purchases. Trial activation is handled by
     // the signature-verified Razorpay webhook and must not be converted into a paid plan.
     if (purpose !== 'plan_purchase') {
-      console.warn('[Webhook Worker] Skipping retry without an explicit plan_purchase purpose.');
+      logger.warn('[Webhook Worker] Skipping retry without an explicit plan_purchase purpose.', { jobId: job.id });
       return;
     }
     const currentAttempt = (job.attemptsMade || 0) + 1;
-    console.log(`🔄 Webhook Retry Worker | Job ID: ${job.id} | Company: ${companyId} | Attempt ${currentAttempt}/3`);
+    logger.info(`Webhook Retry Worker running`, { jobId: job.id, companyId, attempt: currentAttempt });
 
     // Queue payloads are not proof of payment. Re-fetch from Razorpay on every retry
     // before applying any subscription change.
@@ -87,7 +88,7 @@ if (redisConnection) {
       if (duplicateCheck.rows.length > 0) {
         await client.query('ROLLBACK');
         if (String(duplicateCheck.rows[0].company_id) !== String(companyId)) throw new Error('Payment was already applied to another company');
-        console.log(`[Webhook Worker] Payment ${paymentId} already processed.`);
+        logger.debug(`[Webhook Worker] Payment ${paymentId} already processed.`, { companyId, paymentId });
         invalidatePlanCache(companyId);
         return;
       }
@@ -117,10 +118,10 @@ if (redisConnection) {
 
       await client.query('COMMIT');
       invalidatePlanCache(companyId);
-      console.log(`✅ Webhook Retry Succeeded on attempt ${currentAttempt} for Company ${companyId}`);
+      logger.business('SUBSCRIPTION_UPDATED', { companyId, planId, billingCycle, source: 'webhook_retry_worker', attempt: currentAttempt });
     } catch (err) {
       await client.query('ROLLBACK').catch(() => {});
-      console.error(`❌ Webhook Retry attempt ${currentAttempt} failed:`, err.message);
+      logger.error(`Webhook Retry attempt ${currentAttempt} failed`, err, { companyId, attempt: currentAttempt });
 
       // Log retry attempt failure to subscription_events table
       await pool.query(
@@ -140,22 +141,22 @@ if (redisConnection) {
   }, { connection: redisConnection });
 
   notificationWorker.on('completed', (job) => {
-    console.log(`✅ Notification job ${job.id} finished`);
+    logger.debug(`Notification job ${job.id} finished`, { jobId: job.id });
   });
 
   auditWorker.on('completed', (job) => {
-    console.log(`✅ Audit job ${job.id} finished`);
+    logger.debug(`Audit job ${job.id} finished`, { jobId: job.id });
   });
 
   // Security Worker (SmartERP Defensive Security AI)
   const { securityWorker } = require('./securityWorker');
   if (securityWorker) {
     securityWorker.on('completed', (job) => {
-      console.log(`✅ Security analysis job ${job.id} finished`);
+      logger.debug(`Security analysis job ${job.id} finished`, { jobId: job.id });
     });
   }
 
-  console.log('🚀 Redis Workers Initialized (Notifications, Audit, Webhook Retry, & Security AI)');
+  logger.info('Redis Workers Initialized (Notifications, Audit, Webhook Retry, & Security AI)', { pid: process.pid });
 } else {
-  console.warn('⚠️ No Redis connection - Background Workers NOT started.');
+  logger.warn('No Redis connection - Background Workers not started.', { pid: process.pid });
 }

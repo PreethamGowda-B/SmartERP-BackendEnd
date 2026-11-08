@@ -1,6 +1,7 @@
 require('dotenv').config();
 const cloudinary = require('cloudinary').v2;
 const { CloudinaryStorage } = require('multer-storage-cloudinary');
+const logger = require('../utils/logger');
 
 // Never ship Cloudinary credentials in source. Missing configuration disables
 // remote image uploads until the deployment environment supplies all values.
@@ -11,14 +12,14 @@ const apiSecret = (process.env.CLOUDINARY_API_SECRET || '').trim();
 const hasCloudinaryConfig = !!(cloudName && apiKey && apiSecret);
 
 if (!hasCloudinaryConfig) {
-    console.warn('⚠️  Cloudinary credentials not found. Image uploads will be disabled.');
+    logger.warn('Cloudinary credentials not found. Image uploads will be disabled.', { pid: process.pid });
 } else {
     cloudinary.config({
         cloud_name: cloudName,
         api_key: apiKey,
         api_secret: apiSecret
     });
-    console.log(`✅ Cloudinary configured successfully for [${cloudName}]`);
+    logger.info(`Cloudinary storage configured for [${cloudName}]`, { cloudName, pid: process.pid });
 }
 
 // Configure Cloudinary storage for multer
@@ -34,7 +35,7 @@ if (hasCloudinaryConfig) {
             }
         });
     } catch (error) {
-        console.error('❌ Error configuring Cloudinary storage:', error.message);
+        logger.error('Error configuring Cloudinary storage', error, { pid: process.pid });
     }
 }
 

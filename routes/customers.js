@@ -10,6 +10,7 @@
 
 const express = require('express');
 const router = express.Router();
+const logger = require("../utils/logger");
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 
@@ -116,12 +117,13 @@ router.post('/', async (req, res) => {
       [companyId, name.trim(), emailVal, phone ? phone.trim() : null]
     );
 
+    logger.business("CUSTOMER_CREATED", { customerId: result.rows[0].id, companyId, name: result.rows[0].name });
     return res.status(201).json({
       success: true,
       customer: result.rows[0],
     });
   } catch (err) {
-    console.error('POST /api/customers error:', err.message);
+    logger.error('POST /api/customers error', { error: err.message });
     return res.status(500).json({ success: false, error: err.message });
   }
 });

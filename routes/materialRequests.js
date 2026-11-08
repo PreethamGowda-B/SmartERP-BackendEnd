@@ -1,5 +1,6 @@
 const express = require('express');
 const router = express.Router();
+const logger = require("../utils/logger");
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 const { createNotification, createNotificationForOwners } = require('../utils/notificationHelpers');
@@ -90,6 +91,7 @@ router.post('/', authenticateToken, async (req, res) => {
             console.error('❌ Failed to send material request creation notification:', notifErr);
         }
 
+        logger.business("MATERIAL_REQUEST_CREATED", { requestId: createdRequest.id, companyId, requestedBy: safeRequestedBy, itemName: item_name, quantity });
         res.status(201).json(createdRequest);
     } catch (err) {
         console.error('❌ Error creating material request:', err);

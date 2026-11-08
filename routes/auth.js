@@ -1,5 +1,6 @@
 const express = require("express");
 const router = express.Router();
+const logger = require("../utils/logger");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const { pool } = require("../db");
@@ -1166,6 +1167,7 @@ router.post("/login", async (req, res) => {
           identifier: identifier.slice(0, 100),
         }
       });
+      logger.business("LOGIN_FAILED", { identifier: identifier.slice(0, 100), reason: "invalid_credentials", ip: clientIp });
       return res.status(401).json({ message: "Invalid email or password" });
     }
 
@@ -1307,7 +1309,7 @@ router.post("/login", async (req, res) => {
     res.cookie(accessCookieName, accessToken, { ...cookieOpts, maxAge: ACCESS_MAX_AGE });
     res.cookie(refreshCookieName, refreshToken, { ...cookieOpts, maxAge: REFRESH_MAX_AGE });
 
-    console.log(`✅ Login successful for ${user.role}: ${user.email}`);
+    logger.business("LOGIN_SUCCESS", { userId: user.id, companyId: user.company_id, role: user.role, email: user.email, requestId: req.requestId });
 
     delete user.password_hash;
 

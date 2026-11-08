@@ -16,9 +16,17 @@ if (process.env.SENTRY_DSN) {
     ],
     tracesSampleRate: 0.1,
     profilesSampleRate: 0.1,
+    beforeSend(event) {
+      if (event.request?.headers) {
+        delete event.request.headers['authorization'];
+        delete event.request.headers['cookie'];
+        delete event.request.headers['set-cookie'];
+      }
+      return event;
+    },
   });
 
-  console.log("🎯 Sentry Observability initialized");
+  logger.info("Sentry Observability initialized");
 }
 
 const express = require("express");
@@ -52,17 +60,29 @@ app.use((req, res, next) => {
     if (completed) return;
     completed = true;
     const durationMs = performance.now() - startedAt;
-    if (durationMs < Number(process.env.REQUEST_TRACE_THRESHOLD_MS || 100)) return;
-    console.warn(JSON.stringify({
-      type: "request_performance",
-      requestId,
-      method: req.method,
-      path: String(req.originalUrl || req.url).split("?")[0].replace(/[0-9a-f]{8}-[0-9a-f-]{27,}/gi, ":id"),
-      status: res.statusCode,
-      outcome,
-      durationMs: Number(durationMs.toFixed(2)),
-      pool: { total: pool.totalCount, idle: pool.idleCount, waiting: pool.waitingCount },
-    }));
+    const slowThreshold = Number(process.env.REQUEST_TRACE_THRESHOLD_MS || 2000);
+    const sanitizedPath = String(req.originalUrl || req.url).split("?")[0].replace(/[0-9a-f]{8}-[0-9a-f-]{27,}/gi, ":id");
+    if (durationMs >= slowThreshold) {
+      logger.warn("Slow HTTP request detected", {
+        requestId,
+        method: req.method,
+        path: sanitizedPath,
+        status: res.statusCode,
+        outcome,
+        durationMs: Number(durationMs.toFixed(2)),
+        pool: { total: pool.totalCount, idle: pool.idleCount, waiting: pool.waitingCount },
+      });
+    } else if (logger.isDebugEnabled()) {
+      logger.debug("HTTP request completed", {
+        requestId,
+        method: req.method,
+        path: sanitizedPath,
+        status: res.statusCode,
+        outcome,
+        durationMs: Number(durationMs.toFixed(2)),
+        pool: { total: pool.totalCount, idle: pool.idleCount, waiting: pool.waitingCount },
+      });
+    }
   };
   res.once("finish", () => logCompletion("completed"));
   res.once("close", () => {
@@ -504,7 +524,7 @@ async function fixDatabaseConstraints() {
       END $$;
     `).catch(() => {});
 
-    console.log('✅ Database constraints fixed');
+    logger.debug('Database constraints verified and fixed');
 
     // Step 4: Setup Periodic Refresh Token Cleanup (Every 24 hours)
     setInterval(async () => {
@@ -530,10 +550,10 @@ async function fixDatabaseConstraints() {
         console.error("❌ Periodic Cleanup Error:", cleanupErr.message);
       }
     }, 24 * 60 * 60 * 1000);
-    console.log('🧹 Scheduled daily cleanup for refresh tokens');
+    logger.debug('Scheduled daily cleanup for refresh tokens');
 
   } catch (err) {
-    console.warn('⚠️  Could not fix constraints:', err.message);
+    logger.warn('Could not fix database constraints (non-fatal)', { error: err.message });
   } finally {
     if (client) client.release();
   }
@@ -566,7 +586,7 @@ async function runSqlStatements(sql, context = 'migration') {
 // ✅ Consolidated Database Initialization (Run once per deployment)
 async function runDatabaseInitialization() {
   try {
-    console.log('🏗️  Starting Database Initialization...');
+    logger.info('Starting Database Initialization and Schema Verification...');
 
     // 1. Fix constraints
     await fixDatabaseConstraints();
@@ -586,6 +606,8 @@ async function runDatabaseInitialization() {
     try {
       initClient = await pool.connect();
       await initClient.query('SET ROLE postgres').catch(() => {});
+      const { ensureWorkRequestsSchemaOwner } = require('./utils/workRequestsTableInitializer');
+      await ensureWorkRequestsSchemaOwner(initClient);
 
       await initClient.query(`
         ALTER TABLE jobs ADD COLUMN IF NOT EXISTS sla_target_hours NUMERIC DEFAULT 4.0;
@@ -756,11 +778,15 @@ async function runDatabaseInitialization() {
         CREATE INDEX IF NOT EXISTS idx_jar_job_id ON job_action_requests(job_id);
         CREATE INDEX IF NOT EXISTS idx_jar_company_id ON job_action_requests(company_id);
         CREATE INDEX IF NOT EXISTS idx_jar_status ON job_action_requests(status);
-      `).catch(() => {});
-
-    } catch (_) {
+      `);
+    } catch (schemaErr) {
+      logger.error("Fatal error applying CNC/SLA/WorkRequests schema in master initialization", schemaErr);
+      throw schemaErr;
     } finally {
-      if (initClient) initClient.release();
+      if (initClient) {
+        await initClient.query("RESET ROLE").catch(() => {});
+        initClient.release();
+      }
     }
 
     try {
@@ -1101,8 +1127,8 @@ const WORKER_COUNT = process.env.WEB_CONCURRENCY || Math.min(totalCPUs, 2);
 
 if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
 
-  console.log(`📡 Master process ${process.pid} is running`);
-  console.log(`🧵 Spawning ${WORKER_COUNT} workers for cluster mode...`);
+  logger.info('Master process running', { pid: process.pid });
+  logger.info('Spawning cluster workers', { pid: process.pid, workerCount: WORKER_COUNT });
 
   // Run DB initialization ONCE in the master process before forking.
   // Wrap in bypassRls: true so schema mutations aren't blocked by RLS policies.
@@ -1117,9 +1143,9 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
       // The parent only coordinates schema initialization. Release its idle
       // pool before forking workers so it does not consume session-pool slots.
       await pool.end();
-      console.log('✅ Master DB pool closed before worker startup');
+      logger.debug('Master DB pool closed before worker startup');
     } catch (err) {
-      console.error('❌ Master DB Init Error:', err.message);
+      logger.fatal('Master DB Init Error:', { error: err.message });
       // Do not serve a deployment whose required schema migration failed.
       process.exit(1);
       return;
@@ -1132,7 +1158,7 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
   })();
 
   cluster.on('exit', (worker, code, signal) => {
-    console.warn(`⚠️ Worker ${worker.process.pid} died. Spawning replacement...`);
+    logger.warn('Worker process died, spawning replacement', { pid: worker.process.pid, code, signal });
     cluster.fork();
   });
 
@@ -1140,7 +1166,7 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
   // ✅ Start server
   const PORT = process.env.PORT || 4000;
   app.listen(PORT, () => {
-    console.log(`🚀 SmartERP worker ${process.pid} running on port ${PORT}`);
+    logger.info('SmartERP worker running', { pid: process.pid, port: PORT });
 
     // Start background processors on primary cluster worker, or on any single-process deployment
     const shouldStartWorkers = process.env.IS_PRIMARY_WORKER === 'true' ||
@@ -1149,7 +1175,7 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
       process.env.ENABLE_BACKGROUND_WORKERS === 'true';
 
     if (shouldStartWorkers) {
-      console.log("🛠️ Starting background processors and workers...");
+      logger.info("Starting background processors and workers", { pid: process.pid });
 
       require('./jobs/workers'); // Initialize BullMQ workers
 

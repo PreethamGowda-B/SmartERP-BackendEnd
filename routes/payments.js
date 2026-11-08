@@ -6,6 +6,7 @@
  */
 const express = require('express');
 const router = express.Router();
+const logger = require("../utils/logger");
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 const PayrollValidationService = require('../services/payrollValidationService');
@@ -65,6 +66,7 @@ router.post('/pay', authenticateToken, requireOwnerOrAdmin, async (req, res) => 
     );
     await pool.query('UPDATE payroll_entries SET status = $1 WHERE id = $2', ['paid', payrollEntryId]);
 
+    logger.business("PAYMENT_RECEIVED", { payrollEntryId, companyId, paymentId: result.rows[0].id, method });
     res.json({ success: true, data: result.rows[0], error: null });
   } catch (err) {
     console.error('payments POST /pay error:', err.message);

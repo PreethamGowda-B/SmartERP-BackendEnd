@@ -6,6 +6,7 @@ const {
   logAttendanceProcessorCompletion,
   logAttendanceProcessorFailure,
 } = require('../services/attendanceProcessorLogger');
+const logger = require('../utils/logger');
 
 function attachProcessorErrorContext(error, context) {
   if (error && (typeof error === 'object' || typeof error === 'function')) {
@@ -42,7 +43,7 @@ let _attendanceRunning = false;
 
 async function runDailyAttendanceProcessing(now = new Date()) {
   if (_attendanceRunning) {
-    console.log('⏳ Attendance processing pass already in progress. Skipping duplicate tick.');
+    logger.debug('Attendance processing pass already in progress. Skipping duplicate tick.');
     return [];
   }
   _attendanceRunning = true;
@@ -77,7 +78,7 @@ async function runDailyAttendanceProcessing(now = new Date()) {
         throw error;
       }
     }
-    logAttendanceProcessorCompletion(results, Date.now() - startedAt);
+    logAttendanceProcessorCompletion(results, Date.now() - startedAt, logger);
     return results;
   });
   } finally {
@@ -90,16 +91,16 @@ function startDailyAttendanceProcessor() {
   // the next tick, with startup recovery and transactional idempotency intact.
   cron.schedule('* * * * *', () => {
     runDailyAttendanceProcessing().catch((error) => {
-      logAttendanceProcessorFailure(error);
+      logAttendanceProcessorFailure(error, logger);
     });
   }, { timezone: 'Asia/Kolkata' });
 
   // Catch up a missed cutoff after process restart. Service-level due checks
   // ensure this never closes today's session before its configured cutoff.
   runDailyAttendanceProcessing().catch((error) => {
-    logAttendanceProcessorFailure(error, console, 'startup recovery failed');
+    logAttendanceProcessorFailure(error, logger, 'startup recovery failed');
   });
-  console.log('✅ Daily attendance processor scheduled (policy cutoff, Asia/Kolkata; 1-minute retry and startup recovery)');
+  logger.info('Daily attendance processor scheduled (policy cutoff, Asia/Kolkata)', { pid: process.pid });
 }
 
 module.exports = { startDailyAttendanceProcessor, runDailyAttendanceProcessing, processCompany };

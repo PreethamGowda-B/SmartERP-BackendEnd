@@ -8,6 +8,7 @@
 
 const express = require('express');
 const router = express.Router();
+const logger = require("../utils/logger");
 const jwt = require('jsonwebtoken');
 const { pool } = require('../db');
 const { storage } = require('../middleware/als');
@@ -506,6 +507,7 @@ function createInvoicePaymentRecordHandler(paymentService = invoiceService) {
         recordedBy: userId,
       });
 
+      logger.business("PAYMENT_RECEIVED", { invoiceId, companyId, amount, paymentMethod, recordedBy: userId });
       return res.json(result);
     } catch (err) {
       console.error('POST /api/invoices/:id/record-payment failed:', err?.code || 'PAYMENT_RECORDING_ERROR');

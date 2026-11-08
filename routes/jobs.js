@@ -1,5 +1,6 @@
 const express = require('express');
 const router = express.Router();
+const logger = require("../utils/logger");
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 const { createNotification, createNotificationForCompany, createNotificationForOwners, createCustomerPortalNotification } = require('../utils/notificationHelpers');
@@ -159,6 +160,7 @@ router.post('/', authenticateToken, loadPlan, checkPlanLimit('job'), [
       assignedEmployeeId: assignedTo || null,
     }).catch(() => { }); // non-blocking, never breaks response
 
+    logger.business("JOB_CREATED", { jobId: createdJob.id, companyId: req.user.companyId, userId: req.user.id, priority: job.priority || "medium" });
     res.json(createdJob);
   } catch (err) {
     console.error('jobs POST error', err);
@@ -282,7 +284,7 @@ router.get('/', authenticateToken, async (req, res) => {
     }
 
     const total = parseInt(countResult.rows[0].count);
-    console.log(`🧩 Jobs query returned ${result.rows.length} rows (total: ${total}) for role: ${req.user.role}, company: ${req.user.companyId}`);
+    logger.debug("Jobs query executed", { count: result.rows.length, total, role: req.user.role, companyId: req.user.companyId });
 
     const rows = result.rows.map((r) => {
       const job = r.data && typeof r.data === 'object' ? r.data : {};
@@ -857,6 +859,7 @@ const handleJobAccept = async (req, res) => {
       if (!result.rows[0]) {
         return res.status(404).json({ message: 'Job not found or access denied' });
       }
+      logger.business("JOB_UPDATED", { jobId: id, companyId, userId: req.user.id });
       res.json(result.rows[0]);
     } catch (err) {
       console.error('jobs PUT error', err);
@@ -884,6 +887,7 @@ const handleJobAccept = async (req, res) => {
       if (result.rowCount === 0) {
         return res.status(404).json({ message: 'Job not found or access denied' });
       }
+      logger.business("JOB_DELETED", { jobId: id, companyId, userId: req.user.id });
       res.json({ success: true });
     } catch (err) {
       console.error('jobs DELETE error', err);

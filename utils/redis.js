@@ -16,6 +16,7 @@
  */
 
 const Redis = require('ioredis');
+const logger = require('./logger');
 
 const REDIS_URL = process.env.REDIS_URL;
 
@@ -34,17 +35,17 @@ const BASE_OPTS = {
 function attachListeners(client, label) {
   client.on('error', (err) => {
     if (err.message?.includes('max number of clients reached')) {
-      console.warn(`⚠️ Redis [${label}] connection limit reached (non-fatal)`);
+      logger.warn(`Redis [${label}] connection limit reached (non-fatal)`, { label, pid: process.pid });
     } else if (
       !err.message?.includes('Connection is closed') &&
       !err.message?.includes('connect ECONNREFUSED') &&
       !err.message?.includes('Stream isn\'t writeable') &&
       !err.message?.includes("Can't execute 'info'")
     ) {
-      console.warn(`⚠️ Redis [${label}] error:`, err.message);
+      logger.warn(`Redis [${label}] error: ${err.message}`, { label, pid: process.pid });
     }
   });
-  client.on('connect', () => console.log(`🚀 Redis [${label}] connected`));
+  client.on('connect', () => logger.info(`Redis [${label}] connected`, { label, pid: process.pid }));
 }
 
 // ─── Slot 1: Command client ───────────────────────────────────────────────────
@@ -54,7 +55,7 @@ if (REDIS_URL) {
     redisClient = new Redis(REDIS_URL, BASE_OPTS);
     attachListeners(redisClient, 'cmd');
   } catch (e) {
-    console.warn('⚠️ Redis command client setup failed:', e.message);
+    logger.warn(`Redis command client setup failed: ${e.message}`, { pid: process.pid });
   }
 }
 
@@ -76,7 +77,7 @@ function getSharedSubscriber() {
     });
     attachListeners(subscriberClient, 'sub');
   } catch (e) {
-    console.warn('⚠️ Shared Redis subscriber setup failed:', e.message);
+    logger.warn(`Shared Redis subscriber setup failed: ${e.message}`, { pid: process.pid });
     subscriberClient = null;
   }
   return subscriberClient;
@@ -101,7 +102,7 @@ function getBullMQConnection() {
     });
     attachListeners(bullConnection, 'bullmq');
   } catch (e) {
-    console.warn('⚠️ BullMQ Redis connection setup failed:', e.message);
+    logger.warn(`BullMQ Redis connection setup failed: ${e.message}`, { pid: process.pid });
     bullConnection = null;
   }
   return bullConnection;

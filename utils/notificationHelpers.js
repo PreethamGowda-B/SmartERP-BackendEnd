@@ -1,4 +1,5 @@
 const { pool } = require('../db');
+const logger = require('./logger');
 const { redisClient } = require('./redis');
 const { sendPushNotification } = require('../services/firebaseService');
 const { isInternalNotificationRole, isCustomerNotificationTypeAllowed } = require('./notificationAudience');
@@ -101,6 +102,7 @@ async function createNotification(arg1, arg2, arg3, arg4, arg5) {
         }
 
         const notification = result.rows[0];
+        logger.business("NOTIFICATION_SENT", { notificationId: notification.id, userId: user_id, companyId: company_id, type, priority });
 
         // 1. Instant Real-time Web UI Delivery via SSE (<1ms in-process, instant Redis pubsub)
         broadcastToUser(user_id, {

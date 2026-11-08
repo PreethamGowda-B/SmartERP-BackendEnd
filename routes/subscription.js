@@ -1,5 +1,6 @@
 const express = require('express');
 const router = express.Router();
+const logger = require("../utils/logger");
 const crypto = require('crypto');
 const Razorpay = require('razorpay');
 const { pool } = require('../db');
@@ -589,7 +590,7 @@ router.post('/verify-payment', requireOwner, async (req, res) => {
       });
 
       // 4. Update Company Plan & Subscription Expiry Dates
-      console.log(`[Subscription] Updating Companies Table... Target Plan = ${verifiedPlanId}`);
+      logger.business("SUBSCRIPTION_UPDATED", { companyId, planId: verifiedPlanId, billingCycle });
       const updateResult = await dbClient.query(
         `UPDATE companies 
          SET plan_id = $1, 

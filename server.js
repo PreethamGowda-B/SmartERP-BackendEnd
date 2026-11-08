@@ -788,55 +788,53 @@ async function runDatabaseInitialization() {
       errorLogger.log(cpErr, { context: 'migration.customer_portal' });
     }
 
-    // 5. Workflow Enhancement migration (approval workflow, SLA, billing, etc.)
+    // 5. Workflow & Schema migrations (idempotent — skip replay if already applied)
     try {
       const fs = require('fs');
       const path = require('path');
-      const workflowSql = fs.readFileSync(
-        path.join(__dirname, 'migrations', 'workflow_enhancement_migration.sql'),
-        'utf8'
-      );
-      await runSqlStatements(workflowSql, 'migration.workflow_enhancement');
-      console.log('✅ Workflow Enhancement migration complete');
+      const checkResult = await pool.query(
+        "SELECT 1 FROM information_schema.tables WHERE table_name = 'company_settings' LIMIT 1"
+      ).catch(() => ({ rows: [] }));
 
-      const hrMasterSql = fs.readFileSync(
-        path.join(__dirname, 'migrations', 'hr_master_backbone_schema.sql'),
-        'utf8'
-      );
-      await runSqlStatements(hrMasterSql, 'migration.hr_master_backbone');
-      const msgIdxSql = fs.readFileSync(
-        path.join(__dirname, 'migrations', 'messaging_performance_indexes.sql'),
-        'utf8'
-      );
-      await runSqlStatements(msgIdxSql, 'migration.messaging_performance_indexes');
+      if (checkResult.rows.length === 0) {
+        const workflowSql = fs.readFileSync(
+          path.join(__dirname, 'migrations', 'workflow_enhancement_migration.sql'),
+          'utf8'
+        );
+        await runSqlStatements(workflowSql, 'migration.workflow_enhancement');
+        console.log('✅ Workflow Enhancement migration complete');
 
-      const commBackboneSql = fs.readFileSync(
-        path.join(__dirname, 'migrations', 'enterprise_communication_backbone.sql'),
-        'utf8'
-      );
-      await runSqlStatements(commBackboneSql, 'migration.enterprise_communication_backbone');
-      console.log('✅ Enterprise Communication Backbone database schema applied');
+        const hrMasterSql = fs.readFileSync(
+          path.join(__dirname, 'migrations', 'hr_master_backbone_schema.sql'),
+          'utf8'
+        );
+        await runSqlStatements(hrMasterSql, 'migration.hr_master_backbone');
+        const msgIdxSql = fs.readFileSync(
+          path.join(__dirname, 'migrations', 'messaging_performance_indexes.sql'),
+          'utf8'
+        );
+        await runSqlStatements(msgIdxSql, 'migration.messaging_performance_indexes');
+
+        const commBackboneSql = fs.readFileSync(
+          path.join(__dirname, 'migrations', 'enterprise_communication_backbone.sql'),
+          'utf8'
+        );
+        await runSqlStatements(commBackboneSql, 'migration.enterprise_communication_backbone');
+        console.log('✅ Enterprise Communication Backbone database schema applied');
+
+        const indexSql = fs.readFileSync(
+          path.join(__dirname, 'migrations', 'hardening_indexes.sql'),
+          'utf8'
+        );
+        await runSqlStatements(indexSql, 'migration.hardening_indexes');
+        console.log('✅ Hardening indexes applied');
+      } else {
+        console.log('⚡ Workflow & communication backbone migrations already applied — skipping replay');
+      }
     } catch (wfErr) {
-      console.error('⚠️  Workflow/HR/Messaging migration failed:', wfErr.message);
+      console.error('⚠️  Workflow/HR/Messaging migration check failed:', wfErr.message);
       const errorLogger = require('./utils/errorLogger');
       errorLogger.log(wfErr, { context: 'migration.workflow_enhancement' });
-    }
-
-    // 6. Hardening indexes (performance optimization)
-    // Run statement-by-statement so a missing column doesn't abort all indexes
-    try {
-      const fs = require('fs');
-      const path = require('path');
-      const indexSql = fs.readFileSync(
-        path.join(__dirname, 'migrations', 'hardening_indexes.sql'),
-        'utf8'
-      );
-      await runSqlStatements(indexSql, 'migration.hardening_indexes');
-      console.log('✅ Hardening indexes applied');
-    } catch (idxErr) {
-      console.error('⚠️  Hardening indexes failed:', idxErr.message);
-      const errorLogger = require('./utils/errorLogger');
-      errorLogger.log(idxErr, { context: 'migration.hardening_indexes' });
     }
 
     console.log('✅ Database Initialization & Optimization complete');

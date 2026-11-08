@@ -29,6 +29,7 @@ async function optimizeDatabase() {
       
       // Notifications (High volume)
       'CREATE INDEX IF NOT EXISTS idx_notifications_user_id_read ON notifications(user_id, read)',
+      'CREATE INDEX IF NOT EXISTS idx_notifications_user_text_company_text_created ON notifications ((user_id::text), (company_id::text), created_at DESC)',
       
       // Material Requests
       'CREATE INDEX IF NOT EXISTS idx_materials_company_id ON material_requests(company_id)',

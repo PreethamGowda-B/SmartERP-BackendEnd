@@ -8,17 +8,48 @@ const { redisClient } = require('../utils/redis'); // shared singleton — never
 
 const INTERNAL_ROLES = new Set(['owner', 'employee', 'hr', 'admin', 'super_admin']);
 
+// In-memory short-lived cache (60s) to eliminate redundant database round-trips
+// on every notification poll or drawer open, while preserving strict staff role checks.
+const principalCache = new Map();
+const PRINCIPAL_CACHE_TTL_MS = 60000;
+
 // Resolve notification authority from the persisted staff record, never from
 // request parameters or an unverified role/company claim supplied by a client.
 async function requireInternalNotificationPrincipal(req, res, next) {
   try {
     const claimedId = String(req.user?.userId || req.user?.id || '');
     if (!claimedId) return res.status(403).json({ message: 'Internal account required' });
+
+    // Check cache first to avoid redundant 5-round-trip DB query per request
+    const cached = principalCache.get(claimedId);
+    if (cached && (Date.now() - cached.cachedAt < PRINCIPAL_CACHE_TTL_MS)) {
+      const principal = cached.principal;
+      if (!principal || !INTERNAL_ROLES.has(String(principal.role || '').toLowerCase())) {
+        return res.status(403).json({ message: 'Internal account required' });
+      }
+      req.notificationPrincipal = {
+        id: String(principal.id),
+        role: String(principal.role).toLowerCase(),
+        companyId: principal.company_id == null ? null : String(principal.company_id),
+      };
+      return next();
+    }
+
     const result = await pool.query(
       'SELECT id, role, company_id FROM users WHERE id::text = $1::text LIMIT 1',
       [claimedId]
     );
     const principal = result.rows[0];
+    if (principal) {
+      principalCache.set(claimedId, { principal, cachedAt: Date.now() });
+      if (principalCache.size > 2000) {
+        const now = Date.now();
+        for (const [k, v] of principalCache.entries()) {
+          if (now - v.cachedAt > PRINCIPAL_CACHE_TTL_MS) principalCache.delete(k);
+        }
+      }
+    }
+
     if (!principal || !INTERNAL_ROLES.has(String(principal.role || '').toLowerCase())) {
       return res.status(403).json({ message: 'Internal account required' });
     }
@@ -47,15 +78,27 @@ router.get('/', authenticateToken, requireInternalNotificationPrincipal, async (
     const offset = Math.max(0, Number.parseInt(req.query.offset, 10) || 0);
     const search = String(req.query.search || '').trim().slice(0, 120);
 
-    const result = await pool.query(
-      `SELECT * FROM notifications
+    let queryText;
+    let queryParams;
+
+    if (search) {
+      queryText = `SELECT * FROM notifications
        WHERE user_id::text = $1::text
          AND (($2::text IS NULL AND company_id IS NULL) OR company_id::text = $2::text)
-         AND ($3::text = '' OR title ILIKE '%' || $3 || '%' OR message ILIKE '%' || $3 || '%' OR type ILIKE '%' || $3 || '%')
+         AND (title ILIKE '%' || $3 || '%' OR message ILIKE '%' || $3 || '%' OR type ILIKE '%' || $3 || '%')
        ORDER BY created_at DESC 
-       LIMIT $4 OFFSET $5`,
-      [userId, companyId, search, limit, offset]
-    );
+       LIMIT $4 OFFSET $5`;
+      queryParams = [userId, companyId, search, limit, offset];
+    } else {
+      queryText = `SELECT * FROM notifications
+       WHERE user_id::text = $1::text
+         AND (($2::text IS NULL AND company_id IS NULL) OR company_id::text = $2::text)
+       ORDER BY created_at DESC 
+       LIMIT $3 OFFSET $4`;
+      queryParams = [userId, companyId, limit, offset];
+    }
+
+    const result = await pool.query(queryText, queryParams);
 
     res.json(result.rows || []);
   } catch (err) {

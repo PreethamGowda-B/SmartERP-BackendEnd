@@ -4,6 +4,7 @@ if (dns.setDefaultResultOrder) {
 }
 
 require("dotenv").config();
+const logger = require("./utils/logger");
 const Sentry = require("@sentry/node");
 const { nodeProfilingIntegration } = require("@sentry/profiling-node");
 
@@ -37,7 +38,6 @@ const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 const cookieParser = require("cookie-parser");
 const { pool } = require("./db"); // ✅ Make sure db.js exports { pool }
-const logger = require("./utils/logger");
 const { storage } = require("./middleware/als"); // ✅ ALS — needed for global RLS initializer
 
 const app = express();

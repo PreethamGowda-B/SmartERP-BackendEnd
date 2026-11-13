@@ -128,7 +128,7 @@ test('account-state query treats status as an optional legacy column while keepi
   assert.deepEqual(queries[0].params, ['user-1']);
 });
 
-test('simultaneous cold-cache checks for one user share an in-flight database lookup', async () => {
+test('simultaneous cold-cache checks share one lookup and briefly cache active state when Redis is unavailable', async () => {
   let queryCount = 0;
   let finishQuery;
   const pool = {
@@ -151,7 +151,7 @@ test('simultaneous cold-cache checks for one user share an in-flight database lo
   ]);
 
   await check();
-  assert.equal(queryCount, 2, 'completed account state is not cached in process');
+  assert.equal(queryCount, 1, 'the short local cache prevents immediate dashboard fan-out from re-querying PostgreSQL');
 });
 
 test('password login, refresh, and protected requests enforce persisted account state', () => {

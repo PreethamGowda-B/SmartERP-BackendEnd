@@ -2,6 +2,15 @@
 
 const ACCOUNT_STATE_CACHE_TTL = 60; // 60-second Redis cache to avoid heavy DB overhead
 const accountStateLookupsByPool = new WeakMap();
+const localActiveStateByPool = new WeakMap();
+
+// Redis remains the source for immediate revocations. This tiny cache is used
+// only while Redis is unavailable, preventing a dashboard's parallel requests
+// from repeatedly consuming the already constrained PostgreSQL pool.
+const LOCAL_ACTIVE_CACHE_MS = Math.min(
+  10_000,
+  Math.max(0, Number.parseInt(process.env.AUTH_LOCAL_ACTIVE_CACHE_MS || '5000', 10) || 0)
+);
 
 function isUserAccountActive(user) {
   if (!user) return false;
@@ -31,6 +40,33 @@ function loadAccountStateOnce(pool, userId) {
     });
   lookups.set(key, lookup);
   return lookup;
+}
+
+function getLocallyCachedActiveState(pool, userId) {
+  if (!LOCAL_ACTIVE_CACHE_MS) return null;
+  const entries = localActiveStateByPool.get(pool);
+  const entry = entries?.get(String(userId));
+  if (!entry || entry.expiresAt <= Date.now()) {
+    entries?.delete(String(userId));
+    return null;
+  }
+  return entry;
+}
+
+function cacheLocalActiveState(pool, userId) {
+  if (!LOCAL_ACTIVE_CACHE_MS) return;
+  let entries = localActiveStateByPool.get(pool);
+  if (!entries) {
+    entries = new Map();
+    localActiveStateByPool.set(pool, entries);
+  }
+  if (entries.size >= 2000) {
+    const now = Date.now();
+    for (const [key, entry] of entries) {
+      if (entry.expiresAt <= now) entries.delete(key);
+    }
+  }
+  entries.set(String(userId), { expiresAt: Date.now() + LOCAL_ACTIVE_CACHE_MS });
 }
 
 async function verifyAccessAccountState({ pool, redisClient, userId, tokenIssuedAt }) {
@@ -70,10 +106,15 @@ async function verifyAccessAccountState({ pool, redisClient, userId, tokenIssued
     }
   }
 
-  // 2. Query database for current account status
-  // Collapse simultaneous cold-cache requests for the same user into one DB
-  // lookup. Completed results are not retained, so account changes remain
-  // visible on the next request.
+  // Never use this cache while Redis is healthy: a suspension or revocation is
+  // published to Redis and must take precedence immediately.
+  const locallyCached = getLocallyCachedActiveState(pool, userId);
+  if (locallyCached) return { allowed: true, reason: null };
+
+  // 2. Query database for current account status. Collapse simultaneous
+  // cold-cache requests for the same user into one DB lookup. With Redis
+  // unavailable, successful active results are retained only for the brief
+  // local TTL above to protect the database during request fan-out.
   const result = await loadAccountStateOnce(pool, userId);
   if (!result.rows.length) return { allowed: false, reason: 'user_missing' };
 
@@ -94,6 +135,8 @@ async function verifyAccessAccountState({ pool, redisClient, userId, tokenIssued
       await redisClient.set(`user_active:${userId}`, '1', { EX: ACCOUNT_STATE_CACHE_TTL });
     } catch (_) {}
   }
+
+  cacheLocalActiveState(pool, userId);
 
   return { allowed: true, reason: null };
 }

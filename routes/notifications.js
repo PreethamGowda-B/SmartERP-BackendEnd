@@ -7,6 +7,10 @@ const { registerSSEConnection, unregisterSSEConnection, broadcastToUser } = requ
 const { redisClient } = require('../utils/redis'); // shared singleton — never create extra connections for non-pubsub ops
 
 const INTERNAL_ROLES = new Set(['owner', 'employee', 'hr', 'admin', 'super_admin']);
+// A browser may briefly overlap old and replacement EventSource connections.
+// Presence notifications should be emitted only on the first connection and
+// the final disconnect, not once per overlapping stream.
+const ssePresenceConnections = new Map();
 
 // In-memory short-lived cache (60s) to eliminate redundant database round-trips
 // on every notification poll or drawer open, while preserving strict staff role checks.
@@ -67,6 +71,24 @@ async function requireInternalNotificationPrincipal(req, res, next) {
 
 function notificationScope(req) {
   return req.notificationPrincipal;
+}
+
+function beginSsePresence(userId) {
+  const key = String(userId);
+  const count = (ssePresenceConnections.get(key) || 0) + 1;
+  ssePresenceConnections.set(key, count);
+  return count === 1;
+}
+
+function endSsePresence(userId) {
+  const key = String(userId);
+  const count = ssePresenceConnections.get(key) || 0;
+  if (count <= 1) {
+    ssePresenceConnections.delete(key);
+    return count === 1;
+  }
+  ssePresenceConnections.set(key, count - 1);
+  return false;
 }
 
 // ─── GET /api/notifications ──────────────────────────────────────────────────
@@ -137,6 +159,13 @@ router.get('/unread-count', authenticateToken, requireInternalNotificationPrinci
 router.get('/sse', authenticateToken, requireInternalNotificationPrincipal, async (req, res) => {
   const { id: userId, companyId: authorizedCompanyId } = notificationScope(req);
   const redisUrl = process.env.REDIS_URL;
+  const firstConnectionForUser = beginSsePresence(userId);
+  let presenceClosed = false;
+  const isFinalConnection = () => {
+    if (presenceClosed) return false;
+    presenceClosed = true;
+    return endSsePresence(userId);
+  };
 
   console.log(`📡 SSE connection established for user ${userId}`);
 
@@ -156,7 +185,7 @@ router.get('/sse', authenticateToken, requireInternalNotificationPrincipal, asyn
 
   // Mark user as online in Redis — reuse shared singleton, no new connection needed
   const companyId = authorizedCompanyId || '';
-  if (redisClient && companyId) {
+  if (redisClient && companyId && firstConnectionForUser) {
     try {
       const hsetFn = redisClient.hset || redisClient.hSet;
       if (typeof hsetFn === 'function') {
@@ -243,6 +272,8 @@ router.get('/sse', authenticateToken, requireInternalNotificationPrincipal, asyn
         try { subscriber.unsubscribe(channel).catch(() => {}); } catch {}
       }
 
+      if (!isFinalConnection()) return;
+
       // Mark user as offline in Redis — reuse shared singleton
       const companyId = authorizedCompanyId || '';
       if (redisClient && companyId) {
@@ -278,6 +309,7 @@ router.get('/sse', authenticateToken, requireInternalNotificationPrincipal, asyn
     console.log(`📡 SSE connection closed for user ${userId}`);
     clearInterval(heartbeatInterval);
     unregisterSSEConnection(userId, res);
+    isFinalConnection();
   });
 });
 

@@ -11,7 +11,7 @@ test('simultaneous company checks share only the in-flight status query', async 
     queryCount += 1;
     if (queryCount > 1) return Promise.resolve({ rows: [{ status: 'active', is_susp: 'false' }] });
     return new Promise((resolve) => { finishQuery = resolve; });
-  });
+  }, { cacheMs: 0 });
 
   const first = checkSuspended('company-1');
   const second = checkSuspended('company-1');
@@ -22,6 +22,18 @@ test('simultaneous company checks share only the in-flight status query', async 
 
   assert.equal(await checkSuspended('company-1'), false);
   assert.equal(queryCount, 2, 'a later request rechecks current company status');
+});
+
+test('briefly caches a resolved company state to absorb dashboard request fan-out', async () => {
+  let queryCount = 0;
+  const checkSuspended = createCompanySuspensionChecker(async () => {
+    queryCount += 1;
+    return { rows: [{ status: 'active', is_susp: 'false' }] };
+  }, { cacheMs: 1000 });
+
+  assert.equal(await checkSuspended('company-1'), false);
+  assert.equal(await checkSuspended('company-1'), false);
+  assert.equal(queryCount, 1);
 });
 
 test('company check recognizes either persisted suspension marker', async () => {

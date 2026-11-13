@@ -1130,16 +1130,23 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
   logger.info('Master process running', { pid: process.pid });
   logger.info('Spawning cluster workers', { pid: process.pid, workerCount: WORKER_COUNT });
 
-  // Run DB initialization ONCE in the master process before forking.
-  // Wrap in bypassRls: true so schema mutations aren't blocked by RLS policies.
+  // Schema repairs, DDL, seed checks, and storage migrations do not belong on
+  // the request-serving startup path. They create noisy deploy logs, delay the
+  // health check, and can contend with live traffic. Run them deliberately via
+  // a maintenance deploy by setting RUN_STARTUP_DB_MAINTENANCE=true.
+  const runStartupDbMaintenance = process.env.RUN_STARTUP_DB_MAINTENANCE === 'true';
   (async () => {
     try {
-      await new Promise((resolve, reject) =>
-        storage.run({ bypassRls: true }, async () => {
-          try { await runDatabaseInitialization(); resolve(); }
-          catch (err) { reject(err); }
-        })
-      );
+      if (runStartupDbMaintenance) {
+        await new Promise((resolve, reject) =>
+          storage.run({ bypassRls: true }, async () => {
+            try { await runDatabaseInitialization(); resolve(); }
+            catch (err) { reject(err); }
+          })
+        );
+      } else {
+        logger.info('Skipping startup database maintenance; use RUN_STARTUP_DB_MAINTENANCE=true for a controlled maintenance deploy.');
+      }
       // The parent only coordinates schema initialization. Release its idle
       // pool before forking workers so it does not consume session-pool slots.
       await pool.end();

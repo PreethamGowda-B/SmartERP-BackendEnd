@@ -67,6 +67,22 @@ test('policy storage query is always keyed by company id and fixed setting key',
   await assert.rejects(AttendancePolicy.getCompanyPolicy(null, queryable), /Missing company affiliation/);
 });
 
+test('shared pool policy reads coalesce and use a short cache', async () => {
+  let calls = 0;
+  const queryable = {
+    totalCount: 0,
+    query: async () => {
+      calls += 1;
+      return { rows: [] };
+    },
+  };
+  const first = AttendancePolicy.getCompanyPolicy('cached-company', queryable);
+  const second = AttendancePolicy.getCompanyPolicy('cached-company', queryable);
+  assert.deepEqual(await Promise.all([first, second]), [AttendancePolicy.validatePolicy(), AttendancePolicy.validatePolicy()]);
+  await AttendancePolicy.getCompanyPolicy('cached-company', queryable);
+  assert.equal(calls, 1);
+});
+
 test('daily processing remains tenant-scoped, skips approved leave and closes one open session', async () => {
   const calls = [];
   const checkIn = ist('2026-10-17', '09:05');

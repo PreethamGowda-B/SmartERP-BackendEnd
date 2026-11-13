@@ -15,6 +15,15 @@ const DEFAULT_ATTENDANCE_POLICY = Object.freeze({
 
 const TIME_RE = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
 const POLICY_KEY = 'attendance_policy';
+// This setting is read by most dashboard, attendance, and background-job
+// requests. Keep a short process-local cache so a burst does not turn one
+// immutable policy row into dozens of database transactions.
+const POLICY_CACHE_TTL_MS = Math.min(
+  60_000,
+  Math.max(0, Number.parseInt(process.env.ATTENDANCE_POLICY_CACHE_MS || '10000', 10) || 0)
+);
+const policyCache = new Map();
+const policyLoads = new Map();
 
 function validatePolicy(input = {}) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('Attendance policy must be an object');
@@ -115,7 +124,37 @@ function automaticClockOutFor(workDate, at = new Date(), policyInput = DEFAULT_A
 }
 
 async function getCompanyPolicy(companyId, queryable) {
-  return (await getCompanyPolicyEntry(companyId, queryable)).policy;
+  if (!companyId) throw new Error('Missing company affiliation');
+
+  // Only cache requests issued through the shared pg Pool. Transaction clients
+  // must always read their own transactional state.
+  const cacheable = queryable && typeof queryable.totalCount === 'number';
+  if (!cacheable || !POLICY_CACHE_TTL_MS) return (await getCompanyPolicyEntry(companyId, queryable)).policy;
+
+  const key = String(companyId);
+  const cached = policyCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.policy;
+  if (cached) policyCache.delete(key);
+
+  let load = policyLoads.get(key);
+  if (!load) {
+    load = getCompanyPolicyEntry(companyId, queryable)
+      .then((entry) => {
+        policyCache.set(key, { policy: entry.policy, expiresAt: Date.now() + POLICY_CACHE_TTL_MS });
+        if (policyCache.size > 2000) {
+          const now = Date.now();
+          for (const [cacheKey, cacheEntry] of policyCache) {
+            if (cacheEntry.expiresAt <= now) policyCache.delete(cacheKey);
+          }
+        }
+        return entry.policy;
+      })
+      .finally(() => {
+        if (policyLoads.get(key) === load) policyLoads.delete(key);
+      });
+    policyLoads.set(key, load);
+  }
+  return load;
 }
 
 async function getCompanyPolicyEntry(companyId, queryable) {
@@ -137,6 +176,7 @@ async function saveCompanyPolicy(companyId, updatedBy, input, queryable) {
      ON CONFLICT (company_id, setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value, updated_by = EXCLUDED.updated_by, updated_at = NOW()`,
     [String(companyId), POLICY_KEY, JSON.stringify(policy), updatedBy || null],
   );
+  policyCache.delete(String(companyId));
   return policy;
 }
 
@@ -213,6 +253,7 @@ async function processCompanyDate(companyId, workDate, queryable, now = new Date
 module.exports = {
   DEFAULT_ATTENDANCE_POLICY,
   POLICY_KEY,
+  POLICY_CACHE_TTL_MS,
   validatePolicy,
   localDate,
   localTime,

@@ -9,6 +9,17 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const {
+  prepareDisposableDatabaseTest,
+  verifyDisposableDatabaseTest,
+  skipDisposableDatabaseTest,
+} = require('./helpers/disposableDatabaseGuard');
+const databaseTestGate = prepareDisposableDatabaseTest();
+
+if (!databaseTestGate.enabled) {
+  skipDisposableDatabaseTest(test, 'Finance end-to-end database integration [SKIPPED]', databaseTestGate.reason);
+} else {
+process.env.DATABASE_URL = databaseTestGate.env.TEST_DATABASE_URL;
 const { pool } = require('../db');
 const { storage } = require('../middleware/als');
 const invoiceService = require('../services/invoiceService');
@@ -16,6 +27,7 @@ const pdfInvoiceService = require('../services/pdfInvoiceService');
 const autoMigrate = require('../migrations/autoMigrate');
 
 test('🚀 End-to-End Acceptance Test: Job-Centric Financial Architecture', async (t) => {
+  await verifyDisposableDatabaseTest(pool, databaseTestGate);
   let companyId;
   let ownerId;
   let employeeId;
@@ -207,3 +219,4 @@ test('🚀 End-to-End Acceptance Test: Job-Centric Financial Architecture', asyn
     });
   });
 });
+}

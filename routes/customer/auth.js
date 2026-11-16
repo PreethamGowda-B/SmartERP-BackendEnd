@@ -558,7 +558,7 @@ router.post('/login', [
     }
 
     // Issue tokens
-    const { accessToken } = await issueTokens(res, req, customer);
+    await issueTokens(res, req, customer);
 
     // Non-blocking audit log
     auditLog(req, customer.id, 'customer_login_success', { email }, customer.company_id);
@@ -571,7 +571,6 @@ router.post('/login', [
         email: customer.email,
         company_id: customer.company_id,
       },
-      token: accessToken,
     });
   } catch (err) {
     console.error('login error:', err.message);
@@ -663,7 +662,7 @@ router.post('/refresh', async (req, res) => {
             maxAge: ACCESS_MAX_AGE,
           });
 
-          return res.json({ ok: true, token: activeAccessToken });
+          return res.json({ ok: true });
         }
       }
 
@@ -758,7 +757,7 @@ router.post('/refresh', async (req, res) => {
     });
 
     auditLog(req, customer.id, 'customer_token_refresh', {}, customer.company_id);
-    return res.json({ ok: true, token: newAccessToken });
+    return res.json({ ok: true });
   } catch (err) {
     if (client) await client.query('ROLLBACK').catch(() => {});
     console.error('refresh error:', err.message);
@@ -908,7 +907,12 @@ router.get('/validate-company', async (req, res) => {
 });
 
 // â”€â”€â”€ Password Recovery Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-function computeCustomerHmac(data, secretSalt = process.env.JWT_SECRET || 'smarterp_default_sec_salt') {
+function computeCustomerHmac(data, secretSalt = process.env.JWT_SECRET) {
+  if (!secretSalt || String(secretSalt).trim().length < 32) {
+    const error = new Error('Password reset security configuration is unavailable.');
+    error.code = 'SECURITY_CONFIGURATION_ERROR';
+    throw error;
+  }
   return crypto.createHmac('sha256', secretSalt).update(String(data)).digest('hex');
 }
 

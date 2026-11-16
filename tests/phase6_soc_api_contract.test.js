@@ -6,6 +6,18 @@
 
 const assert = require('assert');
 require('dotenv').config();
+const { test } = require('node:test');
+const {
+  prepareDisposableDatabaseTest,
+  verifyDisposableDatabaseTest,
+  skipDisposableDatabaseTest,
+} = require('./helpers/disposableDatabaseGuard');
+const databaseTestGate = prepareDisposableDatabaseTest();
+
+if (!databaseTestGate.enabled) {
+  skipDisposableDatabaseTest(test, 'Phase 6 security database integration [SKIPPED]', databaseTestGate.reason);
+} else {
+process.env.DATABASE_URL = databaseTestGate.env.TEST_DATABASE_URL;
 const { pool } = require('../db');
 const { emitSecurityEvent, SECURITY_EVENT_TYPES } = require('../utils/securityEmitter');
 const { processSecurityIncident, THREAT_CATEGORIES } = require('../jobs/securityWorker');
@@ -14,6 +26,7 @@ const { executeSecurityAction, revertSecurityAction } = require('../utils/securi
 const { redactSensitiveData } = require('../utils/promptShield');
 
 async function runPhase6Tests() {
+  await verifyDisposableDatabaseTest(pool, databaseTestGate);
   console.log('🧪 Starting Phase 6 Super Admin SOC API Contract & Workflow Tests...\n');
 
   let passed = 0;
@@ -192,3 +205,4 @@ runPhase6Tests()
     console.error('Fatal Phase 6 test error:', err);
     process.exit(1);
   });
+}

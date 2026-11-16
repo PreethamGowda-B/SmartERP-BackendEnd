@@ -176,7 +176,7 @@ async function runPhase7Tests() {
     for (const v of envAudit.variables) {
       if (v.present) {
         assert(!v.maskedPreview.includes('Preethu@4959'), 'Database password is never printed in unmasked preview');
-        assert(v.maskedPreview.includes('...'), 'Secrets are properly masked');
+        assert.equal(v.maskedPreview, 'SET', 'Secrets are not exposed, even partially');
       }
     }
   });

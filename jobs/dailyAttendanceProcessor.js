@@ -7,6 +7,7 @@ const {
   logAttendanceProcessorFailure,
 } = require('../services/attendanceProcessorLogger');
 const logger = require('../utils/logger');
+const { runWithPostgresAdvisoryLock } = require('../utils/scheduledTaskLock');
 
 function attachProcessorErrorContext(error, context) {
   if (error && (typeof error === 'object' || typeof error === 'function')) {
@@ -40,6 +41,7 @@ async function processCompany(companyId, workDate, now = new Date()) {
 }
 
 let _attendanceRunning = false;
+let _attendanceTask = null;
 
 async function runDailyAttendanceProcessing(now = new Date()) {
   if (_attendanceRunning) {
@@ -89,18 +91,34 @@ async function runDailyAttendanceProcessing(now = new Date()) {
 function startDailyAttendanceProcessor() {
   // Tick every minute so a transient process/database failure is retried on
   // the next tick, with startup recovery and transactional idempotency intact.
-  cron.schedule('* * * * *', () => {
-    runDailyAttendanceProcessing().catch((error) => {
-      logAttendanceProcessorFailure(error, logger);
+  if (_attendanceTask) return;
+  _attendanceTask = cron.schedule('* * * * *', () => {
+    void runWithPostgresAdvisoryLock('daily-attendance', async () => {
+      try { return await runDailyAttendanceProcessing(); }
+      catch (error) {
+        logAttendanceProcessorFailure(error, logger);
+        throw error;
+      }
     });
   }, { timezone: 'Asia/Kolkata' });
 
   // Catch up a missed cutoff after process restart. Service-level due checks
   // ensure this never closes today's session before its configured cutoff.
-  runDailyAttendanceProcessing().catch((error) => {
-    logAttendanceProcessorFailure(error, logger, 'startup recovery failed');
+  void runWithPostgresAdvisoryLock('daily-attendance', async () => {
+    try { return await runDailyAttendanceProcessing(); }
+    catch (error) {
+      logAttendanceProcessorFailure(error, logger, 'startup recovery failed');
+      throw error;
+    }
   });
   logger.info('Daily attendance processor scheduled (policy cutoff, Asia/Kolkata)', { pid: process.pid });
 }
 
-module.exports = { startDailyAttendanceProcessor, runDailyAttendanceProcessing, processCompany };
+function stopDailyAttendanceProcessor() {
+  if (_attendanceTask) {
+    _attendanceTask.stop();
+    _attendanceTask = null;
+  }
+}
+
+module.exports = { startDailyAttendanceProcessor, stopDailyAttendanceProcessor, runDailyAttendanceProcessing, processCompany };

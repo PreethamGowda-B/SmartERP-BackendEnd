@@ -7,7 +7,7 @@ const { Pool } = require('pg');
 require('dotenv').config();
 const { cleanConnectionString } = require('./utils/databaseUrl');
 
-const DEFAULT_DB_POOL_MAX = 2;
+const DEFAULT_DB_POOL_MAX = 4;
 
 function resolvePoolMax(value = process.env.DB_POOL_MAX) {
   const parsed = Number.parseInt(value, 10);

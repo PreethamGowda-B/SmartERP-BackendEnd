@@ -3,6 +3,18 @@
  * Tests every endpoint, action, role gate, and data contract across all 12 modules.
  */
 
+const { test } = require('node:test');
+const {
+  prepareDisposableDatabaseTest,
+  verifyDisposableDatabaseTest,
+  skipDisposableDatabaseTest,
+} = require('./helpers/disposableDatabaseGuard');
+const databaseTestGate = prepareDisposableDatabaseTest();
+
+if (!databaseTestGate.enabled) {
+  skipDisposableDatabaseTest(test, 'Super Admin portal database end-to-end [SKIPPED]', databaseTestGate.reason);
+} else {
+process.env.DATABASE_URL = databaseTestGate.env.TEST_DATABASE_URL;
 const { pool } = require('../db');
 const jwt = require('jsonwebtoken');
 
@@ -22,6 +34,7 @@ function assert(condition, message) {
 }
 
 async function runRegressionSuite() {
+  await verifyDisposableDatabaseTest(pool, databaseTestGate);
   console.log('🧪 Starting Full Super Admin Portal E2E Regression Suite...\n');
 
   try {
@@ -221,3 +234,4 @@ async function runRegressionSuite() {
 }
 
 runRegressionSuite();
+}

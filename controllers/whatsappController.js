@@ -3,6 +3,17 @@
  * Meta WhatsApp Cloud API Webhook Controller
  */
 const whatsappWebhookService = require('../services/whatsappWebhookService');
+const crypto = require('crypto');
+
+function verifyMetaWebhookSignature({ rawBody, signature, appSecret }) {
+  if (!appSecret || !rawBody || typeof signature !== 'string') return false;
+  const match = /^sha256=([a-f0-9]{64})$/i.exec(signature.trim());
+  if (!match) return false;
+  const expected = crypto.createHmac('sha256', appSecret).update(rawBody).digest('hex');
+  const actualBytes = Buffer.from(match[1], 'hex');
+  const expectedBytes = Buffer.from(expected, 'hex');
+  return actualBytes.length === expectedBytes.length && crypto.timingSafeEqual(actualBytes, expectedBytes);
+}
 
 /**
  * GET /webhooks/whatsapp
@@ -14,15 +25,19 @@ function verifyWebhook(req, res) {
     const token = req.query['hub.verify_token'];
     const challenge = req.query['hub.challenge'];
 
-    const expectedToken = (process.env.WHATSAPP_VERIFY_TOKEN || 'smarterp_whatsapp_verify_token_2026').trim();
+    const expectedToken = String(process.env.WHATSAPP_VERIFY_TOKEN || '').trim();
 
-    console.log('📲 [WhatsApp Webhook Verification Request]');
-    console.log(`   - hub.mode: ${mode}`);
-    console.log(`   - Received Token: "${token}"`);
-    console.log(`   - Expected Token: "${expectedToken}"`);
-    console.log(`   - hub.challenge: ${challenge}`);
+    // Verification tokens and challenges are credentials supplied in the URL.
+    // Do not copy either value into logs, which are broadly retained and may
+    // be available to operational personnel.
+    console.log('📲 [WhatsApp Webhook Verification Request]', { mode: mode || 'missing' });
 
-    if (mode === 'subscribe' && token === expectedToken) {
+    if (!expectedToken) {
+      console.error('[WhatsApp Webhook Verification] Configuration missing: WHATSAPP_VERIFY_TOKEN');
+      return res.status(503).json({ error: 'Service Unavailable', message: 'Webhook verification is not configured.' });
+    }
+
+    if (mode === 'subscribe' && typeof token === 'string' && token.length === expectedToken.length && crypto.timingSafeEqual(Buffer.from(token), Buffer.from(expectedToken))) {
       console.log('✅ [WhatsApp Webhook Verification] SUCCESS! Returning HTTP 200 with hub.challenge.');
       return res.status(200).send(challenge);
     } else {
@@ -44,6 +59,22 @@ function verifyWebhook(req, res) {
  */
 async function handleWebhookEvent(req, res) {
   try {
+    const appSecret = String(process.env.WHATSAPP_APP_SECRET || '').trim();
+    if (!appSecret) {
+      console.error('[WhatsApp Webhook] Configuration missing: WHATSAPP_APP_SECRET');
+      return res.status(503).json({ error: 'Service Unavailable', message: 'Webhook event verification is not configured.' });
+    }
+    if (!Buffer.isBuffer(req.rawBody)) {
+      return res.status(400).json({ error: 'Bad Request', message: 'Webhook payload could not be verified.' });
+    }
+    if (!verifyMetaWebhookSignature({
+      rawBody: req.rawBody,
+      signature: req.get?.('x-hub-signature-256') || req.headers?.['x-hub-signature-256'],
+      appSecret,
+    })) {
+      return res.status(401).json({ error: 'Unauthorized', message: 'Invalid webhook signature.' });
+    }
+
     // 1. Acknowledge Meta immediately with HTTP 200 to prevent event retries
     res.status(200).send('EVENT_RECEIVED');
 
@@ -62,5 +93,6 @@ async function handleWebhookEvent(req, res) {
 
 module.exports = {
   verifyWebhook,
-  handleWebhookEvent
+  handleWebhookEvent,
+  verifyMetaWebhookSignature,
 };

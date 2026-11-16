@@ -4,12 +4,22 @@ const express = require('express');
 const http = require('http');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcrypt');
+const {
+  prepareDisposableDatabaseTest,
+  verifyDisposableDatabaseTest,
+  skipDisposableDatabaseTest,
+} = require('./helpers/disposableDatabaseGuard');
 
-process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-jwt-secret-key-1234567890-secure';
+const databaseTestGate = prepareDisposableDatabaseTest();
 
-const { pool } = require('../db');
-const accountRouter = require('../routes/account');
-const customerProfileRouter = require('../routes/customer/profile');
+if (!databaseTestGate.enabled) {
+  skipDisposableDatabaseTest(test, 'Account deletion database integration [SKIPPED]', databaseTestGate.reason);
+} else {
+  process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-jwt-secret-key-1234567890-secure';
+
+  const { pool } = require('../db');
+  const accountRouter = require('../routes/account');
+  const customerProfileRouter = require('../routes/customer/profile');
 
 function createStaffToken(payload) {
   return jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '1h' });
@@ -38,6 +48,7 @@ describe('SmartERP Secure Account Deletion & Data Erasure Test Suite', () => {
   let tokenCustomer;
 
   before(async () => {
+    await verifyDisposableDatabaseTest(pool, databaseTestGate);
     // Setup Express Test App
     const app = express();
     app.use(express.json());
@@ -405,4 +416,5 @@ describe('SmartERP Secure Account Deletion & Data Erasure Test Suite', () => {
     const delBody = await delReq.json();
     assert.ok(delBody.challengeToken);
   });
-});
+  });
+}

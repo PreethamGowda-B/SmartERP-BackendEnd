@@ -108,6 +108,11 @@ module.exports = {
   enqueueAudit,
   enqueueWebhookRetry,
   enqueueSecurityEvent,
+  closeQueues: async () => {
+    await Promise.allSettled([notificationQueue, auditQueue, webhookRetryQueue, securityQueue]
+      .filter(Boolean)
+      .map((queue) => queue.close()));
+  },
   // Expose so callers that previously used redisConnection can migrate
   redisConnection: connection,
 };

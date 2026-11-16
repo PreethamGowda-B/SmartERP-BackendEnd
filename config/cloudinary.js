@@ -39,4 +39,35 @@ if (hasCloudinaryConfig) {
     }
 }
 
-module.exports = { cloudinary, storage, hasCloudinaryConfig };
+/**
+ * Safely delete an asset from Cloudinary by extracting its public_id from its secure URL.
+ * Attempts raw and image resource types, and returns true if deleted or already gone.
+ */
+async function deleteCloudinaryAsset(fileUrl) {
+    if (!hasCloudinaryConfig || !fileUrl || typeof fileUrl !== 'string' || !fileUrl.includes('cloudinary.com')) {
+        return false;
+    }
+    try {
+        const urlParts = fileUrl.split('/');
+        const uploadIndex = urlParts.indexOf('upload');
+        if (uploadIndex === -1) return false;
+        // public_id is everything after /upload/vXXXXX/ without file extension
+        const publicIdWithExt = urlParts.slice(uploadIndex + 2).join('/');
+        const publicId = publicIdWithExt.replace(/\.[^.]+$/, '');
+        if (!publicId) return false;
+
+        const rawDelete = await cloudinary.uploader.destroy(publicId, { resource_type: 'raw' }).catch(() => null);
+        if (rawDelete?.result === 'ok' || rawDelete?.result === 'not found') return true;
+
+        const imageDelete = await cloudinary.uploader.destroy(publicId, { resource_type: 'image' }).catch(() => null);
+        if (imageDelete?.result === 'ok' || imageDelete?.result === 'not found') return true;
+
+        const videoDelete = await cloudinary.uploader.destroy(publicId, { resource_type: 'video' }).catch(() => null);
+        return videoDelete?.result === 'ok' || videoDelete?.result === 'not found';
+    } catch (err) {
+        logger.warn('Failed to delete Cloudinary asset (non-fatal):', { error: err.message, fileUrl });
+        return false;
+    }
+}
+
+module.exports = { cloudinary, storage, hasCloudinaryConfig, deleteCloudinaryAsset };

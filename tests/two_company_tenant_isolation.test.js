@@ -15,12 +15,17 @@
 'use strict';
 
 const test = require('node:test');
+const {
+  prepareDisposableDatabaseTest,
+  verifyDisposableDatabaseTest,
+  skipDisposableDatabaseTest,
+} = require('./helpers/disposableDatabaseGuard');
+const databaseTestGate = prepareDisposableDatabaseTest();
 
-if (process.env.SMARTERP_DISPOSABLE_TEST_DB !== 'true') {
-  test('🔒 Two-Company Cross-Tenant Security & Invoice System Isolation [SKIPPED]', (t) => {
-    t.skip('Requires SMARTERP_DISPOSABLE_TEST_DB=true with confirmed disposable test database');
-  });
+if (!databaseTestGate.enabled) {
+  skipDisposableDatabaseTest(test, 'Two-Company Cross-Tenant Security & Invoice System Isolation [SKIPPED]', databaseTestGate.reason);
 } else {
+process.env.DATABASE_URL = databaseTestGate.env.TEST_DATABASE_URL;
 
 const assert = require('node:assert/strict');
 const jwt = require('jsonwebtoken');
@@ -34,6 +39,7 @@ const JWT_SECRET = process.env.JWT_SECRET || 'test_jwt_secret_for_isolation_test
 process.env.JWT_SECRET = JWT_SECRET;
 
 test('🔒 Two-Company Cross-Tenant Security & Invoice System Isolation', async (t) => {
+  await verifyDisposableDatabaseTest(pool, databaseTestGate);
   let companyAId, companyBId;
   let ownerAId, ownerBId;
   let customerAId, customerBId;

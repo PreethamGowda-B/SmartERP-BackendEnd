@@ -4,12 +4,17 @@ const crypto = require('crypto');
 const multer = require('multer');
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
+const { authenticateCustomer } = require('../middleware/customerAuthMiddleware');
+const jwt = require('jsonwebtoken');
+const { selectRequestAuthToken } = require('../middleware/requestAuthToken');
+const { authorizeMedia } = require('../services/mediaAuthorization');
 const { createNotification, broadcastToUser } = require('../utils/notificationHelpers');
 const { loadPlan, checkPlanLimit } = require('../middleware/planMiddleware');
 const redisClient = require('../utils/redis');
 const { cloudinary, hasCloudinaryConfig } = require('../config/cloudinary');
 const { requireValidFileSignature } = require('../utils/fileValidation');
-const { recordCompanyStorageUsage } = require('../services/companyStorage');
+const { recordCompanyStorageUsage, removeCompanyStorageUsage } = require('../services/companyStorage');
+const { measureDatabaseFileParameter, withOutboundOperation } = require('../utils/outboundBandwidth');
 
 // Multer setup for message attachments (in-memory, then we upload manually)
 const uploadMiddleware = multer({
@@ -31,9 +36,48 @@ const uploadMiddleware = multer({
 // ─── GET /api/messages/media/:id ─────────────────────────────────────────────
 // Stream public/inline message media (photos, voice notes, attachments)
 // Defined before authentication middleware so <img> and <audio> tags render without auth headers.
-router.get('/media/:id', async (req, res) => {
+function authenticateMediaRequest(req, res, next) {
+  const candidateToken = selectRequestAuthToken(req) || req.cookies?.customer_access_token || req.query?.token;
+  if (!candidateToken) {
+    return res.status(401).json({ message: 'Not authenticated' });
+  }
+
+  let verified = null;
+  const candidateSecrets = [
+    process.env.CUSTOMER_JWT_SECRET,
+    process.env.JWT_SECRET,
+    process.env.JWT_SECRET_OLD
+  ].filter(Boolean);
+
+  for (const secret of candidateSecrets) {
+    try {
+      verified = jwt.verify(candidateToken, secret);
+      break;
+    } catch (_) {}
+  }
+
+  if (!verified) {
+    return res.status(401).json({ message: 'Invalid or expired token' });
+  }
+
+  if (verified.role === 'customer') {
+    const customerId = verified.id || verified.customerId || verified.userId;
+    const companyId = verified.companyId || verified.company_id;
+    req.customer = { ...verified, id: customerId, customerId, companyId, role: 'customer' };
+    return next();
+  }
+
+  return authenticateToken(req, res, next);
+}
+
+router.get('/media/:id', authenticateMediaRequest, async (req, res) => {
   try {
     const { id } = req.params;
+    const principal = req.customer
+      ? { type: 'customer', customerId: req.customer.id, companyId: req.customer.companyId, role: 'customer' }
+      : { type: 'staff', userId: req.user.userId || req.user.id, companyId: req.user.companyId, role: req.user.role };
+    const access = await authorizeMedia({ pool, principal, mediaId: id });
+    if (!access.allowed) return res.status(access.status).json({ message: 'Media not found' });
     const result = await pool.query(
       `SELECT file_name, file_type, file_size, data FROM message_media_files WHERE id = $1`,
       [id]
@@ -47,7 +91,7 @@ router.get('/media/:id', async (req, res) => {
       res.setHeader('Content-Length', file.file_size);
     }
     res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(file.file_name || 'media')}"`);
-    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    res.setHeader('Cache-Control', 'private, no-store');
     return res.send(file.data);
   } catch (err) {
     console.error('Error fetching media:', err);
@@ -239,6 +283,26 @@ router.post('/', async (req, res) => {
         messageCompanyId = convRow.rows[0]?.company_id || null;
       } catch (cErr) {
         // fallback
+      }
+    }
+
+    // Cross-tenant attachment validation: Ensure media is not already owned by another company
+    if (mediaUrl && messageCompanyId) {
+      const mediaId = String(mediaUrl).match(/\/api\/messages\/media\/([0-9a-f-]{36})(?:$|\?)/i)?.[1];
+      if (mediaId) {
+        const existingOwnership = await pool.query(
+          `SELECT DISTINCT company_id::text FROM (
+             SELECT company_id::text FROM employee_documents WHERE file_url LIKE $1
+             UNION ALL
+             SELECT company_id::text FROM messages WHERE media_url LIKE $1
+             UNION ALL
+             SELECT j.company_id::text FROM job_messages jm JOIN jobs j ON j.id = jm.job_id WHERE jm.media_url LIKE $1
+           ) owners WHERE company_id IS NOT NULL`,
+          [`%/api/messages/media/${mediaId}%`]
+        );
+        if (existingOwnership.rows.some(r => String(r.company_id) !== String(messageCompanyId))) {
+          return res.status(403).json({ message: 'Attachment belongs to another organization' });
+        }
       }
     }
 
@@ -1100,7 +1164,7 @@ router.post(
       // 1. Attempt upload to Cloudinary if credentials are configured
       if (hasCloudinaryConfig) {
         try {
-          const uploadResult = await new Promise((resolve, reject) => {
+          const uploadResult = await withOutboundOperation('cloudinary', 'message_attachment_upload', () => new Promise((resolve, reject) => {
             const stream = cloudinary.uploader.upload_stream(
               {
                 folder,
@@ -1114,7 +1178,7 @@ router.post(
               }
             );
             stream.end(buffer);
-          });
+          }));
           if (uploadResult && uploadResult.secure_url) {
             fileUrl = uploadResult.secure_url;
           }
@@ -1125,12 +1189,16 @@ router.post(
 
       // 2. High-performance, resilient fallback: store binary buffer in PostgreSQL message_media_files
       if (!fileUrl) {
-        const insertRes = await pool.query(
-          `INSERT INTO message_media_files (file_name, file_type, file_size, data)
-           VALUES ($1, $2, $3, $4)
-           RETURNING id`,
-          [originalname || (isAudio ? 'voicenote.webm' : 'attachment'), cleanMime, size, buffer]
-        );
+        const insertRes = await measureDatabaseFileParameter({
+          operation: 'message_attachment_fallback_insert',
+          fileBytes: buffer.byteLength,
+          run: () => pool.query(
+            `INSERT INTO message_media_files (file_name, file_type, file_size, data, company_id, uploaded_by)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             RETURNING id`,
+            [originalname || (isAudio ? 'voicenote.webm' : 'attachment'), cleanMime, size, buffer, String(companyId || ''), String(req.user?.userId || req.user?.id || '')]
+          ),
+        });
         const mediaId = insertRes.rows[0].id;
         const reqHost = req.get('host') || 'api.prozync.in';
         const protocol = req.protocol === 'http' && !req.secure ? 'http' : 'https';
@@ -1147,6 +1215,9 @@ router.post(
         file_size: size
       });
     } catch (err) {
+      if (typeof storageKey !== 'undefined' && storageKey) {
+        await removeCompanyStorageUsage(companyId, storageKey).catch(() => {});
+      }
       console.error('Error uploading message attachment:', err);
       res.status(500).json({ message: 'File upload failed: ' + (err.message || 'Server error') });
     }

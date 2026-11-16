@@ -18,6 +18,7 @@ const { pool } = require('../db');
 const redisClient = require('../utils/redis');
 const { createNotification } = require('../utils/notificationHelpers');
 const auditService = require('./auditService');
+const { runWithPostgresAdvisoryLock } = require('../utils/scheduledTaskLock');
 
 const GEOFENCE_RADIUS_M = 100;   // 100 metres
 const POLL_INTERVAL_MS  = 60_000; // 60 seconds — reduced from 12s to conserve DB compute
@@ -156,9 +157,11 @@ async function handleArrival(row) {
 function start() {
   if (_timer) return; // Already running
   console.log(`📍 Geofence service started (interval: ${POLL_INTERVAL_MS / 1000}s)`);
-  _timer = setInterval(evaluateGeofences, POLL_INTERVAL_MS);
+  _timer = setInterval(() => {
+    void runWithPostgresAdvisoryLock('geofence-evaluation', evaluateGeofences);
+  }, POLL_INTERVAL_MS);
   // Run immediately on start
-  evaluateGeofences();
+  void runWithPostgresAdvisoryLock('geofence-evaluation', evaluateGeofences);
 }
 
 function stop() {

@@ -10,6 +10,7 @@ const { storage } = require('../middleware/als');
 const { detectFileSignature } = require('../utils/fileValidation');
 const { loadPlan, checkPlanLimit } = require('../middleware/planMiddleware');
 const { recordCompanyStorageUsage } = require('../services/companyStorage');
+const { measureDatabaseFileParameter } = require('../utils/outboundBandwidth');
 
 const STAFF_ROLES = new Set(['owner', 'admin', 'employee', 'hr', 'manager', 'technician']);
 
@@ -139,14 +140,18 @@ router.post("/:id/proof-of-work", authenticateToken, requireClockIn, loadPlan, c
     let result;
     try {
       await proofClient.query('BEGIN');
-      result = await proofClient.query(
-        `INSERT INTO job_proof_of_work
-         (job_id, company_id, uploaded_by_id, uploaded_by_name, photo_url, notes, gps_latitude, gps_longitude, stage, client_submission_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-         ON CONFLICT (company_id, client_submission_id) WHERE client_submission_id IS NOT NULL DO NOTHING
-         RETURNING *`,
-        [jobId, effectiveCompanyId, userId, userName, photo_url || null, notes || null, gps_latitude ?? null, gps_longitude ?? null, stage, submissionId]
-      );
+      result = await measureDatabaseFileParameter({
+        operation: 'job_proof_photo_insert',
+        fileBytes: typeof photo_url === 'string' ? Buffer.byteLength(photo_url, 'utf8') : 0,
+        run: () => proofClient.query(
+          `INSERT INTO job_proof_of_work
+           (job_id, company_id, uploaded_by_id, uploaded_by_name, photo_url, notes, gps_latitude, gps_longitude, stage, client_submission_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+           ON CONFLICT (company_id, client_submission_id) WHERE client_submission_id IS NOT NULL DO NOTHING
+           RETURNING *`,
+          [jobId, effectiveCompanyId, userId, userName, photo_url || null, notes || null, gps_latitude ?? null, gps_longitude ?? null, stage, submissionId]
+        ),
+      });
       if (result.rows[0] && photoBytes > 0) {
         await recordCompanyStorageUsage(effectiveCompanyId, `job-proof:${result.rows[0].id}`, photoBytes, 'job_proof_image', proofClient);
       }

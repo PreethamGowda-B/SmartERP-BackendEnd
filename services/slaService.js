@@ -19,6 +19,7 @@
 
 const { pool } = require('../db');
 const auditService = require('./auditService');
+const { runWithPostgresAdvisoryLock } = require('../utils/scheduledTaskLock');
 
 // Section 5: Correct defaults
 const SLA_DEFAULTS = {
@@ -272,13 +273,18 @@ function start() {
 
   console.log(`📋 SLA service started (check interval: ${CHECK_INTERVAL_MS / 1000}s)`);
 
-  _slaTimer = setInterval(executeSlaPass, CHECK_INTERVAL_MS);
+  _slaTimer = setInterval(() => {
+    void runWithPostgresAdvisoryLock('sla-evaluation', executeSlaPass);
+  }, CHECK_INTERVAL_MS);
 
   // Run immediately on start
-  void executeSlaPass();
+  void runWithPostgresAdvisoryLock('sla-evaluation', executeSlaPass);
 
   // Section 9: Audit log retention — run once per day
-  _retentionTimer = setInterval(purgeOldAuditLogs, RETENTION_INTERVAL_MS);
+  _retentionTimer = setInterval(() => {
+    void runWithPostgresAdvisoryLock('sla-audit-retention', purgeOldAuditLogs);
+  }, RETENTION_INTERVAL_MS);
+  void runWithPostgresAdvisoryLock('sla-audit-retention', purgeOldAuditLogs);
 }
 
 function stop() {

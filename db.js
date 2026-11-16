@@ -2,6 +2,7 @@ const { pool } = require("./db-base");
 const { storage } = require("./middleware/als");
 const { performance } = require("node:perf_hooks");
 const logger = require("./utils/logger");
+const { observePostgresQuery } = require('./utils/outboundBandwidth');
 
 // Configurable slow query and pool acquisition thresholds for production performance alerts
 const SLOW_QUERY_THRESHOLD_MS = Number(process.env.SLOW_QUERY_THRESHOLD_MS || process.env.DB_SLOW_QUERY_THRESHOLD_MS || 2000);
@@ -22,8 +23,10 @@ function recordDbStage(stage, durationMs, details = {}) {
     return;
   }
 
-  // Connection pool contention alert: emitted when pool checkout is slow or requests are queued
-  if (stage === "pool_acquire" && (durationMs >= POOL_ACQUIRE_WARN_MS || pool.waitingCount > 0)) {
+  // Connection pool contention alert: emitted when pool checkout is genuinely slow
+  // (duration exceeds threshold and is not an initial single-client connection establishment)
+  const isColdStartupConnect = pool.totalCount <= 1 && pool.waitingCount === 0;
+  if (stage === "pool_acquire" && durationMs >= POOL_ACQUIRE_WARN_MS && !isColdStartupConnect) {
     logger.warn("Database connection pool contention detected", {
       type: "pool_contention",
       acquireDurationMs: duration,
@@ -121,7 +124,7 @@ async function applyRlsToClient(client, context = storage.getStore()) {
   recordDbStage('rls_setup_total', performance.now() - setupStartedAt);
 }
 
-const CONTROL = /^(BEGIN|START\s+TRANSACTION|COMMIT|END|ROLLBACK|ABORT)\b/i;
+const CONTROL = /^(BEGIN|START\s+TRANSACTION|COMMIT|END|ROLLBACK(?!\s+TO\b)|ABORT)\b/i;
 
 function getSql(text) {
   return typeof text === 'string' ? text.trim() : String(text?.text || '').trim();
@@ -131,7 +134,12 @@ function getSql(text) {
  * BEGIN/COMMIT calls from existing services remain supported; standalone
  * queries retain normal autocommit behavior. RLS state is transaction-local. */
 function attachTransactionScopedRls(client, context) {
-  const rawQuery = client.query.bind(client);
+  const originalRawQuery = client.query.bind(client);
+  const rawQuery = (text, values) => observePostgresQuery({
+    text,
+    values,
+    run: () => originalRawQuery(text, values),
+  });
   const rawRelease = client.release.bind(client);
   let inTransaction = false;
 

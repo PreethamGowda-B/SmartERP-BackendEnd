@@ -2,6 +2,7 @@ const { Worker } = require('bullmq');
 const { redisConnection } = require('../utils/queue');
 const { createNotification } = require('../utils/notificationHelpers');
 const logger = require('../utils/logger');
+const backgroundWorkers = [];
 
 if (redisConnection) {
   /**
@@ -17,6 +18,7 @@ if (redisConnection) {
       throw err; // Allow BullMQ to retry if needed
     }
   }, { connection: redisConnection });
+  backgroundWorkers.push(notificationWorker);
 
   /**
    * Audit Log Worker
@@ -25,6 +27,7 @@ if (redisConnection) {
   const auditWorker = new Worker('audit', async (job) => {
     logger.debug(`Processing audit job ${job.id} for user ${job.data?.userId}`, { jobId: job.id, userId: job.data?.userId });
   }, { connection: redisConnection });
+  backgroundWorkers.push(auditWorker);
 
   /**
    * Razorpay Webhook Retry Worker
@@ -139,6 +142,7 @@ if (redisConnection) {
       client.release();
     }
   }, { connection: redisConnection });
+  backgroundWorkers.push(webhookWorker);
 
   notificationWorker.on('completed', (job) => {
     logger.debug(`Notification job ${job.id} finished`, { jobId: job.id });
@@ -151,6 +155,7 @@ if (redisConnection) {
   // Security Worker (SmartERP Defensive Security AI)
   const { securityWorker } = require('./securityWorker');
   if (securityWorker) {
+    backgroundWorkers.push(securityWorker);
     securityWorker.on('completed', (job) => {
       logger.debug(`Security analysis job ${job.id} finished`, { jobId: job.id });
     });
@@ -160,3 +165,9 @@ if (redisConnection) {
 } else {
   logger.warn('No Redis connection - Background Workers not started.', { pid: process.pid });
 }
+
+async function closeBackgroundWorkers() {
+  await Promise.allSettled(backgroundWorkers.map((worker) => worker.close()));
+}
+
+module.exports = { closeBackgroundWorkers };

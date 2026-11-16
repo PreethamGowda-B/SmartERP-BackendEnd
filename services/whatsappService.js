@@ -6,6 +6,7 @@
  * Requires pre-approved Meta message templates for business-initiated notifications.
  */
 const fetch = require('node-fetch');
+const { withOutboundOperation } = require('../utils/outboundBandwidth');
 
 const WHATSAPP_ACCESS_TOKEN = process.env.WHATSAPP_ACCESS_TOKEN || '';
 const WHATSAPP_PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID || '';
@@ -58,14 +59,14 @@ async function sendWhatsAppTemplateMessage(recipientPhone, templateName, languag
   };
 
   try {
-    const res = await fetch(url, {
+    const res = await withOutboundOperation('meta-whatsapp', 'template_message', () => fetch(url, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${WHATSAPP_ACCESS_TOKEN}`,
         'Content-Type': 'application/json'
       },
       body: JSON.stringify(payload)
-    });
+    }));
 
     const data = await res.json();
 

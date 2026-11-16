@@ -17,6 +17,7 @@
 
 const Redis = require('ioredis');
 const logger = require('./logger');
+const { instrumentRedisClient } = require('./outboundBandwidth');
 
 const REDIS_URL = process.env.REDIS_URL;
 
@@ -25,8 +26,8 @@ const BASE_OPTS = {
   maxRetriesPerRequest: 3,
   enableOfflineQueue: true,
   retryStrategy(times) {
-    if (times > 3) return null; // stop retrying quickly to release slot
-    return Math.min(times * 500, 2000);
+    // Reconnect with capped backoff; avoid permanent client abandonment on transient network drops
+    return Math.min(times * 300, 3000);
   },
   lazyConnect: false,
 };
@@ -45,14 +46,18 @@ function attachListeners(client, label) {
       logger.warn(`Redis [${label}] error: ${err.message}`, { label, pid: process.pid });
     }
   });
-  client.on('connect', () => logger.info(`Redis [${label}] connected`, { label, pid: process.pid }));
+  client.on('connect', () => {
+    const remoteAddress = client.stream?.remoteAddress;
+    const networkClass = require('./outboundBandwidth').classifyAddress(remoteAddress);
+    logger.info(`Redis [${label}] connected`, { label, pid: process.pid, networkClass });
+  });
 }
 
 // ─── Slot 1: Command client ───────────────────────────────────────────────────
 let redisClient = null;
 if (REDIS_URL) {
   try {
-    redisClient = new Redis(REDIS_URL, BASE_OPTS);
+    redisClient = instrumentRedisClient(new Redis(REDIS_URL, BASE_OPTS));
     attachListeners(redisClient, 'cmd');
   } catch (e) {
     logger.warn(`Redis command client setup failed: ${e.message}`, { pid: process.pid });
@@ -63,18 +68,17 @@ if (REDIS_URL) {
 let subscriberClient = null;
 function getSharedSubscriber() {
   if (!REDIS_URL) return null;
-  if (subscriberClient) return subscriberClient;
+  if (subscriberClient && subscriberClient.status !== 'end') return subscriberClient;
   try {
-    subscriberClient = new Redis(REDIS_URL, {
+    subscriberClient = instrumentRedisClient(new Redis(REDIS_URL, {
       ...BASE_OPTS,
       enableOfflineQueue: true, // Allow subscribe commands to buffer until TCP connection opens
       maxRetriesPerRequest: null,
-      // Subscriber connections should retry longer to stay alive
+      // Subscriber connections retry with backoff to stay alive
       retryStrategy(times) {
-        if (times > 10) return null;
-        return Math.min(times * 1000, 5000);
+        return Math.min(times * 500, 5000);
       },
-    });
+    }));
     attachListeners(subscriberClient, 'sub');
   } catch (e) {
     logger.warn(`Shared Redis subscriber setup failed: ${e.message}`, { pid: process.pid });
@@ -90,16 +94,15 @@ function getSharedSubscriber() {
 let bullConnection = null;
 function getBullMQConnection() {
   if (!REDIS_URL) return null;
-  if (bullConnection) return bullConnection;
+  if (bullConnection && bullConnection.status !== 'end') return bullConnection;
   try {
-    bullConnection = new Redis(REDIS_URL, {
+    bullConnection = instrumentRedisClient(new Redis(REDIS_URL, {
       maxRetriesPerRequest: null,  // required by BullMQ
       enableOfflineQueue: true,    // required by BullMQ & ioredis for Worker polling loop
       retryStrategy(times) {
-        if (times > 10) return null;
         return Math.min(times * 500, 3000);
       },
-    });
+    }));
     attachListeners(bullConnection, 'bullmq');
   } catch (e) {
     logger.warn(`BullMQ Redis connection setup failed: ${e.message}`, { pid: process.pid });
@@ -112,4 +115,12 @@ module.exports = {
   redisClient,
   getSharedSubscriber,
   getBullMQConnection,
+  closeRedisConnections: async () => {
+    const clients = [redisClient, subscriberClient, bullConnection].filter(Boolean);
+    await Promise.allSettled(clients.map(async (client) => {
+      if (client.status === 'end') return;
+      if (client.status === 'ready') await client.quit();
+      else client.disconnect();
+    }));
+  },
 };

@@ -19,6 +19,8 @@ function validateEnvironmentVariables() {
     { key: 'FRONTEND_ORIGIN', required: false, category: 'CORS & Client Routing' },
     { key: 'RESEND_API_KEY', required: false, format: /^re_.+/i, category: 'Email & Out-of-Band Alerts' },
     { key: 'GROQ_API_KEY', required: false, category: 'AI Context Engine' },
+    { key: 'WHATSAPP_VERIFY_TOKEN', required: false, minLength: 32, category: 'WhatsApp Webhook Verification' },
+    { key: 'WHATSAPP_APP_SECRET', required: false, minLength: 32, category: 'WhatsApp Webhook Signature Verification' },
     { key: 'SUPER_ADMIN_EMAIL', required: false, format: /^[^\s@]+@[^\s@]+\.[^\s@]+$/, category: 'Super Admin Identity' },
   ];
 
@@ -53,10 +55,8 @@ function validateEnvironmentVariables() {
       required: rule.required,
       present: isPresent,
       valid: formatValid,
-      // Masked preview only showing first 3 and last 2 characters if present
-      maskedPreview: isPresent 
-        ? `${rawValue.substring(0, Math.min(4, rawValue.length))}...${rawValue.substring(Math.max(0, rawValue.length - 3))}`
-        : 'NOT_SET',
+      // Never expose even a partial credential through an audit API or log.
+      maskedPreview: isPresent ? 'SET' : 'NOT_SET',
       reason: failureReason
     });
   }

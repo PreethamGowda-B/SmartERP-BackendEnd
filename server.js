@@ -4,6 +4,9 @@ if (dns.setDefaultResultOrder) {
 }
 
 require("dotenv").config();
+try { require('./utils/outboundBandwidth').installOutboundBandwidthMonitoring(); }
+catch { try { console.warn('[outbound-bandwidth] instrumentation unavailable; continuing without measurements'); } catch { /* monitoring is optional */ } }
+const { shouldStartBackgroundWorkers } = require('./utils/backgroundWorkerPolicy');
 const logger = require("./utils/logger");
 const Sentry = require("@sentry/node");
 const { nodeProfilingIntegration } = require("@sentry/profiling-node");
@@ -306,7 +309,20 @@ app.use(cookieParser());
 app.use(express.json({
   limit: '50mb',
   verify: (req, res, buf) => {
-    req.rawBody = buf.toString();
+    // Razorpay signs the exact request bytes. Retain those bytes only on the
+    // signed callback route; keeping a decoded duplicate for every API body
+    // doubles peak memory for uploads and unnecessarily extends the lifetime
+    // of sensitive request content.
+    const requestPath = String(req.originalUrl || req.url || '').split('?')[0];
+    if (
+      requestPath === '/api/webhook/razorpay' ||
+      requestPath === '/api/v1/webhook/razorpay' ||
+      requestPath === '/webhooks/whatsapp' ||
+      requestPath === '/api/webhooks/whatsapp' ||
+      requestPath === '/api/v1/webhooks/whatsapp'
+    ) {
+      req.rawBody = buf;
+    }
   }
 }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
@@ -355,6 +371,7 @@ if (process.env.NODE_ENV === "production") {
 
     // Whitelisted explicit domains (same as your CORS)
     const allowedPatterns = [
+      /^https:\/\/smart-erp-front-end(-[a-z0-9-]+)?\.vercel\.app$/,
       /^https:\/\/smart-erp-front(-[a-z0-9]+)?(-[a-z0-9-]+)?\.vercel\.app$/,
       /^https:\/\/smart-erp-front-[a-z0-9]+-thepreethu01-9119s-projects\.vercel\.app$/,
       /^https:\/\/www\.prozync\.in$/,
@@ -526,36 +543,33 @@ async function fixDatabaseConstraints() {
 
     logger.debug('Database constraints verified and fixed');
 
-    // Step 4: Setup Periodic Refresh Token Cleanup (Every 24 hours)
-    setInterval(async () => {
-      try {
-        const cleanupResult = await pool.query(`
-          DELETE FROM refresh_tokens
-          WHERE expires_at < NOW()
-          OR (revoked = TRUE AND created_at < NOW() - INTERVAL '30 days')
-        `);
-        if (cleanupResult.rowCount > 0) {
-          console.log(`🧹 Periodic Cleanup: Removed ${cleanupResult.rowCount} expired/revoked refresh tokens`);
-        }
-        // Also clean up customer_refresh_tokens table
-        const crtCleanup = await pool.query(`
-          DELETE FROM customer_refresh_tokens
-          WHERE expires_at < NOW()
-          OR (revoked = TRUE AND created_at < NOW() - INTERVAL '30 days')
-        `).catch(() => ({ rowCount: 0 }));
-        if (crtCleanup.rowCount > 0) {
-          console.log(`🧹 Periodic Cleanup: Removed ${crtCleanup.rowCount} expired/revoked customer refresh tokens`);
-        }
-      } catch (cleanupErr) {
-        console.error("❌ Periodic Cleanup Error:", cleanupErr.message);
-      }
-    }, 24 * 60 * 60 * 1000);
-    logger.debug('Scheduled daily cleanup for refresh tokens');
-
   } catch (err) {
     logger.warn('Could not fix database constraints (non-fatal)', { error: err.message });
   } finally {
     if (client) client.release();
+  }
+}
+
+async function cleanupExpiredRefreshTokens() {
+  try {
+    const cleanupResult = await pool.query(`
+      DELETE FROM refresh_tokens
+      WHERE expires_at < NOW()
+      OR (revoked = TRUE AND created_at < NOW() - INTERVAL '30 days')
+    `);
+    if (cleanupResult.rowCount > 0) {
+      console.log(`🧹 Periodic Cleanup: Removed ${cleanupResult.rowCount} expired/revoked refresh tokens`);
+    }
+    const customerResult = await pool.query(`
+      DELETE FROM customer_refresh_tokens
+      WHERE expires_at < NOW()
+      OR (revoked = TRUE AND created_at < NOW() - INTERVAL '30 days')
+    `).catch(() => ({ rowCount: 0 }));
+    if (customerResult.rowCount > 0) {
+      console.log(`🧹 Periodic Cleanup: Removed ${customerResult.rowCount} expired/revoked customer refresh tokens`);
+    }
+  } catch (error) {
+    console.error('❌ Periodic Cleanup Error:', error.message);
   }
 }
 /**
@@ -930,7 +944,10 @@ async function runDatabaseInitialization() {
 // ✅ Create API v1 Router
 const v1Router = express.Router();
 
-// ✅ Platform Maintenance Mode Middleware
+// ✅ Platform Maintenance Mode Middleware with in-memory caching to eliminate per-request DB queries
+let maintenanceSettingCache = null;
+let maintenanceSettingExpiresAt = 0;
+
 v1Router.use(async (req, res, next) => {
   // Always bypass maintenance mode for Super Admin management API routes
   if (req.path.startsWith('/admin')) {
@@ -938,11 +955,20 @@ v1Router.use(async (req, res, next) => {
   }
 
   try {
-    const r = await pool.query(
-      "SELECT value FROM system_settings WHERE key = 'maintenance_mode'"
-    ).catch(() => ({ rows: [] }));
+    const now = Date.now();
+    let setting = null;
+    if (maintenanceSettingCache !== null && maintenanceSettingExpiresAt > now) {
+      setting = maintenanceSettingCache;
+    } else {
+      const r = await pool.query(
+        "SELECT value FROM system_settings WHERE key = 'maintenance_mode'"
+      ).catch(() => ({ rows: [] }));
 
-    const setting = r.rows[0]?.value;
+      setting = r.rows[0]?.value || null;
+      maintenanceSettingCache = setting;
+      maintenanceSettingExpiresAt = now + 10000; // 10s in-memory TTL
+    }
+
     if (!setting || setting.mode === 'disabled') {
       return next();
     }
@@ -1075,6 +1101,7 @@ app.use((err, req, res, next) => {
     'http://localhost:3001'
   ];
   const allowedPatterns = [
+    /^https:\/\/smart-erp-front-end(-[a-z0-9-]+)?\.vercel\.app$/,
     /^https:\/\/smart-erp-front(-[a-z0-9]+)?(-[a-z0-9-]+)?\.vercel\.app$/,
     /^https:\/\/smart-erp-front-[a-z0-9]+-thepreethu01-9119s-projects\.vercel\.app$/,
   ];
@@ -1082,7 +1109,6 @@ app.use((err, req, res, next) => {
   const isAllowedOrigin = cleanOrigin && (
     allowedOrigins.includes(cleanOrigin) ||
     cleanOrigin.endsWith('.prozync.in') ||
-    cleanOrigin.endsWith('.vercel.app') ||
     allowedPatterns.some(p => p.test(cleanOrigin))
   );
   if (isAllowedOrigin) {
@@ -1120,6 +1146,7 @@ process.on("unhandledRejection", (reason, promise) => {
 });
 
 const cluster = require('cluster');
+const { createClusterLifecycle } = require('./utils/clusterLifecycle');
 const totalCPUs = require('os').cpus().length;
 // Cap workers to prevent OOM on Render's 512MB RAM limit
 // We recommend 2 workers for 512MB, 4 for 1GB.
@@ -1129,6 +1156,10 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
 
   logger.info('Master process running', { pid: process.pid });
   logger.info('Spawning cluster workers', { pid: process.pid, workerCount: WORKER_COUNT });
+
+  const clusterLifecycle = createClusterLifecycle({ cluster, logger });
+  // Install signal handlers before DB initialization so shutdown cannot race startup.
+  clusterLifecycle.install();
 
   // Schema repairs, DDL, seed checks, and storage migrations do not belong on
   // the request-serving startup path. They create noisy deploy logs, delay the
@@ -1157,17 +1188,8 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
       process.exit(1);
       return;
     }
-
-    for (let i = 0; i < WORKER_COUNT; i++) {
-      const env = i === 0 ? { IS_PRIMARY_WORKER: 'true' } : {};
-      cluster.fork(env);
-    }
+    clusterLifecycle.start(WORKER_COUNT);
   })();
-
-  cluster.on('exit', (worker, code, signal) => {
-    logger.warn('Worker process died, spawning replacement', { pid: worker.process.pid, code, signal });
-    cluster.fork();
-  });
 
 } else {
   // ✅ Start server
@@ -1175,13 +1197,21 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
   app.listen(PORT, () => {
     logger.info('SmartERP worker running', { pid: process.pid, port: PORT });
 
-    // Start background processors on primary cluster worker, or on any single-process deployment
-    const shouldStartWorkers = process.env.IS_PRIMARY_WORKER === 'true' ||
-      !cluster.isWorker ||
-      process.env.NODE_ENV !== 'production' ||
-      process.env.ENABLE_BACKGROUND_WORKERS === 'true';
+    // Run background processors once per Render service instance. In production
+    // cluster mode only the explicitly designated worker owns scheduled work;
+    // development/non-cluster mode has one process and can run it locally.
+    const shouldStartWorkers = shouldStartBackgroundWorkers({
+      isClusterWorker: cluster.isWorker,
+      isPrimaryWorker: process.env.IS_PRIMARY_WORKER,
+      nodeEnv: process.env.NODE_ENV,
+    });
+
+    if (!shouldStartWorkers && process.env.ENABLE_BACKGROUND_WORKERS === 'true') {
+      logger.warn('ENABLE_BACKGROUND_WORKERS is ignored in non-primary cluster workers to prevent duplicate processors', { pid: process.pid });
+    }
 
     if (shouldStartWorkers) {
+      backgroundWorkersStarted = true;
       logger.info("Starting background processors and workers", { pid: process.pid });
 
       require('./jobs/workers'); // Initialize BullMQ workers
@@ -1237,12 +1267,25 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
       // Section 9: Centralized error logging with retention
       try {
         const errorLogger = require('./utils/errorLogger');
+        const { runWithPostgresAdvisoryLock } = require('./utils/scheduledTaskLock');
         // Run once on startup, then daily
-        errorLogger.purgeOldErrors();
-        setInterval(() => errorLogger.purgeOldErrors(), 24 * 60 * 60 * 1000);
+        void runWithPostgresAdvisoryLock('error-log-retention', () => errorLogger.purgeOldErrors());
+        errorLogRetentionTimer = setInterval(() => {
+          void runWithPostgresAdvisoryLock('error-log-retention', () => errorLogger.purgeOldErrors());
+        }, 24 * 60 * 60 * 1000);
         console.log('🗑️  Error log retention scheduled');
       } catch (err) {
         console.error('❌ Failed to start error log retention:', err.message);
+      }
+
+      try {
+        const { runWithPostgresAdvisoryLock } = require('./utils/scheduledTaskLock');
+        refreshTokenCleanupTimer = setInterval(() => {
+          void runWithPostgresAdvisoryLock('refresh-token-cleanup', cleanupExpiredRefreshTokens);
+        }, 24 * 60 * 60 * 1000);
+        logger.info('Scheduled daily cleanup for refresh tokens', { pid: process.pid });
+      } catch (err) {
+        logger.error('Failed to start refresh token cleanup scheduler', { error: err.message });
       }
     }
   });
@@ -1253,47 +1296,70 @@ module.exports = app;
 // ✅ Graceful shutdown — drain in-flight requests before closing DB pool
 // This prevents connection errors on Render deploys and SIGTERM events.
 let httpServer = null;
+let errorLogRetentionTimer = null;
+let refreshTokenCleanupTimer = null;
+let backgroundWorkersStarted = false;
+
+async function stopBackgroundProcessors() {
+  const stops = [];
+  for (const [file, method] of [
+    ['./jobs/dailyAttendanceProcessor', 'stopDailyAttendanceProcessor'],
+    ['./jobs/trialExpiryProcessor', 'stopTrialExpiryProcessor'],
+    ['./jobs/smartNotificationProcessor', 'stopSmartNotificationProcessor'],
+    ['./jobs/keepAlivePinger', 'stopKeepAlivePinger'],
+  ]) {
+    try {
+      const processor = require(file);
+      processor[method]?.();
+    } catch (error) {
+      logger.warn('Background processor stop failed', { processor: file, error: error.message });
+    }
+  }
+  try { require('./services/geofenceService').stop(); } catch (error) { logger.warn('Geofence shutdown failed', { error: error.message }); }
+  try { require('./services/slaService').stop(); } catch (error) { logger.warn('SLA shutdown failed', { error: error.message }); }
+  if (errorLogRetentionTimer) {
+    clearInterval(errorLogRetentionTimer);
+    errorLogRetentionTimer = null;
+  }
+  if (refreshTokenCleanupTimer) {
+    clearInterval(refreshTokenCleanupTimer);
+    refreshTokenCleanupTimer = null;
+  }
+  await Promise.allSettled(stops);
+  try { await require('./utils/scheduledTaskLock').drainScheduledTaskLocks(); }
+  catch (error) { logger.warn('Scheduled task drain failed', { error: error.message }); }
+  if (backgroundWorkersStarted) {
+    try { await require('./jobs/workers').closeBackgroundWorkers(); } catch (error) { logger.warn('Queue worker shutdown failed', { error: error.message }); }
+    try { await require('./utils/queue').closeQueues(); } catch (error) { logger.warn('Queue shutdown failed', { error: error.message }); }
+  }
+}
 
 function registerGracefulShutdown(server) {
   httpServer = server;
-  const shutdown = (signal) => async () => {
-    console.log(`\n📴 ${signal} received — starting graceful shutdown...`);
-    if (httpServer) {
-      httpServer.close(async () => {
-        console.log('✅ HTTP server closed — no new connections accepted');
-        try {
-          const { pool: shutdownPool } = require('./db');
-          await shutdownPool.end();
-          console.log('✅ DB pool closed cleanly');
-        } catch (err) {
-          console.error('❌ Error closing DB pool:', err.message);
-        }
-        console.log('👋 Graceful shutdown complete');
-        process.exit(0);
-      });
-      // Force exit after 15s if graceful close hangs
-      setTimeout(() => {
-        console.error('❌ Forced shutdown after 15s timeout');
-        process.exit(1);
-      }, 15000);
-    } else {
-      process.exit(0);
-    }
-  };
-  process.on('SIGTERM', shutdown('SIGTERM'));
-  process.on('SIGINT',  shutdown('SIGINT'));
+  require('./utils/workerShutdown').registerWorkerShutdown({
+    processRef: process,
+    getServer: () => httpServer,
+    stopProcessors: stopBackgroundProcessors,
+    closeMonitoring: () => require('./utils/outboundBandwidth').stopOutboundBandwidthMonitoring(),
+    closeDatabase: async () => {
+      const { pool: shutdownPool } = require('./db');
+      await shutdownPool.end();
+    },
+    closeRedis: async () => {
+      const redisPath = require.resolve('./utils/redis');
+      if (require.cache[redisPath]) await require('./utils/redis').closeRedisConnections();
+    },
+    logger,
+  });
 }
 
-// Wire graceful shutdown when this is the worker that starts the server
-if (process.env.IS_PRIMARY_WORKER === 'true' || process.env.NODE_ENV !== 'production') {
-  // app.listen returns the server — we capture it below
-  const origListen = app.listen.bind(app);
-  app.listen = (...args) => {
-    const server = origListen(...args);
-    registerGracefulShutdown(server);
-    return server;
-  };
-}
+// Every cluster worker, including secondaries, must drain cleanly.
+const origListen = app.listen.bind(app);
+app.listen = (...args) => {
+  const server = origListen(...args);
+  registerGracefulShutdown(server);
+  return server;
+};
 
 // ✅ Authenticated document access — replaces the removed express.static('/uploads')
 // Files are served only after verifying the requester's company ownership

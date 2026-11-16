@@ -4,12 +4,15 @@
  */
 const express = require('express');
 const http = require('http');
+const crypto = require('crypto');
 
 // Load environment variables
 require('dotenv').config();
 
 const app = express();
-app.use(express.json());
+app.use(express.json({
+  verify: (req, _res, buf) => { req.rawBody = buf; },
+}));
 
 // Mount whatsapp routes
 const whatsappRoutes = require('../routes/whatsapp');
@@ -26,7 +29,7 @@ function makeRequest(options, postData) {
       res.on('end', () => resolve({ status: res.statusCode, body: data }));
     });
     req.on('error', reject);
-    if (postData) req.write(JSON.stringify(postData));
+    if (postData) req.write(typeof postData === 'string' ? postData : JSON.stringify(postData));
     req.end();
   });
 }
@@ -34,8 +37,12 @@ function makeRequest(options, postData) {
 async function runWhatsAppWebhookTests() {
   console.log('\n--- VERIFYING META WHATSAPP CLOUD API WEBHOOK INTEGRATION ---\n');
 
-  const expectedToken = (process.env.WHATSAPP_VERIFY_TOKEN || 'smarterp_whatsapp_verify_token_2026').trim();
-  console.log(`📌 Using Expected Verify Token: "${expectedToken}"`);
+  const expectedToken = String(process.env.WHATSAPP_VERIFY_TOKEN || '').trim();
+  const appSecret = String(process.env.WHATSAPP_APP_SECRET || '').trim();
+  if (!expectedToken || !appSecret) {
+    throw new Error('WHATSAPP_VERIFY_TOKEN and WHATSAPP_APP_SECRET must be configured before running this verification script.');
+  }
+  console.log('📌 WhatsApp verification and signature secrets are configured.');
 
   server = app.listen(0, async () => {
     const port = server.address().port;
@@ -107,13 +114,17 @@ async function runWhatsAppWebhookTests() {
         ]
       };
 
+      const incomingRawBody = JSON.stringify(mockIncomingMsgPayload);
       const res3 = await makeRequest({
         hostname: 'localhost',
         port: port,
         path: '/webhooks/whatsapp',
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' }
-      }, mockIncomingMsgPayload);
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Hub-Signature-256': `sha256=${crypto.createHmac('sha256', appSecret).update(incomingRawBody).digest('hex')}`,
+        }
+      }, incomingRawBody);
 
       console.log(`   - HTTP Status: ${res3.status}`);
       console.log(`   - Response Text: "${res3.body}"`);
@@ -152,13 +163,17 @@ async function runWhatsAppWebhookTests() {
         ]
       };
 
+      const statusRawBody = JSON.stringify(mockStatusPayload);
       const res4 = await makeRequest({
         hostname: 'localhost',
         port: port,
         path: '/webhooks/whatsapp',
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' }
-      }, mockStatusPayload);
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Hub-Signature-256': `sha256=${crypto.createHmac('sha256', appSecret).update(statusRawBody).digest('hex')}`,
+        }
+      }, statusRawBody);
 
       console.log(`   - HTTP Status: ${res4.status}`);
       console.log(`   - Response Text: "${res4.body}"`);

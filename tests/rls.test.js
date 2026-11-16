@@ -17,12 +17,17 @@
  */
 
 const { test, describe, before, after } = require('node:test');
+const {
+  prepareDisposableDatabaseTest,
+  verifyDisposableDatabaseTest,
+  skipDisposableDatabaseTest,
+} = require('./helpers/disposableDatabaseGuard');
+const databaseTestGate = prepareDisposableDatabaseTest();
 
-if (process.env.SMARTERP_DISPOSABLE_TEST_DB !== 'true') {
-  test('RLS Integration Tests [SKIPPED]', (t) => {
-    t.skip('Requires SMARTERP_DISPOSABLE_TEST_DB=true with confirmed disposable test database');
-  });
+if (!databaseTestGate.enabled) {
+  skipDisposableDatabaseTest(test, 'RLS Integration Tests [SKIPPED]', databaseTestGate.reason);
 } else {
+process.env.DATABASE_URL = databaseTestGate.env.TEST_DATABASE_URL;
 
 const assert = require('node:assert/strict');
 const fs = require('fs');
@@ -71,6 +76,7 @@ async function runWithNoContext(sql, params = []) {
 // ─── Lifecycle ────────────────────────────────────────────────────────────────
 
 before(async () => {
+  await verifyDisposableDatabaseTest(pool, databaseTestGate);
   await new Promise((resolve, reject) => {
     storage.run({ bypassRls: true }, async () => {
       try {

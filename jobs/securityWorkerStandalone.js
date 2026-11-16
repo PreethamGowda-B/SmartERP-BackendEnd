@@ -17,6 +17,7 @@ const { pool } = require('../db');
 const { redisClient } = require('../utils/redis');
 const { securityWorker, processSecurityIncident } = require('./securityWorker');
 const logger = require('../utils/logger');
+const { runWithPostgresAdvisoryLock, drainScheduledTaskLocks } = require('../utils/scheduledTaskLock');
 
 console.log('🛡️ [SecurityWorkerStandalone] Initializing SmartERP 24/7 Defensive Security Worker...');
 
@@ -75,7 +76,9 @@ async function runDatabasePollingSweep() {
 }
 
 // Start fallback polling interval (every 30 seconds)
-const pollingInterval = setInterval(runDatabasePollingSweep, 30000);
+const pollingInterval = setInterval(() => {
+  void runWithPostgresAdvisoryLock('security-db-polling-fallback', runDatabasePollingSweep);
+}, 30000);
 
 // Heartbeat logger (every 5 minutes)
 const heartbeatInterval = setInterval(() => {
@@ -90,6 +93,7 @@ async function gracefulShutdown(signal) {
   isRunning = false;
   clearInterval(pollingInterval);
   clearInterval(heartbeatInterval);
+  await drainScheduledTaskLocks();
 
   if (securityWorker) {
     try {

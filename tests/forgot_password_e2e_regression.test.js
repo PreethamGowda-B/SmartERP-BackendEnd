@@ -14,6 +14,18 @@
  * - Anti-enumeration behavior
  */
 
+const { test } = require('node:test');
+const {
+  prepareDisposableDatabaseTest,
+  verifyDisposableDatabaseTest,
+  skipDisposableDatabaseTest,
+} = require('./helpers/disposableDatabaseGuard');
+const databaseTestGate = prepareDisposableDatabaseTest();
+
+if (!databaseTestGate.enabled) {
+  skipDisposableDatabaseTest(test, 'Password recovery database end-to-end [SKIPPED]', databaseTestGate.reason);
+} else {
+process.env.DATABASE_URL = databaseTestGate.env.TEST_DATABASE_URL;
 const http = require('http');
 const express = require('express');
 const cookieParser = require('cookie-parser');
@@ -64,6 +76,7 @@ async function makeRequest(path, options = {}) {
 }
 
 async function runTests() {
+  await verifyDisposableDatabaseTest(pool, databaseTestGate);
   console.log('🚀 Starting Forgot Password & Password Recovery E2E Regression Suite...\n');
 
   let passed = 0;
@@ -460,3 +473,4 @@ server = app.listen(0, '127.0.0.1', () => {
     pool.end();
   });
 });
+}

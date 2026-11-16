@@ -1,4 +1,5 @@
 const admin = require('firebase-admin');
+const { withOutboundOperation } = require('../utils/outboundBandwidth');
 const logger = require('../utils/logger');
 
 let firebaseInitialized = false;
@@ -99,7 +100,7 @@ async function sendPushNotification(token, title, body, data = {}) {
     };
 
     try {
-        const response = await admin.messaging().send(message);
+        const response = await withOutboundOperation('google-firebase', 'single_push', () => admin.messaging().send(message));
         logger.debug('Push notification delivered', { messageId: response });
         logger.business('NOTIFICATION_SENT', { channel: 'fcm_push', count: 1, title });
         return response;
@@ -166,7 +167,7 @@ async function sendMulticastPush(tokens, title, body, data = {}) {
     };
 
     try {
-        const response = await admin.messaging().sendEachForMulticast(payload);
+        const response = await withOutboundOperation('google-firebase', 'multicast_push', () => admin.messaging().sendEachForMulticast(payload));
         logger.debug('Multicast push delivered', { successCount: response.successCount, failureCount: response.failureCount });
         logger.business('NOTIFICATION_SENT', { channel: 'fcm_multicast', successCount: response.successCount, failureCount: response.failureCount, title });
 

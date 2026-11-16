@@ -492,7 +492,12 @@ router.post("/exchange-code", async (req, res) => {
 
 
 // Helper: Compute keyed HMAC-SHA256 for OTPs and Reset Tokens
-function computeHmacToken(data, secretSalt = process.env.JWT_SECRET || 'smarterp_default_sec_salt') {
+function computeHmacToken(data, secretSalt = process.env.JWT_SECRET) {
+  if (!secretSalt || String(secretSalt).trim().length < 32) {
+    const error = new Error('Password reset security configuration is unavailable.');
+    error.code = 'SECURITY_CONFIGURATION_ERROR';
+    throw error;
+  }
   return crypto.createHmac("sha256", secretSalt).update(String(data)).digest("hex");
 }
 
@@ -523,14 +528,17 @@ router.post("/send-otp", async (req, res) => {
   const normalizedEmail = String(email).toLowerCase().trim();
   const actionType = String(type || purpose || "general").toLowerCase().trim();
 
-  // 🛡️ Rate Limiting (5 requests per 10 minutes)
+  // 🛡️ Rate Limiting (5 requests per 10 minutes) — atomic INCR prevents burst race conditions
   const otpLimitKey = `otp_attempts:${normalizedEmail}`;
   if (redisClient && redisClient.status === 'ready') {
     try {
-      const attempts = await redisClient.get(otpLimitKey);
-      if (attempts && parseInt(attempts, 10) >= 5) {
+      const attempts = await redisClient.incr(otpLimitKey);
+      if (attempts === 1) {
+        await redisClient.expire(otpLimitKey, 600);
+      }
+      if (attempts > 5) {
         const ttl = await redisClient.ttl(otpLimitKey);
-        const minutesLeft = Math.ceil(ttl / 60);
+        const minutesLeft = Math.ceil(Math.max(1, ttl) / 60);
         return res.status(429).json({
           message: `You have reached the request limit. Please try again after ${minutesLeft} minutes.`,
           retryAfter: ttl
@@ -547,15 +555,6 @@ router.post("/send-otp", async (req, res) => {
   }
 
   try {
-    if (redisClient && redisClient.status === 'ready') {
-      try {
-        const multi = redisClient.multi();
-        multi.incr(otpLimitKey);
-        multi.expire(otpLimitKey, 600);
-        await multi.exec();
-      } catch (err) {}
-    }
-
     const otp = crypto.randomInt(100000, 999999).toString();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
 

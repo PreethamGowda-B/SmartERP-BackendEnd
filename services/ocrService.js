@@ -1,4 +1,5 @@
 const ProviderFactory = require('../ai/providers/provider.factory');
+const { withOutboundOperation } = require('../utils/outboundBandwidth');
 
 const EXTRACTION_SCHEMA = `Return only one JSON object with this shape; use null for unreadable or absent values and never guess:
 {"supplierName":null,"invoiceNumber":null,"invoiceDate":null,"materialName":null,"quantity":null,"unit":null,"unitPrice":null,"subtotal":null,"discount":null,"tax":null,"total":null,"currency":null,"gstin":null,"fieldConfidence":{"supplierName":0,"invoiceNumber":0,"invoiceDate":0,"materialName":0,"quantity":0,"unit":0,"unitPrice":0,"subtotal":0,"discount":0,"tax":0,"total":0,"currency":0,"gstin":0},"lineItems":[{"description":null,"quantity":null,"unit":null,"unitPrice":null,"subtotal":null,"tax":null,"total":null,"confidence":0}]}`;
@@ -82,7 +83,7 @@ class OCRService {
         const model = process.env.GROQ_VISION_MODEL || undefined;
         if (!process.env.GROQ_API_KEY) return { status: 'unable_to_analyse', parsedData: null, reason: 'Invoice image analysis is not configured (GROQ_API_KEY is required).' };
         const provider = ProviderFactory.getProvider();
-        const completion = await provider.generateCompletion({
+        const completion = await withOutboundOperation('groq', 'invoice_image_ocr', () => provider.generateCompletion({
           model,
           task: 'vision',
           temperature: 0,
@@ -93,7 +94,7 @@ class OCRService {
               { type: 'image_url', image_url: { url: `data:${file.validatedMime};base64,${file.buffer.toString('base64')}` } },
             ] },
           ],
-        });
+        }));
         const parsedData = normalizeParsed(parseJson(completion.content));
         return parsedData ? { status: 'analysed', parsedData } : { status: 'unable_to_analyse', parsedData: null, reason: 'The image did not yield structured invoice fields.' };
       }

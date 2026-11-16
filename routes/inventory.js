@@ -5,12 +5,13 @@ const multer = require('multer');
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
 const { loadPlan, checkPlanLimit } = require('../middleware/planMiddleware');
-const { cloudinary, hasCloudinaryConfig } = require('../config/cloudinary');
+const { cloudinary, hasCloudinaryConfig, deleteCloudinaryAsset } = require('../config/cloudinary');
 const { trackCreation, trackAllChanges, trackDeletion, trackRestoration, getItemHistory } = require('../utils/inventoryHistory');
 const { checkPermission } = require('../middleware/rbac');
 const { requireValidFileSignature } = require('../utils/fileValidation');
 const { requireFeature } = require('../middleware/featureGuard');
 const { recordCompanyStorageUsage, removeCompanyStorageUsage } = require('../services/companyStorage');
+const { withOutboundOperation } = require('../utils/outboundBandwidth');
 
 // Configure multer with memory storage for server-side magic byte inspection
 const upload = multer({
@@ -20,7 +21,7 @@ const upload = multer({
 
 async function uploadInventoryImage(file, companyId) {
     if (!file || !hasCloudinaryConfig || !file.buffer) return null;
-    return new Promise((resolve) => {
+    return withOutboundOperation('cloudinary', 'inventory_image_upload', () => new Promise((resolve) => {
         const stream = cloudinary.uploader.upload_stream(
             {
                 folder: `smarterp/inventory/${companyId}`,
@@ -38,7 +39,7 @@ async function uploadInventoryImage(file, companyId) {
             }
         );
         stream.end(file.buffer);
-    });
+    }));
 }
 
 // Predefined categories and units
@@ -312,8 +313,13 @@ router.delete('/:id', authenticateToken, checkPermission('inventory:write'), asy
             return res.status(404).json({ message: 'Inventory item not found or access denied' });
         }
 
-        // Note: Cloudinary images persist even after deletion
-        // To delete from Cloudinary, you'd need to extract the public_id and call cloudinary.uploader.destroy()
+        const deletedItem = result.rows[0];
+        if (deletedItem.image_url) {
+            await deleteCloudinaryAsset(deletedItem.image_url).catch(() => {});
+        }
+        if (deletedItem.image_storage_key) {
+            await removeCompanyStorageUsage(req.user.companyId, deletedItem.image_storage_key).catch(() => {});
+        }
 
         res.json({ message: 'Inventory item deleted successfully' });
     } catch (err) {
@@ -386,8 +392,16 @@ router.put(
             imageStorageKey = `inventory-image:${crypto.randomUUID()}`;
             await recordCompanyStorageUsage(req.user.companyId, imageStorageKey, req.file.size, 'inventory_image');
             const uploadedUrl = await uploadInventoryImage(req.file, req.user.companyId);
-            if (uploadedUrl) imageUrl = uploadedUrl;
-            else {
+            if (uploadedUrl) {
+                imageUrl = uploadedUrl;
+                // Clean up previous image from Cloudinary and decrement old quota
+                if (oldItem.image_url && oldItem.image_url !== uploadedUrl) {
+                    await deleteCloudinaryAsset(oldItem.image_url).catch(() => {});
+                }
+                if (oldItem.image_storage_key) {
+                    await removeCompanyStorageUsage(req.user.companyId, oldItem.image_storage_key).catch(() => {});
+                }
+            } else {
                 await removeCompanyStorageUsage(req.user.companyId, imageStorageKey);
                 imageStorageKey = null;
             }

@@ -1,13 +1,22 @@
 const test = require('node:test');
+const {
+  prepareDisposableDatabaseTest,
+  verifyDisposableDatabaseTest,
+  skipDisposableDatabaseTest,
+} = require('./helpers/disposableDatabaseGuard');
+const databaseTestGate = prepareDisposableDatabaseTest();
 
-if (process.env.SMARTERP_DISPOSABLE_TEST_DB !== 'true') {
-  test('PostgreSQL Core Tables Row-Level Security (RLS) & Tenant Isolation [SKIPPED]', (t) => {
-    t.skip('Requires SMARTERP_DISPOSABLE_TEST_DB=true with confirmed disposable test database');
-  });
+if (!databaseTestGate.enabled) {
+  skipDisposableDatabaseTest(test, 'PostgreSQL Core Tables Row-Level Security (RLS) & Tenant Isolation [SKIPPED]', databaseTestGate.reason);
 } else {
+process.env.DATABASE_URL = databaseTestGate.env.TEST_DATABASE_URL;
 
 const assert = require('node:assert/strict');
 const { pool } = require('../db');
+
+test('Database identity is verified as disposable before RLS integration tests', async () => {
+  await verifyDisposableDatabaseTest(pool, databaseTestGate);
+});
 
 test.describe('PostgreSQL Core Tables Row-Level Security (RLS) & Tenant Isolation Test Suite', () => {
 

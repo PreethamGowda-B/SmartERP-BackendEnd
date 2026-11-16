@@ -436,6 +436,14 @@ const handleJobAccept = async (req, res) => {
   const { id } = req.params;
 
   const client = await pool.connect();
+  let clientReleased = false;
+  const releaseClient = () => {
+    if (!clientReleased) {
+      client.release();
+      clientReleased = true;
+    }
+  };
+
   try {
     await client.query('BEGIN');
 
@@ -447,6 +455,7 @@ const handleJobAccept = async (req, res) => {
 
     if (checkJob.rows.length === 0) {
       await client.query('ROLLBACK');
+      releaseClient();
       return res.status(403).json({ message: 'Job not assigned to you' });
     }
 
@@ -481,8 +490,11 @@ const handleJobAccept = async (req, res) => {
     );
 
     if (result.rowCount === 0) {
+      // Query current job status using the existing client BEFORE releasing
+      const current = await client.query('SELECT * FROM jobs WHERE id = $1', [id]);
       await client.query('ROLLBACK');
-      const current = await pool.query('SELECT * FROM jobs WHERE id = $1', [id]);
+      releaseClient();
+
       const cur = current.rows[0];
 
       console.warn(`[jobs/accept] UPDATE returned 0 rows for job ${id}. ` +
@@ -503,8 +515,26 @@ const handleJobAccept = async (req, res) => {
 
     const acceptedJob = result.rows[0];
 
-    await client.query('COMMIT');
+    // Fetch employee name using the existing client connection before commit
+    const userInfo = await client.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+    const employeeName = userInfo.rows[0]?.name || req.user.name || 'Employee';
 
+    if (acceptedJob?.machine_id) {
+      await client.query(
+        `INSERT INTO machine_timeline_events (company_id, machine_id, job_id, event_type, title, description, created_at)
+         VALUES ($1, $2, $3, 'engineer_assigned', 'Engineer Assigned & Accepted', $4, NOW())`,
+        [req.user.companyId || 1, acceptedJob.machine_id, acceptedJob.id, `Engineer ${employeeName || 'Technician'} accepted job ${acceptedJob.title}`]
+      ).catch(() => { });
+    }
+
+    await client.query('COMMIT');
+    // Release client connection IMMEDIATELY to prevent connection pool exhaustion/deadlock
+    releaseClient();
+
+    // Respond immediately so user action completes in milliseconds
+    res.json(acceptedJob);
+
+    // Audit and notifications happen asynchronously without blocking the client or holding connections
     logJobAudit({
       companyId: req.user.companyId || acceptedJob.company_id,
       jobId: acceptedJob.id,
@@ -518,61 +548,54 @@ const handleJobAccept = async (req, res) => {
 
     try {
       if (acceptedJob.customer_id && redisClient && redisClient.status === 'ready') {
-        const userInfo2 = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
-        const empName = userInfo2.rows[0]?.name || 'Employee';
         redisClient.publish(
           `customer_job_events:${acceptedJob.id}`,
-          JSON.stringify({ type: 'job_accepted', jobId: acceptedJob.id, employeeName: empName, acceptedAt: new Date().toISOString() })
+          JSON.stringify({ type: 'job_accepted', jobId: acceptedJob.id, employeeName, acceptedAt: new Date().toISOString() })
         );
       }
     } catch (cpErr) {
       console.error('Customer portal SSE publish error (accept):', cpErr.message);
     }
 
-    try {
-      const userInfo = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
-      const employeeName = userInfo.rows[0]?.name || 'Employee';
-      if (acceptedJob.customer_id) {
-        await createCustomerPortalNotification({
-          customerId: acceptedJob.customer_id,
-          companyId: req.user.companyId || acceptedJob.company_id,
-          type: 'customer_job_accepted',
-          title: 'Technician assigned',
-          message: `${employeeName} accepted your service request. You can now view live updates and chat.`,
-          jobId: acceptedJob.id,
-          url: `/customer/job/${acceptedJob.id}`,
+    (async () => {
+      try {
+        if (acceptedJob.customer_id) {
+          await createCustomerPortalNotification({
+            customerId: acceptedJob.customer_id,
+            companyId: req.user.companyId || acceptedJob.company_id,
+            type: 'customer_job_accepted',
+            title: 'Technician assigned',
+            message: `${employeeName} accepted your service request. You can now view live updates and chat.`,
+            jobId: acceptedJob.id,
+            url: `/customer/job/${acceptedJob.id}`,
+          });
+        }
+        await createNotificationForOwners({
+          company_id: req.user.companyId || acceptedJob.company_id,
+          type: 'job_accepted',
+          idempotency_key: `job_accepted:${req.user.companyId || acceptedJob.company_id}:${acceptedJob.id}`,
+          title: 'Job Accepted',
+          message: `${employeeName} accepted the job: ${acceptedJob.title}`,
+          priority: 'medium',
+          data: { job_id: acceptedJob.id, employee_id: req.user.id, url: '/owner/notifications' }
         });
+      } catch (notificationErr) {
+        console.error('❌ Failed to send job acceptance notification:', notificationErr.message);
       }
-      await createNotificationForOwners({
-        company_id: req.user.companyId || acceptedJob.company_id,
-        type: 'job_accepted',
-        idempotency_key: `job_accepted:${req.user.companyId || acceptedJob.company_id}:${acceptedJob.id}`,
-        title: 'Job Accepted',
-        message: `${employeeName} accepted the job: ${acceptedJob.title}`,
-        priority: 'medium',
-        data: { job_id: acceptedJob.id, employee_id: req.user.id, url: '/owner/notifications' }
-      });
-    } catch (notificationErr) {
-      console.error('❌ Failed to send job acceptance notification:', notificationErr.message);
-    }
+    })().catch(() => {});
 
-    if (acceptedJob?.machine_id) {
-      await client.query(
-        `INSERT INTO machine_timeline_events (company_id, machine_id, job_id, event_type, title, description, created_at)
-         VALUES ($1, $2, $3, 'engineer_assigned', 'Engineer Assigned & Accepted', $4, NOW())`,
-        [req.user.companyId || 1, acceptedJob.machine_id, acceptedJob.id, `Engineer ${req.user.name || 'Technician'} accepted job ${acceptedJob.title}`]
-      ).catch(() => { });
-    }
-
-    res.json(acceptedJob);
-    } catch (err) {
+  } catch (err) {
+    if (!clientReleased) {
       await client.query('ROLLBACK').catch(() => { });
-      console.error('jobs ACCEPT error', err);
-      res.status(500).json({ message: 'Server error' });
-    } finally {
-      client.release();
     }
-  };
+    console.error('jobs ACCEPT error', err);
+    if (!res.headersSent) {
+      res.status(500).json({ message: 'Server error' });
+    }
+  } finally {
+    releaseClient();
+  }
+};
 
   router.post('/:id/accept', authenticateToken, requireClockIn, handleJobAccept);
   router.put('/:id/accept', authenticateToken, requireClockIn, handleJobAccept);
@@ -611,28 +634,33 @@ const handleJobAccept = async (req, res) => {
 
       const declinedJob = result.rows[0];
 
-      try {
-        const userInfo = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
-        const employeeName = userInfo.rows[0]?.name || 'Employee';
-
-        await createNotification({
-          user_id: declinedJob.created_by,
-          company_id: req.user.companyId,
-          type: 'job_declined',
-          title: 'Job Declined',
-          message: `${employeeName} declined the job: ${declinedJob.title}`,
-          priority: 'high',
-          data: { job_id: declinedJob.id, employee_id: req.user.id, url: '/owner/notifications' }
-        });
-        console.log(`✅ Notified owner about job decline`);
-      } catch (notificationErr) {
-        console.error('❌ Failed to send job decline notification:', notificationErr);
-      }
-
+      // Respond immediately to the frontend
       res.json(declinedJob);
+
+      (async () => {
+        try {
+          const userInfo = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+          const employeeName = userInfo.rows[0]?.name || req.user.name || 'Employee';
+
+          await createNotification({
+            user_id: declinedJob.created_by,
+            company_id: req.user.companyId,
+            type: 'job_declined',
+            title: 'Job Declined',
+            message: `${employeeName} declined the job: ${declinedJob.title}`,
+            priority: 'high',
+            data: { job_id: declinedJob.id, employee_id: req.user.id, url: '/owner/notifications' }
+          });
+          console.log(`✅ Notified owner about job decline`);
+        } catch (notificationErr) {
+          console.error('❌ Failed to send job decline notification:', notificationErr);
+        }
+      })().catch(() => {});
     } catch (err) {
       console.error('jobs DECLINE error', err);
-      res.status(500).json({ message: 'Server error' });
+      if (!res.headersSent) {
+        res.status(500).json({ message: 'Server error' });
+      }
     }
   };
 
@@ -723,6 +751,10 @@ const handleJobAccept = async (req, res) => {
 
       const updatedJob = result.rows[0];
 
+      // Respond immediately so user action completes in milliseconds
+      res.json(updatedJob);
+
+      // Audit, notifications, and telemetry happen asynchronously
       logJobAudit({
         companyId: req.user.companyId,
         jobId: updatedJob.id,
@@ -761,53 +793,56 @@ const handleJobAccept = async (req, res) => {
       }
 
       if (progress === 100) {
-        try {
-          const userInfo = await pool.query('SELECT name, email FROM users WHERE id = $1', [req.user.id]);
-          const employeeName = userInfo.rows[0]?.name || 'Employee';
-          const ownerResult = await pool.query(
-            "SELECT u.email, u.name FROM users u WHERE u.id = $1",
-            [updatedJob.created_by]
-          );
+        (async () => {
+          try {
+            const [userInfo, ownerResult] = await Promise.all([
+              pool.query('SELECT name, email FROM users WHERE id = $1', [req.user.id]),
+              updatedJob.created_by
+                ? pool.query("SELECT u.email, u.name FROM users u WHERE u.id = $1", [updatedJob.created_by])
+                : { rows: [] }
+            ]);
+            const employeeName = userInfo.rows[0]?.name || req.user.name || 'Employee';
 
-          await createNotificationForOwners({
-            company_id: req.user.companyId,
-            type: 'job_completed',
-            idempotency_key: `job_completed:${req.user.companyId || updatedJob.company_id}:${updatedJob.id}`,
-            title: 'Job Completed',
-            message: `${employeeName} completed the job: ${updatedJob.title}`,
-            priority: 'medium',
-            data: { job_id: updatedJob.id, employee_id: req.user.id, url: '/owner/notifications' }
-          });
-
-          if (updatedJob.customer_id) {
-            await createCustomerPortalNotification({
-              customerId: updatedJob.customer_id,
-              companyId: req.user.companyId || updatedJob.company_id,
-              type: 'customer_job_completed',
-              title: 'Service completed',
-              message: 'Your service request is complete. You can leave a review and view your invoice here.',
-              jobId: updatedJob.id,
-              url: `/customer/job/${updatedJob.id}`,
+            await createNotificationForOwners({
+              company_id: req.user.companyId,
+              type: 'job_completed',
+              idempotency_key: `job_completed:${req.user.companyId || updatedJob.company_id}:${updatedJob.id}`,
+              title: 'Job Completed',
+              message: `${employeeName} completed the job: ${updatedJob.title}`,
+              priority: 'medium',
+              data: { job_id: updatedJob.id, employee_id: req.user.id, url: '/owner/notifications' }
             });
-          }
 
-          if (ownerResult.rows[0]) {
-            sendJobCompletedEmail({
-              ownerEmail: ownerResult.rows[0].email,
-              ownerName: ownerResult.rows[0].name,
-              employeeName,
-              jobTitle: updatedJob.title
-            });
+            if (updatedJob.customer_id) {
+              await createCustomerPortalNotification({
+                customerId: updatedJob.customer_id,
+                companyId: req.user.companyId || updatedJob.company_id,
+                type: 'customer_job_completed',
+                title: 'Service completed',
+                message: 'Your service request is complete. You can leave a review and view your invoice here.',
+                jobId: updatedJob.id,
+                url: `/customer/job/${updatedJob.id}`,
+              });
+            }
+
+            if (ownerResult.rows[0]) {
+              sendJobCompletedEmail({
+                ownerEmail: ownerResult.rows[0].email,
+                ownerName: ownerResult.rows[0].name,
+                employeeName,
+                jobTitle: updatedJob.title
+              });
+            }
+          } catch (notificationErr) {
+            console.error('❌ Failed to send job completion notification:', notificationErr);
           }
-        } catch (notificationErr) {
-          console.error('❌ Failed to send job completion notification:', notificationErr);
-        }
+        })().catch(() => {});
       }
-
-      res.json(updatedJob);
     } catch (err) {
       console.error('jobs PROGRESS error', err);
-      res.status(500).json({ message: 'Server error' });
+      if (!res.headersSent) {
+        res.status(500).json({ message: 'Server error' });
+      }
     }
   };
 

@@ -1,4 +1,5 @@
 const Groq = require("groq-sdk");
+const { withOutboundOperation } = require('../utils/outboundBandwidth');
 
 const client = new Groq({
   apiKey: process.env.GROQ_API_KEY,
@@ -20,7 +21,7 @@ async function chatWithAI(message) {
   }
 
   // Use Groq AI
-  const response = await client.chat.completions.create({
+  const response = await withOutboundOperation('groq', 'legacy_chat_completion', () => client.chat.completions.create({
     model: "llama-3.3-70b-versatile", // Free model
     temperature: 0.7,
     messages: [
@@ -42,7 +43,7 @@ Rules:
         content: message,
       },
     ],
-  });
+  }));
 
   return response.choices[0].message.content;
 }

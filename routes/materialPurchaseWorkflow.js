@@ -10,6 +10,7 @@ const { loadPlan, checkPlanLimit } = require('../middleware/planMiddleware');
 const { getPlanLimit } = require('../services/subscriptionCatalog');
 const { requireValidFileSignature } = require('../utils/fileValidation');
 const { recordCompanyStorageUsage } = require('../services/companyStorage');
+const { measureDatabaseFileParameter } = require('../utils/outboundBandwidth');
 const OCRService = require('../services/ocrService');
 const { normalizedName, compareInvoice, canFinalize } = require('../services/materialPurchaseRules');
 const { createNotificationForOwners } = require('../utils/notificationHelpers');
@@ -181,20 +182,24 @@ router.post('/', loadPlan, upload.single('invoice'), requireValidFileSignature({
     if (previous) {
       await client.query(`UPDATE material_purchase_bills SET draft_status = 'superseded', updated_at = NOW() WHERE id = $1`, [previous.id]);
     }
-    const inserted = await client.query(
-      `INSERT INTO material_purchase_bills
-        (company_id, material_request_id, requested_by, approved_by, version, file_name, file_mime, file_size,
-         file_sha256, file_data, supplier_name, invoice_number, invoice_date, purchased_quantity, purchased_unit,
-         unit_price, subtotal, discount_amount, tax_amount, invoice_total, currency, supplier_gstin, notes, ai_status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,'processing')
-       RETURNING id::text, version, created_at`,
-      [companyId, request.id, userId, request.reviewed_by || null, version, fileName, file.validatedMime, file.size,
-        fileSha256, file.buffer, req.body.supplier_name?.trim() || null, req.body.invoice_number?.trim() || null,
-        req.body.invoice_date || null, positiveNumber(req.body.purchased_quantity), req.body.purchased_unit?.trim() || null,
-        positiveNumber(req.body.unit_price), positiveNumber(req.body.subtotal), positiveNumber(req.body.discount_amount),
-        positiveNumber(req.body.tax_amount), positiveNumber(req.body.invoice_total), req.body.currency?.trim() || null,
-        req.body.supplier_gstin?.trim() || null, req.body.notes?.trim()?.slice(0, 1000) || null]
-    );
+    const inserted = await measureDatabaseFileParameter({
+      operation: 'material_purchase_bill_file_insert',
+      fileBytes: file.buffer.byteLength,
+      run: () => client.query(
+        `INSERT INTO material_purchase_bills
+          (company_id, material_request_id, requested_by, approved_by, version, file_name, file_mime, file_size,
+           file_sha256, file_data, supplier_name, invoice_number, invoice_date, purchased_quantity, purchased_unit,
+           unit_price, subtotal, discount_amount, tax_amount, invoice_total, currency, supplier_gstin, notes, ai_status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,'processing')
+         RETURNING id::text, version, created_at`,
+        [companyId, request.id, userId, request.reviewed_by || null, version, fileName, file.validatedMime, file.size,
+          fileSha256, file.buffer, req.body.supplier_name?.trim() || null, req.body.invoice_number?.trim() || null,
+          req.body.invoice_date || null, positiveNumber(req.body.purchased_quantity), req.body.purchased_unit?.trim() || null,
+          positiveNumber(req.body.unit_price), positiveNumber(req.body.subtotal), positiveNumber(req.body.discount_amount),
+          positiveNumber(req.body.tax_amount), positiveNumber(req.body.invoice_total), req.body.currency?.trim() || null,
+          req.body.supplier_gstin?.trim() || null, req.body.notes?.trim()?.slice(0, 1000) || null]
+      ),
+    });
     bill = inserted.rows[0];
     await recordCompanyStorageUsage(companyId, `purchase-bill:${bill.id}`, file.size, 'material_purchase_bill', client);
     await client.query(`UPDATE material_requests SET purchase_status = 'processing', updated_at = NOW() WHERE id = $1`, [request.id]);

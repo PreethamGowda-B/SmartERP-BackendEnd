@@ -2,6 +2,7 @@ const BaseAIProvider = require("./provider.interface");
 const Groq = require("groq-sdk");
 const { groqConcurrencyLimiter } = require("../../utils/asyncLimiter");
 const { routeTask } = require("./model-registry");
+const { withOutboundOperation } = require('../../utils/outboundBandwidth');
 
 function sanitizeToolArgs(rawArgs) {
   let args = {};
@@ -147,7 +148,7 @@ class GroqProvider extends BaseAIProvider {
         }
 
         try {
-          const response = await this.client.chat.completions.create(payload);
+          const response = await withOutboundOperation('groq', `completion_${task}`, () => this.client.chat.completions.create(payload));
           const choice = response.choices[0];
           const message = choice.message;
 

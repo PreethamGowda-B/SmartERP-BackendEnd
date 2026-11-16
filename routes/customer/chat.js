@@ -21,7 +21,9 @@ const redisClient = require('../../utils/redis');
 const { createNotification } = require('../../utils/notificationHelpers');
 const { requireValidFileSignature } = require('../../utils/fileValidation');
 const { loadPlan, checkPlanLimit } = require('../../middleware/planMiddleware');
-const { recordCompanyStorageUsage } = require('../../services/companyStorage');
+const { recordCompanyStorageUsage, removeCompanyStorageUsage } = require('../../services/companyStorage');
+const { measureDatabaseFileParameter, withOutboundOperation } = require('../../utils/outboundBandwidth');
+const { cloudinary, hasCloudinaryConfig } = require('../../config/cloudinary');
 
 const chatUpload = multer({
   storage: multer.memoryStorage(),
@@ -56,23 +58,64 @@ router.post('/upload', chatUpload.single('attachment'), requireValidFileSignatur
     );
     if (!jobResult.rows.length) return fail(res, 'Chat upload is unavailable for this job', 403);
     const file = req.file;
+    const isImage = file.mimetype.startsWith('image/');
     const storageKey = `customer-chat:${crypto.randomUUID()}`;
     await recordCompanyStorageUsage(companyId, storageKey, file.size, 'customer_chat_attachment');
-    const inserted = await pool.query(
-      `INSERT INTO message_media_files (file_name, file_type, file_size, data)
-       VALUES ($1, $2, $3, $4) RETURNING id`,
-      [file.originalname, file.mimetype, file.size, file.buffer]
-    );
-    const host = req.get('host') || 'api.prozync.in';
-    const protocol = req.protocol === 'http' && !req.secure ? 'http' : 'https';
-    const mediaUrl = `${protocol}://${host}/api/messages/media/${inserted.rows[0].id}`;
+
+    let mediaUrl = null;
+
+    // 1. Attempt upload to Cloudinary if credentials are configured
+    if (hasCloudinaryConfig) {
+      try {
+        const uploadResult = await withOutboundOperation('cloudinary', 'customer_chat_upload', () => new Promise((resolve, reject) => {
+          const stream = cloudinary.uploader.upload_stream(
+            {
+              folder: `smarterp/customer-chat/${companyId}`,
+              resource_type: isImage ? 'image' : 'raw',
+              public_id: `cust_chat_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,
+              ...(isImage && { transformation: [{ width: 1200, crop: 'limit' }] })
+            },
+            (error, result) => {
+              if (error) reject(error);
+              else resolve(result);
+            }
+          );
+          stream.end(file.buffer);
+        }));
+        if (uploadResult && uploadResult.secure_url) {
+          mediaUrl = uploadResult.secure_url;
+        }
+      } catch (cloudErr) {
+        console.warn('⚠️ Cloudinary customer chat upload failed, falling back to database media storage:', cloudErr.message);
+      }
+    }
+
+    // 2. High-performance, resilient fallback: store binary buffer in PostgreSQL message_media_files
+    if (!mediaUrl) {
+      const inserted = await measureDatabaseFileParameter({
+        operation: 'customer_chat_attachment_insert',
+        fileBytes: file.buffer.byteLength,
+        run: () => pool.query(
+          `INSERT INTO message_media_files (file_name, file_type, file_size, data, company_id, uploaded_by)
+           VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+          [file.originalname, file.mimetype, file.size, file.buffer, String(companyId), String(customerId)]
+        ),
+      });
+      const host = req.get('host') || 'api.prozync.in';
+      const protocol = req.protocol === 'http' && !req.secure ? 'http' : 'https';
+      mediaUrl = `${protocol}://${host}/api/messages/media/${inserted.rows[0].id}`;
+    }
+
     return ok(res, {
       media_url: mediaUrl,
-      media_type: file.mimetype.startsWith('image/') ? 'image' : 'document',
+      media_type: isImage ? 'image' : 'document',
       file_name: file.originalname,
       file_size: file.size,
     }, 201);
   } catch (err) {
+    if (storageKey) {
+      await removeCompanyStorageUsage(companyId, storageKey).catch(() => {});
+    }
     console.error('Customer chat upload error:', err.message);
     return fail(res, 'File upload failed', 500);
   }
@@ -179,6 +222,32 @@ router.post('/', async (req, res) => {
       if (!['image/jpeg', 'image/png', 'image/webp', 'application/pdf'].includes(media.file_type)) {
         return fail(res, 'Unsupported attachment type', 400);
       }
+
+      // Attachment validation:
+      // 1. Ensure media is not owned by another company
+      // 2. Ensure customer cannot attach internal employee documents or staff chat media
+      // 3. Ensure customer cannot attach media from an unrelated job
+      const existingOwnership = await pool.query(
+        `SELECT 'employee_doc' AS source, company_id::text, NULL AS job_id FROM employee_documents WHERE file_url LIKE $1
+         UNION ALL
+         SELECT 'staff_msg' AS source, company_id::text, NULL AS job_id FROM messages WHERE media_url LIKE $1
+         UNION ALL
+         SELECT 'job_msg' AS source, j.company_id::text, jm.job_id::text AS job_id FROM job_messages jm JOIN jobs j ON j.id = jm.job_id WHERE jm.media_url LIKE $1`,
+        [`%/api/messages/media/${mediaId}%`]
+      );
+
+      for (const row of existingOwnership.rows) {
+        if (String(row.company_id) !== String(companyId)) {
+          return fail(res, 'Attachment belongs to another organization', 403);
+        }
+        if (row.source === 'employee_doc' || row.source === 'staff_msg') {
+          return fail(res, 'Unauthorized attachment reference', 403);
+        }
+        if (row.source === 'job_msg' && String(row.job_id) !== String(jobId)) {
+          return fail(res, 'Attachment belongs to another job', 403);
+        }
+      }
+
       savedAttachment = {
         media_url: attachment.media_url,
         media_type: media.file_type.startsWith('image/') ? 'image' : 'document',

@@ -20,8 +20,10 @@ const { createNotification } = require('../utils/notificationHelpers');
 const { invalidatePlanCache } = require('../middleware/planMiddleware');
 const { Resend } = require('resend');
 const logger = require('../utils/logger');
+const { runWithPostgresAdvisoryLock } = require('../utils/scheduledTaskLock');
 
 const resend = new Resend(process.env.RESEND_API_KEY);
+let lifecycleTask = null;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper: log to subscription_events
@@ -289,12 +291,20 @@ async function processSubscriptionLifecycle() {
 // Start the cron job
 // ─────────────────────────────────────────────────────────────────────────────
 function startTrialExpiryProcessor() {
+  if (lifecycleTask) return;
   // Run daily at 9:00 AM IST = 3:30 AM UTC
-  cron.schedule('30 3 * * *', processSubscriptionLifecycle, {
+  lifecycleTask = cron.schedule('30 3 * * *', () => {
+    void runWithPostgresAdvisoryLock('subscription-lifecycle', processSubscriptionLifecycle);
+  }, {
     scheduled: true,
     timezone: 'Asia/Kolkata'
   });
   logger.info('Subscription lifecycle processor scheduled (daily 9:00 AM IST)');
 }
 
-module.exports = { startTrialExpiryProcessor, processSubscriptionLifecycle, logSubscriptionEvent };
+function stopTrialExpiryProcessor() {
+  lifecycleTask?.stop();
+  lifecycleTask = null;
+}
+
+module.exports = { startTrialExpiryProcessor, stopTrialExpiryProcessor, processSubscriptionLifecycle, logSubscriptionEvent };

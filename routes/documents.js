@@ -6,10 +6,11 @@ const fs = require('fs');
 const path = require('path');
 const { pool } = require('../db');
 const { authenticateToken } = require('../middleware/authMiddleware');
-const { cloudinary, hasCloudinaryConfig } = require('../config/cloudinary');
+const { cloudinary, hasCloudinaryConfig, deleteCloudinaryAsset } = require('../config/cloudinary');
 const { requireValidFileSignature } = require('../utils/fileValidation');
 const { loadPlan, checkPlanLimit } = require('../middleware/planMiddleware');
 const { recordCompanyStorageUsage, removeCompanyStorageUsage } = require('../services/companyStorage');
+const { measureDatabaseFileParameter, withOutboundOperation } = require('../utils/outboundBandwidth');
 
 // Use in-memory storage — we upload directly to Cloudinary, no local disk needed
 const upload = multer({
@@ -78,21 +79,21 @@ router.post(
 
         if (hasCloudinaryConfig) {
             try {
-                const uploadResult = await new Promise((resolve, reject) => {
-                    const stream = cloudinary.uploader.upload_stream(
-                        {
-                            folder: `smarterp/documents/${companyId}`,
-                            resource_type: isImage ? 'image' : 'raw',
-                            public_id: `doc_${Date.now()}`,
-                            ...(isImage && { transformation: [{ width: 1600, crop: 'limit' }] })
-                        },
-                        (error, result) => {
-                            if (error) reject(error);
-                            else resolve(result);
-                        }
-                    );
-                    stream.end(req.file.buffer);
-                });
+                    const uploadResult = await withOutboundOperation('cloudinary', 'employee_document_upload', () => new Promise((resolve, reject) => {
+                        const stream = cloudinary.uploader.upload_stream(
+                            {
+                                folder: `smarterp/documents/${companyId}`,
+                                resource_type: isImage ? 'image' : 'raw',
+                                public_id: `doc_${Date.now()}`,
+                                ...(isImage && { transformation: [{ width: 1600, crop: 'limit' }] })
+                            },
+                            (error, result) => {
+                                if (error) reject(error);
+                                else resolve(result);
+                            }
+                        );
+                        stream.end(req.file.buffer);
+                    }));
                 fileUrl = uploadResult.secure_url;
             } catch (cloudErr) {
                 console.warn('⚠️ Cloudinary upload failed, falling back to local storage:', cloudErr.message);
@@ -103,12 +104,16 @@ router.post(
         if (!fileUrl) {
             try {
                 console.log('📦 Persisting document to database media storage fallback...');
-                const mediaRes = await pool.query(
-                    `INSERT INTO message_media_files (file_name, file_type, file_size, data)
-                     VALUES ($1, $2, $3, $4)
-                     RETURNING id`,
-                    [req.file.originalname || `doc_${Date.now()}`, req.file.mimetype, req.file.size, req.file.buffer]
-                );
+                const mediaRes = await measureDatabaseFileParameter({
+                    operation: 'employee_document_fallback_insert',
+                    fileBytes: req.file.buffer.byteLength,
+                    run: () => pool.query(
+                        `INSERT INTO message_media_files (file_name, file_type, file_size, data, company_id, uploaded_by)
+                         VALUES ($1, $2, $3, $4, $5, $6)
+                         RETURNING id`,
+                        [req.file.originalname || `doc_${Date.now()}`, req.file.mimetype, req.file.size, req.file.buffer, String(companyId), String(userId)]
+                    ),
+                });
                 const baseUrl = process.env.BASE_URL || 'https://api.prozync.in';
                 fileUrl = `${baseUrl}/api/messages/media/${mediaRes.rows[0].id}`;
                 console.log('✅ Document saved to database media fallback:', fileUrl);
@@ -220,29 +225,21 @@ router.delete('/:id', authenticateToken, async (req, res) => {
 
         const { file_url, storage_key: storageKey } = docResult.rows[0];
 
-        // Delete from DB first (always succeeds)
+        // Delete from DB first
         await pool.query('DELETE FROM employee_documents WHERE id = $1', [id]);
 
-        // Attempt to delete from Cloudinary (non-critical — file might already be gone)
-        if (hasCloudinaryConfig && file_url && file_url.includes('cloudinary.com')) {
-            try {
-                // Extract public_id from Cloudinary URL
-                const urlParts = file_url.split('/');
-                const uploadIndex = urlParts.indexOf('upload');
-                if (uploadIndex !== -1) {
-                    // public_id is everything after /upload/vXXXXX/ without extension
-                    const publicIdWithExt = urlParts.slice(uploadIndex + 2).join('/');
-                    const publicId = publicIdWithExt.replace(/\.[^.]+$/, '');
-                    const rawDelete = await cloudinary.uploader.destroy(publicId, { resource_type: 'raw' }).catch(() => null);
-                    const imageDelete = rawDelete?.result ? null : await cloudinary.uploader.destroy(publicId, { resource_type: 'image' }).catch(() => null);
-                    if (rawDelete?.result === 'ok' || rawDelete?.result === 'not found' || imageDelete?.result === 'ok' || imageDelete?.result === 'not found') {
-                        await removeCompanyStorageUsage(companyId, storageKey || `employee-document:${id}`);
-                    }
-                }
-            } catch (cloudErr) {
-                console.warn('⚠️ Could not delete from Cloudinary (non-fatal):', cloudErr.message);
+        // Clean up underlying storage: Cloudinary or database media files
+        if (file_url && file_url.includes('/api/messages/media/')) {
+            const mediaId = file_url.match(/\/api\/messages\/media\/([0-9a-f-]{36})/i)?.[1];
+            if (mediaId) {
+                await pool.query('DELETE FROM message_media_files WHERE id = $1', [mediaId]).catch(() => {});
             }
+        } else if (file_url && file_url.includes('cloudinary.com')) {
+            await deleteCloudinaryAsset(file_url).catch(() => {});
         }
+
+        // Always release company storage usage tracking
+        await removeCompanyStorageUsage(companyId, storageKey || `employee-document:${id}`).catch(() => {});
 
         res.json({ message: 'Document deleted successfully' });
     } catch (err) {

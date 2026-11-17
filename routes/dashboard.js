@@ -6,7 +6,7 @@ const { cacheMiddleware } = require('../middleware/cache');
 const AttendancePolicy = require('../services/attendancePolicyService');
 
 // ─── GET /api/dashboard/owner/metrics ────────────────────────────────────────
-router.get('/owner/metrics', authenticateToken, cacheMiddleware(300), async (req, res) => {
+router.get('/owner/metrics', authenticateToken, cacheMiddleware(60), async (req, res) => {
     // 🛡️ H-1 Fix: Server-side authorization check (owner / super_admin only)
     if (req.user.role !== 'owner' && req.user.role !== 'super_admin') {
         return res.status(403).json({ 

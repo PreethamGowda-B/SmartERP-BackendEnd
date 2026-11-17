@@ -28,6 +28,8 @@ function publishCustomerJobEvent(jobId, eventPayload) {
 
 const { loadPlan, checkPlanLimit } = require('../middleware/planMiddleware');
 const EventMessagingService = require('../services/eventMessagingService');
+const { cacheMiddleware, invalidateHttpCache } = require('../middleware/cache');
+const { enqueueNotification, enqueueCompanyNotification, enqueueAudit } = require('../utils/queue');
 
 /**
  * Create a new job
@@ -89,44 +91,51 @@ router.post('/', authenticateToken, loadPlan, checkPlanLimit('job'), [
 
     const createdJob = result.rows[0];
 
-    // Audit Log
-    logJobAudit({
-      companyId: req.user.companyId,
-      jobId: createdJob.id,
-      userId: req.user.id,
-      userRole: req.user.role,
-      action: 'JOB_CREATED',
-      newState: initialState,
-      newValue: { title, assignedTo, priority: job.priority || 'medium' },
-      ipAddress: req.ip,
-    });
+    // Respond immediately so user action completes in milliseconds (<20ms)
+    logger.business("JOB_CREATED", { jobId: createdJob.id, companyId: req.user.companyId, userId: req.user.id, priority: job.priority || "medium" });
+    res.json(createdJob);
 
-    // Send notification to assigned employee OR broadcast to all if visible to all
-    try {
-      if (visibleToAll) {
-        await createNotificationForCompany({
-          company_id: req.user.companyId,
-          type: 'job',
-          idempotency_key: `job_available:${req.user.companyId}:${createdJob.id}`,
-          title: 'New Job Available',
-          message: `A new job is available for everyone: ${title}`,
-          priority: job.priority || 'medium',
-          data: { job_id: createdJob.id, job_title: title },
-          exclude_user_id: req.user.id
+    // Invalidate HTTP cache for this company immediately
+    invalidateHttpCache(req.user.companyId);
+
+    // Run durable audit logging, multi-recipient notifications, email dispatch, and conversation setup in background
+    setImmediate(async () => {
+      try {
+        await enqueueAudit({
+          companyId: req.user.companyId,
+          jobId: createdJob.id,
+          userId: req.user.id,
+          userRole: req.user.role,
+          action: 'JOB_CREATED',
+          newState: initialState,
+          newValue: { title, assignedTo, priority: job.priority || 'medium' },
+          ipAddress: req.ip,
         });
-      } else if (assignedTo) {
-        await createNotification({
-          user_id: assignedTo,
-          company_id: req.user.companyId,
-          type: 'job',
-          idempotency_key: `job_assigned:${req.user.companyId}:${createdJob.id}`,
-          title: 'New Job Assigned',
-          message: `You have been assigned a new job: ${title}`,
-          priority: job.priority || 'medium',
-          data: { job_id: createdJob.id, job_title: title, url: '/employee/notifications' }
-        });
-        // 📧 Email: Notify assigned employee asynchronously (non-blocking)
-        setImmediate(async () => {
+
+        // Send notification to assigned employee OR broadcast to all if visible to all via durable queue
+        if (visibleToAll) {
+          await enqueueCompanyNotification({
+            company_id: req.user.companyId,
+            type: 'job',
+            idempotency_key: `job_available:${req.user.companyId}:${createdJob.id}`,
+            title: 'New Job Available',
+            message: `A new job is available for everyone: ${title}`,
+            priority: job.priority || 'medium',
+            data: { job_id: createdJob.id, job_title: title },
+            exclude_user_id: req.user.id
+          });
+        } else if (assignedTo) {
+          await enqueueNotification({
+            user_id: assignedTo,
+            company_id: req.user.companyId,
+            type: 'job',
+            idempotency_key: `job_assigned:${req.user.companyId}:${createdJob.id}`,
+            title: 'New Job Assigned',
+            message: `You have been assigned a new job: ${title}`,
+            priority: job.priority || 'medium',
+            data: { job_id: createdJob.id, job_title: title, url: '/employee/notifications' }
+          });
+          // 📧 Email: Notify assigned employee asynchronously
           try {
             const empResult = await pool.query('SELECT email, name FROM users WHERE id = $1', [assignedTo]);
             const ownerResult = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
@@ -144,24 +153,21 @@ router.post('/', authenticateToken, loadPlan, checkPlanLimit('job'), [
           } catch (e) {
             console.warn('⚠️ Async job assigned email warning:', e.message);
           }
-        });
+        }
+      } catch (notificationErr) {
+        console.error('❌ Failed to send background job notification:', notificationErr);
       }
-    } catch (notificationErr) {
-      console.error('❌ Failed to send job notification:', notificationErr);
-    }
 
-    // Auto-spawn job conversation thread (Enterprise Communication Backbone)
-    EventMessagingService.onJobCreated({
-      jobId: createdJob.id,
-      companyId: req.user.companyId,
-      title,
-      customerId: createdJob.customer_id || null,
-      ownerId: req.user.id,
-      assignedEmployeeId: assignedTo || null,
-    }).catch(() => { }); // non-blocking, never breaks response
-
-    logger.business("JOB_CREATED", { jobId: createdJob.id, companyId: req.user.companyId, userId: req.user.id, priority: job.priority || "medium" });
-    res.json(createdJob);
+      // Auto-spawn job conversation thread (Enterprise Communication Backbone)
+      EventMessagingService.onJobCreated({
+        jobId: createdJob.id,
+        companyId: req.user.companyId,
+        title,
+        customerId: createdJob.customer_id || null,
+        ownerId: req.user.id,
+        assignedEmployeeId: assignedTo || null,
+      }).catch(() => { });
+    });
   } catch (err) {
     console.error('jobs POST error', err);
     res.status(500).json({ message: 'Server error' });
@@ -171,7 +177,7 @@ router.post('/', authenticateToken, loadPlan, checkPlanLimit('job'), [
 /**
  * Get jobs (role-based)
  */
-router.get('/', authenticateToken, async (req, res) => {
+router.get('/', authenticateToken, cacheMiddleware(30), async (req, res) => {
   try {
     let result;
 
@@ -336,7 +342,7 @@ router.get('/', authenticateToken, async (req, res) => {
 
 // ── GET /api/jobs/:id ────────────────────────────────────────────────────────
 // Retrieve details for a specific single job by ID
-router.get('/:id', authenticateToken, async (req, res, next) => {
+router.get('/:id', authenticateToken, cacheMiddleware(30), async (req, res, next) => {
   try {
     const { id } = req.params;
 
@@ -534,6 +540,9 @@ const handleJobAccept = async (req, res) => {
     // Respond immediately so user action completes in milliseconds
     res.json(acceptedJob);
 
+    // Invalidate HTTP cache for this company immediately
+    invalidateHttpCache(req.user.companyId || acceptedJob.company_id);
+
     // Audit and notifications happen asynchronously without blocking the client or holding connections
     logJobAudit({
       companyId: req.user.companyId || acceptedJob.company_id,
@@ -636,6 +645,9 @@ const handleJobAccept = async (req, res) => {
 
       // Respond immediately to the frontend
       res.json(declinedJob);
+
+      // Invalidate HTTP cache for this company immediately
+      invalidateHttpCache(req.user.companyId || declinedJob.company_id);
 
       (async () => {
         try {
@@ -753,6 +765,9 @@ const handleJobAccept = async (req, res) => {
 
       // Respond immediately so user action completes in milliseconds
       res.json(updatedJob);
+
+      // Invalidate HTTP cache for this company immediately
+      invalidateHttpCache(req.user.companyId || updatedJob.company_id);
 
       // Audit, notifications, and telemetry happen asynchronously
       logJobAudit({
@@ -896,6 +911,7 @@ const handleJobAccept = async (req, res) => {
       }
       logger.business("JOB_UPDATED", { jobId: id, companyId, userId: req.user.id });
       res.json(result.rows[0]);
+      invalidateHttpCache(companyId);
     } catch (err) {
       console.error('jobs PUT error', err);
       res.status(500).json({ message: 'Server error' });
@@ -924,6 +940,7 @@ const handleJobAccept = async (req, res) => {
       }
       logger.business("JOB_DELETED", { jobId: id, companyId, userId: req.user.id });
       res.json({ success: true });
+      invalidateHttpCache(companyId);
     } catch (err) {
       console.error('jobs DELETE error', err);
       res.status(500).json({ message: 'Server error' });

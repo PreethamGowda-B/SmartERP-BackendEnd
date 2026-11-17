@@ -12,7 +12,12 @@ if (redisConnection) {
   const notificationWorker = new Worker('notifications', async (job) => {
     logger.debug(`Processing notification job ${job.id} for user ${job.data?.user_id}`, { jobId: job.id, userId: job.data?.user_id });
     try {
-      await createNotification(job.data);
+      if (job.data?.isCompanyNotification) {
+        const { createNotificationForCompany } = require('../utils/notificationHelpers');
+        await createNotificationForCompany(job.data);
+      } else {
+        await createNotification(job.data);
+      }
     } catch (err) {
       logger.error(`Notification Job ${job.id} failed`, err, { jobId: job.id });
       throw err; // Allow BullMQ to retry if needed
@@ -26,6 +31,12 @@ if (redisConnection) {
    */
   const auditWorker = new Worker('audit', async (job) => {
     logger.debug(`Processing audit job ${job.id} for user ${job.data?.userId}`, { jobId: job.id, userId: job.data?.userId });
+    try {
+      const { logJobAudit } = require('../utils/auditLogger');
+      await logJobAudit(job.data);
+    } catch (err) {
+      logger.error(`Audit Job ${job.id} failed`, err, { jobId: job.id });
+    }
   }, { connection: redisConnection });
   backgroundWorkers.push(auditWorker);
 

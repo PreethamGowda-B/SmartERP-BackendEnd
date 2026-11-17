@@ -380,15 +380,13 @@ class InvoiceService {
       laborHours = 8.0; // Default estimate if untracked
     }
 
-    // Get hourly rate from company_settings or default
+    // Get hourly rate from company_settings (cached with 60s TTL) or default
     let hourlyRate = parseFloat(job.hourly_rate) || 500.0;
     try {
-      const rateRes = await pool.query(
-        `SELECT setting_value FROM company_settings WHERE company_id::text = $1::text AND setting_key = 'hourly_rate'`,
-        [String(companyId)]
-      );
-      if (rateRes.rows.length > 0) {
-        hourlyRate = parseFloat(rateRes.rows[0].setting_value) || hourlyRate;
+      const { getCompanySetting } = require('./companySettingsService');
+      const cachedRate = await getCompanySetting(companyId, 'hourly_rate', null, pool);
+      if (cachedRate != null) {
+        hourlyRate = parseFloat(cachedRate) || hourlyRate;
       }
     } catch (_) {}
 

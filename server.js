@@ -271,6 +271,12 @@ app.get("/health", healthHandler);
 app.get("/api/health", healthHandler);
 app.get("/api/v1/health", healthHandler);
 
+// ✅ Lightweight in-memory ping routes for Render keep-alive pinger (avoids DB connection acquisition)
+const pingHandler = (_req, res) => res.status(200).json({ status: "ok", timestamp: Date.now() });
+app.get("/ping", pingHandler);
+app.get("/api/ping", pingHandler);
+app.get("/api/v1/ping", pingHandler);
+
 // ✅ Info & Root routes
 app.get("/api", (req, res) => res.json({ status: "ok" }));
 app.get("/", (req, res) => res.status(200).json({ status: "ok" }));
@@ -1161,6 +1167,17 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
   // Install signal handlers before DB initialization so shutdown cannot race startup.
   clusterLifecycle.install();
 
+  // Cross-worker IPC message forwarding for multi-worker cache invalidation
+  cluster.on('message', (worker, message) => {
+    if (message?.cmd === 'cache:invalidate:company_settings') {
+      for (const id in cluster.workers) {
+        if (cluster.workers[id] && cluster.workers[id].id !== worker.id) {
+          try { cluster.workers[id].send(message); } catch (_) {}
+        }
+      }
+    }
+  });
+
   // Schema repairs, DDL, seed checks, and storage migrations do not belong on
   // the request-serving startup path. They create noisy deploy logs, delay the
   // health check, and can contend with live traffic. Run them deliberately via
@@ -1192,11 +1209,19 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
   })();
 
 } else {
+  // Listen for cluster primary cache invalidation broadcasts
+  process.on('message', (message) => {
+    if (message?.cmd === 'cache:invalidate:company_settings' && message.companyId) {
+      try {
+        const { invalidateCompanySettings } = require('./services/companySettingsService');
+        invalidateCompanySettings(message.companyId, true);
+      } catch (_) {}
+    }
+  });
+
   // ✅ Start server
   const PORT = process.env.PORT || 4000;
-  app.listen(PORT, () => {
-    logger.info('SmartERP worker running', { pid: process.pid, port: PORT });
-
+  app.listen(PORT, async () => {
     // Run background processors once per Render service instance. In production
     // cluster mode only the explicitly designated worker owns scheduled work;
     // development/non-cluster mode has one process and can run it locally.
@@ -1206,14 +1231,37 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
       nodeEnv: process.env.NODE_ENV,
     });
 
+    if (shouldStartWorkers) {
+      backgroundWorkersStarted = true;
+      try {
+        const { printStartupDashboard } = require('./utils/startupDashboard');
+        const redisClient = require('./utils/redis');
+        await printStartupDashboard({
+          port: PORT,
+          processRole: cluster.isWorker ? 'primary-worker' : 'standalone-service',
+          workerId: cluster.worker?.id || 1,
+          isPrimaryWorker: true,
+          pool,
+          redisClient,
+          backgroundWorkersStarted: true,
+        });
+      } catch (dashErr) {
+        logger.warn('Failed to print startup dashboard:', { error: dashErr.message });
+      }
+    } else {
+      logger.info('SmartERP cluster worker running', {
+        pid: process.pid,
+        port: PORT,
+        workerId: cluster.worker?.id || 2,
+        role: 'secondary-worker',
+      });
+    }
+
     if (!shouldStartWorkers && process.env.ENABLE_BACKGROUND_WORKERS === 'true') {
       logger.warn('ENABLE_BACKGROUND_WORKERS is ignored in non-primary cluster workers to prevent duplicate processors', { pid: process.pid });
     }
 
     if (shouldStartWorkers) {
-      backgroundWorkersStarted = true;
-      logger.info("Starting background processors and workers", { pid: process.pid });
-
       require('./jobs/workers'); // Initialize BullMQ workers
 
       try {
@@ -1236,14 +1284,6 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
         startSmartNotificationProcessor();
       } catch (err) {
         console.error('❌ Failed to start smart notification CRON processor:', err.message);
-      }
-
-      // 🏓 Render Keep-Alive Pinger: Prevent cold starts by pinging /api/health every 10 min
-      try {
-        const { startKeepAlivePinger } = require('./jobs/keepAlivePinger');
-        startKeepAlivePinger();
-      } catch (err) {
-        console.error('❌ Failed to start keep-alive pinger:', err.message);
       }
 
       // 📍 Geofence Service: Check employee arrival every 12 seconds
@@ -1306,7 +1346,6 @@ async function stopBackgroundProcessors() {
     ['./jobs/dailyAttendanceProcessor', 'stopDailyAttendanceProcessor'],
     ['./jobs/trialExpiryProcessor', 'stopTrialExpiryProcessor'],
     ['./jobs/smartNotificationProcessor', 'stopSmartNotificationProcessor'],
-    ['./jobs/keepAlivePinger', 'stopKeepAlivePinger'],
   ]) {
     try {
       const processor = require(file);

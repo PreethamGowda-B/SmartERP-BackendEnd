@@ -366,27 +366,25 @@ router.get('/settings', authenticateToken, requireOwnerOrHr, async (req, res) =>
   }
 
   // Safe defaults — returned whenever the DB query fails or returns no rows
-  const DEFAULT_SETTINGS = {
+  const { getCompanySettings, invalidateCompanySettings } = require('../services/companySettingsService');
+const DEFAULT_SETTINGS = {
     auto_approve_customer_jobs: false,
     hourly_rate: 50,
     service_charge: 0,
     sla: { max_accept_time: 15, max_completion_time: 240 },
   };
 
-  // Fetch company_settings — wrapped separately so a UUID type error doesn't 500
-  var settingsMap = {};
+  // Fetch company_settings with in-memory TTL caching to avoid repeated DB queries
+  let settingsMap = {};
   try {
-    const settingsResult = await pool.query(
-      'SELECT setting_key, setting_value FROM company_settings' +
-      ' WHERE company_id = $1' +
-      "   AND setting_key IN ('auto_approve_customer_jobs', 'hourly_rate', 'service_charge')",
-      [companyId]
+    settingsMap = await getCompanySettings(
+      companyId,
+      ['auto_approve_customer_jobs', 'hourly_rate', 'service_charge'],
+      pool
     );
-    settingsResult.rows.forEach(function (r) { settingsMap[r.setting_key] = r.setting_value; });
-    console.log('[customerJobApproval.GET /settings] fetched settings for company', companyId, settingsMap);
+    logger.debug(`[customerJobApproval.GET /settings] fetched settings for company ${companyId}`);
   } catch (settingsErr) {
-    // Non-UUID company_id or missing table — use defaults, don't crash
-    console.warn('[customerJobApproval.GET /settings] company_settings query failed (using defaults):', settingsErr.message);
+    logger.warn('[customerJobApproval.GET /settings] company_settings query failed (using defaults):', { error: settingsErr.message });
   }
 
   // Fetch SLA config — getSlaConfig already never throws (returns defaults on error)
@@ -456,6 +454,7 @@ router.put('/settings', authenticateToken, async (req, res) => {
     if (updates.length === 0) return fail(res, 'No valid settings provided', 400);
 
     await Promise.all(updates);
+    invalidateCompanySettings(companyId);
 
     auditService.logFromRequest(req, {
       companyId, userId: req.user.id, actorType: 'user',

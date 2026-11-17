@@ -39,27 +39,50 @@ const auditQueue = connection
  */
 async function enqueueNotification(data) {
   if (!notificationQueue) {
-    console.warn('⚠️ Redis not connected. Processing notification immediately.');
     const { createNotification } = require('./notificationHelpers');
     return createNotification(data);
   }
-  return notificationQueue.add('send', data, {
+  const opts = {
     removeOnComplete: true,
     attempts: 3,
     backoff: { type: 'exponential', delay: 1000 },
-  });
+  };
+  if (data.idempotency_key) {
+    opts.jobId = String(data.idempotency_key);
+  }
+  return notificationQueue.add('send', data, opts);
+}
+
+/**
+ * Offload a company-wide broadcast notification task to the background queue.
+ * Falls back to direct execution if BullMQ is unavailable.
+ */
+async function enqueueCompanyNotification(data) {
+  if (!notificationQueue) {
+    const { createNotificationForCompany } = require('./notificationHelpers');
+    return createNotificationForCompany(data);
+  }
+  const opts = {
+    removeOnComplete: true,
+    attempts: 3,
+    backoff: { type: 'exponential', delay: 1000 },
+  };
+  if (data.idempotency_key) {
+    opts.jobId = `comp:${String(data.idempotency_key)}`;
+  }
+  return notificationQueue.add('send', { ...data, isCompanyNotification: true }, opts);
 }
 
 /**
  * Offload an audit log task to the background queue.
- * Silently skipped if BullMQ is unavailable (non-critical path).
+ * Falls back to direct logJobAudit if BullMQ is unavailable.
  */
 async function enqueueAudit(data) {
   if (!auditQueue) {
-    console.warn('⚠️ Redis not connected. Skipping background audit log.');
-    return;
+    const { logJobAudit } = require('./auditLogger');
+    return logJobAudit(data);
   }
-  return auditQueue.add('log', data, { removeOnComplete: true });
+  return auditQueue.add('log', data, { removeOnComplete: true, attempts: 2 });
 }
 
 const webhookRetryQueue = connection
@@ -105,6 +128,7 @@ module.exports = {
   webhookRetryQueue,
   securityQueue,
   enqueueNotification,
+  enqueueCompanyNotification,
   enqueueAudit,
   enqueueWebhookRetry,
   enqueueSecurityEvent,

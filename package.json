@@ -46,7 +46,6 @@
     "resend": "^6.9.3"
   },
   "devDependencies": {
-    "artillery": "^2.0.30",
     "nodemon": "^3.1.14"
   }
 }

@@ -4,19 +4,32 @@ if (dns.setDefaultResultOrder) {
 }
 
 require("dotenv").config();
-try { require('./utils/outboundBandwidth').installOutboundBandwidthMonitoring(); }
-catch { try { console.warn('[outbound-bandwidth] instrumentation unavailable; continuing without measurements'); } catch { /* monitoring is optional */ } }
+try {
+  const outboundBandwidth = require('./utils/outboundBandwidth');
+  // Payload telemetry is deliberately opt-in and never installs in production.
+  // It is intended for an approved staging investigation only.
+  if (outboundBandwidth.outboundBandwidthMonitoringEnabled()) {
+    outboundBandwidth.installOutboundBandwidthMonitoring();
+  }
+} catch { try { console.warn('[outbound-bandwidth] instrumentation unavailable; continuing without measurements'); } catch { /* monitoring is optional */ } }
 const { shouldStartBackgroundWorkers } = require('./utils/backgroundWorkerPolicy');
 const logger = require("./utils/logger");
 const Sentry = require("@sentry/node");
-const { nodeProfilingIntegration } = require("@sentry/profiling-node");
+let nodeProfilingIntegration = null;
+try {
+  nodeProfilingIntegration = require("@sentry/profiling-node").nodeProfilingIntegration;
+} catch (profErr) {
+  if (typeof logger?.warn === "function") {
+    logger.warn("Sentry profiling native binary unavailable for this architecture/runtime; continuing without CPU profiling", { error: profErr.message });
+  }
+}
 
 // ✅ Initialize Sentry BEFORE anything else
 if (process.env.SENTRY_DSN) {
   Sentry.init({
     dsn: process.env.SENTRY_DSN,
     integrations: [
-      nodeProfilingIntegration(),
+      ...(typeof nodeProfilingIntegration === "function" ? [nodeProfilingIntegration()] : []),
     ],
     tracesSampleRate: 0.1,
     profilesSampleRate: 0.1,
@@ -118,11 +131,18 @@ const corsOptions = {
       "https://client.prozync.in",
     ];
 
+    const configuredOrigins = [
+      process.env.FRONTEND_ORIGIN,
+      process.env.CUSTOMER_PORTAL_ORIGIN,
+      process.env.SUPERADMIN_FRONTEND_ORIGIN,
+    ].filter(Boolean).map(o => o.toLowerCase().trim());
+
     // Only allow specific authorized origins, *.prozync.in subdomains, or exact SmartERP vercel deployments
     const isAllowedVercelPreview = /^https:\/\/smart-erp-front-end(-[a-z0-9-]+)?\.vercel\.app$/.test(cleanOrigin);
 
     if (
       allowedOrigins.includes(cleanOrigin) ||
+      configuredOrigins.includes(cleanOrigin) ||
       cleanOrigin.endsWith(".prozync.in") ||
       isAllowedVercelPreview
     ) {
@@ -950,9 +970,40 @@ async function runDatabaseInitialization() {
 // ✅ Create API v1 Router
 const v1Router = express.Router();
 
-// ✅ Platform Maintenance Mode Middleware with in-memory caching to eliminate per-request DB queries
+// ✅ Platform Maintenance Mode Middleware with single-flight promise deduplication and in-memory caching
 let maintenanceSettingCache = null;
 let maintenanceSettingExpiresAt = 0;
+let maintenanceSettingInFlight = null;
+
+async function resolveMaintenanceSetting() {
+  const now = Date.now();
+  if (maintenanceSettingCache !== null && maintenanceSettingExpiresAt > now) {
+    return maintenanceSettingCache;
+  }
+  if (maintenanceSettingInFlight) {
+    return maintenanceSettingInFlight;
+  }
+
+  maintenanceSettingInFlight = (async () => {
+    try {
+      const r = await pool.query(
+        "SELECT value FROM system_settings WHERE key = 'maintenance_mode'"
+      );
+      const setting = r.rows[0]?.value || null;
+      maintenanceSettingCache = setting;
+      maintenanceSettingExpiresAt = Date.now() + 10000; // 10s in-memory TTL
+      return setting;
+    } catch (err) {
+      // Fail open: retain previous setting or null briefly (2s) so failures don't hammer DB
+      maintenanceSettingExpiresAt = Date.now() + 2000;
+      return maintenanceSettingCache || null;
+    } finally {
+      maintenanceSettingInFlight = null;
+    }
+  })();
+
+  return maintenanceSettingInFlight;
+}
 
 v1Router.use(async (req, res, next) => {
   // Always bypass maintenance mode for Super Admin management API routes
@@ -961,19 +1012,7 @@ v1Router.use(async (req, res, next) => {
   }
 
   try {
-    const now = Date.now();
-    let setting = null;
-    if (maintenanceSettingCache !== null && maintenanceSettingExpiresAt > now) {
-      setting = maintenanceSettingCache;
-    } else {
-      const r = await pool.query(
-        "SELECT value FROM system_settings WHERE key = 'maintenance_mode'"
-      ).catch(() => ({ rows: [] }));
-
-      setting = r.rows[0]?.value || null;
-      maintenanceSettingCache = setting;
-      maintenanceSettingExpiresAt = now + 10000; // 10s in-memory TTL
-    }
+    const setting = await resolveMaintenanceSetting();
 
     if (!setting || setting.mode === 'disabled') {
       return next();
@@ -1234,6 +1273,12 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
     if (shouldStartWorkers) {
       backgroundWorkersStarted = true;
       try {
+        const { validateEnvironmentVariables } = require('./utils/envValidator');
+        const envAudit = validateEnvironmentVariables();
+        if (!envAudit.isValid) {
+          const failures = envAudit.variables.filter(v => !v.valid).map(v => `${v.key} (${v.reason})`).join(', ');
+          logger.warn(`Environment configuration issues detected at startup: ${failures}`, { pid: process.pid });
+        }
         const { printStartupDashboard } = require('./utils/startupDashboard');
         const redisClient = require('./utils/redis');
         await printStartupDashboard({

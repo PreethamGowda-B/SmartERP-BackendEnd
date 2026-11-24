@@ -8,11 +8,11 @@ function createCompanySuspensionChecker(queryCompanyStatus, { cacheMs } = {}) {
   const inFlight = new Map();
   const resolved = new Map();
   const resolvedCacheMs = Math.min(
-    5_000,
-    Math.max(0, Number.parseInt(cacheMs ?? process.env.COMPANY_SUSPENSION_CACHE_MS ?? '1000', 10) || 0)
+    60_000,
+    Math.max(0, Number.parseInt(cacheMs ?? process.env.COMPANY_SUSPENSION_CACHE_MS ?? '30000', 10) || 0)
   );
 
-  return async function isCompanySuspended(companyId) {
+  async function isCompanySuspended(companyId) {
     if (!companyId) return false;
 
     const key = String(companyId);
@@ -45,7 +45,21 @@ function createCompanySuspensionChecker(queryCompanyStatus, { cacheMs } = {}) {
     }
 
     return pending;
+  }
+
+  isCompanySuspended.invalidate = function (companyId) {
+    if (!companyId) return;
+    const key = String(companyId);
+    resolved.delete(key);
+    inFlight.delete(key);
   };
+
+  isCompanySuspended.clear = function () {
+    resolved.clear();
+    inFlight.clear();
+  };
+
+  return isCompanySuspended;
 }
 
 module.exports = { createCompanySuspensionChecker };

@@ -14,11 +14,12 @@ const { measureDatabaseFileParameter } = require('../utils/outboundBandwidth');
 const OCRService = require('../services/ocrService');
 const { normalizedName, compareInvoice, canFinalize } = require('../services/materialPurchaseRules');
 const { createNotificationForOwners } = require('../utils/notificationHelpers');
+const { MAX_FILE_SIZE, handleMulterError } = require('../config/uploadLimits');
 
 const router = express.Router({ mergeParams: true });
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024, files: 1 },
+  limits: { fileSize: MAX_FILE_SIZE, files: 1 }, // 5 MB – global SmartERP upload policy
   fileFilter: (_req, file, callback) => {
     const allowed = new Set(['application/pdf', 'image/jpeg', 'image/png']);
     callback(allowed.has(String(file.mimetype || '').toLowerCase()) ? null : new Error('Only PDF, JPG, JPEG and PNG invoices are accepted.'), allowed.has(String(file.mimetype || '').toLowerCase()));
@@ -110,7 +111,7 @@ async function notifyUser(payload) {
 }
 
 // Employee uploads. Requester/company authorization is checked inside a transaction before storing any bill.
-router.post('/', loadPlan, upload.single('invoice'), requireValidFileSignature({ allowedMimes, fieldName: 'invoice', required: true }), checkPlanLimit('storage', { getRequestedUsage: (req) => req.file?.size || 0 }), async (req, res) => {
+router.post('/', loadPlan, upload.single('invoice'), handleMulterError, requireValidFileSignature({ allowedMimes, fieldName: 'invoice', required: true }), checkPlanLimit('storage', { getRequestedUsage: (req) => req.file?.size || 0 }), async (req, res) => {
   const file = req.file;
   if (!file || !allowedMimes.includes(file.validatedMime)) return res.status(400).json({ message: 'Upload a valid PDF, JPG, JPEG or PNG invoice.' });
   if (String(file.mimetype).toLowerCase() !== file.validatedMime) return res.status(400).json({ message: 'The file extension or declared media type does not match its content.' });

@@ -168,5 +168,5 @@ test('approved company suspension uses the same status field that authentication
   const middleware = fs.readFileSync(path.join(__dirname, '..', 'middleware', 'authMiddleware.js'), 'utf8');
   assert.match(executor, /UPDATE companies SET status = 'suspended'/);
   assert.doesNotMatch(executor, /companies SET is_suspended/);
-  assert.match(middleware, /SELECT status, COALESCE\(NULLIF\(to_jsonb\(c\)->>'is_suspended'/);
+  assert.match(middleware, /SELECT status, COALESCE\(settings->>'is_suspended'/);
 });

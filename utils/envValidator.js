@@ -5,6 +5,9 @@
  */
 
 function validateEnvironmentVariables() {
+  if (!process.env.DATABASE_URL) {
+    try { require('dotenv').config(); } catch (_) {}
+  }
   const auditResults = {
     isValid: true,
     checkedAt: new Date().toISOString(),
@@ -19,8 +22,17 @@ function validateEnvironmentVariables() {
     { key: 'FRONTEND_ORIGIN', required: false, category: 'CORS & Client Routing' },
     { key: 'RESEND_API_KEY', required: false, format: /^re_.+/i, category: 'Email & Out-of-Band Alerts' },
     { key: 'GROQ_API_KEY', required: false, category: 'AI Context Engine' },
-    { key: 'WHATSAPP_VERIFY_TOKEN', required: false, minLength: 32, category: 'WhatsApp Webhook Verification' },
-    { key: 'WHATSAPP_APP_SECRET', required: false, minLength: 32, category: 'WhatsApp Webhook Signature Verification' },
+    { key: 'CLOUDINARY_CLOUD_NAME', required: false, category: 'Media & File Storage' },
+    { key: 'CLOUDINARY_API_KEY', required: false, category: 'Media & File Storage' },
+    { key: 'CLOUDINARY_API_SECRET', required: false, category: 'Media & File Storage' },
+    { key: 'FIREBASE_SERVICE_ACCOUNT', required: false, category: 'Mobile & Web Push Notifications' },
+    { key: 'RAZORPAY_KEY_ID', required: false, category: 'Payment Processing' },
+    { key: 'RAZORPAY_KEY_SECRET', required: false, category: 'Payment Processing' },
+    { key: 'SENTRY_DSN', required: false, category: 'Error Monitoring & Telemetry' },
+    { key: 'GOOGLE_CLIENT_ID', required: false, category: 'Google OAuth Single Sign-On' },
+    { key: 'GOOGLE_CLIENT_SECRET', required: false, category: 'Google OAuth Single Sign-On' },
+    { key: 'WHATSAPP_VERIFY_TOKEN', required: false, minLength: 16, category: 'WhatsApp Webhook Verification' },
+    { key: 'WHATSAPP_APP_SECRET', required: false, minLength: 16, category: 'WhatsApp Webhook Signature Verification' },
     { key: 'SUPER_ADMIN_EMAIL', required: false, format: /^[^\s@]+@[^\s@]+\.[^\s@]+$/, category: 'Super Admin Identity' },
   ];
 

@@ -24,10 +24,11 @@ const { loadPlan, checkPlanLimit } = require('../../middleware/planMiddleware');
 const { recordCompanyStorageUsage, removeCompanyStorageUsage } = require('../../services/companyStorage');
 const { measureDatabaseFileParameter, withOutboundOperation } = require('../../utils/outboundBandwidth');
 const { cloudinary, hasCloudinaryConfig } = require('../../config/cloudinary');
+const { MAX_FILE_SIZE, handleMulterError } = require('../../config/uploadLimits');
 
 const chatUpload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 },
+  limits: { fileSize: MAX_FILE_SIZE }, // 5 MB – global SmartERP upload policy
   fileFilter: (_req, file, cb) => cb(null, ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'].includes((file.mimetype || '').split(';')[0].toLowerCase())),
 });
 
@@ -41,7 +42,7 @@ function fail(res, message, statusCode = 400) {
 // ── Schema for job_messages is managed via versioned database migrations ───────
 
 // Customer uploads are scoped to a job where the employee has accepted it.
-router.post('/upload', chatUpload.single('attachment'), requireValidFileSignature({
+router.post('/upload', chatUpload.single('attachment'), handleMulterError, requireValidFileSignature({
   allowedMimes: ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'],
   fieldName: 'attachment',
   required: true,
@@ -50,7 +51,7 @@ router.post('/upload', chatUpload.single('attachment'), requireValidFileSignatur
   const companyId = req.customer.companyId;
   const jobId = req.params.id;
   try {
-    if (!req.file) return fail(res, 'Choose an image or PDF (up to 10 MB)', 400);
+    if (!req.file) return fail(res, 'Choose an image or PDF (up to 5 MB)', 400);
     const jobResult = await pool.query(
       `SELECT id FROM jobs WHERE id = $1 AND customer_id = $2 AND company_id::text = $3
          AND employee_status IN ('accepted', 'arrived') AND status <> 'completed'`,
@@ -81,7 +82,7 @@ router.post('/upload', chatUpload.single('attachment'), requireValidFileSignatur
             }
           );
           stream.end(file.buffer);
-        }));
+        }), { responsibleModule: 'routes/customer/chat' });
         if (uploadResult && uploadResult.secure_url) {
           mediaUrl = uploadResult.secure_url;
         }

@@ -17,9 +17,16 @@
 
 const Redis = require('ioredis');
 const logger = require('./logger');
-const { instrumentRedisClient } = require('./outboundBandwidth');
+const { instrumentRedisClient, hostFrom, outboundBandwidthMonitoringEnabled } = require('./outboundBandwidth');
 
 const REDIS_URL = process.env.REDIS_URL;
+const REDIS_DESTINATION = hostFrom(REDIS_URL || '', 'redis:');
+
+function instrumentStagingRedisClient(client) {
+  return outboundBandwidthMonitoringEnabled()
+    ? instrumentRedisClient(client, { destination: REDIS_DESTINATION })
+    : client;
+}
 
 // ─── Shared options ────────────────────────────────────────────────────────────
 const BASE_OPTS = {
@@ -57,7 +64,7 @@ function attachListeners(client, label) {
 let redisClient = null;
 if (REDIS_URL) {
   try {
-    redisClient = instrumentRedisClient(new Redis(REDIS_URL, BASE_OPTS));
+    redisClient = instrumentStagingRedisClient(new Redis(REDIS_URL, BASE_OPTS));
     attachListeners(redisClient, 'cmd');
   } catch (e) {
     logger.warn(`Redis command client setup failed: ${e.message}`, { pid: process.pid });
@@ -70,7 +77,7 @@ function getSharedSubscriber() {
   if (!REDIS_URL) return null;
   if (subscriberClient && subscriberClient.status !== 'end') return subscriberClient;
   try {
-    subscriberClient = instrumentRedisClient(new Redis(REDIS_URL, {
+    subscriberClient = instrumentStagingRedisClient(new Redis(REDIS_URL, {
       ...BASE_OPTS,
       enableOfflineQueue: true, // Allow subscribe commands to buffer until TCP connection opens
       maxRetriesPerRequest: null,
@@ -96,7 +103,7 @@ function getBullMQConnection() {
   if (!REDIS_URL) return null;
   if (bullConnection && bullConnection.status !== 'end') return bullConnection;
   try {
-    bullConnection = instrumentRedisClient(new Redis(REDIS_URL, {
+    bullConnection = instrumentStagingRedisClient(new Redis(REDIS_URL, {
       maxRetriesPerRequest: null,  // required by BullMQ
       enableOfflineQueue: true,    // required by BullMQ & ioredis for Worker polling loop
       retryStrategy(times) {

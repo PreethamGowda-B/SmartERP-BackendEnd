@@ -25,24 +25,26 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'security_events' AND policyname = 'sec_events_select_scoped') THEN
     CREATE POLICY sec_events_select_scoped ON security_events
       FOR SELECT USING (
-        current_setting('app.current_user_role', true) = 'super_admin'
-        OR current_setting('app.bypass_rls', true) = 'true'
-        OR (company_id IS NOT NULL AND company_id = current_setting('app.current_company_id', true))
+        current_setting('app.current_role', true) = 'super_admin'
+        OR current_setting('app.current_user_role', true) = 'super_admin'
+        OR current_setting('app.bypass_rls', true) IN ('on', 'true')
+        OR (company_id IS NOT NULL AND company_id = NULLIF(current_setting('app.current_company_id', true), ''))
       );
   END IF;
 
   IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'security_events' AND policyname = 'sec_events_no_update') THEN
     CREATE POLICY sec_events_no_update ON security_events
       FOR UPDATE USING (
-        current_setting('app.bypass_rls', true) = 'true'
+        current_setting('app.bypass_rls', true) IN ('on', 'true')
       );
   END IF;
 
   IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'security_events' AND policyname = 'sec_events_delete_superadmin_only') THEN
     CREATE POLICY sec_events_delete_superadmin_only ON security_events
       FOR DELETE USING (
-        current_setting('app.current_user_role', true) = 'super_admin'
-        OR current_setting('app.bypass_rls', true) = 'true'
+        current_setting('app.current_role', true) = 'super_admin'
+        OR current_setting('app.current_user_role', true) = 'super_admin'
+        OR current_setting('app.bypass_rls', true) IN ('on', 'true')
       );
   END IF;
 END $$;
@@ -53,12 +55,14 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'security_incidents' AND policyname = 'sec_incidents_superadmin_all') THEN
     CREATE POLICY sec_incidents_superadmin_all ON security_incidents
       FOR ALL USING (
-        current_setting('app.current_user_role', true) = 'super_admin'
-        OR current_setting('app.bypass_rls', true) = 'true'
+        current_setting('app.current_role', true) = 'super_admin'
+        OR current_setting('app.current_user_role', true) = 'super_admin'
+        OR current_setting('app.bypass_rls', true) IN ('on', 'true')
       )
       WITH CHECK (
-        current_setting('app.current_user_role', true) = 'super_admin'
-        OR current_setting('app.bypass_rls', true) = 'true'
+        current_setting('app.current_role', true) = 'super_admin'
+        OR current_setting('app.current_user_role', true) = 'super_admin'
+        OR current_setting('app.bypass_rls', true) IN ('on', 'true')
       );
   END IF;
 
@@ -66,7 +70,7 @@ BEGIN
     CREATE POLICY sec_incidents_tenant_select ON security_incidents
       FOR SELECT USING (
         company_id IS NOT NULL
-        AND company_id = current_setting('app.current_company_id', true)
+        AND company_id = NULLIF(current_setting('app.current_company_id', true), '')
       );
   END IF;
 END $$;
@@ -77,12 +81,14 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'security_actions' AND policyname = 'sec_actions_superadmin_all') THEN
     CREATE POLICY sec_actions_superadmin_all ON security_actions
       FOR ALL USING (
-        current_setting('app.current_user_role', true) = 'super_admin'
-        OR current_setting('app.bypass_rls', true) = 'true'
+        current_setting('app.current_role', true) = 'super_admin'
+        OR current_setting('app.current_user_role', true) = 'super_admin'
+        OR current_setting('app.bypass_rls', true) IN ('on', 'true')
       )
       WITH CHECK (
-        current_setting('app.current_user_role', true) = 'super_admin'
-        OR current_setting('app.bypass_rls', true) = 'true'
+        current_setting('app.current_role', true) = 'super_admin'
+        OR current_setting('app.current_user_role', true) = 'super_admin'
+        OR current_setting('app.bypass_rls', true) IN ('on', 'true')
       );
   END IF;
 
@@ -90,7 +96,7 @@ BEGIN
     CREATE POLICY sec_actions_tenant_select ON security_actions
       FOR SELECT USING (
         company_id IS NOT NULL
-        AND company_id = current_setting('app.current_company_id', true)
+        AND company_id = NULLIF(current_setting('app.current_company_id', true), '')
       );
   END IF;
 END $$;

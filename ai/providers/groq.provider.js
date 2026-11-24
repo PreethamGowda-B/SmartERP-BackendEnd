@@ -135,7 +135,7 @@ class GroqProvider extends BaseAIProvider {
       const candidateModels = [...new Set([selected, fallbackModel].filter(Boolean))];
       let lastError = null;
 
-      for (const modelToTry of candidateModels) {
+      for (const [retryCount, modelToTry] of candidateModels.entries()) {
         const payload = {
           model: modelToTry,
           messages: sanitizedMessages,
@@ -148,7 +148,12 @@ class GroqProvider extends BaseAIProvider {
         }
 
         try {
-          const response = await withOutboundOperation('groq', `completion_${task}`, () => this.client.chat.completions.create(payload));
+          const response = await withOutboundOperation(
+            'groq',
+            `completion_${task}`,
+            () => this.client.chat.completions.create(payload),
+            { responsibleModule: 'ai/providers/groq.provider', retryCount },
+          );
           const choice = response.choices[0];
           const message = choice.message;
 

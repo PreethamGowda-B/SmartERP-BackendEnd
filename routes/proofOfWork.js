@@ -11,6 +11,7 @@ const { detectFileSignature } = require('../utils/fileValidation');
 const { loadPlan, checkPlanLimit } = require('../middleware/planMiddleware');
 const { recordCompanyStorageUsage } = require('../services/companyStorage');
 const { measureDatabaseFileParameter } = require('../utils/outboundBandwidth');
+const { MAX_FILE_SIZE } = require('../config/uploadLimits');
 
 const STAFF_ROLES = new Set(['owner', 'admin', 'employee', 'hr', 'manager', 'technician']);
 
@@ -92,7 +93,7 @@ router.post("/:id/proof-of-work", authenticateToken, requireClockIn, loadPlan, c
       }
       const imageBuffer = Buffer.from(photoMatch[2], 'base64');
       const detected = detectFileSignature(imageBuffer);
-      if (imageBuffer.length > 5 * 1024 * 1024) {
+      if (imageBuffer.length > MAX_FILE_SIZE) {
         return res.status(413).json({ message: 'Compressed site proof images must be 5 MB or smaller.' });
       }
       if (!detected || detected.mime !== photoMatch[1].toLowerCase()) {

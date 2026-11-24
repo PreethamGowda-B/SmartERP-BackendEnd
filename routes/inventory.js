@@ -12,11 +12,12 @@ const { requireValidFileSignature } = require('../utils/fileValidation');
 const { requireFeature } = require('../middleware/featureGuard');
 const { recordCompanyStorageUsage, removeCompanyStorageUsage } = require('../services/companyStorage');
 const { withOutboundOperation } = require('../utils/outboundBandwidth');
+const { MAX_FILE_SIZE, handleMulterError } = require('../config/uploadLimits');
 
 // Configure multer with memory storage for server-side magic byte inspection
 const upload = multer({
     storage: multer.memoryStorage(),
-    limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
+    limits: { fileSize: MAX_FILE_SIZE }, // 5MB limit
 });
 
 async function uploadInventoryImage(file, companyId) {
@@ -26,7 +27,7 @@ async function uploadInventoryImage(file, companyId) {
             {
                 folder: `smarterp/inventory/${companyId}`,
                 resource_type: 'image',
-                public_id: `inv_${Date.now()}`,
+                public_id: `inv_${crypto.randomUUID()}`,
                 transformation: [{ width: 1200, crop: 'limit' }]
             },
             (error, result) => {
@@ -39,7 +40,7 @@ async function uploadInventoryImage(file, companyId) {
             }
         );
         stream.end(file.buffer);
-    }));
+    }), { responsibleModule: 'routes/inventory' });
 }
 
 // Predefined categories and units
@@ -74,6 +75,7 @@ router.post(
   loadPlan,
   checkPlanLimit('inventory'),
   upload.single('image'),
+  handleMulterError,
   requireValidFileSignature({
     allowedMimes: ['image/jpeg', 'image/png', 'image/webp'],
     fieldName: 'image',
@@ -335,6 +337,7 @@ router.put(
   authenticateToken,
   checkPermission('inventory:write'),
   upload.single('image'),
+  handleMulterError,
   requireValidFileSignature({
     allowedMimes: ['image/jpeg', 'image/png', 'image/webp'],
     fieldName: 'image',

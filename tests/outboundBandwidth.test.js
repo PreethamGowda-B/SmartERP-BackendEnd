@@ -11,6 +11,7 @@ const {
   flushMeasurements,
   instrumentRedisClient,
   observePostgresQuery,
+  outboundBandwidthMonitoringEnabled,
   installOutboundBandwidthMonitoring,
   measureDatabaseFileParameter,
   observeHttpRequest,
@@ -47,7 +48,8 @@ test('HTTP transport records write and end body bytes and response bytes once', 
   let entries;
   try { entries = flushMeasurements(); } finally { console.info = originalInfo; }
   assert.equal(entries.length, 1);
-  assert.equal(entries[0].destination, 'external-http');
+  assert.equal(entries[0].destination, '127.0.0.1');
+  assert.equal(entries[0].endpoint, '/');
   assert.equal(entries[0].operation, 'POST');
   assert.equal(entries[0].networkClass, 'private_or_reserved');
   assert.equal(entries[0].outboundRequestBodyBytes, 5);
@@ -96,14 +98,17 @@ test('Fetch transport measures JSON request and consumed response bodies', async
   const response = await withOutboundOperation('test-fetch', 'json_call', () => measuredFetch(
     'https://api.groq.com/chat/completions?private=value',
     { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"x":1}' },
-  ));
+  ), { responsibleModule: 'tests/outboundBandwidth', retryCount: 1 });
   assert.equal(response, originalResponse, 'monitor must not replace the caller response');
   assert.deepEqual(await response.json(), { ok: true });
 
   const entries = flushMeasurements();
   const measurement = entries.find((entry) => entry.service === 'test-fetch');
   assert.ok(measurement);
-  assert.equal(measurement.destination, 'groq');
+  assert.equal(measurement.destination, 'api.groq.com');
+  assert.equal(measurement.endpoint, '/chat/completions');
+  assert.equal(measurement.responsibleModule, 'tests/outboundBandwidth');
+  assert.equal(measurement.retryCount, 1);
   assert.equal(measurement.networkClass, 'public');
   assert.equal(measurement.outboundRequestBodyBytes, Buffer.byteLength('{"x":1}'));
   assert.equal(measurement.responseBodyBytesReceived, Buffer.byteLength('{"ok":true}'));
@@ -195,7 +200,7 @@ test('fetch streaming upload and large streaming response are forwarded without 
   assert.equal(bytes.byteLength, 1024 * 1024);
 
   const entries = flushMeasurements();
-  const entry = entries.find((measurement) => measurement.destination === 'external-http' && measurement.operation === 'POST');
+  const entry = entries.find((measurement) => measurement.destination === '127.0.0.1' && measurement.operation === 'POST');
   assert.ok(entry);
   assert.equal(entry.requestsWithUnknownBody, 1);
   assert.equal(entry.responseBodyBytesReceived, null, 'chunked response remains unknown rather than changing stream flow');
@@ -231,7 +236,7 @@ test('failed fetch is measured without replacing the original network error', as
   const original = new Error('DNS test failure');
   const measuredFetch = createMeasuredFetch(async () => { throw original; });
   await assert.rejects(measuredFetch('https://api.groq.com/unlogged?secret=x'), (error) => error === original);
-  const entry = flushMeasurements().find((measurement) => measurement.destination === 'groq');
+  const entry = flushMeasurements().find((measurement) => measurement.destination === 'api.groq.com');
   assert.ok(entry);
   assert.equal(entry.failedRequests, 1);
 });
@@ -296,4 +301,10 @@ test('Redis duplicate clients retain instrumentation for BullMQ-style connection
   instrumentRedisClient(client);
   const duplicate = client.duplicate();
   assert.equal(duplicate.sendCommand.__outboundBandwidthWrapped, true);
+});
+
+test('outbound telemetry is an explicit staging-only opt-in', () => {
+  assert.equal(outboundBandwidthMonitoringEnabled({ NODE_ENV: 'production', OUTBOUND_BANDWIDTH_TELEMETRY: 'true' }), false);
+  assert.equal(outboundBandwidthMonitoringEnabled({ NODE_ENV: 'staging', OUTBOUND_BANDWIDTH_TELEMETRY: 'false' }), false);
+  assert.equal(outboundBandwidthMonitoringEnabled({ NODE_ENV: 'staging', OUTBOUND_BANDWIDTH_TELEMETRY: 'true' }), true);
 });

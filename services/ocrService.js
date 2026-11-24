@@ -94,7 +94,7 @@ class OCRService {
               { type: 'image_url', image_url: { url: `data:${file.validatedMime};base64,${file.buffer.toString('base64')}` } },
             ] },
           ],
-        }));
+        }), { responsibleModule: 'services/ocrService' });
         const parsedData = normalizeParsed(parseJson(completion.content));
         return parsedData ? { status: 'analysed', parsedData } : { status: 'unable_to_analyse', parsedData: null, reason: 'The image did not yield structured invoice fields.' };
       }

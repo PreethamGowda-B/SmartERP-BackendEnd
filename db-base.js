@@ -7,7 +7,7 @@ const { Pool } = require('pg');
 require('dotenv').config();
 const { cleanConnectionString } = require('./utils/databaseUrl');
 
-const DEFAULT_DB_POOL_MAX = 4;
+const DEFAULT_DB_POOL_MAX = 2;
 
 function resolvePoolMax(value = process.env.DB_POOL_MAX) {
   const parsed = Number.parseInt(value, 10);
@@ -36,7 +36,7 @@ const pool = new Pool({
   // after sizing every process and service instance using the same database.
   max: resolvePoolMax(),
   idleTimeoutMillis: parseInt(process.env.DB_IDLE_TIMEOUT_MS || '10000', 10),
-  connectionTimeoutMillis: 10000, // 10s connection queue timeout under load
+  connectionTimeoutMillis: parseInt(process.env.DB_CONNECTION_TIMEOUT_MS || '10000', 10), // connection queue timeout under load
   statement_timeout: 15000,       // 15s query safety limit
 });
 

@@ -11,14 +11,25 @@ try {
     if (process.env.FIREBASE_SERVICE_ACCOUNT) {
         try {
             let rawData = process.env.FIREBASE_SERVICE_ACCOUNT.trim();
-            // Defensive: Remove surrounding single/double quotes if present
-            if ((rawData.startsWith("'") && rawData.endsWith("'")) ||
-                (rawData.startsWith('"') && rawData.endsWith('"'))) {
-                rawData = rawData.substring(1, rawData.length - 1);
+            // Defensive: Strip any wrapping backticks or quotes added during shell paste
+            while ((rawData.startsWith('`') && rawData.endsWith('`')) ||
+                   (rawData.startsWith("'") && rawData.endsWith("'")) ||
+                   (rawData.startsWith('"') && rawData.endsWith('"'))) {
+                rawData = rawData.substring(1, rawData.length - 1).trim();
             }
             serviceAccount = JSON.parse(rawData);
         } catch (parseErr) {
             logger.error('Failed to parse FIREBASE_SERVICE_ACCOUNT environment variable', parseErr);
+        }
+    } else if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY) {
+        try {
+            serviceAccount = {
+                projectId: process.env.FIREBASE_PROJECT_ID.trim(),
+                clientEmail: process.env.FIREBASE_CLIENT_EMAIL.trim(),
+                privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n').trim(),
+            };
+        } catch (fieldErr) {
+            logger.error('Failed to construct Firebase service account from individual env vars', fieldErr);
         }
     } else {
         // Development: fallback to local JSON file
@@ -100,7 +111,7 @@ async function sendPushNotification(token, title, body, data = {}) {
     };
 
     try {
-        const response = await withOutboundOperation('google-firebase', 'single_push', () => admin.messaging().send(message));
+        const response = await withOutboundOperation('google-firebase', 'single_push', () => admin.messaging().send(message), { responsibleModule: 'services/firebaseService' });
         logger.debug('Push notification delivered', { messageId: response });
         logger.business('NOTIFICATION_SENT', { channel: 'fcm_push', count: 1, title });
         return response;
@@ -167,7 +178,7 @@ async function sendMulticastPush(tokens, title, body, data = {}) {
     };
 
     try {
-        const response = await withOutboundOperation('google-firebase', 'multicast_push', () => admin.messaging().sendEachForMulticast(payload));
+        const response = await withOutboundOperation('google-firebase', 'multicast_push', () => admin.messaging().sendEachForMulticast(payload), { responsibleModule: 'services/firebaseService' });
         logger.debug('Multicast push delivered', { successCount: response.successCount, failureCount: response.failureCount });
         logger.business('NOTIFICATION_SENT', { channel: 'fcm_multicast', successCount: response.successCount, failureCount: response.failureCount, title });
 

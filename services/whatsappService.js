@@ -66,7 +66,7 @@ async function sendWhatsAppTemplateMessage(recipientPhone, templateName, languag
         'Content-Type': 'application/json'
       },
       body: JSON.stringify(payload)
-    }));
+    }), { responsibleModule: 'services/whatsappService' });
 
     const data = await res.json();
 

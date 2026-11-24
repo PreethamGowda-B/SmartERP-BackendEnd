@@ -12,10 +12,11 @@ const { createAiPersistenceRepository, canonicalHash } = require('../services/ai
 const { aiPersistencePoliciesAreReady } = require('../services/aiPersistencePolicyReadiness');
 const { pool } = require('../db');
 const SecurityShield = require('../ai/gateway/security.shield');
+const { MAX_FILE_SIZE } = require('../config/uploadLimits');
 
 const router = express.Router();
 const repository = createAiPersistenceRepository({ pool });
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024, files: 1 } });
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: MAX_FILE_SIZE, files: 1 } });
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function config() {

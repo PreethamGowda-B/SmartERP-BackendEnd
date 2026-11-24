@@ -14,6 +14,10 @@ const buckets = new Map();
 let installed = false;
 let flushTimer = null;
 
+function outboundBandwidthMonitoringEnabled(env = process.env) {
+  return env.OUTBOUND_BANDWIDTH_TELEMETRY === 'true' && env.NODE_ENV !== 'production';
+}
+
 const SERVICE_HOSTS = [
   [/cloudinary\.com$/i, 'cloudinary'],
   [/groq\.com$/i, 'groq'],
@@ -36,6 +40,27 @@ function hostFrom(value, protocol = 'http:') {
     return host ? new URL(`${options.protocol || protocol}//${host}`).hostname.toLowerCase() : 'unknown';
   } catch {
     return 'unknown';
+  }
+}
+
+function sanitiseEndpoint(value, protocol = 'https:') {
+  try {
+    const raw = value instanceof URL
+      ? value
+      : typeof value === 'string' && /^[a-z][a-z\d+.-]*:\/\//i.test(value)
+        ? new URL(value)
+        : null;
+    const pathname = raw ? raw.pathname : String(value || '/').split('?')[0];
+    const clean = pathname.startsWith('/') ? pathname : `/${pathname}`;
+    const safeSegments = clean.split('/').map((segment) => {
+      if (!segment) return '';
+      if (/^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(segment) || /^\d{3,}$/.test(segment)) return ':id';
+      if (!/^[a-zA-Z0-9._-]{1,80}$/.test(segment)) return ':value';
+      return segment;
+    });
+    return safeSegments.join('/') || '/';
+  } catch {
+    return '/';
   }
 }
 
@@ -122,7 +147,9 @@ function makeBucket(sample) {
   return {
     service: sample.service,
     destination: sample.destination,
+    endpoint: sample.endpoint || '/',
     operation: sample.operation,
+    responsibleModule: sample.responsibleModule || 'unattributed',
     measurementSource: sample.measurementSource || 'http_transport_body',
     measurementKind: sample.measurementKind || 'measured_application_payload',
     networkClass: sample.networkClass || 'unknown',
@@ -130,6 +157,7 @@ function makeBucket(sample) {
     redirectedRequests: 0,
     successfulRequests: 0,
     failedRequests: 0,
+    retryCount: 0,
     outboundRequestBodyBytes: 0,
     requestsWithMeasuredBody: 0,
     requestsWithUnknownBody: 0,
@@ -144,17 +172,19 @@ function makeBucket(sample) {
 }
 
 function recordMeasurement(sample) {
+  if (!installed) return;
   try {
     const context = operationContext.getStore() || {};
     const rawDestination = String(sample.destination || 'unknown').toLowerCase();
     const hostService = serviceForHost(rawDestination);
-    // Preserve known integration names while avoiding arbitrary/tenant-controlled hostnames in logs.
-    const destination = ['database-url', 'redis'].includes(rawDestination) ? rawDestination
-      : (hostService === 'external-http' ? 'external-http' : hostService);
+    const destination = /^[a-z0-9.-]{1,253}$/i.test(rawDestination) ? rawDestination : 'unknown';
     const serviceCandidate = String(sample.service || context.service || hostService);
     const service = /^[a-z0-9_-]{1,64}$/i.test(serviceCandidate) ? serviceCandidate : 'external-http';
     const operationCandidate = String(sample.operation || context.operation || 'unknown');
     const operation = /^[a-z0-9_-]{1,48}$/i.test(operationCandidate) ? operationCandidate : 'other';
+    const responsibleModuleCandidate = String(sample.responsibleModule || context.responsibleModule || 'unattributed');
+    const responsibleModule = /^[a-z0-9_./-]{1,96}$/i.test(responsibleModuleCandidate) ? responsibleModuleCandidate : 'unattributed';
+    const endpoint = sanitiseEndpoint(sample.endpoint || context.endpoint || '/');
     const measurementSource = /^[a-z0-9_-]{1,48}$/i.test(sample.measurementSource || '')
       ? sample.measurementSource
       : 'http_transport_body';
@@ -164,17 +194,17 @@ function recordMeasurement(sample) {
     const networkClass = ['public', 'private_or_reserved', 'unknown'].includes(sample.networkClass)
       ? sample.networkClass
       : 'unknown';
-    const key = `${service}|${destination}|${operation}|${networkClass}|${measurementSource}|${measurementKind}`;
+    const key = `${service}|${destination}|${endpoint}|${operation}|${responsibleModule}|${networkClass}|${measurementSource}|${measurementKind}`;
     let bucket = buckets.get(key);
     if (!bucket && buckets.size >= MAX_BUCKETS - 1) {
       bucket = buckets.get(OVERFLOW_KEY);
       if (!bucket) {
-        bucket = makeBucket({ service: 'other', destination: 'other', operation: 'other', networkClass: 'unknown', measurementSource: 'aggregated_overflow', measurementKind: 'mixed_estimate' });
+        bucket = makeBucket({ service: 'other', destination: 'other', endpoint: '/', operation: 'other', responsibleModule: 'aggregated_overflow', networkClass: 'unknown', measurementSource: 'aggregated_overflow', measurementKind: 'mixed_estimate' });
         buckets.set(OVERFLOW_KEY, bucket);
       }
     }
     if (!bucket) {
-      bucket = makeBucket({ service, destination, operation, networkClass, measurementSource, measurementKind });
+      bucket = makeBucket({ service, destination, endpoint, operation, responsibleModule, networkClass, measurementSource, measurementKind });
       buckets.set(key, bucket);
     }
 
@@ -185,6 +215,7 @@ function recordMeasurement(sample) {
     bucket.redirectedRequests += sample.redirected ? 1 : 0;
     bucket.successfulRequests += sample.success ? 1 : 0;
     bucket.failedRequests += sample.success ? 0 : 1;
+    bucket.retryCount += finiteBytes(sample.retryCount ?? context.retryCount) ?? 0;
     if (requestBytes === null) bucket.requestsWithUnknownBody += 1;
     else {
       bucket.requestsWithMeasuredBody += 1;
@@ -295,7 +326,8 @@ function requestDetails(protocol, args) {
   const options = first instanceof URL ? (second || {}) : (typeof first === 'object' && first ? first : (second || {}));
   const host = hostFrom(first, protocol);
   const method = String(options.method || 'GET').toUpperCase();
-  return { host, method };
+  const requestPath = first instanceof URL ? first : options.path || options.pathname || '/';
+  return { host, method, endpoint: sanitiseEndpoint(requestPath, protocol) };
 }
 
 function addNodeRequestHooks(req, details, startedAt) {
@@ -334,6 +366,7 @@ function addNodeRequestHooks(req, details, startedAt) {
     recordMeasurement({
       service: operationContext.getStore()?.service || serviceForHost(details.host),
       destination: details.host,
+      endpoint: details.endpoint,
       operation: operationContext.getStore()?.operation || details.method,
       networkClass,
       requestBodyBytes: requestBodyKnown ? requestBytes : null,
@@ -401,6 +434,7 @@ function createMeasuredFetch(originalFetch) {
     // a Content-Length header is a declaration, not proof of transmitted bytes.
     const destination = hostFrom(input, 'https:');
     const method = String(init?.method || input?.method || 'GET').toUpperCase();
+    const endpoint = sanitiseEndpoint(typeof input === 'string' || input instanceof URL ? input : input?.url, 'https:');
     const startedAt = process.hrtime.bigint();
     const context = operationContext.getStore() || {};
     let networkClass = net.isIP(destination) ? classifyAddress(destination) : 'unknown';
@@ -416,6 +450,7 @@ function createMeasuredFetch(originalFetch) {
       recordMeasurement({
         service: context.service || serviceForHost(responseHost),
         destination: responseHost,
+        endpoint,
         operation: context.operation || method,
         networkClass,
         requestBodyBytes: requestBytes,
@@ -432,6 +467,7 @@ function createMeasuredFetch(originalFetch) {
       recordMeasurement({
         service: context.service || serviceForHost(destination),
         destination,
+        endpoint,
         operation: context.operation || method,
         networkClass,
         requestBodyBytes: requestBytes,
@@ -477,16 +513,19 @@ function stopOutboundBandwidthMonitoring() {
   flushMeasurements();
 }
 
-function withOutboundOperation(service, operation, callback) {
+function withOutboundOperation(service, operation, callback, metadata = {}) {
   let safeService = 'external-http';
   let safeOperation = 'other';
+  let safeModule = 'unattributed';
+  const retryCount = finiteBytes(metadata.retryCount) ?? 0;
   try {
     if (/^[a-z0-9_-]{1,64}$/i.test(String(service))) safeService = String(service);
     if (/^[a-z0-9_-]{1,48}$/i.test(String(operation))) safeOperation = String(operation);
+    if (/^[a-z0-9_./-]{1,96}$/i.test(String(metadata.responsibleModule || ''))) safeModule = String(metadata.responsibleModule);
   } catch { /* defaults are safe */ }
   let callbackInvoked = false;
   try {
-    return operationContext.run({ service: safeService, operation: safeOperation }, () => {
+    return operationContext.run({ service: safeService, operation: safeOperation, responsibleModule: safeModule, retryCount }, () => {
       callbackInvoked = true;
       return callback();
     });
@@ -509,8 +548,10 @@ async function measureDatabaseFileParameter({ operation, fileBytes, run }) {
     } finally {
       recordMeasurement({
         service: 'supabase-postgres',
-        destination: 'database-url',
+        destination: hostFrom(process.env.DATABASE_URL || '', 'postgres:'),
+        endpoint: '/postgres',
         operation,
+        responsibleModule: 'pg',
         measurementSource: 'postgres_file_parameter',
         networkClass: 'unknown',
         requestBodyBytes: finiteBytes(fileBytes),
@@ -564,8 +605,8 @@ function estimateRedisResponseBytes(value, depth = 0) {
   }
 }
 
-function instrumentRedisClient(client) {
-  if (!client || client.sendCommand?.__outboundBandwidthWrapped) return client;
+function instrumentRedisClient(client, { destination = 'redis' } = {}) {
+  if (!installed || !client || client.sendCommand?.__outboundBandwidthWrapped) return client;
   try {
     const original = client.sendCommand;
     function measuredSendCommand(command, stream) {
@@ -578,12 +619,12 @@ function instrumentRedisClient(client) {
       try {
         result = original.call(this, command, stream);
       } catch (error) {
-        recordMeasurement({ service: 'redis', destination: 'redis', operation, measurementSource: 'redis_resp_estimate', measurementKind: 'estimated_redis_protocol_bytes', networkClass: classifyAddress(this.stream?.remoteAddress), requestBodyBytes, responseBodyBytes: null, durationMs: Number(process.hrtime.bigint() - startedAt) / 1e6, success: false });
+        recordMeasurement({ service: 'redis', destination, endpoint: '/resp', operation, responsibleModule: 'ioredis', measurementSource: 'redis_resp_estimate', measurementKind: 'estimated_redis_protocol_bytes', networkClass: classifyAddress(this.stream?.remoteAddress), requestBodyBytes, responseBodyBytes: null, durationMs: Number(process.hrtime.bigint() - startedAt) / 1e6, success: false });
         throw error;
       }
       Promise.resolve(result).then(
-        (value) => recordMeasurement({ service: 'redis', destination: 'redis', operation, measurementSource: 'redis_resp_estimate', measurementKind: 'estimated_redis_protocol_bytes', networkClass: classifyAddress(this.stream?.remoteAddress), requestBodyBytes, responseBodyBytes: estimateRedisResponseBytes(value), durationMs: Number(process.hrtime.bigint() - startedAt) / 1e6, success: true }),
-        () => recordMeasurement({ service: 'redis', destination: 'redis', operation, measurementSource: 'redis_resp_estimate', measurementKind: 'estimated_redis_protocol_bytes', networkClass: classifyAddress(this.stream?.remoteAddress), requestBodyBytes, responseBodyBytes: null, durationMs: Number(process.hrtime.bigint() - startedAt) / 1e6, success: false }),
+        (value) => recordMeasurement({ service: 'redis', destination, endpoint: '/resp', operation, responsibleModule: 'ioredis', measurementSource: 'redis_resp_estimate', measurementKind: 'estimated_redis_protocol_bytes', networkClass: classifyAddress(this.stream?.remoteAddress), requestBodyBytes, responseBodyBytes: estimateRedisResponseBytes(value), durationMs: Number(process.hrtime.bigint() - startedAt) / 1e6, success: true }),
+        () => recordMeasurement({ service: 'redis', destination, endpoint: '/resp', operation, responsibleModule: 'ioredis', measurementSource: 'redis_resp_estimate', measurementKind: 'estimated_redis_protocol_bytes', networkClass: classifyAddress(this.stream?.remoteAddress), requestBodyBytes, responseBodyBytes: null, durationMs: Number(process.hrtime.bigint() - startedAt) / 1e6, success: false }),
       ).catch(() => {});
       return result;
     }
@@ -592,7 +633,7 @@ function instrumentRedisClient(client) {
     if (typeof client.duplicate === 'function' && !client.duplicate.__outboundBandwidthWrapped) {
       const originalDuplicate = client.duplicate;
       function measuredDuplicate(...args) {
-        return instrumentRedisClient(originalDuplicate.apply(this, args));
+        return instrumentRedisClient(originalDuplicate.apply(this, args), { destination });
       }
       measuredDuplicate.__outboundBandwidthWrapped = true;
       client.duplicate = measuredDuplicate;
@@ -665,8 +706,10 @@ function observePostgresQuery({ text, values, run }) {
   const operation = postgresOperation(text);
   const record = (success) => recordMeasurement({
     service: 'supabase-postgres',
-    destination: 'database-url',
+    destination: hostFrom(process.env.DATABASE_URL || '', 'postgres:'),
+    endpoint: '/postgres',
     operation,
+    responsibleModule: 'pg',
     measurementSource: 'postgres_query_payload_estimate',
     measurementKind: 'estimated_postgres_query_bytes_excluding_binary_parameters',
     networkClass: 'unknown',
@@ -694,12 +737,15 @@ module.exports = {
   classifyFetchHost,
   createMeasuredFetch,
   flushMeasurements,
+  hostFrom,
   instrumentRedisClient,
   observePostgresQuery,
   installOutboundBandwidthMonitoring,
+  outboundBandwidthMonitoringEnabled,
   stopOutboundBandwidthMonitoring,
   measureDatabaseFileParameter,
   recordMeasurement,
   observeHttpRequest: addNodeRequestHooks,
+  sanitiseEndpoint,
   withOutboundOperation,
 };

@@ -15,11 +15,12 @@ const { cloudinary, hasCloudinaryConfig } = require('../config/cloudinary');
 const { requireValidFileSignature } = require('../utils/fileValidation');
 const { recordCompanyStorageUsage, removeCompanyStorageUsage } = require('../services/companyStorage');
 const { measureDatabaseFileParameter, withOutboundOperation } = require('../utils/outboundBandwidth');
+const { MAX_FILE_SIZE, handleMulterError } = require('../config/uploadLimits');
 
 // Multer setup for message attachments (in-memory, then we upload manually)
 const uploadMiddleware = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB
+  limits: { fileSize: MAX_FILE_SIZE }, // 5 MB – global SmartERP upload policy
   fileFilter: (_req, file, cb) => {
     const allowed = [
       'image/jpeg', 'image/png', 'image/gif', 'image/webp',
@@ -1135,6 +1136,7 @@ router.post('/typing', async (req, res) => {
 router.post(
   '/upload',
   uploadMiddleware.single('attachment'),
+  handleMulterError,
   requireValidFileSignature({
     allowedMimes: [
       'image/jpeg', 'image/png', 'image/webp', 'image/gif', 'application/pdf',
@@ -1178,7 +1180,7 @@ router.post(
               }
             );
             stream.end(buffer);
-          }));
+          }), { responsibleModule: 'routes/messages' });
           if (uploadResult && uploadResult.secure_url) {
             fileUrl = uploadResult.secure_url;
           }

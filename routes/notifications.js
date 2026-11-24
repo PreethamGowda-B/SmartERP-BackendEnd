@@ -15,7 +15,31 @@ const ssePresenceConnections = new Map();
 // In-memory short-lived cache (60s) to eliminate redundant database round-trips
 // on every notification poll or drawer open, while preserving strict staff role checks.
 const principalCache = new Map();
-const PRINCIPAL_CACHE_TTL_MS = 60000;
+const PRINCIPAL_CACHE_TTL_MS = parseInt(process.env.PRINCIPAL_CACHE_TTL_MS || '60000', 10);
+
+const companyPeersCache = new Map();
+const COMPANY_PEERS_CACHE_TTL_MS = parseInt(process.env.COMPANY_PEERS_CACHE_TTL_MS || '60000', 10);
+
+async function getCachedCompanyPeerIds(companyId) {
+  const key = String(companyId);
+  const cached = companyPeersCache.get(key);
+  if (cached && Date.now() - cached.cachedAt < COMPANY_PEERS_CACHE_TTL_MS) {
+    return cached.ids;
+  }
+  const isNumComp = /^[0-9]+$/.test(key);
+  const peers = isNumComp
+    ? await pool.query(
+        `SELECT id FROM users WHERE company_id = $1 AND role IN ('owner', 'employee', 'hr', 'admin')`,
+        [parseInt(key, 10)]
+      )
+    : await pool.query(
+        `SELECT id FROM users WHERE company_id::text = $1 AND role IN ('owner', 'employee', 'hr', 'admin')`,
+        [key]
+      );
+  const ids = peers.rows.map(r => String(r.id));
+  companyPeersCache.set(key, { ids, cachedAt: Date.now() });
+  return ids;
+}
 
 // Resolve notification authority from the persisted staff record, never from
 // request parameters or an unverified role/company claim supplied by a client.
@@ -40,7 +64,7 @@ async function requireInternalNotificationPrincipal(req, res, next) {
     }
 
     const result = await pool.query(
-      'SELECT id, role, company_id FROM users WHERE id::text = $1::text LIMIT 1',
+      'SELECT id, role, company_id FROM users WHERE id = $1::uuid LIMIT 1',
       [claimedId]
     );
     const principal = result.rows[0];
@@ -198,20 +222,20 @@ router.get('/sse', authenticateToken, requireInternalNotificationPrincipal, asyn
       console.warn('⚠️ Could not set online status:', e.message);
     }
 
-    // Broadcast status_change (online) to all other users in the same company
-    try {
-      const peers = await pool.query(
-        `SELECT id FROM users WHERE company_id::text = $1 AND id::text != $2
-           AND role IN ('owner', 'employee', 'hr', 'admin')`,
-        [companyId, userId]
-      );
-      const payload = { type: 'status_change', data: { user_id: userId, online: true } };
-      for (const peer of peers.rows) {
-        broadcastToUser(String(peer.id), payload);
+    // Broadcast status_change (online) asynchronously in background so SSE handshake is immediate
+    (async () => {
+      try {
+        const peerIds = await getCachedCompanyPeerIds(companyId);
+        const payload = { type: 'status_change', data: { user_id: userId, online: true } };
+        for (const peerId of peerIds) {
+          if (peerId !== String(userId)) {
+            broadcastToUser(peerId, payload);
+          }
+        }
+      } catch (e) {
+        console.warn('⚠️ Could not broadcast status_change (online):', e.message);
       }
-    } catch (e) {
-      console.warn('⚠️ Could not broadcast status_change (online):', e.message);
-    }
+    })();
   }
 
   // Active Keep-Alive Ping every 15 seconds to prevent Render / Cloudflare TCP reset
@@ -411,4 +435,7 @@ router.post('/devices', authenticateToken, requireInternalNotificationPrincipal,
   }
 });
 
+router.principalCache = principalCache;
+router.companyPeersCache = companyPeersCache;
+router.getCachedCompanyPeerIds = getCachedCompanyPeerIds;
 module.exports = router;

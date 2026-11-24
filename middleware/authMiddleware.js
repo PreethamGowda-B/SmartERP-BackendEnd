@@ -1,5 +1,5 @@
 const jwt = require("jsonwebtoken");
-const { redisClient } = require("../utils/redis");
+const { redisClient, getSharedSubscriber } = require("../utils/redis");
 const { setTenantContext } = require("./tenantContext");
 const { getRequestPath, isSuperAdminRoute, selectRequestAuthToken } = require("./requestAuthToken");
 const { storage } = require('./als');
@@ -8,11 +8,40 @@ const { createCompanySuspensionChecker } = require('./companySuspensionState');
 
 const isCompanySuspended = createCompanySuspensionChecker(async (companyId) => {
   const { pool } = require("../db");
+  const raw = String(companyId || '').trim();
+  const isNumeric = /^[0-9]+$/.test(raw);
+  if (isNumeric) {
+    return pool.query(
+      "SELECT status, COALESCE(settings->>'is_suspended', 'false') as is_susp FROM companies WHERE id = $1 OR company_id = $2 LIMIT 1",
+      [parseInt(raw, 10), raw]
+    );
+  }
   return pool.query(
-    "SELECT status, COALESCE(NULLIF(to_jsonb(c)->>'is_suspended', ''), 'false') as is_susp FROM companies c WHERE c.id::text = $1::text OR to_jsonb(c)->>'company_id' = $1::text LIMIT 1",
-    [companyId]
+    "SELECT status, COALESCE(settings->>'is_suspended', 'false') as is_susp FROM companies WHERE company_id = $1 LIMIT 1",
+    [raw]
   );
 });
+
+// Invalidate local company suspension cache when Redis broadcast arrives
+try {
+  const subscriber = typeof getSharedSubscriber === 'function' ? getSharedSubscriber() : null;
+  if (subscriber && typeof subscriber.subscribe === 'function') {
+    subscriber.subscribe('company_suspension_events', (err) => {
+      if (!err && typeof subscriber.on === 'function') {
+        subscriber.on('message', (channel, message) => {
+          if (channel === 'company_suspension_events') {
+            try {
+              const data = JSON.parse(message);
+              if (data?.companyId) {
+                isCompanySuspended.invalidate(data.companyId);
+              }
+            } catch (_) {}
+          }
+        });
+      }
+    });
+  }
+} catch (_) {}
 
 async function authenticateToken(req, res, next) {
   const token = selectRequestAuthToken(req);

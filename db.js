@@ -8,7 +8,11 @@ const { observePostgresQuery } = require('./utils/outboundBandwidth');
 const SLOW_QUERY_THRESHOLD_MS = Number(process.env.SLOW_QUERY_THRESHOLD_MS || process.env.DB_SLOW_QUERY_THRESHOLD_MS || 2000);
 const POOL_ACQUIRE_WARN_MS = Number(process.env.POOL_ACQUIRE_WARN_MS || 1000);
 
+const EventEmitter = require('events');
+const dbMetricsEmitter = new EventEmitter();
+
 function recordDbStage(stage, durationMs, details = {}) {
+  dbMetricsEmitter.emit('stage', { stage, durationMs, details });
   const context = storage.getStore();
   const requestId = context?.requestId || null;
   const duration = Number(durationMs.toFixed(2));
@@ -105,22 +109,16 @@ async function applyRlsToClient(client, context = storage.getStore()) {
   const safeRole = String(role || '').replace(/[^a-zA-Z0-9_-]/g, '');
   const setupStartedAt = performance.now();
 
-  let stageStartedAt = performance.now();
-  await client.query(
+  const pRls = client.query(
     `SELECT set_config('app.bypass_rls', $1, true),
             set_config('app.current_company_id', $2, true),
             set_config('app.current_role', $3, true),
             set_config('app.current_user_id', $4, true)`,
     [bypassRls ? 'on' : 'off', companyId, safeRole, userId]
   );
-  recordDbStage('rls_tenant_context', performance.now() - stageStartedAt);
-  if (!bypassRls) {
-    // Failure must abort this transaction. Falling back to the database owner
-    // could bypass RLS.
-    stageStartedAt = performance.now();
-    await client.query('SET LOCAL ROLE smarterp_app');
-    recordDbStage('rls_set_role', performance.now() - stageStartedAt);
-  }
+  const pRole = !bypassRls ? client.query('SET LOCAL ROLE smarterp_app') : null;
+
+  await Promise.all([pRls, ...(pRole ? [pRole] : [])]);
   recordDbStage('rls_setup_total', performance.now() - setupStartedAt);
 }
 
@@ -144,11 +142,26 @@ function attachTransactionScopedRls(client, context) {
   let inTransaction = false;
 
   async function begin(beginSql = 'BEGIN') {
-    const result = await rawQuery(beginSql);
     inTransaction = true;
     try {
-      await applyRlsToClient({ query: rawQuery }, context);
-      return result;
+      const pBegin = rawQuery(beginSql);
+      const activeContext = storage.getStore() || context;
+      const { bypassRls, role, companyId, userId } = buildRlsConfig(activeContext);
+      const safeRole = String(role || '').replace(/[^a-zA-Z0-9_-]/g, '');
+      const setupStartedAt = performance.now();
+
+      const pRls = rawQuery(
+        `SELECT set_config('app.bypass_rls', $1, true),
+            set_config('app.current_company_id', $2, true),
+            set_config('app.current_role', $3, true),
+            set_config('app.current_user_id', $4, true)`,
+        [bypassRls ? 'on' : 'off', companyId, safeRole, userId]
+      );
+      const pRole = !bypassRls ? rawQuery('SET LOCAL ROLE smarterp_app') : null;
+
+      const [beginResult] = await Promise.all([pBegin, pRls, ...(pRole ? [pRole] : [])]);
+      recordDbStage('rls_setup_total', performance.now() - setupStartedAt);
+      return beginResult;
     } catch (error) {
       try { await rawQuery('ROLLBACK'); } catch (_) {}
       inTransaction = false;
@@ -211,7 +224,14 @@ pool.connect = async function () {
   const acquireStartedAt = performance.now();
   const client = await originalConnect();
   recordDbStage('pool_acquire', performance.now() - acquireStartedAt);
-  return attachTransactionScopedRls(client, storage.getStore());
+  const checkoutTime = performance.now();
+  const wrappedClient = attachTransactionScopedRls(client, storage.getStore());
+  const rlsRelease = wrappedClient.release.bind(wrappedClient);
+  wrappedClient.release = function (err) {
+    recordDbStage('connection_hold_time', performance.now() - checkoutTime);
+    return rlsRelease(err);
+  };
+  return wrappedClient;
 };
 
 // ─── Patch pool.query ─────────────────────────────────────────────────────────
@@ -239,4 +259,4 @@ pool.query = async function (text, params) {
   }
 };
 
-module.exports = { pool, buildRlsConfig, applyRlsToClient, attachTransactionScopedRls };
+module.exports = { pool, buildRlsConfig, applyRlsToClient, attachTransactionScopedRls, dbMetricsEmitter };

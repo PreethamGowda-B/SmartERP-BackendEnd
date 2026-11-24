@@ -11,11 +11,12 @@ const { requireValidFileSignature } = require('../utils/fileValidation');
 const { loadPlan, checkPlanLimit } = require('../middleware/planMiddleware');
 const { recordCompanyStorageUsage, removeCompanyStorageUsage } = require('../services/companyStorage');
 const { measureDatabaseFileParameter, withOutboundOperation } = require('../utils/outboundBandwidth');
+const { MAX_FILE_SIZE, handleMulterError } = require('../config/uploadLimits');
 
 // Use in-memory storage — we upload directly to Cloudinary, no local disk needed
 const upload = multer({
     storage: multer.memoryStorage(),
-    limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
+    limits: { fileSize: MAX_FILE_SIZE }, // 5 MB – global SmartERP upload policy
     fileFilter: (req, file, cb) => {
         const allowed = ['image/jpeg', 'image/png', 'application/pdf'];
         const ext = (file.originalname || '').toLowerCase();
@@ -34,6 +35,7 @@ router.post(
     authenticateToken,
     loadPlan,
     upload.single('file'),
+    handleMulterError,
     requireValidFileSignature({
         allowedMimes: ['image/jpeg', 'image/png', 'application/pdf'],
         fieldName: 'file',
@@ -84,7 +86,7 @@ router.post(
                             {
                                 folder: `smarterp/documents/${companyId}`,
                                 resource_type: isImage ? 'image' : 'raw',
-                                public_id: `doc_${Date.now()}`,
+                                public_id: `doc_${crypto.randomUUID()}`,
                                 ...(isImage && { transformation: [{ width: 1600, crop: 'limit' }] })
                             },
                             (error, result) => {
@@ -93,7 +95,7 @@ router.post(
                             }
                         );
                         stream.end(req.file.buffer);
-                    }));
+                    }), { responsibleModule: 'routes/documents' });
                 fileUrl = uploadResult.secure_url;
             } catch (cloudErr) {
                 console.warn('⚠️ Cloudinary upload failed, falling back to local storage:', cloudErr.message);
@@ -111,10 +113,10 @@ router.post(
                         `INSERT INTO message_media_files (file_name, file_type, file_size, data, company_id, uploaded_by)
                          VALUES ($1, $2, $3, $4, $5, $6)
                          RETURNING id`,
-                        [req.file.originalname || `doc_${Date.now()}`, req.file.mimetype, req.file.size, req.file.buffer, String(companyId), String(userId)]
+                        [req.file.originalname || `doc_${crypto.randomUUID()}`, req.file.mimetype, req.file.size, req.file.buffer, String(companyId), String(userId)]
                     ),
                 });
-                const baseUrl = process.env.BASE_URL || 'https://api.prozync.in';
+                const baseUrl = process.env.BASE_URL || process.env.BACKEND_URL || 'https://api.prozync.in';
                 fileUrl = `${baseUrl}/api/messages/media/${mediaRes.rows[0].id}`;
                 console.log('✅ Document saved to database media fallback:', fileUrl);
             } catch (dbErr) {
@@ -203,6 +205,45 @@ router.get('/employee/:employeeId', authenticateToken, async (req, res) => {
     }
 });
 
+// ─── GET /api/documents/:id/download ─────────────────────────────────────────
+// Authorized document download/view with company isolation & role verification
+router.get('/:id/download', authenticateToken, async (req, res) => {
+    try {
+        const { role, companyId } = req.user;
+        const userId = req.user.userId || req.user.id;
+        const { id } = req.params;
+
+        const docResult = await pool.query(
+            `SELECT d.id, d.company_id, d.employee_id, d.document_type, d.file_url, d.storage_key
+             FROM employee_documents d
+             WHERE d.id = $1 AND d.company_id = $2`,
+            [id, companyId]
+        );
+
+        if (docResult.rows.length === 0) {
+            return res.status(404).json({ message: 'Document not found' });
+        }
+
+        const doc = docResult.rows[0];
+
+        // Authorization check: owner, admin, or the employee themselves
+        if (role !== 'owner' && role !== 'admin') {
+            if (String(doc.employee_id) !== String(userId)) {
+                return res.status(403).json({ message: 'Access denied to this document' });
+            }
+        }
+
+        if (!doc.file_url) {
+            return res.status(404).json({ message: 'Document file URL missing' });
+        }
+
+        return res.redirect(doc.file_url);
+    } catch (err) {
+        console.error('❌ Error downloading document:', err);
+        res.status(500).json({ message: 'Server error downloading document' });
+    }
+});
+
 // ─── DELETE /api/documents/:id ───────────────────────────────────────────────
 // Delete a document (removes from Cloudinary + DB)
 router.delete('/:id', authenticateToken, async (req, res) => {
@@ -225,8 +266,8 @@ router.delete('/:id', authenticateToken, async (req, res) => {
 
         const { file_url, storage_key: storageKey } = docResult.rows[0];
 
-        // Delete from DB first
-        await pool.query('DELETE FROM employee_documents WHERE id = $1', [id]);
+        // Delete from DB first with explicit company_id guard
+        await pool.query('DELETE FROM employee_documents WHERE id = $1 AND company_id = $2', [id, companyId]);
 
         // Clean up underlying storage: Cloudinary or database media files
         if (file_url && file_url.includes('/api/messages/media/')) {

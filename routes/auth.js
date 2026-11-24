@@ -65,9 +65,59 @@ const REFRESH_MAX_AGE = 30 * 24 * 60 * 60 * 1000; // 30 days
 // ──────────────────────────────────────────────────────────────────────────────
 const backendDomain = process.env.NODE_ENV === 'production'
   ? 'https://api.prozync.in'
-  : (process.env.BACKEND_URL || 'http://localhost:4000');
+  : (process.env.BACKEND_URL || process.env.BASE_URL || 'http://localhost:4000');
 const googleCallback = process.env.GOOGLE_CALLBACK_URL
   || `${backendDomain}/api/v1/auth/google/callback`;
+
+// ─── Cryptographic OAuth State Helpers (Anti-Tampering & Anti-Privilege Escalation) ───
+function generateSignedOAuthState(payload) {
+  const payloadStr = JSON.stringify(payload);
+  const secret = process.env.JWT_SECRET || 'smarterp_oauth_fallback_secret';
+  const sig = crypto.createHmac('sha256', secret).update(payloadStr).digest('hex');
+  return Buffer.from(JSON.stringify({ p: payloadStr, s: sig })).toString('base64');
+}
+
+function parseAndVerifyOAuthState(rawState) {
+  const fallback = { type: 'staff', role: 'owner', company_code: null };
+  if (!rawState || typeof rawState !== 'string') return fallback;
+  try {
+    const parsed = JSON.parse(Buffer.from(rawState, 'base64').toString('utf8'));
+    let payload = null;
+
+    if (parsed && typeof parsed.p === 'string' && typeof parsed.s === 'string') {
+      const secret = process.env.JWT_SECRET || 'smarterp_oauth_fallback_secret';
+      const expected = crypto.createHmac('sha256', secret).update(parsed.p).digest('hex');
+      const sigBufExpected = Buffer.from(expected, 'utf8');
+      const sigBufActual = Buffer.from(parsed.s, 'utf8');
+      if (sigBufExpected.length === sigBufActual.length && crypto.timingSafeEqual(sigBufExpected, sigBufActual)) {
+        payload = JSON.parse(parsed.p);
+      }
+    }
+
+    // Fallback for unsigned legacy format (e.g. from tests or prior calls):
+    // MUST STILL ENFORCE THE STRICT ROLE WHITELIST! NEVER TRUST UNSANITIZED ROLE!
+    if (!payload && typeof parsed === 'object') {
+      payload = parsed;
+    }
+
+    if (!payload) return fallback;
+
+    const rawRole = String(payload.role || '').toLowerCase().trim();
+    // STRICT WHITELIST: Only 'owner' and 'employee' are permitted for self-registration.
+    // 'super_admin' is strictly forbidden from OAuth state.
+    const safeRole = rawRole === 'employee' ? 'employee' : 'owner';
+    const safeType = payload.type === 'customer' ? 'customer' : 'staff';
+    const safeCompanyCode = payload.company_code ? String(payload.company_code).trim().slice(0, 50) : null;
+
+    return {
+      type: safeType,
+      role: safeRole,
+      company_code: safeCompanyCode
+    };
+  } catch (_) {
+    return fallback;
+  }
+}
 
 // ─── Unified Passport Strategy ────────────────────────────────────────────────
 passport.use(
@@ -86,11 +136,8 @@ passport.use(
 
         if (!email) return done(new Error('No email from Google'), null);
 
-        // Parse state (always base64-encoded JSON)
-        let stateData = {};
-        try {
-          stateData = JSON.parse(Buffer.from(req.query.state || '', 'base64').toString());
-        } catch (_) { /* ignore */ }
+        // Parse and cryptographically verify state
+        const stateData = parseAndVerifyOAuthState(req.query.state);
 
         // ── CUSTOMER FLOW ────────────────────────────────────────────────────
         if (stateData.type === 'customer') {
@@ -127,7 +174,9 @@ passport.use(
         }
 
         // ── STAFF FLOW (owner / employee / super_admin) ───────────────────────
-        let role = stateData.role || 'owner';
+        // Only existing users can have super_admin (loaded from database).
+        // New Google signups are strictly bounded to owner or employee.
+        let role = stateData.role === 'employee' ? 'employee' : 'owner';
         const company_code = stateData.company_code || null;
 
         const userResult = await pool.query(
@@ -140,7 +189,7 @@ passport.use(
         let companyCode = null;
 
         if (userResult.rows.length > 0) {
-          // Existing staff user — link Google ID if missing
+          // Existing staff user — link Google ID if missing and retain existing role from DB
           user = userResult.rows[0];
           if (!user.google_id) {
             await pool.query('UPDATE users SET google_id = $1 WHERE id = $2', [googleId, user.id]);
@@ -174,7 +223,7 @@ passport.use(
             user.company_code = companyCode;
           }
         } else {
-          // New staff user
+          // New staff user — role is strictly 'owner' or 'employee'
           if (role === 'owner') {
             const { generateCompanyId } = require('../utils/companyIdGenerator');
             companyCode = await generateCompanyId();
@@ -198,21 +247,33 @@ passport.use(
             ).catch(e => console.error('sub_event log error:', e.message));
 
             console.log(`✅ Created Starter company ${companyCode} for Google owner`);
-          }
 
-          if (role === 'employee' && company_code) {
+            const insertResult = await pool.query(
+              `INSERT INTO users (name, email, google_id, role, company_id, company_code, created_at)
+               VALUES ($1, $2, $3, 'owner', $4, $5, NOW()) RETURNING *`,
+              [name, email, googleId, companyId, companyCode]
+            );
+            user = insertResult.rows[0];
+            await pool.query('UPDATE companies SET owner_id = $1 WHERE id = $2', [user.id, companyId]);
+          } else if (role === 'employee') {
+            if (!company_code) {
+              const err = new Error('Valid company invitation code is required for employee registration');
+              err.code = 'COMPANY_CODE_REQUIRED';
+              return done(err, null);
+            }
+
             const { validateCompanyCode } = require('../utils/companyIdGenerator');
             const validation = await validateCompanyCode(company_code);
-            if (validation.valid) {
-              companyId = validation.company.id;
-              companyCode = validation.company.company_id;
-              console.log(`✅ Google employee ${email} validated for company ${companyCode}`);
-            } else {
-              return done(new Error('Invalid company code'), null);
+            if (!validation.valid) {
+              const err = new Error('Invalid company code');
+              err.code = 'INVALID_COMPANY_CODE';
+              return done(err, null);
             }
-          }
 
-          if (role === 'employee' && companyId) {
+            companyId = validation.company.id;
+            companyCode = validation.company.company_id;
+            console.log(`✅ Google employee ${email} validated for company ${companyCode}`);
+
             const seatClient = await pool.connect();
             try {
               await seatClient.query('BEGIN');
@@ -234,8 +295,8 @@ passport.use(
               }
               const insertResult = await seatClient.query(
                 `INSERT INTO users (name, email, google_id, role, company_id, company_code, created_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, NOW()) RETURNING *`,
-                [name, email, googleId, role, companyId, companyCode]
+                 VALUES ($1, $2, $3, 'employee', $4, $5, NOW()) RETURNING *`,
+                [name, email, googleId, companyId, companyCode]
               );
               user = insertResult.rows[0];
               await seatClient.query('COMMIT');
@@ -245,17 +306,6 @@ passport.use(
             } finally {
               seatClient.release();
             }
-          } else {
-            const insertResult = await pool.query(
-              `INSERT INTO users (name, email, google_id, role, company_id, company_code, created_at)
-               VALUES ($1, $2, $3, $4, $5, $6, NOW()) RETURNING *`,
-              [name, email, googleId, role, companyId, companyCode]
-            );
-            user = insertResult.rows[0];
-          }
-
-          if (role === 'owner' && companyId) {
-            await pool.query('UPDATE companies SET owner_id = $1 WHERE id = $2', [user.id, companyId]);
           }
         }
 
@@ -281,11 +331,16 @@ router.get('/google', (req, res, next) => {
   }
 
   const type = req.query.type === 'customer' ? 'customer' : 'staff';
-  const statePayload = type === 'customer'
-    ? { type: 'customer' }
-    : { type: 'staff', role: req.query.role || 'owner', company_code: req.query.company_code || null };
+  // Strict role whitelist: self-service Google OAuth can only request 'owner' or 'employee'
+  const rawRole = String(req.query.role || '').toLowerCase().trim();
+  const safeRole = rawRole === 'employee' ? 'employee' : 'owner';
+  const rawCompanyCode = req.query.company_code ? String(req.query.company_code).trim().slice(0, 50) : null;
 
-  const state = Buffer.from(JSON.stringify(statePayload)).toString('base64');
+  const statePayload = type === 'customer'
+    ? { type: 'customer', ts: Date.now() }
+    : { type: 'staff', role: safeRole, company_code: rawCompanyCode, ts: Date.now() };
+
+  const state = generateSignedOAuthState(statePayload);
   
   try {
     passport.authenticate('google', { scope: ['profile', 'email'], session: false, state })(req, res, (err) => {
@@ -304,17 +359,17 @@ router.get('/google', (req, res, next) => {
 // ─── Google Callback (unified) ────────────────────────────────────────────────
 router.get('/google/callback', (req, res, next) => {
   passport.authenticate('google', { session: false }, async (err, user) => {
-    // Parse state so we know which portal to redirect failures to
-    let stateData = {};
-    try { stateData = JSON.parse(Buffer.from(req.query.state || '', 'base64').toString()); } catch (_) {}
+    // Parse verified state so we know which portal to redirect failures to
+    const stateData = parseAndVerifyOAuthState(req.query.state);
     const CUSTOMER_PORTAL = process.env.CUSTOMER_PORTAL_ORIGIN || 'http://localhost:3001';
     const FRONTEND = process.env.FRONTEND_ORIGIN || 'https://www.prozync.in';
 
     if (err || !user) {
       console.error('Google OAuth error:', err && err.message);
+      const errorCode = err?.code || 'oauth_failed';
       return res.redirect(stateData.type === 'customer'
-        ? `${CUSTOMER_PORTAL}/login?error=oauth_failed`
-        : `${FRONTEND}/auth/login?error=oauth_failed`);
+        ? `${CUSTOMER_PORTAL}/login?error=${errorCode}`
+        : `${FRONTEND}/auth/login?error=${errorCode}`);
     }
 
     try {

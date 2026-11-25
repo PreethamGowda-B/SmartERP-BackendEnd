@@ -116,7 +116,8 @@ async function applyRlsToClient(client, context = storage.getStore()) {
             set_config('app.current_user_id', $4, true)`,
     [bypassRls ? 'on' : 'off', companyId, safeRole, userId]
   );
-  const pRole = !bypassRls ? client.query('SET LOCAL ROLE smarterp_app') : null;
+  const targetRole = safeRole === 'super_admin' ? 'smarterp_superadmin' : 'smarterp_app';
+  const pRole = !bypassRls ? client.query(`SET LOCAL ROLE ${targetRole}`) : null;
 
   await Promise.all([pRls, ...(pRole ? [pRole] : [])]);
   recordDbStage('rls_setup_total', performance.now() - setupStartedAt);
@@ -157,7 +158,8 @@ function attachTransactionScopedRls(client, context) {
             set_config('app.current_user_id', $4, true)`,
         [bypassRls ? 'on' : 'off', companyId, safeRole, userId]
       );
-      const pRole = !bypassRls ? rawQuery('SET LOCAL ROLE smarterp_app') : null;
+      const targetRole = safeRole === 'super_admin' ? 'smarterp_superadmin' : 'smarterp_app';
+      const pRole = !bypassRls ? rawQuery(`SET LOCAL ROLE ${targetRole}`) : null;
 
       const [beginResult] = await Promise.all([pBegin, pRls, ...(pRole ? [pRole] : [])]);
       recordDbStage('rls_setup_total', performance.now() - setupStartedAt);

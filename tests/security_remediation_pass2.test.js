@@ -58,14 +58,31 @@ describe('SmartERP Security Remediation — Pass 2 Regression Suite', () => {
       customerMachinesRouter(req, res, next);
     });
 
-    // Mount standard routes
-    app.use('/api/jobs', proofOfWorkRouter);
-    app.use('/api/work-requests', workRequestsRouter);
-    app.use('/api/warranty-claims', warrantyClaimsRouter);
-    app.use('/api/feedback', feedbackRouter);
-    app.use('/api/search', enterpriseSearchRouter);
-    app.use('/api/customer-reports', customerReportsRouter);
-    app.use('/api/quotations', quotationsRouter);
+    // Mount standard routes with ALS tenant context from Bearer token when present
+    const { storage } = require('../middleware/als');
+    const bindTestAls = (req, res, next) => {
+      const authHeader = req.headers.authorization;
+      if (authHeader && authHeader.startsWith('Bearer ')) {
+        try {
+          const decoded = jwt.verify(authHeader.split(' ')[1], process.env.JWT_SECRET);
+          if (decoded?.companyId || decoded?.company_id) {
+            return storage.run({
+              companyId: decoded.companyId || decoded.company_id,
+              userId: decoded.userId || decoded.id,
+              role: decoded.role
+            }, next);
+          }
+        } catch (_) {}
+      }
+      return next();
+    };
+    app.use('/api/jobs', bindTestAls, proofOfWorkRouter);
+    app.use('/api/work-requests', bindTestAls, workRequestsRouter);
+    app.use('/api/warranty-claims', bindTestAls, warrantyClaimsRouter);
+    app.use('/api/feedback', bindTestAls, feedbackRouter);
+    app.use('/api/search', bindTestAls, enterpriseSearchRouter);
+    app.use('/api/customer-reports', bindTestAls, customerReportsRouter);
+    app.use('/api/quotations', bindTestAls, quotationsRouter);
 
     server = http.createServer(app);
     await new Promise((resolve) => {
@@ -81,10 +98,10 @@ describe('SmartERP Security Remediation — Pass 2 Regression Suite', () => {
     }
   });
 
-  const tokenCompanyA_Owner = createToken({ userId: '1001', id: '1001', role: 'owner', companyId: 1001, company_id: 1001 });
-  const tokenCompanyA_Employee = createToken({ userId: '1002', id: '1002', role: 'employee', companyId: 1001, company_id: 1001 });
-  const tokenCompanyA_CustA = createToken({ id: '2001', userId: '2001', role: 'customer', companyId: 1001, company_id: 1001 });
-  const tokenNoCompany = createToken({ userId: '9999', id: '9999', role: 'owner' });
+  const tokenCompanyA_Owner = createToken({ userId: '00000000-0000-4000-8000-000000001001', id: '00000000-0000-4000-8000-000000001001', role: 'owner', companyId: 1001, company_id: 1001 });
+  const tokenCompanyA_Employee = createToken({ userId: '00000000-0000-4000-8000-000000001002', id: '00000000-0000-4000-8000-000000001002', role: 'employee', companyId: 1001, company_id: 1001 });
+  const tokenCompanyA_CustA = createToken({ id: '00000000-0000-4000-8000-000000002001', userId: '00000000-0000-4000-8000-000000002001', role: 'customer', companyId: 1001, company_id: 1001 });
+  const tokenNoCompany = createToken({ userId: '00000000-0000-4000-8000-000000009999', id: '00000000-0000-4000-8000-000000009999', role: 'owner' });
 
   // -------------------------------------------------------------------------
   // P0 #1: Customer Documents Isolation

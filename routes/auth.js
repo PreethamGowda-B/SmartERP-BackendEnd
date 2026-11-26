@@ -94,13 +94,13 @@ function parseAndVerifyOAuthState(rawState) {
       }
     }
 
-    // Fallback for unsigned legacy format (e.g. from tests or prior calls):
-    // MUST STILL ENFORCE THE STRICT ROLE WHITELIST! NEVER TRUST UNSANITIZED ROLE!
-    if (!payload && typeof parsed === 'object') {
-      payload = parsed;
-    }
-
     if (!payload) return fallback;
+
+    // Enforce OAuth state TTL (15 minutes) to prevent stale/replayed state payloads
+    const maxStateAgeMs = 15 * 60 * 1000;
+    if (typeof payload.ts === 'number' && Math.abs(Date.now() - payload.ts) > maxStateAgeMs) {
+      return fallback;
+    }
 
     const rawRole = String(payload.role || '').toLowerCase().trim();
     // STRICT WHITELIST: Only 'owner' and 'employee' are permitted for self-registration.
@@ -1202,10 +1202,19 @@ router.post("/login", async (req, res) => {
   };
 
   try {
-    const result = await pool.query(
-      "SELECT * FROM users WHERE LOWER(email) = $1 OR LOWER(name) = $1",
+    let result = await pool.query(
+      "SELECT * FROM users WHERE LOWER(email) = $1 LIMIT 1",
       [identifier]
     );
+    if (result.rows.length === 0 && !identifier.includes("@")) {
+      const nameMatches = await pool.query(
+        "SELECT * FROM users WHERE LOWER(name) = $1 LIMIT 2",
+        [identifier]
+      );
+      if (nameMatches.rows.length === 1) {
+        result = nameMatches;
+      }
+    }
     if (result.rows.length === 0) {
       await recordFailedAttempt();
       emitSecurityEvent({
@@ -1790,13 +1799,22 @@ router.post("/validate-company", async (req, res) => {
 // ---------------------------------------------
 // ✅ Complete Employee Onboarding & Link Company
 // ---------------------------------------------
-router.post("/employee/onboarding", authenticateToken, async (req, res) => {
+async function completeEmployeeOnboardingHandler(req, res) {
   const userId = req.user.userId || req.user.id;
+  const requesterRole = String(req.user.role || "").toLowerCase().trim();
+
+  if (requesterRole !== "employee") {
+    return res.status(403).json({
+      message: "Only unlinked employee accounts can complete employee onboarding."
+    });
+  }
+
   return storage.run({ isWebRequest: true, bypassRls: true, userId }, async () => {
+    let client;
     try {
       const { name, phone, position, department, company_code } = req.body;
 
-      if (!company_code) {
+      if (!company_code || !String(company_code).trim()) {
         return res.status(400).json({ message: "Company code is required to complete onboarding" });
       }
 
@@ -1817,96 +1835,133 @@ router.post("/employee/onboarding", authenticateToken, async (req, res) => {
         return res.status(403).json({ message: "This company account is currently suspended. Please contact your employer." });
       }
 
-      // 2. Update Users table
-      let updatedUser = null;
-      try {
-        const updateResult = await pool.query(
-          `UPDATE users 
-           SET name = COALESCE(NULLIF($1, ''), name), 
-               phone = COALESCE(NULLIF($2, ''), phone),
-               position = COALESCE(NULLIF($3, ''), position),
-               department = COALESCE(NULLIF($4, ''), department),
-               company_id = $5, 
-               company_code = $6,
-               updated_at = NOW()
-           WHERE id::text = $7::text
-           RETURNING id, name, email, role, company_id, company_code, phone, position, department`,
-          [
-            name?.trim() || null,
-            phone?.trim() || null,
-            position?.trim() || null,
-            department?.trim() || null,
-            targetCompanyId,
-            targetCompanyCode,
-            String(userId)
-          ]
-        );
-        updatedUser = updateResult.rows[0];
-      } catch (dbErr) {
-        console.warn("⚠️ Full update users failed, executing lightweight fallback:", dbErr.message);
-        const fallbackResult = await pool.query(
-          `UPDATE users 
-           SET name = COALESCE(NULLIF($1, ''), name), 
-               company_id = $2, 
-               company_code = $3
-           WHERE id::text = $4::text
-           RETURNING id, name, email, role, company_id, company_code`,
-          [name?.trim() || null, targetCompanyId, targetCompanyCode, String(userId)]
-        );
-        updatedUser = fallbackResult.rows[0];
-      }
+      client = await pool.connect();
+      await client.query("BEGIN");
 
-      if (!updatedUser) {
+      // 2. Lock user row and enforce one-time company association (prevent cross-tenant hijack)
+      const userCheck = await client.query(
+        `SELECT id, name, email, role, company_id, company_code
+         FROM users
+         WHERE id::text = $1::text
+         FOR UPDATE`,
+        [String(userId)]
+      );
+
+      if (userCheck.rows.length === 0) {
+        await client.query("ROLLBACK");
         return res.status(404).json({ message: "User account not found. Please log in again." });
       }
 
-      // 3. Upsert into employee_profiles with company_id so employee profile RLS works
-      try {
-        await pool.query(
-          `INSERT INTO employee_profiles (user_id, company_id, name, email, phone, position, department, created_at, updated_at)
-           VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, NOW(), NOW())
-           ON CONFLICT (user_id) 
-           DO UPDATE SET 
-             company_id = EXCLUDED.company_id,
-             name = COALESCE(EXCLUDED.name, employee_profiles.name),
-             email = COALESCE(EXCLUDED.email, employee_profiles.email),
-             phone = COALESCE(EXCLUDED.phone, employee_profiles.phone),
-             position = COALESCE(EXCLUDED.position, employee_profiles.position),
-             department = COALESCE(EXCLUDED.department, employee_profiles.department),
-             updated_at = NOW()`,
-          [
-            updatedUser.id,
-            targetCompanyId,
-            updatedUser.name,
-            updatedUser.email,
-            phone?.trim() || null,
-            position?.trim() || null,
-            department?.trim() || null
-          ]
-        );
-      } catch (epErr) {
-        console.warn("⚠️ Note: employee_profiles update non-critical:", epErr.message);
+      const existingUser = userCheck.rows[0];
+      if (String(existingUser.role || "").toLowerCase().trim() !== "employee") {
+        await client.query("ROLLBACK");
+        return res.status(403).json({ message: "Only unlinked employee accounts can complete employee onboarding." });
       }
 
-      // 4. Issue Fresh JWT Tokens with the linked companyId
+      if (existingUser.company_id !== null && existingUser.company_id !== undefined) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          message: "Account is already linked to a company and cannot be reassigned."
+        });
+      }
+
+      // 3. Atomic Employee Seat Limit Check (matches /signup)
+      await client.query("SELECT pg_advisory_xact_lock(hashtext($1 || $2))", ["employee_seats_", String(targetCompanyId)]);
+      const planCheck = await client.query(
+        `SELECT c.plan_id,
+                (SELECT COUNT(*) FROM users WHERE company_id = c.id AND role = 'employee') AS current_count
+         FROM companies c
+         WHERE c.id = $1
+         FOR UPDATE`,
+        [targetCompanyId]
+      );
+
+      if (!planCheck.rows.length) {
+        await client.query("ROLLBACK");
+        return res.status(503).json({ message: "Could not verify the company's subscription plan. Please retry." });
+      }
+
+      const { plan_id, current_count } = planCheck.rows[0];
+      const employee_limit = getPlan(plan_id)?.employeeLimit;
+      if (employee_limit === undefined) {
+        await client.query("ROLLBACK");
+        return res.status(503).json({ message: "Could not verify the company's employee limit. Please retry." });
+      }
+      if (employee_limit !== null && Number(current_count) >= employee_limit) {
+        await client.query("ROLLBACK");
+        return res.status(403).json({ message: "Employee limit reached for this company's plan." });
+      }
+
+      // 4. Update Users table (guarded with company_id IS NULL)
+      const updateResult = await client.query(
+        `UPDATE users 
+         SET name = COALESCE(NULLIF($1, ''), name), 
+             phone = COALESCE(NULLIF($2, ''), phone),
+             position = COALESCE(NULLIF($3, ''), position),
+             department = COALESCE(NULLIF($4, ''), department),
+             company_id = $5, 
+             company_code = $6,
+             updated_at = NOW()
+         WHERE id::text = $7::text AND company_id IS NULL
+         RETURNING id, name, email, role, company_id, company_code, phone, position, department`,
+        [
+          name?.trim() || null,
+          phone?.trim() || null,
+          position?.trim() || null,
+          department?.trim() || null,
+          targetCompanyId,
+          targetCompanyCode,
+          String(userId)
+        ]
+      );
+      const updatedUser = updateResult.rows[0];
+
+      if (!updatedUser) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ message: "Account is already linked to a company and cannot be reassigned." });
+      }
+
+      // 5. Upsert into employee_profiles with company_id so employee profile RLS works
+      await client.query(
+        `INSERT INTO employee_profiles (user_id, company_id, name, email, phone, position, department, created_at, updated_at)
+         VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+         ON CONFLICT (user_id) 
+         DO UPDATE SET 
+           company_id = EXCLUDED.company_id,
+           name = COALESCE(EXCLUDED.name, employee_profiles.name),
+           email = COALESCE(EXCLUDED.email, employee_profiles.email),
+           phone = COALESCE(EXCLUDED.phone, employee_profiles.phone),
+           position = COALESCE(EXCLUDED.position, employee_profiles.position),
+           department = COALESCE(EXCLUDED.department, employee_profiles.department),
+           updated_at = NOW()`,
+        [
+          updatedUser.id,
+          targetCompanyId,
+          updatedUser.name,
+          updatedUser.email,
+          phone?.trim() || null,
+          position?.trim() || null,
+          department?.trim() || null
+        ]
+      );
+
+      // 6. Issue Fresh JWT Tokens with the linked companyId
+      const tokenFamily = crypto.randomUUID();
       const newAccessToken = jwt.sign(
-        { id: updatedUser.id, userId: updatedUser.id, role: updatedUser.role, email: updatedUser.email, companyId: updatedUser.company_id },
+        { id: updatedUser.id, userId: updatedUser.id, role: updatedUser.role, email: updatedUser.email, companyId: updatedUser.company_id, sid: tokenFamily },
         ACCESS_SECRET,
         { expiresIn: ACCESS_EXPIRY }
       );
       const newRefreshToken = jwt.sign({ id: updatedUser.id, userId: updatedUser.id }, REFRESH_SECRET, { expiresIn: REFRESH_EXPIRY });
 
-      // 5. Store rotated refresh token safely
-      try {
-        const tokenFamily = crypto.randomUUID();
-        await pool.query(
-          `INSERT INTO refresh_tokens (user_id, token, token_family, expires_at, created_at, user_agent, ip_address)
-           VALUES ($1::uuid, $2, $3::uuid, NOW() + INTERVAL '30 days', NOW(), $4, $5)`,
-          [updatedUser.id, newRefreshToken, tokenFamily, req.headers["user-agent"] || null, req.ip || null]
-        );
-      } catch (rtErr) {
-        console.warn("⚠️ Note: refresh_tokens storage non-critical:", rtErr.message);
-      }
+      // 7. Store hashed refresh token safely
+      await client.query(
+        `INSERT INTO refresh_tokens (user_id, token, token_family, expires_at, created_at, user_agent, ip_address)
+         VALUES ($1::uuid, $2, $3::uuid, NOW() + INTERVAL '30 days', NOW(), $4, $5)`,
+        [updatedUser.id, hashToken(newRefreshToken), tokenFamily, req.headers["user-agent"] || null, req.ip || null]
+      );
+
+      await client.query("COMMIT");
 
       const cookieOpts = {
         httpOnly: true,
@@ -1938,11 +1993,16 @@ router.post("/employee/onboarding", authenticateToken, async (req, res) => {
         }
       });
     } catch (err) {
+      if (client) await client.query("ROLLBACK").catch(() => {});
       console.error("Employee onboarding error:", err);
-      res.status(500).json({ message: err.message || "Server error during onboarding. Please try again." });
+      res.status(500).json({ message: "Server error during onboarding. Please try again." });
+    } finally {
+      if (client) client.release();
     }
   });
-});
+}
+
+router.post("/employee/onboarding", authenticateToken, completeEmployeeOnboardingHandler);
 
 // ---------------------------------------------
 // ✅ Get Company Settings (Authenticated)
@@ -2021,8 +2081,24 @@ router.post("/set-cookie", async (req, res) => {
   }
 
   try {
-    // Validate their structure before setting (lightweight check)
-    jwt.verify(accessToken, ACCESS_SECRET);
+    // Verify both accessToken and refreshToken signatures and subject match
+    const accessPayload = jwt.verify(accessToken, ACCESS_SECRET);
+    let refreshPayload;
+    try {
+      refreshPayload = jwt.verify(refreshToken, REFRESH_SECRET);
+    } catch (rtErr) {
+      if (REFRESH_SECRET_OLD) {
+        refreshPayload = jwt.verify(refreshToken, REFRESH_SECRET_OLD);
+      } else {
+        throw rtErr;
+      }
+    }
+
+    const accessUserId = String(accessPayload.userId || accessPayload.id || "");
+    const refreshUserId = String(refreshPayload.userId || refreshPayload.id || "");
+    if (!accessUserId || accessUserId !== refreshUserId) {
+      return res.status(401).json({ message: "Token pair mismatch" });
+    }
 
     const cookieOpts = {
       httpOnly: true,
@@ -2102,4 +2178,5 @@ async function updatePushToken(req, res) {
   }
 }
 
+router._completeEmployeeOnboardingHandler = completeEmployeeOnboardingHandler;
 module.exports = router;

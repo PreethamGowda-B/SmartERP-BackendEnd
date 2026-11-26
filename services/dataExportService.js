@@ -6,7 +6,7 @@
  */
 
 const { pool } = require('../db');
-const archiver = require('archiver');
+const JSZip = require('jszip');
 
 class DataExportService {
   /**
@@ -39,15 +39,12 @@ class DataExportService {
    * Generates a complete ZIP archive stream of all company data
    */
   static async streamCompanyBackup({ companyId, res }) {
-    const archive = new archiver.ZipArchive({
-      zlib: { level: 9 } // Maximum compression
-    });
-
-    archive.on('error', (err) => {
-      console.error('❌ Archiver stream error:', err);
-    });
-
-    archive.pipe(res);
+    const zip = new JSZip();
+    const archive = {
+      append(content, { name }) {
+        zip.file(name, content);
+      }
+    };
 
     const safeCompanyId = String(companyId);
 
@@ -115,8 +112,19 @@ class DataExportService {
       archive.append(this.jsonToCsv(matReq.rows), { name: '9_material_requests.csv' });
     } catch (e) { console.warn('Export material requests warning:', e.message); }
 
-    // Finalize
-    await archive.finalize();
+    // Finalize and stream compressed ZIP archive
+    await new Promise((resolve, reject) => {
+      const stream = zip.generateNodeStream({
+        type: 'nodebuffer',
+        streamFiles: true,
+        compression: 'DEFLATE',
+        compressionOptions: { level: 9 }
+      });
+      stream.on('error', reject);
+      res.on('finish', resolve);
+      res.on('error', reject);
+      stream.pipe(res);
+    });
   }
 }
 

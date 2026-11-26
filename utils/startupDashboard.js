@@ -66,7 +66,7 @@ async function gatherInfrastructureStatus(pool, redisClient) {
   // 5. Firebase Admin
   try {
     const admin = require('firebase-admin');
-    status.firebase.initialized = Boolean(admin.apps && admin.apps.length > 0);
+    status.firebase.initialized = Boolean(typeof admin.getApps === 'function' ? admin.getApps().length > 0 : (admin.apps && admin.apps.length > 0));
   } catch {
     status.firebase.initialized = false;
   }

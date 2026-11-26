@@ -1,7 +1,7 @@
 const { Resend } = require('resend');
-const resend = new Resend(process.env.RESEND_API_KEY);
+const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
 
-const FROM_EMAIL = 'SmartERP <noreply@prozync.in>';
+const FROM_EMAIL = process.env.RESEND_FROM_EMAIL || 'SmartERP <noreply@prozync.in>';
 const APP_URL = process.env.FRONTEND_ORIGIN || 'https://www.prozync.in';
 
 /**

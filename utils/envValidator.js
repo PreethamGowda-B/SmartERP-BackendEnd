@@ -16,7 +16,7 @@ function validateEnvironmentVariables() {
 
   const rules = [
     { key: 'DATABASE_URL', required: true, format: /^postgres(ql)?:\/\/.+/i, category: 'Database Connection' },
-    { key: 'REDIS_URL', required: true, format: /^redis:\/\/.+/i, category: 'Telemetry & Sliding Window Cache' },
+    { key: 'REDIS_URL', required: true, format: /^rediss?:\/\/.+/i, category: 'Telemetry & Sliding Window Cache' },
     { key: 'JWT_SECRET', required: true, minLength: 32, category: 'Authentication & Session Signing' },
     { key: 'JWT_REFRESH_SECRET', required: true, minLength: 32, category: 'Authentication & Token Refresh' },
     { key: 'FRONTEND_ORIGIN', required: false, category: 'CORS & Client Routing' },

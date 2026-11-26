@@ -152,8 +152,13 @@ router.use((req, res, next) => {
   const csrfHeader = req.headers['x-csrf-token'];
   const csrfCookie = req.cookies && req.cookies['csrf_token'];
 
-  // If no cookie yet (first request), allow through â€” client must call /csrf first
+  // If no cookie yet (unauthenticated pre-auth request), allow through — client must call /csrf first
+  // If an authenticated session cookie is already present, require csrf_token cookie + header
+  const hasSessionCookie = Boolean(req.cookies?.['customer_access_token'] || req.cookies?.['customer_refresh_token']);
   if (!csrfCookie) {
+    if (hasSessionCookie) {
+      return res.status(403).json({ message: 'Invalid CSRF token' });
+    }
     return next();
   }
 
@@ -245,15 +250,16 @@ router.post('/send-otp', [
       }
     }
 
-    // Generate 6-digit OTP
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    // Generate 6-digit OTP using CSPRNG and store hashed at rest
+    const otp = crypto.randomInt(100000, 1000000).toString();
+    const otpHash = hashToken(`${email}:customer:${otp}`);
 
-    // Delete old OTPs for this email, then insert new one
-    await pool.query('DELETE FROM email_otps WHERE email = $1', [email]);
+    // Delete old customer OTPs for this email, then insert new hashed one
+    await pool.query("DELETE FROM email_otps WHERE LOWER(email) = $1 AND account_type = 'customer'", [email.toLowerCase()]);
     await pool.query(
-      `INSERT INTO email_otps (email, otp_code, expires_at, used, created_at)
-       VALUES ($1, $2, NOW() + INTERVAL '10 minutes', FALSE, NOW())`,
-      [email, otp]
+      `INSERT INTO email_otps (email, otp_code, account_type, purpose, expires_at, used, created_at)
+       VALUES ($1, $2, 'customer', 'email_verification', NOW() + INTERVAL '10 minutes', FALSE, NOW())`,
+      [email.toLowerCase(), otpHash]
     );
 
     // Set Redis cooldown and increment count (after DB insert to avoid counting failed sends)
@@ -310,27 +316,50 @@ router.post('/verify-otp', [
     return res.status(400).json({ message: 'Invalid or expired code.' });
   }
 
-  const { email, otp } = req.body;
+  const normalizedEmail = String(req.body.email || '').toLowerCase().trim();
+  const plainOtp = String(req.body.otp || '').trim();
+  const verifyAttemptKey = `customer_email_verify_otp_attempts:${normalizedEmail}`;
+
+  if (redisClient && redisClient.status === 'ready') {
+    try {
+      const attempts = await redisClient.get(verifyAttemptKey);
+      if (attempts && parseInt(attempts, 10) >= 5) {
+        return res.status(429).json({ message: 'Too many failed attempts. Please request a new verification code.' });
+      }
+    } catch (_) {}
+  }
 
   try {
+    const otpHash = hashToken(`${normalizedEmail}:customer:${plainOtp}`);
     const result = await pool.query(
       `SELECT id FROM email_otps
-       WHERE email = $1
+       WHERE LOWER(email) = $1
+         AND account_type = 'customer'
          AND otp_code = $2
          AND used = FALSE
          AND expires_at > NOW()
        LIMIT 1`,
-      [email, otp]
+      [normalizedEmail, otpHash]
     );
 
     if (result.rows.length === 0) {
+      if (redisClient && redisClient.status === 'ready') {
+        try {
+          await redisClient.incr(verifyAttemptKey);
+          await redisClient.expire(verifyAttemptKey, 600);
+        } catch (_) {}
+      }
       // Non-blocking audit log for OTP failure
       pool.query(
         `INSERT INTO activities (user_id, activity_type, details, ip_address, created_at)
          VALUES ($1, $2, $3, $4, NOW())`,
-        [null, 'otp_failure', JSON.stringify({ email }), req.ip]
+        [null, 'otp_failure', JSON.stringify({ email: normalizedEmail }), req.ip]
       ).catch(e => console.error('Audit log error:', e.message));
       return res.status(400).json({ message: 'Invalid or expired code.' });
+    }
+
+    if (redisClient && redisClient.status === 'ready') {
+      await redisClient.del(verifyAttemptKey).catch(() => {});
     }
 
     // Mark OTP as used
@@ -767,15 +796,41 @@ router.post('/refresh', async (req, res) => {
   }
 });
 
-// â”€â”€â”€ POST /logout â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-router.post('/logout', async (req, res) => {
-  const refreshToken = req.cookies && req.cookies['customer_refresh_token'];
+// ─── POST /logout ─────────────────────────────────────────────────────────────
+async function customerLogoutHandler(req, res) {
+  const refreshToken =
+    (req.cookies && req.cookies['customer_refresh_token']) ||
+    (req.body && typeof req.body.refreshToken === 'string' ? req.body.refreshToken.trim() : null);
+
+  let revokedCustomerId = null;
 
   if (refreshToken) {
-    pool.query(
-      'UPDATE customer_refresh_tokens SET revoked = TRUE WHERE token = $1',
-      [refreshToken]
-    ).catch(e => console.error('Logout revoke error:', e.message));
+    try {
+      const tokenHash = hashToken(refreshToken);
+      const rtRes = await pool.query(
+        'SELECT id, customer_id, token_family FROM customer_refresh_tokens WHERE token = $1 OR token = $2 LIMIT 1',
+        [tokenHash, refreshToken]
+      );
+
+      if (rtRes.rows.length > 0) {
+        const row = rtRes.rows[0];
+        revokedCustomerId = row.customer_id;
+
+        if (row.token_family) {
+          await pool.query(
+            'UPDATE customer_refresh_tokens SET revoked = TRUE, revoked_at = NOW() WHERE customer_id = $1 AND token_family = $2::uuid AND revoked = FALSE',
+            [row.customer_id, row.token_family]
+          );
+        } else {
+          await pool.query(
+            'UPDATE customer_refresh_tokens SET revoked = TRUE, revoked_at = NOW() WHERE id = $1 AND revoked = FALSE',
+            [row.id]
+          );
+        }
+      }
+    } catch (e) {
+      console.error('Logout revoke error:', e.message);
+    }
   }
 
   // Clear cookies
@@ -784,10 +839,12 @@ router.post('/logout', async (req, res) => {
   res.clearCookie('csrf_token', { path: '/', sameSite: 'none', secure: true });
 
   // Non-blocking audit log
-  auditLog(req, null, 'customer_logout', {}, null);
+  auditLog(req, revokedCustomerId, 'customer_logout', {}, null);
 
   return res.json({ ok: true });
-});
+}
+
+router.post('/logout', customerLogoutHandler);
 
 // â”€â”€â”€ Google OAuth â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // The unified Google OAuth strategy now lives in routes/auth.js.
@@ -1196,4 +1253,5 @@ router.post('/reset-password', async (req, res) => {
   }
 });
 
+router._customerLogoutHandler = customerLogoutHandler;
 module.exports = router;

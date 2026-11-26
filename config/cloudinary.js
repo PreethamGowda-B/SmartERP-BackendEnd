@@ -1,6 +1,5 @@
 require('dotenv').config();
 const cloudinary = require('cloudinary').v2;
-const { CloudinaryStorage } = require('multer-storage-cloudinary');
 const logger = require('../utils/logger');
 
 // Never ship Cloudinary credentials in source. Missing configuration disables
@@ -22,22 +21,8 @@ if (!hasCloudinaryConfig) {
     logger.info(`Cloudinary storage configured for [${cloudName}]`, { cloudName, pid: process.pid });
 }
 
-// Configure Cloudinary storage for multer
-let storage = null;
-if (hasCloudinaryConfig) {
-    try {
-        storage = new CloudinaryStorage({
-            cloudinary: cloudinary,
-            params: {
-                folder: 'smarterp/inventory',
-                allowed_formats: ['jpg', 'jpeg', 'png', 'gif', 'webp'],
-                transformation: [{ width: 800, height: 800, crop: 'limit' }]
-            }
-        });
-    } catch (error) {
-        logger.error('Error configuring Cloudinary storage', error, { pid: process.pid });
-    }
-}
+// Legacy multer-storage-cloudinary removed (all routes use cloudinary.uploader.upload_stream).
+const storage = null;
 
 /**
  * Safely delete an asset from Cloudinary by extracting its public_id from its secure URL.

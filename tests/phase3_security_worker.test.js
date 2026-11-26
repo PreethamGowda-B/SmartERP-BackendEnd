@@ -11,6 +11,7 @@
 
 require('dotenv').config();
 const { pool } = require('../db');
+const { storage } = require('../middleware/als');
 const {
   processSecurityIncident,
   calculateDeterministicRisk,
@@ -133,7 +134,7 @@ async function runPhase3Tests() {
   process.exit(failed === 0 ? 0 : 1);
 }
 
-runPhase3Tests().catch((e) => {
+storage.run({ role: 'super_admin', bypassRls: true }, () => runPhase3Tests()).catch((e) => {
   console.error('Fatal Phase 3 test runner error:', e);
   process.exit(1);
 });

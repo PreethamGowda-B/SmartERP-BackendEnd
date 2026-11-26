@@ -97,18 +97,22 @@ function sanitizeForPrompt(rawText, tagLabel = 'untrusted_telemetry') {
   // Redact bearer tokens
   safe = redactSensitiveData(safe);
 
+  const safeTag = String(tagLabel || 'untrusted_telemetry').replace(/[^a-zA-Z0-9_-]/g, '');
+  const tagBreakoutRegex = new RegExp(`</?${safeTag}>`, 'gi');
+
   // Neutralize delimiters that could fool Markdown / LLM parsers
   safe = safe
     .replace(/```/g, "'''")
     .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '[REMOVED_SCRIPT]')
     .replace(/<\/?system>/gi, '[SYSTEM_TAG_STRIPPED]')
-    .replace(/<\/?instruction>/gi, '[INSTRUCTION_TAG_STRIPPED]');
+    .replace(/<\/?instruction>/gi, '[INSTRUCTION_TAG_STRIPPED]')
+    .replace(tagBreakoutRegex, '[BOUNDARY_TAG_STRIPPED]');
 
   // Flag prompt injection if detected
   const isSuspicious = containsPromptInjection(safe);
   const flagAttr = isSuspicious ? ' prompt_injection_detected="true"' : '';
 
-  return `<${tagLabel}${flagAttr}>\n${safe.trim()}\n</${tagLabel}>`;
+  return `<${safeTag}${flagAttr}>\n${safe.trim()}\n</${safeTag}>`;
 }
 
 /**

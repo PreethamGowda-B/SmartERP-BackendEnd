@@ -325,12 +325,15 @@ router.post('/recruitment', authenticateToken, async (req, res) => {
 router.get('/skills', authenticateToken, async (req, res) => {
   try {
     const companyId = req.user.companyId;
+    const isPrivileged = ['owner', 'admin', 'hr'].includes(req.user.role);
+    const params = isPrivileged ? [companyId] : [companyId, req.user.userId || req.user.id];
+    const userFilter = isPrivileged ? '' : 'AND s.user_id::text = $2::text';
     const result = await pool.query(
       `SELECT s.*, u.name as employee_name, u.email as employee_email 
        FROM hr_skills_certifications s 
        JOIN users u ON s.user_id::text = u.id::text 
-       WHERE s.company_id = $1 ORDER BY s.created_at DESC`,
-      [companyId]
+       WHERE s.company_id = $1 ${userFilter} ORDER BY s.created_at DESC`,
+      params
     );
     res.json({ success: true, skills: result.rows });
   } catch (err) {
@@ -341,12 +344,17 @@ router.get('/skills', authenticateToken, async (req, res) => {
 router.post('/skills', authenticateToken, async (req, res) => {
   try {
     const companyId = req.user.companyId;
+    const isPrivileged = ['owner', 'admin', 'hr'].includes(req.user.role);
     const { user_id, skill_name, certification_name, issuing_authority, expiry_date } = req.body;
+    const targetUserId = isPrivileged && user_id ? user_id : (req.user.userId || req.user.id);
+    if (!skill_name || !String(skill_name).trim()) {
+      return res.status(400).json({ message: 'skill_name is required' });
+    }
 
     const result = await pool.query(
       `INSERT INTO hr_skills_certifications (company_id, user_id, skill_name, certification_name, issuing_authority, expiry_date)
        VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-      [companyId, user_id, skill_name, certification_name, issuing_authority, expiry_date || null]
+      [companyId, targetUserId, String(skill_name).trim(), certification_name || null, issuing_authority || null, expiry_date || null]
     );
 
     res.status(201).json({ success: true, skill: result.rows[0] });

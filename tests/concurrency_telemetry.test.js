@@ -8,6 +8,7 @@
 
 require('dotenv').config();
 const { pool } = require('../db');
+const { storage } = require('../middleware/als');
 const { redisClient } = require('../utils/redis');
 const { emitSecurityEvent, SECURITY_EVENT_TYPES } = require('../utils/securityEmitter');
 
@@ -86,7 +87,7 @@ async function runConcurrencyTest() {
   process.exit(redisPassed && dbPassed ? 0 : 1);
 }
 
-runConcurrencyTest().catch((e) => {
+storage.run({ role: 'super_admin', bypassRls: true }, () => runConcurrencyTest()).catch((e) => {
   console.error('Fatal concurrency runner error:', e);
   process.exit(1);
 });

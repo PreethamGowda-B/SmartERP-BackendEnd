@@ -28,6 +28,8 @@ try {
 if (process.env.SENTRY_DSN) {
   Sentry.init({
     dsn: process.env.SENTRY_DSN,
+    environment: process.env.NODE_ENV || "development",
+    release: process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || undefined,
     integrations: [
       ...(typeof nodeProfilingIntegration === "function" ? [nodeProfilingIntegration()] : []),
     ],
@@ -38,6 +40,18 @@ if (process.env.SENTRY_DSN) {
         delete event.request.headers['authorization'];
         delete event.request.headers['cookie'];
         delete event.request.headers['set-cookie'];
+        delete event.request.headers['x-razorpay-signature'];
+        delete event.request.headers['x-hub-signature-256'];
+      }
+      if (event.request?.query_string && typeof event.request.query_string === 'string') {
+        event.request.query_string = event.request.query_string.replace(/(token|code|secret|key)=[^&]*/gi, '$1=[REDACTED]');
+      }
+      if (event.request?.data && typeof event.request.data === 'object') {
+        for (const sensitiveKey of ['password', 'newPassword', 'token', 'accessToken', 'refreshToken', 'otp']) {
+          if (sensitiveKey in event.request.data) {
+            event.request.data[sensitiveKey] = '[REDACTED]';
+          }
+        }
       }
       return event;
     },
@@ -376,7 +390,6 @@ if (process.env.NODE_ENV === "production") {
       '/api/auth/send-otp', '/api/v1/auth/send-otp',
       '/api/auth/verify-otp', '/api/v1/auth/verify-otp',
       '/api/auth/validate-company', '/api/v1/auth/validate-company',
-      '/api/auth/set-cookie', '/api/v1/auth/set-cookie',
       '/api/webhook', '/api/v1/webhook',
       '/webhooks/whatsapp', '/api/webhooks/whatsapp', '/api/v1/webhooks/whatsapp'
     ];
@@ -1260,7 +1273,7 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
 
   // ✅ Start server
   const PORT = process.env.PORT || 4000;
-  app.listen(PORT, async () => {
+  const serverInstance = app.listen(PORT, async () => {
     // Run background processors once per Render service instance. In production
     // cluster mode only the explicitly designated worker owns scheduled work;
     // development/non-cluster mode has one process and can run it locally.
@@ -1374,6 +1387,7 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
       }
     }
   });
+  registerGracefulShutdown(serverInstance);
 }
 
 module.exports = app;

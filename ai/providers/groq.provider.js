@@ -140,6 +140,7 @@ class GroqProvider extends BaseAIProvider {
           model: modelToTry,
           messages: sanitizedMessages,
           temperature,
+          max_tokens: Number(process.env.GROQ_MAX_TOKENS || 2048),
         };
 
         if (tools && tools.length > 0) {
@@ -212,6 +213,7 @@ class GroqProvider extends BaseAIProvider {
                   toolCalls: [],
                   usage: {},
                   model: modelToTry,
+                  provider: 'groq',
                 };
               }
             } catch (_) {}
@@ -224,6 +226,7 @@ class GroqProvider extends BaseAIProvider {
               toolCalls: parsedCalls,
               usage: {},
               model: modelToTry,
+              provider: 'groq',
             };
           }
         }

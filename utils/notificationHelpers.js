@@ -138,7 +138,13 @@ async function createNotification(arg1, arg2, arg3, arg4, arg5) {
                     };
 
                     const { sendMulticastPush } = require('../services/firebaseService');
-                    await sendMulticastPush(tokens, title, message, pushData);
+                    const pushResult = await sendMulticastPush(tokens, title, message, pushData);
+                    if (pushResult?.failedTokens?.length) {
+                        await pool.query(
+                            'DELETE FROM user_devices WHERE user_id = $1 AND fcm_token = ANY($2::text[])',
+                            [user_id, pushResult.failedTokens]
+                        ).catch(() => {});
+                    }
                 }
             } catch (pushErr) {
                 console.error('❌ Multi-device push failed:', pushErr.message);

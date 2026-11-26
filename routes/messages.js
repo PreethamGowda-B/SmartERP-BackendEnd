@@ -65,7 +65,10 @@ function authenticateMediaRequest(req, res, next) {
     const customerId = verified.id || verified.customerId || verified.userId;
     const companyId = verified.companyId || verified.company_id;
     req.customer = { ...verified, id: customerId, customerId, companyId, role: 'customer' };
-    return next();
+    return storage.run(
+      { isWebRequest: true, companyId, role: 'customer', userId: customerId, bypassRls: false },
+      next
+    );
   }
 
   return authenticateToken(req, res, next);
@@ -1147,18 +1150,20 @@ router.post(
   }),
   checkPlanLimit('storage', { getRequestedUsage: (req) => req.file?.size || 0 }),
   async (req, res) => {
+    let companyId = null;
+    let storageKey = null;
     try {
       if (!req.file) {
         return res.status(400).json({ message: 'No file provided' });
       }
 
-      const { originalname, mimetype, size, buffer } = req.file;
-      const cleanMime = (mimetype || '').split(';')[0].trim().toLowerCase();
+      const { originalname, mimetype, size, buffer, validatedMime } = req.file;
+      const cleanMime = (validatedMime || mimetype || '').split(';')[0].trim().toLowerCase();
       const isImage = cleanMime.startsWith('image/');
       const isAudio = cleanMime.startsWith('audio/');
       const folder = 'smarterp/messages';
-      const companyId = req.user?.companyId || req.user?.company_id;
-      const storageKey = `message-upload:${crypto.randomUUID()}`;
+      companyId = req.user?.companyId || req.user?.company_id;
+      storageKey = `message-upload:${crypto.randomUUID()}`;
       await recordCompanyStorageUsage(companyId, storageKey, size, 'message_attachment');
 
       let fileUrl = null;

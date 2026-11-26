@@ -64,7 +64,7 @@ test('customer feed SQL scopes tenant, customer, event type and referenced owned
 
 test('staff notification endpoints authorize against persisted role and scope all mutations by user/company', () => {
   const source = fs.readFileSync(path.join(__dirname, '../routes/notifications.js'), 'utf8');
-  assert.match(source, /SELECT id, role, company_id FROM users WHERE id::text = \$1::text/);
+  assert.match(source, /SELECT id, role, company_id FROM users WHERE id (?:= \$1::uuid|::text = \$1::text)/);
   assert.match(source, /INTERNAL_ROLES\.has\(String\(principal\.role/);
   assert.match(source, /router\.get\('\/', authenticateToken, requireInternalNotificationPrincipal/);
   assert.match(source, /router\.get\('\/:id', authenticateToken, requireInternalNotificationPrincipal/);

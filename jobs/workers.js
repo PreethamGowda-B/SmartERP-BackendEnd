@@ -1,6 +1,7 @@
 const { Worker } = require('bullmq');
 const { redisConnection } = require('../utils/queue');
 const { createNotification } = require('../utils/notificationHelpers');
+const { storage } = require('../middleware/als');
 const logger = require('../utils/logger');
 const backgroundWorkers = [];
 
@@ -10,18 +11,20 @@ if (redisConnection) {
    * Processes FCM and SSE deliveries in the background
    */
   const notificationWorker = new Worker('notifications', async (job) => {
-    logger.debug(`Processing notification job ${job.id} for user ${job.data?.user_id}`, { jobId: job.id, userId: job.data?.user_id });
-    try {
-      if (job.data?.isCompanyNotification) {
-        const { createNotificationForCompany } = require('../utils/notificationHelpers');
-        await createNotificationForCompany(job.data);
-      } else {
-        await createNotification(job.data);
+    return storage.run({ isWebRequest: false, bypassRls: true }, async () => {
+      logger.debug(`Processing notification job ${job.id} for user ${job.data?.user_id}`, { jobId: job.id, userId: job.data?.user_id });
+      try {
+        if (job.data?.isCompanyNotification) {
+          const { createNotificationForCompany } = require('../utils/notificationHelpers');
+          await createNotificationForCompany(job.data);
+        } else {
+          await createNotification(job.data);
+        }
+      } catch (err) {
+        logger.error(`Notification Job ${job.id} failed`, err, { jobId: job.id });
+        throw err; // Allow BullMQ to retry if needed
       }
-    } catch (err) {
-      logger.error(`Notification Job ${job.id} failed`, err, { jobId: job.id });
-      throw err; // Allow BullMQ to retry if needed
-    }
+    });
   }, { connection: redisConnection });
   backgroundWorkers.push(notificationWorker);
 
@@ -30,13 +33,16 @@ if (redisConnection) {
    * Processes activity logging without blocking the API
    */
   const auditWorker = new Worker('audit', async (job) => {
-    logger.debug(`Processing audit job ${job.id} for user ${job.data?.userId}`, { jobId: job.id, userId: job.data?.userId });
-    try {
-      const { logJobAudit } = require('../utils/auditLogger');
-      await logJobAudit(job.data);
-    } catch (err) {
-      logger.error(`Audit Job ${job.id} failed`, err, { jobId: job.id });
-    }
+    return storage.run({ isWebRequest: false, bypassRls: true }, async () => {
+      logger.debug(`Processing audit job ${job.id} for user ${job.data?.userId}`, { jobId: job.id, userId: job.data?.userId });
+      try {
+        const { logJobAudit } = require('../utils/auditLogger');
+        await logJobAudit(job.data);
+      } catch (err) {
+        logger.error(`Audit Job ${job.id} failed`, err, { jobId: job.id });
+        throw err;
+      }
+    });
   }, { connection: redisConnection });
   backgroundWorkers.push(auditWorker);
 
@@ -50,6 +56,7 @@ if (redisConnection) {
   const { getPlan, getPricePaise, paymentMatchesOrder, isRazorpayConfigured } = require('../services/subscriptionCatalog');
 
   const webhookWorker = new Worker('webhook-retry', async (job) => {
+    return storage.run({ isWebRequest: false, bypassRls: true }, async () => {
     const { companyId, planId, billingCycle, paymentId, orderId, purpose } = job.data;
 
     // Retry worker only handles plan purchases. Trial activation is handled by
@@ -152,6 +159,7 @@ if (redisConnection) {
     } finally {
       client.release();
     }
+    });
   }, { connection: redisConnection });
   backgroundWorkers.push(webhookWorker);
 

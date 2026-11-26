@@ -51,7 +51,7 @@ class ReActEngine {
   static async run({ userPrompt, history = [], context, systemPromptOverride = null, modelScope = 'general', toolsEnabled = true }) {
     const startTime = Date.now();
     const provider = ProviderFactory.getProvider();
-    const systemPrompt = systemPromptOverride || ContextEngine.generateSystemPrompt(context);
+    const systemPrompt = systemPromptOverride || ContextEngine.generateSystemPrompt(context, modelScope);
     const executionContext = { ...context, aiModelScope: modelScope };
     const availableTools = toolsEnabled ? pluginRegistry.getAvailableTools(executionContext) : [];
 

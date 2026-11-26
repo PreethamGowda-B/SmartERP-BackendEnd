@@ -1,4 +1,5 @@
 const admin = require('firebase-admin');
+const { getMessaging } = require('firebase-admin/messaging');
 const { withOutboundOperation } = require('../utils/outboundBandwidth');
 const logger = require('../utils/logger');
 
@@ -42,9 +43,9 @@ try {
     }
 
     if (serviceAccount) {
-        if (!admin.apps.length) {
+        if (!admin.getApps().length) {
             admin.initializeApp({
-                credential: admin.credential.cert(serviceAccount)
+                credential: admin.cert(serviceAccount)
             });
             logger.info('Firebase Admin initialized', { pid: process.pid, isFirstApp: true });
         } else {
@@ -111,7 +112,7 @@ async function sendPushNotification(token, title, body, data = {}) {
     };
 
     try {
-        const response = await withOutboundOperation('google-firebase', 'single_push', () => admin.messaging().send(message), { responsibleModule: 'services/firebaseService' });
+        const response = await withOutboundOperation('google-firebase', 'single_push', () => getMessaging().send(message), { responsibleModule: 'services/firebaseService' });
         logger.debug('Push notification delivered', { messageId: response });
         logger.business('NOTIFICATION_SENT', { channel: 'fcm_push', count: 1, title });
         return response;
@@ -178,20 +179,34 @@ async function sendMulticastPush(tokens, title, body, data = {}) {
     };
 
     try {
-        const response = await withOutboundOperation('google-firebase', 'multicast_push', () => admin.messaging().sendEachForMulticast(payload), { responsibleModule: 'services/firebaseService' });
-        logger.debug('Multicast push delivered', { successCount: response.successCount, failureCount: response.failureCount });
-        logger.business('NOTIFICATION_SENT', { channel: 'fcm_multicast', successCount: response.successCount, failureCount: response.failureCount, title });
-
-        // Return tokens that failed so we can clean them up if needed
+        let totalSuccess = 0;
+        let totalFailure = 0;
         const failedTokens = [];
-        if (response.failureCount > 0) {
-            response.responses.forEach((resp, idx) => {
-                if (!resp.success) {
-                    failedTokens.push(tokens[idx]);
-                }
-            });
+
+        // FCM sendEachForMulticast supports up to 500 tokens per batch
+        for (let i = 0; i < tokens.length; i += 500) {
+            const batchTokens = tokens.slice(i, i + 500);
+            const batchPayload = { ...payload, tokens: batchTokens };
+            const response = await withOutboundOperation(
+                'google-firebase',
+                'multicast_push',
+                () => getMessaging().sendEachForMulticast(batchPayload),
+                { responsibleModule: 'services/firebaseService' }
+            );
+            totalSuccess += response.successCount || 0;
+            totalFailure += response.failureCount || 0;
+            if (response.failureCount > 0) {
+                response.responses.forEach((resp, idx) => {
+                    if (!resp.success) {
+                        failedTokens.push(batchTokens[idx]);
+                    }
+                });
+            }
         }
-        return { response, failedTokens };
+
+        logger.debug('Multicast push delivered', { successCount: totalSuccess, failureCount: totalFailure });
+        logger.business('NOTIFICATION_SENT', { channel: 'fcm_multicast', successCount: totalSuccess, failureCount: totalFailure, title });
+        return { response: { successCount: totalSuccess, failureCount: totalFailure }, failedTokens };
     } catch (error) {
         logger.error('Error sending multicast notification', error, { title });
         throw error;

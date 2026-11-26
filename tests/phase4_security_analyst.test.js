@@ -11,6 +11,7 @@
 
 require('dotenv').config();
 const { pool } = require('../db');
+const { storage } = require('../middleware/als');
 const SecurityPlugin = require('../ai/plugins/security.plugin');
 const {
   redactSensitiveData,
@@ -151,7 +152,7 @@ async function runPhase4Tests() {
   process.exit(failed === 0 ? 0 : 1);
 }
 
-runPhase4Tests().catch((e) => {
+storage.run({ role: 'super_admin', bypassRls: true }, () => runPhase4Tests()).catch((e) => {
   console.error('Fatal Phase 4 test runner error:', e);
   process.exit(1);
 });

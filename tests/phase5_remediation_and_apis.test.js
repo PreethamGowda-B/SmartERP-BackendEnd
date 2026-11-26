@@ -12,6 +12,7 @@
 require('dotenv').config();
 const jwt = require('jsonwebtoken');
 const { pool } = require('../db');
+const { storage } = require('../middleware/als');
 const { redisClient } = require('../utils/redis');
 const {
   SECURITY_ACTION_TYPES,
@@ -34,6 +35,12 @@ function generateTestToken(user) {
 
 async function runPhase5Tests() {
   console.log('🧪 Starting Phase 5 Remediation Policy & Super Admin Security Tests...\n');
+  if (redisClient && redisClient.status !== 'ready') {
+    await new Promise((resolve) => {
+      redisClient.once('ready', resolve);
+      setTimeout(resolve, 3000);
+    });
+  }
   let passed = 0;
   let failed = 0;
 
@@ -115,6 +122,7 @@ async function runPhase5Tests() {
 
   // ── Test 4: Sensitive Action Approval Gate Enforcement ──────────────────────
   {
+    await pool.query(`UPDATE users SET is_active = true WHERE id = '00000000-0000-0000-0000-000000000001'`);
     const insertSensitiveRes = await pool.query(
       `INSERT INTO security_actions (incident_id, company_id, action_type, is_automated, approval_status, details, created_at)
        VALUES ($1, '1', $2, FALSE, 'pending', $3, NOW())
@@ -183,7 +191,7 @@ async function runPhase5Tests() {
   process.exit(failed === 0 ? 0 : 1);
 }
 
-runPhase5Tests().catch((e) => {
+storage.run({ role: 'super_admin', bypassRls: true }, () => runPhase5Tests()).catch((e) => {
   console.error('Fatal Phase 5 test runner error:', e);
   process.exit(1);
 });

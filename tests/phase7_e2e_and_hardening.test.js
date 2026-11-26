@@ -7,6 +7,7 @@
 const assert = require('assert');
 require('dotenv').config();
 const { pool } = require('../db');
+const { storage } = require('../middleware/als');
 const { emitSecurityEvent, SECURITY_EVENT_TYPES } = require('../utils/securityEmitter');
 const { processSecurityIncident, THREAT_CATEGORIES } = require('../jobs/securityWorker');
 const { applyRemediationPolicy, SECURITY_ACTION_TYPES, generateActionIdempotencyKey } = require('../utils/securityPolicyEngine');
@@ -197,7 +198,7 @@ async function runPhase7Tests() {
   }
 }
 
-runPhase7Tests()
+storage.run({ role: 'super_admin', bypassRls: true }, () => runPhase7Tests())
   .then(async () => {
     await pool.end();
     process.exit(0);

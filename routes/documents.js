@@ -76,7 +76,8 @@ router.post(
         await recordCompanyStorageUsage(companyId, storageKey, req.file.size, 'employee_document');
 
         // Upload buffer to Cloudinary or fallback to local disk
-        const isImage = req.file.mimetype.startsWith('image/');
+        const effectiveMime = req.file.validatedMime || req.file.mimetype;
+        const isImage = effectiveMime.startsWith('image/');
         let fileUrl = null;
 
         if (hasCloudinaryConfig) {
@@ -113,7 +114,7 @@ router.post(
                         `INSERT INTO message_media_files (file_name, file_type, file_size, data, company_id, uploaded_by)
                          VALUES ($1, $2, $3, $4, $5, $6)
                          RETURNING id`,
-                        [req.file.originalname || `doc_${crypto.randomUUID()}`, req.file.mimetype, req.file.size, req.file.buffer, String(companyId), String(userId)]
+                        [req.file.originalname || `doc_${crypto.randomUUID()}`, effectiveMime, req.file.size, req.file.buffer, String(companyId), String(userId)]
                     ),
                 });
                 const baseUrl = process.env.BASE_URL || process.env.BACKEND_URL || 'https://api.prozync.in';

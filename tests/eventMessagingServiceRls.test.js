@@ -113,8 +113,8 @@ test('messages RLS remains enabled and tenant-scoped', () => {
 
 test('job creation response remains independent from best-effort messaging failures', () => {
   const route = fs.readFileSync(path.join(__dirname, '..', 'routes', 'jobs.js'), 'utf8');
+  const response = route.indexOf('res.json(createdJob);');
   const eventCall = route.indexOf('EventMessagingService.onJobCreated({');
-  const response = route.indexOf('res.json(createdJob);', eventCall);
-  assert.ok(eventCall >= 0 && response > eventCall);
-  assert.match(route.slice(eventCall, response), /\.catch\(\(\) => \{ \}\)/);
+  assert.ok(response >= 0 && eventCall > response);
+  assert.match(route.slice(eventCall, eventCall + 350), /\.catch\(\(\) => \{ \}\)/);
 });

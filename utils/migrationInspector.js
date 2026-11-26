@@ -20,7 +20,7 @@ function getLocalMigrationFiles() {
   try {
     if (!fs.existsSync(MIGRATIONS_DIR)) return [];
     return fs.readdirSync(MIGRATIONS_DIR)
-      .filter(f => /^\d{3}_.*\.sql$/.test(f))
+      .filter(f => /^\d{3}[a-z]?_.*\.sql$/i.test(f) && !/\.rollback\.sql$/i.test(f))
       .sort()
       .map(f => {
         const match = f.match(/^(\d{3}[a-z]?)_(.*)\.sql$/);

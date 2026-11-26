@@ -28,12 +28,7 @@ async function optimizeDatabase() {
       'CREATE INDEX IF NOT EXISTS idx_hr_requests_comp_status ON hr_employee_requests(company_id, status)',
       
       // Notifications (High volume)
-      'CREATE INDEX IF NOT EXISTS idx_notifications_user_id_read ON notifications(user_id, read)',
-      'CREATE INDEX IF NOT EXISTS idx_notifications_user_text_company_text_created ON notifications ((user_id::text), (company_id::text), created_at DESC)',
-      
-      // Material Requests
-      'CREATE INDEX IF NOT EXISTS idx_materials_company_id ON material_requests(company_id)',
-      'CREATE INDEX IF NOT EXISTS idx_materials_requested_by ON material_requests(requested_by)'
+      'CREATE INDEX IF NOT EXISTS idx_notifications_user_text_company_text_created ON notifications ((user_id::text), (company_id::text), created_at DESC)'
     ];
 
     for (const q of queries) {
